@@ -236,10 +236,10 @@ Baseline (as of this phase entry): four open High-severity advisories at <https:
 
 Python code in `src/` has no static type checking today — type regressions only surface at runtime. Pyright will act as an additional quality guardrail for the agent alongside ruff and pytest, enforcing type annotations across the backend.
 
-- Add `pyright` to `[tool.pdm.dev-dependencies]` in `pyproject.toml` and create `pyrightconfig.json` at the repo root with `include: ["src"]`, `pythonVersion: "3.11"`, and `typeCheckingMode: "basic"` as the starting bar (ratchet to `standard`/`strict` later if helpful)
-- Add `typecheck = "pyright"` to `[tool.pdm.scripts]` so `pdm run typecheck` is the single invocation used locally, in the Claude hook, and in CI
-- Annotate all modules under `src/` until `pdm run typecheck` exits clean — cover function signatures, class attributes, and Pydantic model fields where inferred types are insufficient; handle dependencies without stubs (e.g. `arazzo-runner`, `rank-bm25`) via targeted `ignore` config rather than blanket `# type: ignore`
-- Add a `PostToolUse` hook in `.claude/settings.json` that runs `pdm run typecheck` on `Edit`/`Write`/`MultiEdit` matches under `src/**/*.py`, so agent-introduced type errors surface at edit time instead of PR time
+- Add `pyright` to `[dependency-groups] dev` in `pyproject.toml` and create `pyrightconfig.json` at the repo root with `include: ["src"]`, `pythonVersion: "3.11"`, and `typeCheckingMode: "basic"` as the starting bar (ratchet to `standard`/`strict` later if helpful)
+- Add `typecheck = "pyright"` to `[tool.poe.tasks]` so `uv run poe typecheck` is the single invocation used locally, in the Claude hook, and in CI
+- Annotate all modules under `src/` until `uv run poe typecheck` exits clean — cover function signatures, class attributes, and Pydantic model fields where inferred types are insufficient; handle dependencies without stubs (e.g. `arazzo-runner`, `rank-bm25`) via targeted `ignore` config rather than blanket `# type: ignore`
+- Add a `PostToolUse` hook in `.claude/settings.json` that runs `uv run poe typecheck` on `Edit`/`Write`/`MultiEdit` matches under `src/**/*.py`, so agent-introduced type errors surface at edit time instead of PR time
 - Add a typecheck step to `.github/workflows/ci-backend.yml` alongside the existing lint/test steps so any pyright error fails the backend job
 - Update `specs/tech-stack.md`: rewrite the Python type-checking entry under the formatting/linting section (currently says Python has no static type checking) to reflect pyright adoption, and remove the "No mypy or pyright" bullet under "What We Are Not Using"
 
@@ -428,7 +428,7 @@ The two-actor invariant is preserved (humans gain a third auth path; agents and 
 - Update `docs/auth.md` and `README.md`; remove PR #369's note pointing at this issue
 - Close #366; cross-reference #364, #365, PR #369
 
-## Phase 29 — Migrate Python Packaging from PDM to uv
+## Phase 29 — Migrate Python Packaging from PDM to uv ✅
 
 **Goal:** Replace PDM with uv across the project's Python tooling so Dependabot resumes opening version-bump PRs against `pyproject.toml`.
 **Depends on:** none (self-contained — Python tooling only)
@@ -437,7 +437,7 @@ The two-actor invariant is preserved (humans gain a third auth path; agents and 
 Dependabot's pip parser short-circuits when it sees `pdm.lock` alongside PEP 621 fields — every Python dep has been silently un-bumped for ~4 weeks, and the PDM-side fix in dependabot-core ([PR #12435](https://github.com/dependabot/dependabot-core/pull/12435)) was abandoned by its author on 2026-05-19. uv's Dependabot ecosystem reads `[project.dependencies]` + `[dependency-groups]` and updates `uv.lock` atomically in the same PR, so the migration unblocks Python bumps without reintroducing a lock-sync workflow.
 
 - Add `poethepoet` to `[dependency-groups] dev` and replace `[tool.pdm.scripts]` with `[tool.poe.tasks]` blocks for `lint`, `lint:fix`, and `test` — mirrors the convention in [jentic-openapi-tools](https://github.com/jentic/jentic-openapi-tools/blob/main/pyproject.toml) so task invocation is `uv run poe <task>` across the org
-- Swap `[build-system]` from `pdm-backend` to `uv_build` (uv's first-party PEP 517 backend, also used in `jentic-openapi-tools`) — `jentic-mini` is Docker-distributed only, so the `[build-system]` block is for `uv sync` / `uv build` consistency, not PyPI publication
+- Delete the `[build-system]` block entirely and add `[tool.uv] package = false` — `jentic-mini` is Docker-distributed and never wheelable, so no PEP 517 backend is needed; application mode means `uv sync` resolves and installs deps without invoking any backend
 - Delete `pdm.lock`; generate and commit `uv.lock` via `uv lock`
 - Replace `pdm-project/setup-pdm@v4` with `astral-sh/setup-uv` across all CI workflows; update `ci-backend.yml`'s `paths:` filter from `pdm.lock` to `uv.lock` so Python CI gating still triggers on lock changes
 - Replace every `pdm install` / `pdm run …` invocation with `uv sync` / `uv run poe …` across CI workflows and any dev scripts
