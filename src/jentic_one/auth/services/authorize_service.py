@@ -1,0 +1,322 @@
+"""Authorization code + PKCE flow service."""
+
+from __future__ import annotations
+
+import hashlib
+import hmac as hmac_mod
+import secrets
+from base64 import urlsafe_b64encode
+from datetime import UTC, datetime, timedelta
+
+from jentic_one.admin.repos import (
+    AuthorizationCodeRepository,
+    ExternalIdentityRepository,
+    UserRepository,
+)
+from jentic_one.auth.core.id_token import issue_id_token
+from jentic_one.auth.core.idp import IdpAdapter, IdpClaims, OidcAdapter
+from jentic_one.auth.services.errors import InvalidGrantError
+from jentic_one.auth.services.token_service import TokenService
+from jentic_one.shared.audit import AuditAction, AuditTargetType, record_audit
+from jentic_one.shared.config import AuthConfig
+from jentic_one.shared.context import Context
+from jentic_one.shared.db import DatabaseIntegrityError
+from jentic_one.shared.models import ActorType, InviteState
+
+
+def _hash_code(code: str) -> str:
+    return hashlib.sha256(code.encode()).hexdigest()
+
+
+def _verify_pkce(code_verifier: str, code_challenge: str) -> bool:
+    digest = hashlib.sha256(code_verifier.encode()).digest()
+    computed = urlsafe_b64encode(digest).rstrip(b"=").decode()
+    return hmac_mod.compare_digest(computed, code_challenge)
+
+
+class AuthorizeService:
+    """Handles AuthCode+PKCE flow: code issuance, exchange, and IdP federation."""
+
+    def __init__(self, ctx: Context) -> None:
+        self._ctx = ctx
+        self._token_svc = TokenService(ctx)
+
+    @property
+    def _auth_config(self) -> AuthConfig:
+        return self._ctx.config.auth
+
+    def _get_idp_adapter(self) -> IdpAdapter | None:
+        if not self._auth_config.idp.enabled:
+            return None
+        return OidcAdapter(self._auth_config.idp)
+
+    def get_authorize_redirect_url(
+        self,
+        *,
+        state: str,
+        nonce: str,
+        redirect_uri: str,
+    ) -> str | None:
+        """Get the upstream IdP authorization URL, or None if local-only."""
+        adapter = self._get_idp_adapter()
+        if adapter is None:
+            return None
+        return adapter.authorize_url(state=state, nonce=nonce, redirect_uri=redirect_uri)
+
+    async def handle_idp_callback(
+        self,
+        *,
+        code: str,
+        redirect_uri: str,
+        client_id: str,
+        original_redirect_uri: str,
+        code_challenge: str,
+        scopes: str,
+        nonce: str | None,
+    ) -> str:
+        """Handle IdP callback: exchange upstream code, map identity, issue auth code.
+
+        Returns the platform authorization code.
+        """
+        adapter = self._get_idp_adapter()
+        if adapter is None:
+            raise InvalidGrantError("No external IdP configured")
+
+        userinfo = await adapter.exchange_code(code, redirect_uri=redirect_uri)
+        claims = adapter.map_claims(userinfo)
+        user_id = await self._resolve_or_create_user(claims)
+
+        return await self._issue_authorization_code(
+            user_id=user_id,
+            client_id=client_id,
+            redirect_uri=original_redirect_uri,
+            code_challenge=code_challenge,
+            scopes=scopes,
+            nonce=nonce,
+        )
+
+    async def issue_authorization_code(
+        self,
+        *,
+        user_id: str,
+        client_id: str,
+        redirect_uri: str,
+        code_challenge: str,
+        scopes: str = "openid",
+        nonce: str | None = None,
+    ) -> str:
+        """Issue an authorization code for a locally-authenticated user."""
+        return await self._issue_authorization_code(
+            user_id=user_id,
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            code_challenge=code_challenge,
+            scopes=scopes,
+            nonce=nonce,
+        )
+
+    async def _issue_authorization_code(
+        self,
+        *,
+        user_id: str,
+        client_id: str,
+        redirect_uri: str,
+        code_challenge: str,
+        scopes: str,
+        nonce: str | None,
+    ) -> str:
+        code_plain = secrets.token_urlsafe(32)
+        code_hash = _hash_code(code_plain)
+        ttl = self._auth_config.auth_code_ttl_seconds
+
+        async with self._ctx.admin_db.transaction() as session:
+            auth_code = await AuthorizationCodeRepository.create(
+                session,
+                code_hash=code_hash,
+                user_id=user_id,
+                client_id=client_id,
+                redirect_uri=redirect_uri,
+                code_challenge=code_challenge,
+                scopes=scopes,
+                nonce=nonce,
+                expires_at=datetime.now(UTC) + timedelta(seconds=ttl),
+                created_by=user_id,
+            )
+            await record_audit(
+                session,
+                action=AuditAction.CREATE,
+                target_type=AuditTargetType.TOKEN,
+                target_id=auth_code.id,
+                actor_type=ActorType.USER,
+                actor_id=user_id,
+                reason="authorization code issued",
+                origin=None,
+            )
+
+        return code_plain
+
+    async def exchange_code(
+        self,
+        *,
+        code: str,
+        code_verifier: str,
+        redirect_uri: str,
+        client_id: str,
+    ) -> tuple[str, str, str]:
+        """Exchange auth code + PKCE verifier for tokens.
+
+        Returns (access_token, refresh_token, id_token).
+        """
+        code_hash = _hash_code(code)
+        now = datetime.now(UTC)
+
+        async with self._ctx.admin_db.transaction() as session:
+            auth_code = await AuthorizationCodeRepository.get_by_hash(
+                session, code_hash, for_update=True
+            )
+
+            if auth_code is None:
+                raise InvalidGrantError("authorization code not found")
+
+            if auth_code.consumed_at is not None:
+                raise InvalidGrantError("authorization code already used")
+
+            if auth_code.expires_at <= now:
+                raise InvalidGrantError("authorization code expired")
+
+            if auth_code.client_id != client_id:
+                raise InvalidGrantError("client_id mismatch")
+
+            if auth_code.redirect_uri != redirect_uri:
+                raise InvalidGrantError("redirect_uri mismatch")
+
+            if not _verify_pkce(code_verifier, auth_code.code_challenge):
+                raise InvalidGrantError("PKCE verification failed")
+
+            await AuthorizationCodeRepository.consume(session, auth_code.id, now)
+
+            user = await UserRepository.get_by_id(session, auth_code.user_id)
+
+            if user is not None:
+                await record_audit(
+                    session,
+                    action=AuditAction.LOGIN,
+                    target_type=AuditTargetType.SESSION,
+                    target_id=user.id,
+                    actor_type=ActorType.USER,
+                    actor_id=user.id,
+                    reason="authorization code exchange",
+                    origin=None,
+                )
+
+        if user is None:
+            raise InvalidGrantError("user not found")
+
+        scopes = auth_code.scopes.split() if auth_code.scopes else ["openid"]
+        access_token, refresh_token = await self._token_svc.issue_pair(
+            user.id, ActorType.USER, scopes
+        )
+
+        id_token = issue_id_token(
+            self._auth_config,
+            sub=user.id,
+            email=user.email,
+            aud=client_id,
+            nonce=auth_code.nonce,
+        )
+
+        return access_token, refresh_token, id_token
+
+    async def _resolve_or_create_user(self, claims: IdpClaims) -> str:
+        """Resolve external identity to existing user or create a new one.
+
+        Auto-links to an existing account by email only when the IdP asserts
+        email_verified=true. When the email is unverified and already belongs to
+        a local account, the login is rejected (fail closed) rather than linked
+        or silently creating a duplicate — emails are unique, so a duplicate is
+        impossible and a takeover via unverified email must not be allowed.
+
+        Handles the race condition where concurrent callbacks for the same
+        external_subject both pass the initial lookup — the UniqueConstraint
+        on (provider, external_subject) rejects the second insert, which is
+        caught and retried as a lookup.
+        """
+        provider = self._auth_config.idp.provider
+
+        async with self._ctx.admin_db.transaction() as session:
+            ext_id = await ExternalIdentityRepository.get_by_provider_subject(
+                session, provider, claims.external_subject
+            )
+            if ext_id is not None:
+                return ext_id.user_id
+
+        try:
+            async with self._ctx.admin_db.transaction() as session:
+                existing_user = await UserRepository.get_by_email(session, claims.email)
+                if existing_user is not None:
+                    if not claims.email_verified:
+                        raise InvalidGrantError(
+                            "Email is not verified by the identity provider and is "
+                            "already associated with an existing account"
+                        )
+                    await ExternalIdentityRepository.create(
+                        session,
+                        provider=provider,
+                        external_subject=claims.external_subject,
+                        user_id=existing_user.id,
+                        email=claims.email,
+                        created_by=existing_user.id,
+                    )
+                    await record_audit(
+                        session,
+                        action=AuditAction.CREATE,
+                        target_type=AuditTargetType.USER,
+                        target_id=existing_user.id,
+                        actor_type=ActorType.USER,
+                        actor_id=existing_user.id,
+                        reason=f"linked external identity ({provider})",
+                        origin=None,
+                    )
+                    return existing_user.id
+
+                new_user = await UserRepository.create(
+                    session,
+                    email=claims.email,
+                    first_name=claims.first_name,
+                    last_name=claims.last_name,
+                    active=True,
+                    auth_provider=provider,
+                    external_subject_id=claims.external_subject,
+                    invite_state=InviteState.ACCEPTED,
+                    created_by="self",
+                )
+                await ExternalIdentityRepository.create(
+                    session,
+                    provider=provider,
+                    external_subject=claims.external_subject,
+                    user_id=new_user.id,
+                    email=claims.email,
+                    created_by=new_user.id,
+                )
+                await record_audit(
+                    session,
+                    action=AuditAction.CREATE,
+                    target_type=AuditTargetType.USER,
+                    target_id=new_user.id,
+                    actor_type=ActorType.USER,
+                    actor_id=new_user.id,
+                    after={"email": claims.email, "auth_provider": provider},
+                    reason="provisioned via external IdP",
+                    origin=None,
+                )
+                return new_user.id
+        except DatabaseIntegrityError:
+            pass
+
+        async with self._ctx.admin_db.transaction() as session:
+            ext_id = await ExternalIdentityRepository.get_by_provider_subject(
+                session, provider, claims.external_subject
+            )
+            if ext_id is not None:
+                return ext_id.user_id
+            raise InvalidGrantError("concurrent identity creation failed")
