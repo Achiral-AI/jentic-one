@@ -4,6 +4,7 @@
   THEME — Tailwind utility class mappings.
   @theme inline maps CSS vars to Tailwind classes without emitting extra variables.
   All values are wrapped in hsl() so Tailwind opacity modifiers work (bg-primary/50 etc.).
+  Ported from jentic-mini/ui/src/index.css.
 */
 @theme inline {
 	/* Surface colors */
@@ -89,11 +90,10 @@
 	/*
 	 * Page gutter token — the canonical horizontal inset for every gutter-aware
 	 * surface in the app (PageShell body, PageHeader band, sticky toolbars, …).
-	 * Pinned to 1rem to match `jentic-webapp`'s `px-4`. Because this lives on
-	 * the spacing scale, Tailwind 4 generates every utility we need:
-	 *   px-page-gutter, py-page-gutter, mx-page-gutter, -mx-page-gutter, …
-	 * Change it here and the whole app updates in lock-step. NEVER reach for
-	 * an inline `px-N` value on individual pages.
+	 * Because this lives on the spacing scale, Tailwind 4 generates every utility
+	 * we need: px-page-gutter, py-page-gutter, mx-page-gutter, -mx-page-gutter, …
+	 * Change it here and the whole app updates in lock-step. NEVER reach for an
+	 * inline px-N value on individual pages.
 	 */
 	--spacing-page-gutter: 1rem;
 
@@ -102,12 +102,24 @@
 	--radius-md: calc(var(--radius) - 4px);
 	--radius-lg: var(--radius);
 	--radius-xl: calc(var(--radius) * 1.4);
+
+	/* Motion — a small, restrained baseline (#374 has no formal doc yet).
+	   Fast + subtle: enter/hover transitions and a skeleton shimmer that
+	   reads as "loading" without being noisy. */
+	--ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
+
+	/* Elevation utilities — `shadow-card`, `shadow-card-hover`, `shadow-pop`.
+	   Backed by the distinctly-named `--elevation-*` sources in :root below, so
+	   this @theme inline mapping is not self-referential (matches the
+	   `--color-X: hsl(var(--X))` pattern used by every other token here). */
+	--shadow-card: var(--elevation-card);
+	--shadow-card-hover: var(--elevation-card-hover);
+	--shadow-pop: var(--elevation-pop);
 }
 
 /*
   TOKENS — HSL triplets (no hsl() wrapper here).
   Format: `H S% L%` so Tailwind can apply opacity modifiers: bg-primary/50.
-  All values match @jentic/frontend-theme/styles.css conventions.
 
   Primary scale (higher = darker — standard Tailwind convention):
     --primary-50  → #F5F7F7 lightest
@@ -213,6 +225,19 @@
 	--dropdown-text-muted: 0 0% 85%; /* #d9d9d9 */
 	--dropdown-accent: 183 29% 72%; /* #a3cacc */
 	--dropdown-accent-hover: 186 28% 79%; /* #b8d8da */
+
+	/* ======================================================================
+	   ELEVATION
+	   Soft, dark-first shadows. Cards rest flat with a hairline border and
+	   lift on hover; dialogs sit at the top layer. Kept subtle so the dark
+	   surface still reads as calm, not glossy.
+	   ====================================================================== */
+	--elevation-card: 0 1px 2px 0 hsl(var(--primary-950) / 0.4);
+	--elevation-card-hover:
+		0 6px 20px -6px hsl(var(--primary-950) / 0.7), 0 2px 6px -2px hsl(var(--primary-950) / 0.5);
+	--elevation-pop:
+		0 16px 40px -12px hsl(var(--primary-950) / 0.85),
+		0 4px 12px -4px hsl(var(--primary-950) / 0.6);
 }
 
 @layer base {
@@ -263,7 +288,7 @@
 }
 
 /* ============================================================================
-   UTILITY CLASSES (mirrored from @jentic/frontend-theme tailwind.config.js)
+   UTILITY CLASSES
    ============================================================================ */
 
 .text-link {
@@ -278,6 +303,80 @@
 	@apply hover:border-card-border-hover transition-colors duration-150;
 }
 
+/* ----------------------------------------------------------------------------
+   MOTION — restrained baseline (#374). All of this is disabled under
+   prefers-reduced-motion by the global reset at the bottom of this file.
+   ---------------------------------------------------------------------------- */
+
+/* Skeleton shimmer — a sweep across the placeholder surface that reads as
+   "loading" more clearly than a flat pulse, without flashing. */
+@keyframes j1-shimmer {
+	0% {
+		background-position: -150% 0;
+	}
+	100% {
+		background-position: 150% 0;
+	}
+}
+
+.skeleton-shimmer {
+	background-image: linear-gradient(
+		90deg,
+		hsl(var(--muted)) 0%,
+		hsl(var(--primary-700) / 0.55) 50%,
+		hsl(var(--muted)) 100%
+	);
+	background-size: 200% 100%;
+	animation: j1-shimmer 1.6s ease-in-out infinite;
+}
+
+/* Soft entrance for cards/rows — a small upward rise, fast and once. Opacity is
+   intentionally NOT animated: starting at opacity:0 makes the element fail
+   visibility/contrast assertions (and reads as a flash). The translate alone
+   gives the "settle into place" feel without ever rendering invisible. */
+@keyframes j1-rise {
+	from {
+		transform: translateY(6px);
+	}
+	to {
+		transform: translateY(0);
+	}
+}
+
+.animate-rise {
+	animation: j1-rise 0.32s var(--ease-out-soft) both;
+}
+
+/* Card lift — used by interactive cards/tiles. Pairs a border-tint + elevation
+   on hover; transform is intentionally tiny so it feels responsive, not jumpy. */
+.card-lift {
+	transition:
+		transform 0.18s var(--ease-out-soft),
+		box-shadow 0.18s var(--ease-out-soft),
+		border-color 0.18s var(--ease-out-soft),
+		background-color 0.18s var(--ease-out-soft);
+}
+
+.card-lift:hover {
+	transform: translateY(-2px);
+}
+
+/* Dialog entrance — small scale + fade, layered over the native top-layer. */
+@keyframes j1-dialog-in {
+	from {
+		opacity: 0;
+		transform: translateY(8px) scale(0.98);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0) scale(1);
+	}
+}
+
+.animate-dialog-in {
+	animation: j1-dialog-in 0.2s var(--ease-out-soft);
+}
+
 .hide-scrollbar {
 	-ms-overflow-style: none;
 	scrollbar-width: none;
@@ -285,28 +384,6 @@
 
 .hide-scrollbar::-webkit-scrollbar {
 	display: none;
-}
-
-.mask-fade-x {
-	-webkit-mask-image: linear-gradient(
-		to right,
-		transparent 0%,
-		black 5%,
-		black 95%,
-		transparent 100%
-	);
-	mask-image: linear-gradient(to right, transparent 0%, black 5%, black 95%, transparent 100%);
-}
-
-.mask-fade-x-sm {
-	-webkit-mask-image: linear-gradient(
-		to right,
-		transparent 0%,
-		black 2%,
-		black 98%,
-		transparent 100%
-	);
-	mask-image: linear-gradient(to right, transparent 0%, black 2%, black 98%, transparent 100%);
 }
 
 .custom-scrollbar {
@@ -326,6 +403,22 @@
 .custom-scrollbar::-webkit-scrollbar-thumb {
 	background-color: hsl(var(--border));
 	border-radius: 9999px;
+}
+
+/* ============================================================================
+   DOCS PORTAL — dark-only, self-contained theme.
+   The portal renders against the app's dark surface. We re-assert that surface
+   on the docs container (rather than relying on inherited body styles) so the
+   page stays dark and fills the viewport even when content is short.
+   ============================================================================ */
+.jentic-docs-root {
+	background-color: hsl(var(--background));
+	color: hsl(var(--foreground));
+	/* Establish a stacking context and guarantee the dark surface fills the
+	   viewport even when content is short. */
+	position: relative;
+	z-index: 0;
+	min-height: 100vh;
 }
 
 @media (prefers-reduced-motion: reduce) {

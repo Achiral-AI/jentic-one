@@ -1,36 +1,23 @@
 {
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/commitlint-before-commit.py",
-            "statusMessage": "Validating Conventional Commit format"
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Write|Edit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/ruff-fix.sh",
-            "statusMessage": "Running ruff on edited file"
-          },
-          {
-            "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/eslint-fix.sh",
-            "statusMessage": "Running eslint on edited file"
-          }
-        ]
-      }
+  "permissions": {
+    "allow": [
+      "Bash(make lint)",
+      "Bash(make typecheck)",
+      "Bash(make test)",
+      "Bash(make check)",
+      "Bash(make fmt)",
+      "Bash(make sync)",
+      "Bash(make install)",
+      "Bash(make pre-commit)",
+      "Bash(make clean)",
+      "Bash(uv sync*)",
+      "Bash(uv run pytest*)",
+      "Bash(uv run ruff*)",
+      "Bash(uv run mypy*)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git branch*)"
     ]
-  },
-  "enabledPlugins": {
-    "skill-creator@claude-plugins-official": true
   }
 }
