@@ -109,6 +109,7 @@ async def test_introspect_expired_returns_inactive(
             token_family_id="tfam_expired",
             expires_at=datetime.now(UTC) - timedelta(hours=1),
             created_by="usr_test",
+            is_ephemeral=False,
         )
 
     svc = TokenService(integration_context)

@@ -69,6 +69,7 @@ async def _seed_opaque_token(admin_db: DatabaseSession, *, plaintext: str) -> No
             token_family_id="fam_test",
             expires_at=datetime.now(UTC) + timedelta(hours=1),
             created_by="agnt_opaque",
+            is_ephemeral=True,
         )
         await session.commit()
 
@@ -117,7 +118,7 @@ async def _seed_pair_and_grants(
     snapshot: list[str],
     grants: list[str],
 ) -> None:
-    """Seed a long-lived access+refresh pair (has a refresh sibling) plus live grants."""
+    """Seed a long-lived access+refresh pair (is_ephemeral=False) plus live grants."""
     now = datetime.now(UTC)
     async with admin_db.session() as session:
         await AccessTokenRepository.create(
@@ -129,6 +130,7 @@ async def _seed_pair_and_grants(
             token_family_id=family_id,
             expires_at=now + timedelta(hours=1),
             created_by=actor_id,
+            is_ephemeral=False,
         )
         await RefreshTokenRepository.create(
             session,
@@ -155,7 +157,7 @@ async def _seed_pair_and_grants(
 async def test_long_lived_token_resolves_live_grants(
     admin_db: DatabaseSession, clean_access_tokens: None
 ) -> None:
-    """A long-lived agent token (with a refresh sibling) resolves the actor's
+    """A long-lived agent token (is_ephemeral=False) resolves the actor's
     current grants, not the frozen snapshot — the broker sees scope edits."""
     await _seed_pair_and_grants(
         admin_db,
@@ -175,7 +177,7 @@ async def test_long_lived_token_resolves_live_grants(
 async def test_ephemeral_minted_token_keeps_downscoped_snapshot(
     admin_db: DatabaseSession, clean_access_tokens: None
 ) -> None:
-    """An ephemeral minted token (no refresh sibling) must NOT be re-broadened to
+    """An ephemeral minted token (is_ephemeral=True) must NOT be re-broadened to
     the actor's full grants — its downscoped snapshot is a security guarantee."""
     now = datetime.now(UTC)
     async with admin_db.session() as session:
@@ -188,8 +190,9 @@ async def test_ephemeral_minted_token_keeps_downscoped_snapshot(
             token_family_id="fam_eph",
             expires_at=now + timedelta(minutes=5),
             created_by="agnt_eph",
+            is_ephemeral=True,
         )
-        # Broader live grants exist, but there is NO refresh sibling for fam_eph.
+        # Broader live grants exist, but the token is flagged ephemeral.
         for scope in (BROKER_EXECUTE_SCOPE, "apis:write"):
             await ActorScopeGrantRepository.grant(
                 session,

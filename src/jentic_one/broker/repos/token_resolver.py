@@ -33,7 +33,7 @@ class InProcessTokenResolver:
         now = datetime.now(UTC)
 
         stmt = text(
-            "SELECT actor_id, actor_type, scopes, token_family_id, expires_at, revoked_at"
+            "SELECT actor_id, actor_type, scopes, is_ephemeral, expires_at, revoked_at"
             " FROM access_tokens"
             " WHERE token_hash = :token_hash"
         )
@@ -46,25 +46,23 @@ class InProcessTokenResolver:
 
             permissions = _as_scope_list(row.scopes)
 
-            # Long-lived agent/SA tokens (an access+refresh pair) resolve scopes
-            # live from actor_scope_grants so scope edits take effect immediately.
-            # Ephemeral minted tokens (no refresh sibling) keep their downscoped
-            # snapshot; user tokens do not draw scopes from actor_scope_grants.
-            if row.actor_type in (ActorType.AGENT.value, ActorType.SERVICE_ACCOUNT.value):
-                fam = await session.execute(
-                    text("SELECT 1 FROM refresh_tokens WHERE token_family_id = :family_id LIMIT 1"),
-                    {"family_id": row.token_family_id},
+            # Long-lived agent/SA tokens (is_ephemeral=False) resolve scopes live
+            # from actor_scope_grants so scope edits take effect immediately.
+            # Ephemeral minted tokens keep their downscoped snapshot; user tokens
+            # do not draw scopes from actor_scope_grants.
+            if not _as_bool(row.is_ephemeral) and row.actor_type in (
+                ActorType.AGENT.value,
+                ActorType.SERVICE_ACCOUNT.value,
+            ):
+                grants = await session.execute(
+                    text(
+                        "SELECT scope FROM actor_scope_grants"
+                        " WHERE actor_id = :actor_id AND actor_type = :actor_type"
+                        " ORDER BY scope"
+                    ),
+                    {"actor_id": row.actor_id, "actor_type": row.actor_type},
                 )
-                if fam.first() is not None:
-                    grants = await session.execute(
-                        text(
-                            "SELECT scope FROM actor_scope_grants"
-                            " WHERE actor_id = :actor_id AND actor_type = :actor_type"
-                            " ORDER BY scope"
-                        ),
-                        {"actor_id": row.actor_id, "actor_type": row.actor_type},
-                    )
-                    permissions = [str(g.scope) for g in grants.all()]
+                permissions = [str(g.scope) for g in grants.all()]
 
         # SQLite returns DATETIME columns from a ``text()`` query as ISO strings
         # (Postgres returns aware ``datetime``); normalise so comparisons and the
@@ -86,6 +84,17 @@ def _as_aware_datetime(value: datetime | str) -> datetime:
     """Coerce a DB datetime value to a timezone-aware UTC ``datetime``."""
     dt = value if isinstance(value, datetime) else datetime.fromisoformat(value)
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
+def _as_bool(value: object) -> bool:
+    """Coerce a DB boolean column to ``bool`` (SQLite returns 0/1 integers)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "t"}
+    return bool(value)
 
 
 def _as_scope_list(value: object) -> list[str]:
