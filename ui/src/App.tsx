@@ -1,150 +1,98 @@
-import {
-	createBrowserRouter,
-	RouterProvider,
-	Navigate,
-	useLocation,
-	useParams,
-} from 'react-router-dom';
-import { MotionConfig } from 'framer-motion';
-import { Layout } from '@/components/layout/Layout';
-import { AuthGuard } from '@/components/AuthGuard';
-import SetupPage from '@/pages/SetupPage';
-import LoginPage from '@/pages/LoginPage';
-import DashboardPage from '@/pages/DashboardPage';
-import DiscoverPage from '@/pages/DiscoverPage';
-import WorkspacePage from '@/pages/WorkspacePage';
-import ToolkitsPage from '@/pages/ToolkitsPage';
-import ToolkitDetailPage from '@/pages/ToolkitDetailPage';
-import CredentialsPage from '@/pages/CredentialsPage';
-import CredentialFormPage from '@/pages/CredentialFormPage';
-import WorkflowDetailPage from '@/pages/WorkflowDetailPage';
-import ApiDetailPage from '@/pages/ApiDetailPage';
-import TraceDetailPage from '@/pages/TraceDetailPage';
-import JobDetailPage from '@/pages/JobDetailPage';
-import MonitorPage from '@/pages/MonitorPage';
-import ApprovalPage from '@/pages/ApprovalPage';
-import AgentsPage from '@/pages/AgentsPage';
-
-// Read the basename from the backend-injected <base href> so the SPA bundle
-// stays prefix-agnostic — works at "/" or any "/foo" mount the operator
-// configures via JENTIC_ROOT_PATH / X-Forwarded-Prefix.
-const basename = new URL(document.baseURI).pathname.replace(/\/$/, '') || undefined;
+import { Navigate, useRoutes, type RouteObject } from 'react-router-dom';
+import { AuthGuard } from '@/shared/auth/AuthGuard';
+import { SetupGate } from '@/shared/auth/SetupGate';
+import { LoginPage } from '@/shared/auth/LoginPage';
+import { SetupPage } from '@/shared/auth/SetupPage';
+import { ChangePasswordPage } from '@/shared/auth/ChangePasswordPage';
+import { OAuthPopupReturn } from '@/shared/auth/OAuthPopupReturn';
+import { Layout } from '@/shared/app/Layout';
+import { moduleRoutes, ROUTES } from '@/shared/app/routes';
+import { PlaceholderPage } from '@/shared/app/placeholders';
+import { sortedNavItems } from '@/shared/app/nav';
+// [ui-dashboard] Dashboard owns the /app index — replaces DashboardPlaceholder.
+import { dashboardIndexRoute } from '@/modules/dashboard/routes';
+import { publicDocsRoutes } from '@/modules/docs/routes';
 
 /**
- * Redirect /search → /discover, preserving the query string so that
- * bookmarks like /search?q=stripe keep working. /catalog → /discover
- * uses the same component so legacy bookmarks (/catalog?q=stripe&inspect=…)
- * land on the new Discover surface with all params intact.
+ * Route tree. All paths are relative to the router `basename` (`/app`, set in
+ * `main.tsx` from Vite's `base`), so a path like `/login` resolves to
+ * `/app/login` in the browser and `/credentials` to `/app/credentials`. The
+ * SPA owns the entire `/app` namespace; nothing here is served outside it.
  *
- * Exported so unit tests can mount it inside a `MemoryRouter` without
- * spinning up the whole `createBrowserRouter` tree.
- */
-export function DiscoverRedirect() {
-	const { search } = useLocation();
-	return <Navigate to={`/discover${search}`} replace />;
-}
-
-/**
- * Redirect /workflows → /workspace, preserving the query string. The
- * dedicated Workflows list page was retired when the IA collapsed
- * "what's mine" into a single Workspace surface — your own workflows
- * now live alongside your APIs there, and the catalog of workflows
- * lives in Discover. The detail route `/workflows/:slug` is matched
- * before this redirect (router specificity) and stays untouched.
- */
-export function WorkflowsRedirect() {
-	const { search } = useLocation();
-	return <Navigate to={`/workspace${search}`} replace />;
-}
-
-/**
- * Redirect legacy `/workflows/:slug` deep links to the canonical
- * `/workspace/workflows/:slug`. The IA contract is "Workspace owns
- * workflows", so the URL hierarchy now mirrors the breadcrumb. We
- * preserve the slug and the full query string so the
- * `?view=diagram|docs|split` deep-link parameter survives the bounce.
- */
-export function WorkflowDetailRedirect() {
-	const { search } = useLocation();
-	const params = useParams<{ slug: string }>();
-	return <Navigate to={`/workspace/workflows/${params.slug}${search}`} replace />;
-}
-
-/**
- * Redirect legacy `/credentials/:id/edit` deep links to the new
- * sheet-driven edit surface at `/credentials?edit=:id`. Agent guides
- * and external bookmarks still link here; the UI just renders them
- * inside the credentials list with the edit sheet open instead of
- * navigating to a dedicated form page.
+ *   /login, /setup                   → SetupGate steers by setup_required
+ *                                      (→ /app/login, /app/setup)
+ *   /change-password                 → outside the Layout, reachable pre-session
+ *                                      (→ /app/change-password)
+ *   /oauth/connected                  → public OAuth popup landing (self-closes)
+ *                                      (→ /app/oauth/connected; the backend
+ *                                      callback redirects the popup here)
+ *   / (basename index) + children    → AuthGuard → Layout → feature pages
+ *                                      (uniformly authenticated; no exceptions)
  *
- * Preserves the query string so query-param prefills (e.g.
- * `?label=...` from agent runbooks — only ever applied on `/new`,
- * but harmless if forwarded through) round-trip cleanly.
+ * Feature PRs register real pages in `shared/app/routes.ts` (moduleRoutes);
+ * those win over the per-slot placeholders below (their path is "claimed").
+ *
+ * Because the bundle is served under `/app`, bare API prefixes (`/credentials`,
+ * `/agents`, …) can never collide with an SPA route on hard refresh — they live
+ * in a different namespace from the SPA entirely.
  */
-export function CredentialEditRedirect() {
-	const { search } = useLocation();
-	const params = useParams<{ id: string }>();
-	const sp = new URLSearchParams(search);
-	if (params.id) sp.set('edit', params.id);
-	const qs = sp.toString();
-	return <Navigate to={`/credentials${qs ? `?${qs}` : ''}`} replace />;
+export function App() {
+	return useRoutes(buildRoutes());
 }
 
-const router = createBrowserRouter(
-	[
+function buildRoutes(): RouteObject[] {
+	// A nav slot gets a placeholder until a real module route claims its path.
+	const claimed = new Set(moduleRoutes.map((r) => r.path).filter(Boolean));
+	const placeholderRoutes: RouteObject[] = sortedNavItems()
+		.filter((item) => item.to !== ROUTES.app && !claimed.has(relativeToApp(item.to)))
+		.map((item) => ({
+			path: relativeToApp(item.to),
+			element: <PlaceholderPage title={item.label} />,
+		}));
+
+	return [
+		{
+			// SetupGate steers between sign-in and first-run setup based on the
+			// server's setup_required flag; both live outside the Layout.
+			element: <SetupGate />,
+			children: [
+				{ path: '/login', element: <LoginPage /> },
+				{ path: '/setup', element: <SetupPage /> },
+			],
+		},
+		{ path: '/change-password', element: <ChangePasswordPage /> },
+		// Public landing for the OAuth connect popup. The backend callback
+		// redirects the popup here (→ /app/oauth/connected?status=ok|error); it
+		// self-closes. Outside the AuthGuard (the popup has no guaranteed
+		// session). Registered before the '*' catch-all below.
+		{ path: '/oauth/connected', element: <OAuthPopupReturn /> },
+		// Public API reference — API docs are public-by-norm; lives outside the
+		// AuthGuard/Layout. Matched before the authenticated shell so it wins for
+		// `/app/docs` whether or not a session exists.
+		...publicDocsRoutes,
 		{
 			element: <AuthGuard />,
 			children: [
-				{ path: '/setup', element: <SetupPage /> },
-				{ path: '/login', element: <LoginPage /> },
-				// Approval page has minimal chrome — outside Layout
-				{ path: '/approve/:toolkit_id/:req_id', element: <ApprovalPage /> },
 				{
+					// Basename index: the authenticated app shell home (`/app`).
+					path: '/',
 					element: <Layout />,
-					children: [
-						{ path: '/', element: <DashboardPage /> },
-						// Both legacy paths (/search, /catalog) redirect into the
-						// Discover surface preserving the query string so bookmarks
-						// keep working: /search?q=stripe and /catalog?q=stripe both
-						// land on /discover?q=stripe with all params intact.
-						{ path: '/search', element: <DiscoverRedirect /> },
-						{ path: '/catalog', element: <DiscoverRedirect /> },
-						{ path: '/discover', element: <DiscoverPage /> },
-						{ path: '/workspace', element: <WorkspacePage /> },
-						{ path: '/workspace/apis/:apiId', element: <ApiDetailPage /> },
-						{ path: '/workspace/workflows/:slug', element: <WorkflowDetailPage /> },
-						{ path: '/workflows', element: <WorkflowsRedirect /> },
-						{ path: '/workflows/:slug', element: <WorkflowDetailRedirect /> },
-						{ path: '/toolkits', element: <ToolkitsPage /> },
-						{ path: '/toolkits/new', element: <ToolkitsPage createNew /> },
-						{ path: '/toolkits/:id', element: <ToolkitDetailPage /> },
-						{ path: '/agents', element: <AgentsPage /> },
-						{ path: '/credentials', element: <CredentialsPage /> },
-						{ path: '/credentials/new', element: <CredentialFormPage /> },
-						{ path: '/credentials/:id/edit', element: <CredentialEditRedirect /> },
-						{ path: '/oauth-brokers', element: <Navigate to="/credentials" replace /> },
-						{ path: '/monitor', element: <MonitorPage /> },
-						{ path: '/traces', element: <Navigate to="/monitor" replace /> },
-						{ path: '/traces/:id', element: <TraceDetailPage /> },
-						{ path: '/jobs', element: <Navigate to="/monitor?tab=log" replace /> },
-						{ path: '/jobs/:id', element: <JobDetailPage /> },
-					],
+					children: [dashboardIndexRoute, ...moduleRoutes, ...placeholderRoutes],
 				},
 			],
 		},
-	],
-	{ basename },
-);
+		// Unknown in-app path → the shell home. (A bare host hit at `/`, before
+		// the basename, is redirected to `/app/` by the backend.)
+		{ path: '*', element: <Navigate to="/" replace /> },
+	];
+}
 
-export default function App() {
-	// `reducedMotion="user"` makes every framer-motion animation respect the
-	// browser's `prefers-reduced-motion` media query: motion-sensitive users
-	// see static UI, and Playwright (browser-mode tests) — which we configure
-	// with `reducedMotion: 'reduce'` — skips entrance animations so axe doesn't
-	// observe mid-animation opacity values.
-	return (
-		<MotionConfig reducedMotion="user">
-			<RouterProvider router={router} />
-		</MotionConfig>
-	);
+/**
+ * A nav item's `to` is a root-relative client path (e.g. `/credentials`). The
+ * module route registry mounts pages relative to the basename index, so strip
+ * the leading slash to get the route `path` (`credentials`). The dashboard
+ * index (`ROUTES.app` === `/`) is filtered out before this is called.
+ */
+function relativeToApp(path: string): string {
+	return path.startsWith('/') ? path.slice(1) : path;
 }

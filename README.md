@@ -1,274 +1,150 @@
 <p align="center">
-  <a href="https://jentic.com/mini"><img src="https://raw.githubusercontent.com/jentic/jentic-mini/main/assets/jentic-mini-logo.svg" alt="Jentic Mini" width="400"></a>
+  <img src="docs/assets/jentic-logo.svg" alt="Jentic One" width="420">
 </p>
 
-<a href="https://www.producthunt.com/products/jentic-mini?embed=true&utm_source=badge-featured&utm_medium=badge&utm_campaign=badge-jentic-mini" target="_blank"><img src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1107386&theme=light&t=1775041287603" alt="Jentic&#0032;Mini - Give&#0032;your&#0032;AI&#0032;agents&#0032;safe&#0032;access&#0032;to&#0032;10&#0044;000&#0043;&#0032;APIs | Product Hunt" style="width: 250px; height: 54px;" width="250" height="54" /></a>
+<p align="center">
+  <strong>Secure third-party API execution for AI agents.</strong>
+</p>
 
-Give your AI agents access to **10,000+ APIs** — without leaking a single credential.
-Building agents that call real APIs is painful. You end up hardcoding auth, juggling secrets in prompts,
-writing bespoke glue code for every service, and praying nothing leaks. Jentic Mini fixes this.
-It's a self-hosted API execution layer that sits between your agent and the outside world.
-Your agent says what it wants to do. Jentic Mini handles the how — finding the right API,
-injecting credentials at runtime, and brokering the request. Secrets never touch the agent. Ever.
-
-> ⚠️ **Early Access** — Jentic Mini is new and under active development. It may contain bugs, rough edges, and security gaps we haven't found yet. It is **not recommended for production use** at this stage. We're sharing it early so the community can explore it, test it, and help shape it. Use it in personal or development environments, and please [report issues](https://github.com/jentic/jentic-mini/issues) as you find them.
+<p align="center">
+  <a href="https://github.com/jentic/jentic-one/actions/workflows/ci.yml"><img src="https://github.com/jentic/jentic-one/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-A3CACC.svg" alt="License: Apache 2.0"></a>
+  <img src="https://img.shields.io/badge/Python-3.12-68BAEC.svg?logo=python&logoColor=white" alt="Python 3.12">
+  <img src="https://img.shields.io/badge/Go-1.25-5EDEB9.svg?logo=go&logoColor=white" alt="Go 1.25">
+  <img src="https://img.shields.io/badge/PostgreSQL-16-A3CACC.svg?logo=postgresql&logoColor=white" alt="PostgreSQL">
+  <img src="https://img.shields.io/badge/SQLite-3-A3CACC.svg?logo=sqlite&logoColor=white" alt="SQLite">
+  <br>
+  <img src="https://img.shields.io/badge/lint-ruff-FDBD79.svg?logo=ruff&logoColor=black" alt="Linted with Ruff">
+  <img src="https://img.shields.io/badge/types-mypy_strict-F1E38B.svg" alt="mypy strict">
+  <a href="https://www.conventionalcommits.org/"><img src="https://img.shields.io/badge/commits-conventional-EDADAF.svg?logo=conventionalcommits&logoColor=white" alt="Conventional Commits"></a>
+ </p>
+ 
+> [!WARNING]
+> **Jentic One is currently in Public Beta.**  
+> APIs, database schemas, and CLI commands are subject to breaking changes without a major version bump. We do not recommend running this in production yet.
+ 
+Jentic One is a backend platform for secure third-party API execution. A stateless **Broker** proxy injects stored credentials into outbound requests so secrets never leave the data plane, while a **Control Plane** (Registry, Admin, Control) manages the catalogue of available APIs, access grants, and credential storage.
 
 ## Quick Start
 
-**Using OpenClaw?** The fastest way to get started is via the Jentic skill on [ClawHub](https://clawhub.com) — it will guide you through your installation options and connect your agent automatically. Just tell your OpenClaw agent:
-
-> "install and set up the jentic skill from ClawHub"
-
-**Want the full stack on a fresh VPS?** [jentic-quick-claw](https://github.com/jentic/jentic-quick-claw) installs OpenClaw, Jentic Mini, Mattermost, and a file browser in one command — everything pre-wired and secured via Tailscale.
-
-**Just want Jentic Mini standalone?** See [Getting Started](#getting-started) below.
-
-**Already running?** Jump to the [hands-on tutorial](docs/tutorials/01-notion-permissions.md) — connect the Notion API, see the permissions model in action, and have your agent create pages with controlled access.
-
-## What is Jentic Mini?
-
-**Jentic Mini** is the open-source, self-hosted implementation of the Jentic API — fully API-compatible with the [Jentic hosted and VPC editions](https://jentic.com).
-
----
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/jentic/jentic-mini/main/assets/architecture-light.svg" alt="Jentic Mini Architecture" width="800">
-</p>
-
----
-
-Jentic Mini gives any AI agent a local execution layer:
-
-- **Search** — find the right API operation or workflow from a registered catalog using full-text BM25 search
-- **Execute** — broker authenticated requests through any registered API without ever exposing credentials to the agent
-- **Observe** — inspect execution traces, async job handles, and audit logs
-- **Toolkits** — define scoped access policies and credential bundles for agents (one toolkit key per agent, individually revocable)
-- **Credentials vault** — store API keys, OAuth tokens, and secrets in an encrypted local vault; they're injected at execution time and never returned via the API
-- **Public catalog** — browse and import from 10,000+ OpenAPI specs and 380 Arazzo workflow sources in the [Jentic public catalog](https://github.com/jentic/jentic-public-apis); specs and workflows are imported automatically when you add credentials
-
-## Hosted vs Self-hosted
-
-The **Jentic hosted and VPC editions** offer deeper implementations across four areas:
-
-| Capability            | Jentic Mini (this)                                                                                                                             | Jentic hosted / VPC                                                                                                                                                                     |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Search**            | BM25 full-text search                                                                                                                          | Advanced semantic search (~64% accuracy improvement over BM25)                                                                                                                          |
-| **Request brokering** | In-process credential injection                                                                                                                | Scalable AWS Lambda-based broker with encryption at rest and in-transit, SOC 2-grade security, and 3rd-party credential vault integrations (HashiCorp Vault, AWS Secrets Manager, etc.) |
-| **Simulation**        | Basic simulate mode                                                                                                                            | Full sandbox for simulating API calls and toolkit behaviour (enterprise-only)                                                                                                           |
-| **Catalog**           | ~10,000+ APIs + ~380 workflow sources from [jentic-public-apis](https://github.com/jentic/jentic-public-apis); auto-imported on credential add | Central catalog — aggregates the collective know-how of agents across API definitions and Arazzo workflows                                                                              |
-
-Jentic Mini is a self-hosted deployment option for individuals and small teams who want full control over their data and credentials. For teams that need managed scaling, SLAs, or enterprise features, [Jentic](https://jentic.com) offers hosted and on-premises editions — [get in touch](https://jentic.com/contact) to find out more.
-
-## Getting Started
-
-### Prerequisites
-
-- [Docker](https://docs.docker.com/get-docker/) and Docker Compose
-
-### Quick Start (pre-built image)
-
-**Hosting:** Host Jentic Mini separately from your agent where possible. Running both on the same machine gives the agent process direct access to the credential database, which weakens the security boundary.
-
-From **DockerHub**:
+Install `jenticctl` to deploy Jentic One locally or manage an existing environment:
 
 ```bash
-docker run -d --name jentic-mini -p 8900:8900 -v jentic-mini-data:/app/data jentic/jentic-mini
+curl -fsSL https://raw.githubusercontent.com/jentic/jentic-one/main/tools/install.sh | sh
 ```
 
-From **GitHub Container Registry**:
+## What is Jentic One?
 
-```bash
-docker run -d --name jentic-mini -p 8900:8900 -v jentic-mini-data:/app/data ghcr.io/jentic/jentic-mini
-```
-
-Open `http://localhost:8900` to complete setup.
-
-### Quick Start (from source)
-
-```bash
-git clone https://github.com/jentic/jentic-mini.git
-cd jentic-mini
-docker compose up -d
-```
-
-Open `http://localhost:8900` to complete setup.
-
-**Next:** Follow the [hands-on tutorial](docs/tutorials/01-notion-permissions.md) — connect the Notion API and see the permissions model in action.
-
-### Configuration
-
-Optional environment variables (set in `.env` or pass to `docker compose`):
-
-| Variable                 | Default        | Description                                                                                                                                                                                                    |
-| ------------------------ | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `JENTIC_VAULT_KEY`       | auto-generated | [Fernet](https://cryptography.io/en/latest/fernet/) key for the credentials vault                                                                                                                              |
-| `JENTIC_PUBLIC_HOSTNAME` | `localhost`    | Public hostname for self-links and workflow IDs, e.g. `jentic.example.com`                                                                                                                                     |
-| `JENTIC_ROOT_PATH`              | _(unset)_      | Path prefix to mount the app under, e.g. `/jentic`. Pair with `JENTIC_PUBLIC_BASE_URL` (which must include the prefix) for OAuth issuer correctness. If unset, falls back to the per-request `X-Forwarded-Prefix` header — CIDR-gated when both `JENTIC_TRUSTED_PROXY_HEADER` and `JENTIC_TRUSTED_PROXY_NETS` are set, accepted from any client when either is unset (pre-Phase-28 behaviour; deploy behind a header-sanitising reverse proxy in that mode). |
-| `JENTIC_TRUSTED_PROXY_HEADER`   | _(unset)_      | Header name the reverse proxy sets to the authenticated username, e.g. `X-Remote-User`. Both this and `JENTIC_TRUSTED_PROXY_NETS` must be set to activate the trusted-proxy auth path (identity forwarding and `X-Forwarded-Prefix` gating). |
-| `JENTIC_TRUSTED_PROXY_NETS`     | _(unset)_      | Comma-separated CIDR allowlist of trusted reverse-proxy peer IPs, e.g. `10.0.0.0/8`. Both this and `JENTIC_TRUSTED_PROXY_HEADER` must be set to activate the trusted-proxy auth path. |
-| `LOG_LEVEL`                     | `info`         | `debug`, `info`, `warning`, `error`                                                                                                                                                   |
-
-### Authentication
-
-Two ways an agent can authenticate to Jentic Mini:
-
-- **OAuth (recommended)** — agent registers via [Dynamic Client
-  Registration](docs/agent-identity.md), a human approves the registration
-  in the admin UI, the agent signs a JWT-bearer assertion to mint an
-  access token (`at_…`), and sends `Authorization: Bearer at_…` on every
-  request. Refresh tokens rotate automatically.
-- **Toolkit key (legacy)** (`tk_xxx`) — a static, per-toolkit shared
-  secret created by an admin in the UI. Sent as `X-Jentic-API-Key:
-  tk_xxx`. Retained for backwards compatibility; new integrations should
-  prefer OAuth.
-
-Humans use a username + password session for admin operations (credential
-management, toolkit setup, agent approvals).
-
-First-time setup is guided through the UI at `http://localhost:8900`.
-Roughly:
-
-1. Open `/setup` and create the admin account (username + password).
-2. *(OAuth path)* Have your agent call `GET
-   /.well-known/oauth-authorization-server`, then `POST /register`, then
-   approve the registration from the admin UI's Agents page. The agent
-   then mints a token via `POST /oauth/token`.
-3. *(Legacy path)* Create a toolkit key from the admin UI under
-   `Toolkits → default → Keys` and share the `tk_xxx` value with your
-   agent out of band.
-4. Add credentials for your APIs — specs are auto-imported from the
-   [public catalog](https://github.com/jentic/jentic-public-apis).
-
-## API Overview
-
-| Tag             | Who uses it   | Purpose                                                                                   |
-| --------------- | ------------- | ----------------------------------------------------------------------------------------- |
-| **search**      | Agents        | Full-text search — the main entrypoint                                                    |
-| **inspect**     | Agents        | Inspect a capability before calling it — parameters, response schema, auth requirements   |
-| **execute**     | Agents        | Transparent request broker — runs API operations and Arazzo workflows                     |
-| **toolkits**    | Agents/Humans | Toolkits, access keys, policies, permission requests                                      |
-| **observe**     | Agents        | Read execution traces                                                                     |
-| **catalog**     | Humans/admin  | Register APIs, browse public catalog, upload specs, overlays, notes                       |
-| **credentials** | Humans only   | Manage the credentials vault; adding credentials auto-imports catalog specs and workflows |
-
-## Public Catalog
-
-Jentic Mini is connected to the [Jentic public API catalog](https://github.com/jentic/jentic-public-apis) — ~10,000+ API specs and ~380 Arazzo workflow sources.
-
-The catalog manifest is fetched lazily at startup (two GitHub API calls) and cached locally for 24 hours. Specs and workflows are imported **automatically** the first time you add credentials for a catalog API.
-
-```http
-# Just add credentials — Jentic Mini handles the rest
-POST /credentials
-{ "api_id": "slack.com", "auth_type": "bearer", "value": "xoxb-..." }
-
-# Slack's 17 workflows and its full API spec are now in your local registry
-GET /workflows?source=local&q=slack
-```
-
-See [docs/catalog.md](https://github.com/jentic/jentic-mini/blob/main/docs/catalog.md) for full details.
-
-## Updating
-
-Pull the latest image from whichever registry you originally used, then recreate the container.
-
-If you used `docker run` (replace the image name with `ghcr.io/jentic/jentic-mini` if you used GHCR):
-
-```bash
-docker pull jentic/jentic-mini:latest
-docker stop jentic-mini && docker rm jentic-mini
-docker run -d --name jentic-mini -p 8900:8900 -v jentic-mini-data:/app/data jentic/jentic-mini
-```
-
-If you used `docker compose`:
-
-```bash
-docker compose pull jentic-mini && docker compose up -d jentic-mini
-```
-
-Database migrations run automatically on startup, so your data is preserved across updates.
-
-## Browser Requirements
-
-The admin UI targets modern browsers: **Chrome 107+**, **Firefox 104+**, **Safari 16+**, **Edge 107+**.
-
-## Development
-
-Prerequisites for local development without Docker:
-
-- [Python 3.11+](https://www.python.org/downloads/)
-- [Node.js 24](https://nodejs.org/) (matches Docker and `.nvmrc`)
-
-Python source (`src/`) is volume-mounted into the container — edit any `.py` file and the server hot-reloads automatically.
-
-For UI development, use the dev compose override which runs Vite in a container with full HMR:
-
-```bash
-docker compose -f compose.yml -f compose.dev.yml up
-```
-
-This starts a Vite dev server on `http://localhost:5173` with hot module replacement, proxying API calls to the backend on port 8900. Edit files in `ui/` and changes appear instantly. The Vite service uses the same `JENTIC_UID` / `JENTIC_GID` as `compose.yml` (defaults **1000:1000**), including for the bind-mounted `ui/` directory and for `npm`’s cache — **on Linux**, if your workstation user isn’t UID 1000, export matching values before spinning up compose (same snippet as below) so `./ui` is not littered with root- or mismatched-owner files from the container.
-
-Alternatively, run Vite directly on the host (requires Node.js 24):
-
-```bash
-cd ui && npm install && npm run dev
-```
-
-### Testing
-
-```bash
-cd ui
-npm run test:run       # Unit + integration tests (Vitest, browser mode)
-npm run test:coverage  # With coverage report
-npm run test:e2e       # Playwright E2E tests
-```
-
-See `ui/TESTING.md` for the full contributor guide.
-
-To rebuild the production UI bundle: `cd ui && npm run build`, then `docker compose up -d --build`.
-
-> **Note:** The backend container runs as a non-root user. `compose.yml` defaults to uid/gid 1000 for bind mount compatibility.
-> If your host user has a different UID/GID (common on Linux), set `JENTIC_UID` and `JENTIC_GID` before starting — applies to **`compose.yml`** and to **`compose.dev.yml`** so the bundled Vite service matches too:
->
-> ```bash
-> JENTIC_UID=$(id -u) JENTIC_GID=$(id -g) docker compose up -d
-> # or with UI dev server:
-> JENTIC_UID=$(id -u) JENTIC_GID=$(id -g) docker compose -f compose.yml -f compose.dev.yml up
-> ```
-
-Swagger UI is available at `http://localhost:8900/docs` for interactive API exploration.
+AI agents increasingly need to call real third-party APIs — but handing an agent your raw API keys is a security problem. Jentic One is a **self-hosted gateway** that keeps that from happening: you register the APIs an agent may use, store the credentials once, and the agent calls out through the Broker. The Broker injects the right credential at execution time and forwards the request, so **secrets never leave your infrastructure** and never reach the agent. Every call is governed by fine-grained permissions and recorded in an append-only audit log.
 
 ## Architecture
 
-- **FastAPI + uvicorn** — async HTTP server with hot reload in dev
-- **SQLite** — local registry, toolkit/key store, execution log
-- **BM25** — in-memory full-text search index over operation descriptions
-- **Fernet** — symmetric encryption for the credentials vault
-- **arazzo-runner** — Arazzo workflow execution engine
-- **@jentic/arazzo-ui** — React workflow visualization component (diagram/docs/split views) from [jentic-arazzo-tools](https://github.com/jentic/jentic-arazzo-tools)
+The system deploys as two peer units — **App** (the control plane, combining Registry + Admin + Control surfaces) and **Broker** (the data plane) — above a shared PostgreSQL database layer.
 
-## Telemetry & Community Contributions
+```mermaid
+flowchart TD
+    clientsApp["Clients"] --> app
+    clientsBroker["Clients"] --> broker
 
-On first startup, Jentic Mini generates a random UUID and registers it with Jentic (`https://api.jentic.com/api/v1/register-install`). This ID is fully anonymous — only the UUID is included in the registration payload, and no hostname or other machine identifiers are sent. As with any HTTPS request, the client IP address may still appear in standard server or network logs, but it is not included in the application payload.
+    subgraph app [App · control plane]
+        registry["Registry"]
+        control["Control"]
+        admin["Admin"]
+    end
 
-This install ID is the foundation for community contribution features: when your instance discovers a working workflow or an API improvement, it can share that back under your anonymous install ID, benefiting everyone running Jentic. Disabling telemetry also disables the ability to contribute workflows and API fixes back to the community.
+    broker["Broker · data plane<br/>credential-injecting HTTP proxy"]
 
-The install ID is stored locally at `/app/data/install-id.txt`. A second marker file (`/app/data/install-registered.txt`) is written after successful registration so that subsequent startups skip the network call.
+    app --> db[("PostgreSQL · 3 schemas<br/>registry · control · admin")]
+    broker --> db
+```
 
-**To opt out**, set `JENTIC_TELEMETRY=off`:
+## Components
+
+| Component | Responsibility |
+| --------- | -------------- |
+| **Broker** | Stateless execution proxy. Receives an HTTP request with the upstream URL as the path, injects the caller's stored credentials, forwards method/headers/body, and returns the upstream response. Secrets never leave the Broker. |
+| **Registry** | API specification catalogue. Stores registered APIs with immutable revisions, operations, security schemes, and server definitions. Owns what APIs are available and at which version. |
+| **Control** | Credential storage. Manages polymorphic API credentials (API keys, OAuth2 client credentials, bearer tokens, basic auth) used by the Broker at execution time. |
+| **Admin** | Permissions, jobs, audit, and execution telemetry. Owns the operator account, role-based access grants, async job lifecycle, append-only audit log, and execution records. |
+| **Shared** | Internal infrastructure layer: configuration loading, async database sessions, structured logging, metrics facade, and the multi-surface application factory. |
+| **CLI** | Two Go binaries: `jenticctl` onboards and operates the platform (`jenticctl install`), and `jentic` registers agent identities (`jentic register`) and drives the catalog/broker (`jentic catalog`, `jentic execute`). See [`cli/`](cli/README.md). |
+
+## Quick start
+
+Install the CLI and stand up a local stack with one command:
 
 ```bash
-docker run -d --name jentic-mini -p 8900:8900 \
-  -v jentic-mini-data:/app/data \
-  -e JENTIC_TELEMETRY=off \
-  jentic/jentic-mini
+curl -fsSL https://raw.githubusercontent.com/jentic/jentic-one/main/tools/install.sh | sh
 ```
+
+Or work from source:
+
+```bash
+make install   # install dependencies and git hooks
+make check     # lint + typecheck + tests
+make start-app # run the application locally
+```
+
+See the [Build & Deploy Guide](deploy/README.md) for full setup instructions.
+See the [Security Hardening Guide](docs/security/hardening.md) for information on securing your deployment.
+
+## CLI
+
+The Jentic CLI ships as two Go binaries with a branded, colour-aware terminal
+experience — `jenticctl` (install/lifecycle) and `jentic` (API catalog):
+
+```bash
+jenticctl install # interactive wizard: generate config + install the app (local venv or Docker)
+jentic register   # mint an agent identity (Ed25519 keypair + dynamic client registration)
+jentic execute GET:/get --json   # run a real call through the Broker with injected credentials
+```
+
+Full reference: [`cli/README.md`](cli/README.md).
+
+## Documentation
+
+| Guide | Description |
+| ----- | ----------- |
+| [Build & Deploy](deploy/README.md) | Docker, Helm, Terraform, versioning, local kind cluster, and observability |
+| [API Specs](openapi/) | OpenAPI specifications (broker, control) |
+
+## Development & testing
+
+Common `make` targets (run `make help` for the full list):
+
+| Target | Description |
+| ------ | ----------- |
+| `make install` | Full dev setup: sync deps + install git hooks |
+| `make check` | Lint, score, secrets audit, unit + arch tests |
+| `make fix` | Auto-fix lint issues and reformat code |
+| `make test` | Run unit tests |
+| `make start-app` | Start the combined app (all surfaces) |
+
+Tests are split into tiers:
+
+- **Unit** — logic with no external services (`make test-unit`).
+- **Integration** — database lifecycle against Docker fixtures (`make test-integration`).
+- **Architecture** — enforcement of layering and conventions (`make test-arch`).
+- **Smoke** — liveness against running services (`make test-smoke`).
+
+Commits follow [Conventional Commits](https://www.conventionalcommits.org/) with a mandatory scope, enforced repo-wide by a `commit-msg` hook.
+
+## Security & telemetry
+
+- **Credentials stay local.** Stored credentials are encrypted at rest and are only ever decrypted inside the Broker at execution time. They are never returned to callers, logged in cleartext, or exposed to the agent.
+- **Run Jentic One separately from your agent.** The guarantee above holds on the network path, but a process running as the same OS user as Jentic One can read the key and credential database directly. For real credentials, don't run Jentic One in the same trust boundary as your agent — sandbox the agent or run Jentic One on a separate host/network. See the [security hardening guide](docs/security/hardening.md) for the deployment-tier ladder and a production checklist.
+- **Telemetry is opt-in and off by default.** Jentic One sends nothing unless you explicitly enable anonymous product telemetry (`telemetry.enabled: true`); an instance whose config omits the telemetry block stays silent. When enabled, it sends a small, fixed set of anonymous events to Jentic. Each event is a closed schema — `{id, version, event, actor_type?, tags?, ts}` — where `event` and `actor_type` are fixed enums and `tags` are fixed labels (never free text), so there is no room for credentials, request data, or PII.
+- **Observability is self-hosted.** Metrics and tracing exporters emit to an OpenTelemetry/Prometheus endpoint *you* configure.
+- **Reporting a vulnerability.** Please do not open a public issue for security reports — see [SECURITY.md](SECURITY.md) for responsible-disclosure instructions.
 
 ## Contributing
 
-Please read our [Contributing Guide](https://github.com/jentic/.github/blob/main/CONTRIBUTING.md) and [Code of Conduct](https://github.com/jentic/.github/blob/main/CODE_OF_CONDUCT.md) before submitting a pull request.
+Contributions are welcome. Commit messages follow Conventional Commits, and `make check` must pass before opening a PR. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow, and the Jentic [Code of Conduct](https://github.com/jentic/.github/blob/main/CODE_OF_CONDUCT.md).
+
+## Enterprise & commercial support
+
+Jentic One is fully open source (Apache-2.0) and free to self-host — the open-source build is the real thing, not a trial. If your organization is running it in production and wants help operating a credential broker safely at scale — security hardening reviews, deployment architecture, SLAs, or a managed option — we're happy to help. Reach out at [jentic.com/contact](https://jentic.com/contact). See [SUPPORT.md](SUPPORT.md) for community and commercial support options.
 
 ## License
 
-This project is licensed under the [Apache 2.0 License](https://github.com/jentic/jentic-mini/blob/main/LICENSE).
+Jentic One is licensed under the [Apache 2.0](LICENSE) license, and ships with an explicit [NOTICE](NOTICE) file containing additional legal notices.
