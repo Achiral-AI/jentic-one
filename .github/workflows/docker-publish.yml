@@ -32,7 +32,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # For workflow_run, build the exact commit CI ran on (head_sha), not
           # the default-branch tip at dispatch time. Falls back to github.ref
@@ -86,6 +86,8 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
+          file: deploy/docker/app.multiarch.Dockerfile
+          target: broker
           push: true
           platforms: linux/amd64,linux/arm64
           provenance: false

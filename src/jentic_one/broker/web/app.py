@@ -18,6 +18,7 @@ from jentic_one.broker.adapters.http_client import HttpClientProvider
 from jentic_one.broker.adapters.runners.circuit import CircuitBreakerRunner
 from jentic_one.broker.adapters.runners.http import HttpRunner
 from jentic_one.broker.adapters.runners.registry import RunnerRegistry
+from jentic_one.broker.adapters.runners.sigv4 import SigV4SigningRunner
 from jentic_one.broker.core.setup import install_broker_auth
 from jentic_one.broker.services.credentials.orchestrator import CredentialService
 from jentic_one.broker.services.execution.executor import PipelineExecutor
@@ -27,12 +28,14 @@ from jentic_one.broker.web.errors import install_broker_error_handlers
 from jentic_one.broker.web.middleware import AdmissionControlMiddleware, _AdmissionGate
 from jentic_one.broker.web.readiness import make_readiness_router
 from jentic_one.broker.web.routers import execute
+from jentic_one.shared.broker.execution import UpstreamRunner
 from jentic_one.shared.context import Context
 from jentic_one.shared.metrics import get_meter
 from jentic_one.shared.resilience import CircuitBreaker, RateLimiter
 from jentic_one.shared.state import build_state_backend
 from jentic_one.shared.tracing import instrument_outbound_client
 from jentic_one.shared.web.app_factory import create_surface_app
+from jentic_one.shared.web.container import AppContainer
 from jentic_one.shared.web.health import make_health_router
 
 
@@ -51,8 +54,17 @@ def _routers(*, readiness_saturation_threshold: float) -> list[tuple[APIRouter, 
     ]
 
 
-def create_app(ctx: Context) -> FastAPI:
-    """Create the broker FastAPI application for standalone deployment."""
+def create_app(ctx: Context, container: AppContainer | None = None) -> FastAPI:
+    """Create the broker FastAPI application for standalone deployment.
+
+    ``container`` is the DI seam: when omitted the default is used and behavior is
+    unchanged. A caller passes its own container to inject a ``Broker`` — it is
+    threaded to :func:`create_surface_app`, which sets ``app.state.broker`` and
+    ``app.state.broker_factory`` so the injected broker reaches BOTH the sync
+    router and the async worker (the worker's ``PipelineExecutor`` reads
+    ``broker_factory`` in ``broker_lifespan`` below).
+    """
+    container = container or AppContainer.default(ctx)
     resilience = ctx.config.broker.resilience
     upstream_cfg = resilience.upstream
     meter = get_meter("broker")
@@ -110,11 +122,16 @@ def create_app(ctx: Context) -> FastAPI:
             max_per_host=upstream_cfg.max_per_host,
             max_response_bytes=upstream_cfg.max_response_bytes,
         )
+        # SigV4 signing sits innermost — closest to the transport, inside the
+        # breaker and the retry loop — so it signs the final (method, URL, body)
+        # and re-signs each retry attempt with a fresh x-amz-date. It is a no-op
+        # passthrough for every non-sigv4 credential (#776).
+        signing_runner = SigV4SigningRunner(http_runner)
         # Capability profile of the underlying transport — the breaker/deadline
         # wrappers don't declare capabilities, so capture it from the HTTP runner
         # itself and hand it to build_runner for capability-gating (§11 RN-0.3).
         runner_caps = http_runner.capabilities()
-        base_runner: HttpRunner | CircuitBreakerRunner = http_runner
+        base_runner: UpstreamRunner = signing_runner
         cb = resilience.circuit_breaker
         if cb.enabled:
             breaker = CircuitBreaker(
@@ -155,7 +172,18 @@ def create_app(ctx: Context) -> FastAPI:
         # resolves credentials with the same CredentialService. Both are stashed
         # on app.state so the shared/ worker factory wires them without importing
         # broker/ (the arch boundary). Built here so they wrap the live runner.
-        app.state.broker_upstream_executor = PipelineExecutor(registry)
+        #
+        # Seam symmetry ("one pipeline, two callers"): if a caller set a
+        # `broker_factory` on app.state (the same factory the sync router honors
+        # in web/routers/execute.py), the worker's executor uses it too — so an
+        # injected Broker reaches BOTH the sync and async paths, not just sync.
+        # Unset by default → PipelineExecutor falls back to `default_broker`.
+        injected_broker_factory = getattr(app.state, "broker_factory", None)
+        app.state.broker_upstream_executor = (
+            PipelineExecutor(registry, broker_factory=injected_broker_factory)
+            if injected_broker_factory is not None
+            else PipelineExecutor(registry)
+        )
         app.state.broker_credential_injector = CredentialService(ctx)
         try:
             yield
@@ -174,7 +202,10 @@ def create_app(ctx: Context) -> FastAPI:
         ctx,
         title="jentic-one-broker",
         routers=_routers(readiness_saturation_threshold=resilience.readiness_saturation_threshold),
+        enabled_apps={"broker"},
         extra_lifespan=broker_lifespan,
+        container=container,
+        include_instance_router=False,
     )
     # One admission gate shared by the shedding middleware and the readiness
     # probe (§05 R5.2), so both observe the same in-flight counter.

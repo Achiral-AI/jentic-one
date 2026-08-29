@@ -1,5 +1,6 @@
 """Event-related enums shared across modules."""
 
+import platform
 from enum import StrEnum
 
 
@@ -30,6 +31,29 @@ class EventType:
     UPSTREAM_CIRCUIT_OPEN = "upstream.circuit_open"
     JOB_FAILED_PERMANENTLY = "job.failed_permanently"
     UNAUTHORIZED_ACCESS_ATTEMPT = "security.unauthorized_access_attempt"
+    # A registered catalog/imported API's upstream spec changed (detected by the
+    # update-notify sweep). Emitted with requires_action=True — the operator resolves
+    # it by re-importing the upstream spec (one-click in the UI / `jentic catalog
+    # outdated` in the CLI), which the ImportHandler settles via
+    # settle_actionable_events. Deduped on the observed spec digest so it fires once
+    # per real change, not every sweep.
+    CATALOG_UPDATE_AVAILABLE = "catalog.update_available"
+    # A registered API's upstream spec changed AND that change collides with a
+    # confirmed overlay's *base* (the overlay was materialized over an older base;
+    # the upstream now differs from that base). Distinct from CATALOG_UPDATE_AVAILABLE
+    # because the resolution differs: adopting the upstream would *supersede* the
+    # operator's overlay, so this is an operator decision (re-import → auto-deprecate,
+    # gated) rather than a routine "update available" nudge. Emitted by the Flow-3
+    # sweep once per (digest, class) pair.
+    CATALOG_UPDATE_CONFLICTS_OVERLAY = "catalog.update_conflicts_overlay"
+
+    # An overlay's lifecycle changed in a way a human should see beyond the audit log
+    # (L2/L3): today emitted when an authorized catalog re-import auto-deprecates a
+    # live confirmed overlay (A4b). Carries the deprecating actor + reason so the
+    # overlay author is attributed/notified and the UI can surface "deprecated by
+    # re-import on <date>" rather than a silent status flip behind the audit log.
+    # requires_action=False — it is a notification, not an inbox item.
+    OVERLAY_DEPRECATED = "overlay.deprecated"
 
     # --- Product-telemetry event types (issue #446) ----------------------
     # These flow through emit_event (the single entry point) like any other
@@ -42,6 +66,7 @@ class EventType:
     CREDENTIAL_CONNECTION_FAILED = "credential.connection_failed"
     CREDENTIAL_REFRESH_FAILED = "credential.refresh_failed"
     CREDENTIAL_NOT_PROVISIONED = "credential.not_provisioned"
+    CREDENTIAL_UNDECRYPTABLE = "credential.undecryptable"
     CREDENTIAL_BOUND_TO_TOOLKIT = "credential.bound_to_toolkit"
     CREDENTIAL_UNBOUND_FROM_TOOLKIT = "credential.unbound_from_toolkit"
     TOOLKIT_CREATED = "toolkit.created"
@@ -54,6 +79,17 @@ class EventType:
     AGENT_REGISTRATION_APPROVED = "agent.registration_approved"
     AGENT_REGISTRATION_DENIED = "agent.registration_denied"
     PBAC_DENIED = "broker.pbac_denied"
+    # Emitted when the broker denies an execute with 403 ``no_toolkit_binding``
+    # AND no toolkit yet serves the requested API — the caller's next step is
+    # for an operator to provision a credential (which is what makes a toolkit
+    # serve the API). Distinct from ``CREDENTIAL_NOT_PROVISIONED`` (424, fires
+    # when a bound toolkit's credential is unresolvable at inject time): this
+    # event is the *pre-binding* signal, giving operators visibility into
+    # agent-needed APIs before a doomed access request appears. Despite the
+    # ``broker.`` namespace, the control plane also emits it as a file-time
+    # advisory for the same condition (see
+    # ``AccessRequestService._advise_unserved_bind_references``).
+    TOOLKIT_BINDING_UNSERVED = "broker.toolkit_binding_unserved"
 
     ALL: frozenset[str] = frozenset(
         {
@@ -72,6 +108,9 @@ class EventType:
             UPSTREAM_CIRCUIT_OPEN,
             JOB_FAILED_PERMANENTLY,
             UNAUTHORIZED_ACCESS_ATTEMPT,
+            CATALOG_UPDATE_AVAILABLE,
+            CATALOG_UPDATE_CONFLICTS_OVERLAY,
+            OVERLAY_DEPRECATED,
             INSTANCE_INITIALIZED,
             INSTANCE_BOOTED,
             CREDENTIAL_STORED,
@@ -79,6 +118,7 @@ class EventType:
             CREDENTIAL_CONNECTION_FAILED,
             CREDENTIAL_REFRESH_FAILED,
             CREDENTIAL_NOT_PROVISIONED,
+            CREDENTIAL_UNDECRYPTABLE,
             CREDENTIAL_BOUND_TO_TOOLKIT,
             CREDENTIAL_UNBOUND_FROM_TOOLKIT,
             TOOLKIT_CREATED,
@@ -91,6 +131,7 @@ class EventType:
             AGENT_REGISTRATION_APPROVED,
             AGENT_REGISTRATION_DENIED,
             PBAC_DENIED,
+            TOOLKIT_BINDING_UNSERVED,
         }
     )
 
@@ -146,9 +187,61 @@ class ImportFailReason(StrEnum):
     FETCH = "fetch"
 
 
+class HostOs(StrEnum):
+    """Closed-enum tag naming the host OS family, sent once per boot.
+
+    Attached only to ``instance_booted`` — the lifecycle event emitted on every
+    startup — so the OS rides on one request per boot under the same opaque
+    instance id, and on no other event. Per-boot (rather than once-ever)
+    matches how comparable products report environment facts (n8n's "Instance
+    started", GitLab's Service Ping, Grafana's usage report) and lets the
+    dimension self-heal: a lost request or a config moved to another machine
+    is corrected on the next boot.
+
+    Detection order matters because the recommended install runs the backend in
+    Docker, where ``platform.system()`` reports the *container's* kernel
+    (always Linux), not the operator's machine. The onboarding CLI runs on the
+    host, so it stamps ``telemetry.host_os`` (from Go's ``runtime.GOOS``) into
+    the generated config; ``resolve`` prefers that and only falls back to
+    runtime detection for hand-rolled configs. Anything unrecognised collapses
+    to ``OTHER``, so no free-form platform string can reach the wire.
+    """
+
+    LINUX = "linux"
+    DARWIN = "darwin"
+    WINDOWS = "windows"
+    OTHER = "other"
+
+    @classmethod
+    def current(cls) -> "HostOs":
+        """Classify the running platform into the closed set."""
+        system = platform.system().lower()
+        try:
+            return cls(system)
+        except ValueError:
+            return cls.OTHER
+
+    @classmethod
+    def resolve(cls, configured: str | None) -> "HostOs":
+        """Prefer the install-time config value, else detect at runtime.
+
+        ``configured`` is the raw ``telemetry.host_os`` string; surrounding
+        whitespace is forgiven (a quoted hand-edit like ``" darwin "``), but a
+        value outside the closed set degrades to OTHER rather than falling back
+        to runtime detection — a stamped-but-garbled value must not silently
+        become the container's OS.
+        """
+        if configured is None or not configured.strip():
+            return cls.current()
+        try:
+            return cls(configured.strip().lower())
+        except ValueError:
+            return cls.OTHER
+
+
 #: Union of every closed-enum tag type. A tag on the wire is always a member of
 #: one of these — there is deliberately no free-form variant.
-EventTag = ErrorSource | SpecSource | ImportFailReason
+EventTag = ErrorSource | SpecSource | ImportFailReason | HostOs
 
 
 #: Which closed-enum tag type each event may carry. ``emit_event`` validates
@@ -160,4 +253,5 @@ EVENT_TAGS: dict[str, type[StrEnum]] = {
     EventType.CREDENTIAL_REFRESH_FAILED: ErrorSource,
     EventType.IMPORT_COMPLETED: SpecSource,
     EventType.IMPORT_FAILED: ImportFailReason,
+    EventType.INSTANCE_BOOTED: HostOs,
 }
