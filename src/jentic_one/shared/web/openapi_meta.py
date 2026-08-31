@@ -655,6 +655,26 @@ OPENAPI_TAGS: list[dict[str, str]] = [
             "tracked follow-up."
         ),
     },
+    {
+        "name": "OAuth Clients",
+        "description": (
+            "Admin-managed registry of third-party OAuth clients (confidential, secret-bearing). "
+            "Registered clients integrate with Jentic One via the standard Authorization Code + "
+            "PKCE flow. Admins can create, list, update, rotate secrets, and deactivate clients. "
+            "Deactivating a client immediately invalidates all tokens issued through it."
+        ),
+    },
+    {
+        "name": "MCP",
+        "description": (
+            "MCP (Model Context Protocol) transport reporting. The `jentic mcp` stdio "
+            "server terminates all MCP protocol traffic locally; the control plane only "
+            "sees plain HTTP. This tag covers the small reporting surface behind it — "
+            "today, the config-registration report `jentic setup`/`jentic skill init` "
+            "send after writing an MCP server entry for a detected agent runtime, which "
+            "feeds the config-written → first-session → first-execute adoption funnel."
+        ),
+    },
 ]
 
 # Redoc tag groups (vendor extension). Tags not listed here still render; this
@@ -697,6 +717,7 @@ X_TAG_GROUPS: list[dict[str, Any]] = [
             "Audit",
             "Monitoring",
             "Configuration",
+            "OAuth Clients",
         ],
     },
     {
@@ -712,7 +733,7 @@ X_TAG_GROUPS: list[dict[str, Any]] = [
     },
     {
         "name": "Operations",
-        "tags": ["System"],
+        "tags": ["System", "MCP"],
     },
 ]
 
@@ -771,6 +792,9 @@ PUBLIC_OPERATION_IDS: frozenset[str] = frozenset(
         # OAuth redirect callbacks (bound by a signed state param, not a session).
         "oauthCallback",
         "authorizeOauthCallback",
+        # OAuth consent screen (presented after IdP login, before issuing the code).
+        "consentPage",
+        "consentSubmit",
         # Browser-facing OAuth error page (no auth; just renders an error code).
         "errorPage",
         # Unauthenticated discovery metadata.
@@ -832,12 +856,14 @@ _TAG_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^/executions"), "Executions"),
     (re.compile(r"^/jobs"), "Jobs"),
     (re.compile(r"^/events"), "Events"),
+    (re.compile(r"^/mcp"), "MCP"),
     (re.compile(r"^/permissions"), "Permissions"),
     (re.compile(r"^/actors"), "Actors"),
     (re.compile(r"^/users"), "Users"),
     (re.compile(r"^/auth/(login|refresh)"), "Users"),
     (re.compile(r"^/auth/idp"), "Discovery"),
     (re.compile(r"^/audit"), "Audit"),
+    (re.compile(r"^/admin/oauth-clients"), "OAuth Clients"),
     # Platform-actor surfaces (superset, not in the original reference).
     (re.compile(r"^/agents"), "Agents"),
     (re.compile(r"^/service-accounts"), "Service Accounts"),
