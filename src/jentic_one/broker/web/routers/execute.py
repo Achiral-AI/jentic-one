@@ -94,6 +94,7 @@ from jentic_one.broker.web.deps import (
     ToolkitDeriver,
 )
 from jentic_one.broker.web.streaming import StreamingOutcome
+from jentic_one.shared.access_guidance import connect_vendor_key
 from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.broker.broker import Broker
 from jentic_one.shared.broker.protocols import (
@@ -341,8 +342,27 @@ def _context_from_discovery(
     )
 
 
+def _connect_vendor_for(ctx: Context, api: APIReference) -> str | None:
+    """Resolve the vendor-registry key covering ``api``, if any (Phase 1b).
+
+    Gates the missing-binding directives' ``suggested_command`` (``jentic
+    connect <vendor>``) on the registry: the connect surface takes the
+    registry key, not the API identity, and suggesting a connect for an
+    off-registry API would send the agent into a guaranteed
+    ``unknown vendor`` error. The broker call-path owns ``AppConfig`` via
+    ``ctx``, so the reverse map is a pure config scan — no I/O.
+    """
+    return connect_vendor_key(
+        ctx.config.vendors, vendor=api.vendor, name=api.name, version=api.version
+    )
+
+
 def _empty_derivation_denial(
-    d: ToolkitDerivation, api: APIReference, *, instance: str
+    d: ToolkitDerivation,
+    api: APIReference,
+    *,
+    instance: str,
+    connect_vendor: str | None = None,
 ) -> BrokerError:
     """Pick the right denial for an empty toolkit derivation (#683 + #747/#748).
 
@@ -352,10 +372,11 @@ def _empty_derivation_denial(
     "not bound to toolkit" detail):
 
     - Bound + a bound credential is a near-miss for the API → the credential's
-      identity does not cover the operation (#747/#748). Fix the *credential*,
-      never file an access request (that auto-denies).
-    - Otherwise → ``no_toolkit_binding``, whose recovery (file a bind request vs.
-      provision a credential first) is chosen by ``no_toolkit_binding_directive``
+      identity does not cover the operation (#747/#748). Fix the *credential* —
+      an operator action; no new binding would help.
+    - Otherwise → ``no_toolkit_binding``, whose recovery ask (bind to the
+      serving credential vs. provision one first) is chosen by
+      ``no_toolkit_binding_directive``
       from whether any toolkit serves the API at all (#683).
     """
     serves = bool(d.api_served_toolkits)
@@ -371,7 +392,11 @@ def _empty_derivation_denial(
         type="no_toolkit_binding",
         instance=instance,
         directive=no_toolkit_binding_directive(
-            vendor=api.vendor, name=api.name, version=api.version, toolkit_serves_api=serves
+            vendor=api.vendor,
+            name=api.name,
+            version=api.version,
+            toolkit_serves_api=serves,
+            connect_vendor=connect_vendor,
         ),
     )
 
@@ -381,7 +406,8 @@ def _is_unserved_no_toolkit_binding(exc: ActionDeniedError) -> bool:
 
     Splits the two ``no_toolkit_binding`` flavours ``_empty_derivation_denial``
     emits: ``serves=True`` (a toolkit exists, the caller just isn't bound) is
-    agent-recoverable via an access request and does not warrant an operator
+    a routine bind the operator grants on the agent's ask and does not warrant
+    an operator
     event; ``serves=False`` (nothing serves this API yet — a credential must be
     provisioned first) is the operator-attention case, mirroring the 424
     ``CREDENTIAL_NOT_PROVISIONED`` event on the post-binding side.
@@ -449,6 +475,7 @@ async def select_toolkit(
     api: APIReference,
     header_toolkit: str | None,
     instance: str,
+    connect_vendor: str | None = None,
 ) -> ToolkitSelection:
     """Derive the toolkit for this execution from the caller's bindings.
 
@@ -457,13 +484,12 @@ async def select_toolkit(
     header is validated against the derived candidates; never silently honoured or
     silently picked.
 
-    Non-agent actors (service accounts, users) follow the **same** derivation
-    rule — there is no implicit bypass. Broadening this for service accounts
-    is an explicit future decision, not an accident. Toolkit keys — the one
-    actor kind that authenticated *as* a toolkit and skipped derivation — are
-    retired (theme-5 Phase 4): a presented ``jntc_live_`` plaintext resolves
-    as the service account the retirement job bound to the same toolkit, so
-    it derives here like any other caller.
+    Non-agent actors (users, and not-yet-migrated service accounts) follow
+    the **same** derivation rule — there is no implicit bypass. Toolkit keys
+    — the one actor kind that authenticated *as* a toolkit and skipped
+    derivation — are retired (theme-5 Phase 4): a presented ``jntc_live_``
+    plaintext resolves as the successor the retirement job bound to the same
+    toolkit, so it derives here like any other caller.
     """
     # Invariant: the API identity here is the *discovered* spec identity, which is
     # always concrete (vendor/name/version all set) — the registry never yields a
@@ -496,11 +522,15 @@ async def select_toolkit(
                     instance=instance,
                     directive=ambiguous_toolkit_directive(candidates),
                 )
-            raise _empty_derivation_denial(derivation, api, instance=instance)
+            raise _empty_derivation_denial(
+                derivation, api, instance=instance, connect_vendor=connect_vendor
+            )
         return _selection(derivation, header_toolkit)
 
     if not candidates:
-        raise _empty_derivation_denial(derivation, api, instance=instance)
+        raise _empty_derivation_denial(
+            derivation, api, instance=instance, connect_vendor=connect_vendor
+        )
     if len(candidates) > 1:
         raise AmbiguousMatchError(
             "Multiple toolkits match this API; resend with the Jentic-Toolkit-Id header.",
@@ -529,7 +559,11 @@ def _selection(derivation: ToolkitDerivation, toolkit_id: str) -> ToolkitSelecti
 
 
 def _empty_credential_derivation_denial(
-    d: CredentialDerivation, api: APIReference, *, instance: str
+    d: CredentialDerivation,
+    api: APIReference,
+    *,
+    instance: str,
+    connect_vendor: str | None = None,
 ) -> BrokerError:
     """Pick the right denial for an empty credential derivation (direct path).
 
@@ -573,7 +607,11 @@ def _empty_credential_derivation_denial(
         type="no_credential_binding",
         instance=instance,
         directive=no_credential_binding_directive(
-            vendor=api.vendor, name=api.name, version=api.version, api_served=d.api_served
+            vendor=api.vendor,
+            name=api.name,
+            version=api.version,
+            api_served=d.api_served,
+            connect_vendor=connect_vendor,
         ),
     )
 
@@ -633,8 +671,8 @@ async def derive_credential_bindings(
     by ``CredentialService.select``, which shares the resolver with injection
     so selection and injection can never disagree.
 
-    Non-agent actors (service accounts, users) follow the **same** derivation
-    rule — no implicit bypass, mirroring the toolkit path. Toolkit keys never
+    Non-agent actors (users) follow the **same** derivation rule — no
+    implicit bypass, mirroring the toolkit path. Toolkit keys never
     reach here (the caller keeps them on the legacy path until Phase 4).
     """
     assert api.vendor and api.name and api.version, (
@@ -647,7 +685,12 @@ async def derive_credential_bindings(
         version=api.version,
     )
     if not derivation.credentials:
-        denial = _empty_credential_derivation_denial(derivation, api, instance=instance)
+        denial = _empty_credential_derivation_denial(
+            derivation,
+            api,
+            instance=instance,
+            connect_vendor=_connect_vendor_for(ctx, api),
+        )
         # The operator-visible pre-binding signal fires only for the plain
         # no-binding + nothing-serves case — an identity mismatch already has
         # its own actionable diagnostic (mirrors the toolkit path's
@@ -886,7 +929,7 @@ async def _handle(
     # agent→credential bindings when enabled; the legacy toolkit path
     # otherwise. Every caller kind rides the same split — toolkit keys, the
     # one identity that bypassed it, are retired (Phase 4) and resolve as
-    # service accounts holding both binding forms.
+    # successor agents holding both binding forms.
     direct_bindings = ctx.config.broker.direct_bindings_enabled
     selected_credential: ResolvedCredential | None = None
     allowed_credential_ids: list[str] | None = None
@@ -985,6 +1028,7 @@ async def _handle(
                 api=resolved.api,
                 header_toolkit=request.headers.get("jentic-toolkit-id"),
                 instance=request.url.path,
+                connect_vendor=_connect_vendor_for(ctx, resolved.api),
             )
         except ActionDeniedError as exc:
             # Emit the operator-visible signal for the pre-binding no-toolkit case

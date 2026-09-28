@@ -30,6 +30,10 @@ from jentic_one.migrations.run import (
 # per-database loop is exercised by the CLI-facing --check tests below.
 _DB = "admin"
 
+# The sqlite_stack fixture (fresh per-database SQLite files via
+# JENTIC_CONFIG_FILE) lives in tests/unit/conftest.py — shared with the
+# per-migration up/down tests.
+
 
 def _tables(db_path: Path) -> set[str]:
     if not db_path.exists():
