@@ -19,7 +19,11 @@ from jentic_one.admin.repos import (
     AgentToolkitBindingRepository,
 )
 from jentic_one.admin.scoping.filters import build_access_filters
-from jentic_one.auth.repos import CredentialRefRepository, ToolkitNameRepository
+from jentic_one.auth.repos import (
+    BindingRuleRepository,
+    CredentialRefRepository,
+    ToolkitNameRepository,
+)
 from jentic_one.auth.services.agent_scope_ceiling import check_agent_scope_grant
 from jentic_one.auth.services.errors import (
     ActorNotFoundError,
@@ -549,6 +553,15 @@ class AgentService:
             and created_by == identity.parent_actor_id
         )
 
+    @staticmethod
+    def _is_own_binding(agent_id: str, identity: Identity) -> bool:
+        """True when a non-admin caller is the bound agent itself.
+
+        Suspension is the owner's cut-off, so the agent may not undo it on its
+        own binding — neither by resuming nor by purging and re-binding.
+        """
+        return ORG_ADMIN not in identity.permissions and agent_id == identity.sub
+
     async def list_credentials(
         self, agent_id: str, *, identity: Identity
     ) -> list[CredentialBindingView]:
@@ -640,9 +653,28 @@ class AgentService:
         Default is a reversible suspend (the binding row and its authored
         permission rules survive; the broker derivation will exclude it).
         ``purge=True`` deletes the row outright — the explicit destructive
-        path.
+        path — together with the pair's inline permission rules, so a later
+        re-bind starts from default deny instead of resurrecting rules that
+        were dormant under an attached rule set. The rules go first: if the
+        admin-side delete then fails, the surviving binding has no inline
+        rules and denies (fail-closed) rather than the other way round.
         """
         await self.get_agent(agent_id, identity=identity)
+        if purge and self._is_own_binding(agent_id, identity):
+            # A purge followed by a re-bind would drop a suspension the owner
+            # set, so an agent may suspend its own binding but not purge it.
+            raise CredentialBindingNotFoundError(agent_id, credential_id)
+        if purge and self._ctx.is_db_allowed("control"):
+            async with self._ctx.admin_db.session() as session:
+                existing = await AgentCredentialBindingRepository.get(
+                    session, agent_id=agent_id, credential_id=credential_id
+                )
+            if existing is None:
+                raise CredentialBindingNotFoundError(agent_id, credential_id)
+            async with self._ctx.control_db.transaction() as session:
+                await BindingRuleRepository.delete_for_binding(
+                    session, agent_id=agent_id, credential_id=credential_id
+                )
         async with self._ctx.admin_db.transaction() as session:
             if purge:
                 removed = await AgentCredentialBindingRepository.purge(
@@ -679,8 +711,24 @@ class AgentService:
     async def resume_credential(
         self, agent_id: str, *, credential_id: str, identity: Identity
     ) -> CredentialBindingView:
-        """Lift a suspended binding — the reverse of the default unbind."""
+        """Lift a suspended binding — the reverse of the default unbind.
+
+        Resuming re-grants the agent the credential's secret at the broker,
+        so it takes the same credential-ownership check as
+        :meth:`bind_credential` on top of agent visibility: a suspension set
+        by the credential's owner cannot be lifted by an agent owner who
+        could not bind that credential themselves. The agent itself never
+        lifts a suspension on its own binding (``org:admin`` aside).
+        """
         await self.get_agent(agent_id, identity=identity)
+        if self._is_own_binding(agent_id, identity):
+            raise CredentialNotVisibleError(credential_id)
+        ref = None
+        if self._ctx.is_db_allowed("control"):
+            async with self._ctx.control_db.session() as session:
+                ref = await CredentialRefRepository.get_by_id(session, credential_id)
+        if ref is None or not self._can_bind_credential(identity, ref.created_by):
+            raise CredentialNotVisibleError(credential_id)
         async with self._ctx.admin_db.transaction() as session:
             updated = await AgentCredentialBindingRepository.set_suspended(
                 session, agent_id=agent_id, credential_id=credential_id, suspended=False
