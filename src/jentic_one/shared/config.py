@@ -244,6 +244,16 @@ class LoggingConfig(BaseModel):
     file_name: str = "app.log"
     file_max_bytes: int = 10 * 1024 * 1024  # 10 MB
     file_backup_count: int = 5
+    http_wire_trace: bool = Field(
+        default=False,
+        description=(
+            "Let the outbound wire-trace DEBUG loggers (httpcore, hpack) through when "
+            "the log level is DEBUG. Off by default: those lines can quote outbound "
+            "header values and request paths with their query strings, including "
+            "injected credentials, unredacted. Not safe for production; enable only "
+            "for short-lived local debugging."
+        ),
+    )
 
 
 class DatabasesConfig(BaseModel):

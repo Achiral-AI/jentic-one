@@ -1385,6 +1385,13 @@ type LoggingConfig struct {
 
 	// FileName corresponds to the JSON schema field "file_name".
 	FileName string `json:"file_name,omitempty,omitzero" yaml:"file_name,omitempty" mapstructure:"file_name,omitempty"`
+
+	// Let the outbound wire-trace DEBUG loggers (httpcore, hpack) through when the
+	// log level is DEBUG. Off by default: those lines can quote outbound header
+	// values and request paths with their query strings, including injected
+	// credentials, unredacted. Not safe for production; enable only for short-lived
+	// local debugging.
+	HttpWireTrace bool `json:"http_wire_trace,omitempty,omitzero" yaml:"http_wire_trace,omitempty" mapstructure:"http_wire_trace,omitempty"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -1412,6 +1419,9 @@ func (j *LoggingConfig) UnmarshalJSON(value []byte) error {
 	}
 	if v, ok := raw["file_name"]; !ok || v == nil {
 		plain.FileName = "app.log"
+	}
+	if v, ok := raw["http_wire_trace"]; !ok || v == nil {
+		plain.HttpWireTrace = false
 	}
 	*j = LoggingConfig(plain)
 	return nil
