@@ -1019,7 +1019,11 @@ class OverlayService:
 
             # The superseded revision goes live again, so it is held to the same
             # one-vendor-per-host rule as promotion: another vendor may have gone
-            # live on one of its hosts since it was superseded.
+            # live on one of its hosts since it was superseded. The server-host
+            # change guard (``registry/ingest/host_change_guard.py``) is not applied:
+            # rollback needs ``overlays:confirm``, the same operator scope that let
+            # the overlay rewrite the servers on confirm, and it only restores the
+            # revision that was live right before the overlay.
             owners = await UrlIndexRepository.find_live_hosts_of_other_vendors(
                 session, revision_id=superseded_id, vendor=api.vendor
             )
