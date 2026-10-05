@@ -1,0 +1,354 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { AnimatePresence, motion } from 'framer-motion';
+import { ArrowUpDown, Minus, Plus, RotateCcw, Save, ShieldCheck } from 'lucide-react';
+import {
+	Button,
+	allowAllRule,
+	cleanPermissionRule,
+	grantsEverything,
+	isEmptyAllowRule,
+} from '@/shared/ui';
+import { ruleSummary, type PermissionRule as DisplayRule } from '@/shared/lib';
+import {
+	useReplaceAgentBindingPermissions,
+	type BindingPermissionRule,
+	type PermissionRuleInput,
+} from '@/modules/agents/api';
+import { panelMotion } from '@/modules/agents/components/detail/shared';
+import { RuleListEditor } from '@/shared/credentials/components/RuleListEditor';
+import { useVendorOperations } from '@/shared/credentials/api/vendors-hooks';
+import type { OpsApiReference } from '@/shared/credentials/components/OperationImpactPreview';
+import type { PermissionRule as PreviewPermissionRule } from '@/shared/credentials/api/vendors-types';
+
+/**
+ * Inline editor for the permission rules on one direct agent↔credential
+ * binding (theme 5 phase 5a, transplanted from the toolkit rule editor).
+ * System safety rules (`_system: true`) are platform-managed — they are
+ * filtered out of the editor so saving never persists them as agent rules.
+ *
+ * The draft is diffed live against the saved rules into a "Pending changes"
+ * panel (− removed / + added, in the same `ruleSummary` voice the platform
+ * uses everywhere), so the operator sees exactly which grants a save will
+ * revoke or introduce before committing. Because evaluation is
+ * first-match-wins, a pure reorder is also a change — dirtiness is
+ * order-sensitive and reorders get their own pending-changes line.
+ *
+ * `onDirtyChange` reports that dirtiness to the host so the dry-run tester, which
+ * evaluates SAVED rules, can disable itself while a draft diverges.
+ */
+export interface AgentBindingPermissionsEditorProps {
+	agentId: string;
+	credentialId: string;
+	credentialLabel: string;
+	initialRules: BindingPermissionRule[];
+	/**
+	 * Dismiss affordance: renders a Cancel button and is called after a successful
+	 * save. Omit for always-open hosts — they get a "Discard changes" reset instead.
+	 */
+	onClose?: () => void;
+	/** Reports the live draft-vs-saved dirtiness (order-sensitive). */
+	onDirtyChange?: (dirty: boolean) => void;
+	/**
+	 * The API the credential is bound against. Feeds the rule editor's path
+	 * autocomplete and "no operations affected" warning from the API's real
+	 * operations. Omitted (no concrete version known) → the editor works
+	 * without suggestions.
+	 */
+	apiReference?: OpsApiReference | null;
+}
+
+/**
+ * Adapt a mutable ``PermissionRuleInput`` (agent-module type generated
+ * from ``PermissionRuleSchema``) to the credentials-module ``PermissionRule``
+ * shape the shared ``RuleListEditor`` expects. Structurally identical for our
+ * fields; the explicit narrow avoids a bare cast so a future divergence in
+ * either type is caught at build.
+ */
+function toPreviewRule(rule: PermissionRuleInput): PreviewPermissionRule {
+	return {
+		effect: rule.effect === 'deny' ? 'deny' : 'allow',
+		methods: rule.methods ?? null,
+		path: rule.path ?? null,
+		match_mode: (rule.match_mode as PreviewPermissionRule['match_mode']) ?? undefined,
+		operations: rule.operations ?? null,
+	};
+}
+
+/** Reverse of ``toPreviewRule`` — for saving edits back through the agent-module API. */
+function fromPreviewRule(rule: PreviewPermissionRule): PermissionRuleInput {
+	return {
+		effect: rule.effect as PermissionRuleInput['effect'],
+		methods: rule.methods ?? undefined,
+		path: rule.path ?? undefined,
+		match_mode: (rule.match_mode as PermissionRuleInput['match_mode']) ?? undefined,
+		operations: rule.operations ?? undefined,
+	};
+}
+
+function toInput(rule: BindingPermissionRule): PermissionRuleInput {
+	// `effect`/`match_mode` are distinct generated string enums (read vs write
+	// schema) with identical values; TS treats string-enum members as assignable
+	// across them, so copying directly is type-safe (verified under `strict`).
+	return {
+		effect: rule.effect,
+		methods: rule.methods ?? undefined,
+		path: rule.path ?? undefined,
+		match_mode: rule.match_mode ?? undefined,
+		operations: rule.operations ?? undefined,
+	};
+}
+
+/** Drop empty conditions so the wire body (and the diff) never carries noise. */
+const cleanRule = cleanPermissionRule;
+
+function toDisplay(rule: PermissionRuleInput): DisplayRule {
+	const mode = String(rule.match_mode ?? 'regex');
+	return {
+		effect: String(rule.effect) === 'deny' ? 'deny' : 'allow',
+		methods: rule.methods ?? null,
+		path: rule.path ?? null,
+		match_mode: mode === 'prefix' || mode === 'exact' ? mode : null,
+		operations: rule.operations ?? null,
+	};
+}
+
+/** Canonical key for one rule — order-insensitive over its CONDITIONS only. */
+function canon(rule: DisplayRule): string {
+	return JSON.stringify({
+		e: rule.effect,
+		m: [...(rule.methods ?? [])].sort(),
+		p: rule.path ?? null,
+		// regex is the backend default, so normalize it to null for comparison.
+		mm: rule.match_mode ?? null,
+		o: [...(rule.operations ?? [])].sort(),
+	});
+}
+
+/** Rules in `a` with no counterpart left in `b` (multiset semantics). */
+function diffRules(a: DisplayRule[], b: DisplayRule[]): DisplayRule[] {
+	const counts = new Map<string, number>();
+	for (const rule of b) {
+		const key = canon(rule);
+		counts.set(key, (counts.get(key) ?? 0) + 1);
+	}
+	return a.filter((rule) => {
+		const key = canon(rule);
+		const left = counts.get(key) ?? 0;
+		if (left > 0) {
+			counts.set(key, left - 1);
+			return false;
+		}
+		return true;
+	});
+}
+
+/** One rule in the shared `ruleSummary` voice, without the trailing period. */
+function oneLiner(rule: DisplayRule): string {
+	return ruleSummary([rule]).replace(/\.$/, '');
+}
+
+export function AgentBindingPermissionsEditor({
+	agentId,
+	credentialId,
+	credentialLabel,
+	initialRules,
+	onClose,
+	onDirtyChange,
+	apiReference,
+}: AgentBindingPermissionsEditorProps) {
+	const [rules, setRules] = useState<PermissionRuleInput[]>(() =>
+		initialRules.filter((r) => !r._system).map(toInput),
+	);
+	const replace = useReplaceAgentBindingPermissions(agentId, credentialId);
+
+	// Feed op paths + templates into the shared editor so autocomplete
+	// and the "no ops affected" warning work identically to the
+	// connect-flow rules page. Reuses the same query key as the row's
+	// ops preview via ``useVendorOperations``.
+	const opsQuery = useVendorOperations(apiReference ?? undefined, {
+		enabled: !!apiReference,
+	});
+	const pathSuggestions = useMemo<readonly string[]>(() => {
+		const rows = opsQuery.data?.data;
+		if (!rows) return [];
+		return Array.from(new Set(rows.map((op) => op.path))).sort();
+	}, [opsQuery.data]);
+
+	const clean = rules.map(cleanRule);
+	// A condition-less `allow` is rejected by the backend (422). Block save and
+	// rely on the editor's inline warning rather than submitting a known error.
+	const hasInvalidRule = clean.some(isEmptyAllowRule);
+
+	// Live draft-vs-saved diff — what a save would revoke (−) and grant (+).
+	const savedDisplay = initialRules
+		.filter((r) => !r._system)
+		.map(toInput)
+		.map(cleanRule)
+		.map(toDisplay);
+	const draftDisplay = clean.map(toDisplay);
+	const added = diffRules(draftDisplay, savedDisplay);
+	const removed = diffRules(savedDisplay, draftDisplay);
+	// First match wins, so ORDER is part of the grant: a pure permutation of the
+	// saved rules must be saveable (and announced), even though the multiset
+	// diff is empty.
+	const reordered =
+		added.length === 0 &&
+		removed.length === 0 &&
+		draftDisplay.map(canon).join('\u0000') !== savedDisplay.map(canon).join('\u0000');
+	const dirty = added.length > 0 || removed.length > 0 || reordered;
+
+	// Lift the dirty flag to the host (tester gating). Effect, not render-time
+	// call: the parent may setState in response.
+	useEffect(() => {
+		onDirtyChange?.(dirty);
+	}, [dirty, onDirtyChange]);
+
+	// Retract the report when the editor UNMOUNTS: hosts render it conditionally, and
+	// a dirty draft that disappears would otherwise leave the host's flag stuck true,
+	// disabling the tester over an editor that no longer exists.
+	const onDirtyChangeRef = useRef(onDirtyChange);
+	useEffect(() => {
+		onDirtyChangeRef.current = onDirtyChange;
+	});
+	useEffect(
+		() => () => {
+			onDirtyChangeRef.current?.(false);
+		},
+		[],
+	);
+
+	const save = () => {
+		if (hasInvalidRule || !dirty) return;
+		replace.mutate(clean, { onSuccess: () => onClose?.() });
+	};
+
+	const discard = () => {
+		setRules(initialRules.filter((r) => !r._system).map(toInput));
+	};
+
+	return (
+		<div className="border-border bg-muted/20 space-y-4 rounded-lg border p-4 sm:p-5">
+			<div>
+				<p className="text-foreground text-sm font-semibold">
+					Permission rules for {credentialLabel}
+				</p>
+				<p className="text-muted-foreground mt-0.5 text-xs">
+					Rules are evaluated in order — first match wins, anything unmatched is denied.
+					System safety rules, when present, are platform-managed and not edited here.
+				</p>
+			</div>
+
+			<RuleListEditor
+				rules={rules.map(toPreviewRule)}
+				onChange={(next): void => setRules(next.map(fromPreviewRule))}
+				pathSuggestions={pathSuggestions}
+				opTemplates={pathSuggestions}
+				opsLoaded={pathSuggestions.length > 0}
+			/>
+
+			{/* What this save changes — removals first (the security-critical
+			    signal), then additions, each in the platform's rule voice. */}
+			<AnimatePresence initial={false}>
+				{dirty && (
+					<motion.div {...panelMotion} className="overflow-hidden">
+						<div
+							className="border-border/60 bg-card rounded-lg border p-3"
+							data-testid="rules-diff"
+						>
+							<p className="text-muted-foreground mb-2 font-mono text-[10px] tracking-wide uppercase">
+								Pending changes
+								<span className="text-muted-foreground/60 normal-case">
+									{' '}
+									· applied when you save
+								</span>
+							</p>
+							<ul className="space-y-1 text-xs">
+								{reordered && (
+									<li className="text-foreground flex items-start gap-1.5">
+										<ArrowUpDown
+											className="mt-0.5 h-3 w-3 shrink-0"
+											aria-hidden="true"
+										/>
+										<span>
+											Rules reordered — evaluation is first-match-wins, so the
+											new order changes which rule decides a request.
+										</span>
+									</li>
+								)}
+								{removed.map((rule, i) => (
+									<li
+										key={`removed-${i}`}
+										className="text-danger flex items-start gap-1.5"
+									>
+										<Minus
+											className="mt-0.5 h-3 w-3 shrink-0"
+											aria-hidden="true"
+										/>
+										<span>
+											<span className="sr-only">Removed: </span>
+											{oneLiner(rule)}
+										</span>
+									</li>
+								))}
+								{added.map((rule, i) => (
+									<li
+										key={`added-${i}`}
+										className="text-success flex items-start gap-1.5"
+									>
+										<Plus
+											className="mt-0.5 h-3 w-3 shrink-0"
+											aria-hidden="true"
+										/>
+										<span>
+											<span className="sr-only">Added: </span>
+											{oneLiner(rule)}
+										</span>
+									</li>
+								))}
+							</ul>
+						</div>
+					</motion.div>
+				)}
+			</AnimatePresence>
+
+			{/* One verb row: the catch-all shortcut on the left (reachable with
+			    rules already present — broadening a narrow grant is a normal
+			    edit), the commit pair on the right. */}
+			<div className="flex flex-wrap items-center justify-between gap-2">
+				<div className="flex flex-wrap items-center gap-2">
+					{!grantsEverything(rules) && (
+						<Button
+							variant="ghost"
+							size="sm"
+							onClick={() => setRules([...rules, allowAllRule()])}
+							className="text-muted-foreground hover:text-foreground"
+						>
+							<ShieldCheck className="h-4 w-4" /> Allow all operations
+						</Button>
+					)}
+				</div>
+				<div className="flex flex-wrap items-center gap-2">
+					{onClose ? (
+						<Button variant="secondary" size="sm" onClick={onClose}>
+							Cancel
+						</Button>
+					) : (
+						dirty && (
+							<Button variant="secondary" size="sm" onClick={discard}>
+								<RotateCcw className="h-4 w-4" /> Discard changes
+							</Button>
+						)
+					)}
+					<Button
+						size="sm"
+						onClick={save}
+						loading={replace.isPending}
+						disabled={hasInvalidRule || !dirty}
+					>
+						<Save className="h-4 w-4" /> {replace.isPending ? 'Saving…' : 'Save rules'}
+					</Button>
+				</div>
+			</div>
+		</div>
+	);
+}

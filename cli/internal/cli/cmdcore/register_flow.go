@@ -9,6 +9,7 @@ import (
 
 	"github.com/jentic/jentic-one/cli/client/auth"
 	sdkconfig "github.com/jentic/jentic-one/cli/client/config"
+	"github.com/jentic/jentic-one/cli/internal/cli/clictx"
 	"github.com/jentic/jentic-one/cli/internal/cli/ux"
 	"github.com/jentic/jentic-one/cli/internal/theme"
 )
@@ -105,6 +106,16 @@ func (a *App) registerAndWait(ctx context.Context, identity, envName, baseURL, c
 	a.presentClaimAffordance(ctx, baseURL, clientID, claimToken)
 
 	creds := auth.Credentials{BaseURL: baseURL, IdentityName: identity, EnvironmentName: envName}
+	// The approval wait proves approval by MINTING (the exact credential path
+	// every data command uses), so the mint must ride the same transport those
+	// commands will: the SEC-20 CA-pinned client when this environment declares
+	// ca_cert_path, fail closed on a broken bundle (#1205). cfg was loaded
+	// above; an env registered without a custom CA yields the default client.
+	hc, err := clictx.AuthHTTPClient(ctx, cfg.Environments[envName].CACertPath)
+	if err != nil {
+		return err
+	}
+	creds.HTTPClient = hc
 	if err := a.waitForApproval(ctx, creds, clientID, timeout, claimToken != ""); err != nil {
 		return err
 	}
@@ -194,7 +205,7 @@ func siblingContextInEnv(envName, currentContext string) string {
 
 // printNextSteps teaches the core discover -> inspect -> execute workflow after a
 // successful register. Bare `jentic register` on an already-configured machine
-// used to (in V1) reopen onboarding; now it just re-mints, so this block is what
+// just re-mints, so this block is what
 // makes "what do I do now?" obvious — a few copy-pasteable examples plus the
 // pointer to full help, in place of a bare "Ready:" line.
 func (a *App) printNextSteps(st theme.Styles) {
@@ -202,12 +213,16 @@ func (a *App) printNextSteps(st theme.Styles) {
 	steps := []struct{ desc, cmd string }{
 		{"Browse the API catalog", "jentic catalog"},
 		{"Find an operation (each result prints a ready-to-paste inspect/execute target)", "jentic search \"send a slack message\""},
-		{"See what you can run right now", "jentic access whoami"},
-		{"A fresh agent is bound to no APIs — request access to one you found", "jentic access request --toolkit <vendor/name> --wait"},
+		{"See what you can run right now", "jentic api GET /me"},
+		{"A fresh agent is bound to no APIs — ask your operator to connect one and bind you (dashboard)", ""},
 		{"Inspect that operation (paste the target search printed)", "jentic inspect <METHOD:url from search>"},
 		{"Run it (same target)", "jentic execute <METHOD:url from search> -d '{\"key\":\"value\"}'"},
 	}
 	for _, s := range steps {
+		if s.cmd == "" {
+			fmt.Fprintf(a.Out, "  %s\n", st.Dim.Render(s.desc))
+			continue
+		}
 		fmt.Fprintf(a.Out, "  %s\n    %s\n", st.Dim.Render(s.desc), st.Command.Render(s.cmd))
 	}
 	fmt.Fprintf(a.Out, "\n%s %s\n", st.Dim.Render("See all commands:"), st.Command.Render("jentic --help"))

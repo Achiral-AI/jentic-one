@@ -15,12 +15,14 @@
  *   - McpSessionsCard  → session history from `mcp.session_started` internal
  *     events plus "last active" from the newest MCP-origin execution. The
  *     label vocabulary is "started / last active" — NEVER "connected":
- *     stdio liveness is unknowable server-side and phase 3's `/mcp` is
+ *     stdio liveness is unknowable server-side and the `/mcp` endpoint is
  *     stateless by design, so request-level recency is the honest signal.
  *
- * The HTTP variant is unconditionally hidden in phase 2: `server.mcp` config
- * doesn't exist yet (phase 3 creates it and exposes `server.mcp.enabled`).
- * Un-hiding is a phase-3 follow-up; a test pins it hidden until then.
+ * The HTTP variant is instance-gated: the
+ * instance endpoint exposes `server.mcp.enabled`, so the config card renders
+ * the Streamable HTTP snippet exactly when this instance actually serves
+ * `/mcp` (advertising it unconditionally would show a transport that 404s on
+ * default installs).
  */
 import { Plug, Terminal } from 'lucide-react';
 import {
@@ -42,12 +44,14 @@ import {
 import { MetaItem } from '@/modules/agents/components/detail/shared';
 
 /**
- * Phase-2 pin: the streamable-HTTP variant stays hidden until phase 3 lands
- * `server.mcp` and exposes `server.mcp.enabled` to the UI. Exported so the
- * test suite can assert the pin still holds (flipping this without the
- * backend capability would advertise a transport that 404s).
+ * The streamable-HTTP variant renders only when the instance reports
+ * `server.mcp.enabled`. Kept as an explicit predicate (and exported
+ * for the test suite) so the gate is one auditable expression: flipping it to
+ * ignore the instance flag would advertise a transport that 404s.
  */
-export const SHOW_HTTP_VARIANT = false;
+export function showHttpVariant(mcpEnabled: boolean | undefined): boolean {
+	return mcpEnabled === true;
+}
 
 interface McpPanelProps {
 	agentName: string;
@@ -89,9 +93,13 @@ export function McpConfigCard({ agentName }: { agentName: string }) {
 	const instanceHost = identity.data?.host || safeHost(instanceUrl);
 	// On a remote install the broker lives on its own host and is never derived
 	// from the control-plane URL — without --broker-url the environment has no
-	// broker and `jentic execute` fail-closes (register.go). The UI can't know
-	// the broker URL, so the snippet carries an explicit placeholder.
+	// broker and `jentic execute` fail-closes (register.go). The instance
+	// endpoint reports the operator-configured broker URL when it can honestly
+	// advertise one (#1249); when it can't (older backend, or a loopback-only
+	// broker on a remote install) the snippet keeps an explicit placeholder
+	// and the help text sends the operator to whoever deployed the instance.
 	const isRemote = identity.data?.backend === 'remote';
+	const brokerUrl = identity.data?.brokerUrl ?? null;
 
 	// §3.10 one-agent-per-runtime: the context name is whatever binding the
 	// operator created on the agent machine — the agent's name is the
@@ -99,10 +107,26 @@ export function McpConfigCard({ agentName }: { agentName: string }) {
 	const context = shellArg(agentName);
 	const command = `jentic mcp --context ${context}`;
 	const registerCommand = `jentic register --url ${shellArg(instanceUrl)}${
-		isRemote ? ' --broker-url <broker-url>' : ''
+		isRemote ? ` --broker-url ${brokerUrl ? shellArg(brokerUrl) : '<broker-url>'}` : ''
 	}`;
 	const jsonConfig = JSON.stringify(
 		{ mcpServers: { jentic: { command: 'jentic', args: ['mcp', '--context', agentName] } } },
+		null,
+		2,
+	);
+	// The daemon-native Streamable HTTP endpoint: per-request bearer
+	// auth against this instance's /mcp — the agent's API key (or an access
+	// token) goes in the Authorization header, no CLI or context needed on the
+	// agent machine.
+	const httpConfig = JSON.stringify(
+		{
+			mcpServers: {
+				jentic: {
+					url: `${instanceUrl.replace(/\/+$/, '')}/mcp`,
+					headers: { Authorization: 'Bearer <agent-api-key>' },
+				},
+			},
+		},
 		null,
 		2,
 	);
@@ -115,7 +139,7 @@ export function McpConfigCard({ agentName }: { agentName: string }) {
 				<code className="font-mono text-xs">{registerCommand}</code> on the{' '}
 				<strong>agent machine</strong> — or{' '}
 				<code className="font-mono text-xs">jentic setup</code> for the guided path.
-				{isRemote && (
+				{isRemote && !brokerUrl && (
 					<>
 						{' '}
 						On a remote install <code className="font-mono text-xs">
@@ -126,6 +150,17 @@ export function McpConfigCard({ agentName }: { agentName: string }) {
 						your operator for the broker (data plane) URL.
 					</>
 				)}
+				{isRemote && brokerUrl && (
+					<>
+						{' '}
+						On a remote install <code className="font-mono text-xs">
+							--broker-url
+						</code>{' '}
+						is required — without it{' '}
+						<code className="font-mono text-xs">jentic execute</code> fail-closes. The
+						snippet carries this instance's broker (data plane) URL.
+					</>
+				)}
 			</p>
 
 			<div className="space-y-3">
@@ -134,9 +169,14 @@ export function McpConfigCard({ agentName }: { agentName: string }) {
 					label=".cursor/mcp.json · claude_desktop_config.json"
 					code={jsonConfig}
 				/>
-				{/* Phase-3 follow-up: the streamable-HTTP variant renders here once
-				    `server.mcp.enabled` exists and is true. Test-pinned hidden. */}
-				{SHOW_HTTP_VARIANT && <CodeSnippet label="Streamable HTTP" code="" />}
+				{/* Instance-gated (server.mcp.enabled): the HTTP transport only
+				    renders when this instance actually serves /mcp. */}
+				{showHttpVariant(identity.data?.mcpEnabled) && (
+					<CodeSnippet
+						label="Streamable HTTP (.mcp.json url variant)"
+						code={httpConfig}
+					/>
+				)}
 			</div>
 
 			<p className="text-muted-foreground text-xs">
@@ -158,6 +198,14 @@ export function McpConfigCard({ agentName }: { agentName: string }) {
 				/>
 				{identity.data?.backend && (
 					<MetaItem label="Backend" value={identity.data.backend} />
+				)}
+				{/* Operator-facing lookup for the data plane address (#1249):
+				    rendered only when the backend reports one — never a guess. */}
+				{brokerUrl && (
+					<MetaItem
+						label="Broker URL"
+						value={<span className="font-mono">{brokerUrl}</span>}
+					/>
 				)}
 			</dl>
 		</DetailSection>
@@ -190,7 +238,8 @@ export function McpSessionsCard({ agentId }: { agentId: string }) {
 			key: 'transport',
 			header: 'Transport',
 			className: 'w-28',
-			// Rendered verbatim (`stdio` today, `http` when phase 3 lands) so a
+			// Rendered verbatim (`stdio` today, `http` when the mounted `/mcp`
+			// app lands) so a
 			// future transport value degrades gracefully instead of breaking.
 			render: (row) => (
 				<span className="text-muted-foreground font-mono text-xs">

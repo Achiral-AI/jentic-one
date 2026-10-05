@@ -143,7 +143,7 @@ func (s *mcpServer) executeTool(ctx context.Context, req *mcp.CallToolRequest, r
 	target, _ := args["operation_id"].(string)
 	if target == "" {
 		return nil, invalidParams(errors.New(toolName + ` requires "operation_id" (aliases: "id", "uuid"): ` +
-			`a registry operation id from a search_apis hit, or a METHOD:url pair like "GET:https://api.example.com/v1/things"`))
+			`a METHOD:url pair like "GET:https://api.example.com/v1/things" (a search_apis hit's target)`))
 	}
 	body, _ := args["body"].(json.RawMessage)
 	if readOnlyVariant && len(body) > 0 {
@@ -157,7 +157,7 @@ func (s *mcpServer) executeTool(ctx context.Context, req *mcp.CallToolRequest, r
 	}
 	// Auth failures (not registered / pending / revoked) map to their coded
 	// soft errors with the default get_started pointer (§3.7 table).
-	_, token, err := s.app.contextSession(st)
+	_, token, err := s.app.contextSession(cctx, st)
 	if err != nil {
 		s.logger.Warn(toolName+" auth failed", "error", err)
 		return s.softError(cctx, err), nil
@@ -345,7 +345,7 @@ func (s *mcpServer) executeResolveError(ctx context.Context, target string, err 
 // double-execute, so it gets `retryable: false` plus recovery guidance
 // (verify first, idempotency_key, get_execution_result for held jobs).
 // get_execution_result shares this helper for its own transport failures
-// (finding: they previously surfaced as INTERNAL_ERROR with no hints).
+// so they surface with hints rather than as a bare INTERNAL_ERROR.
 func (s *mcpServer) executeTransportError(ctx context.Context, err error, retrySafe bool) *mcp.CallToolResult {
 	s.logger.Warn("transport failure", "error", err, "retry_safe", retrySafe)
 	coded := asCoded(err)
@@ -394,9 +394,14 @@ func classifyTransportErr(err error) error {
 // the broker sent (the broker's recovery instructions must reach the model
 // intact — a struct projection would silently drop unknown future fields),
 // retryable: false — re-sending the same call cannot succeed until access
-// changes. next_tool is whoami (deliberate): the §3.2 flow guidance is "check
-// your bindings, never execute to probe access", and no access-request tool
-// exists on this surface yet (it queues behind this PR).
+// changes. next_tool forks on the problem+json type (theme-7 Phase 1b):
+// provisioning-shaped denials (no_credential_binding /
+// credential_not_provisioned) point at request_connection — the agent can
+// start the credential-provisioning leg itself — while everything else
+// (action_denied, credential_identity_mismatch, unknown types) keeps whoami
+// ("check your bindings, never execute to probe access", §3.2). Binding an
+// existing credential and scope grants stay operator actions; the hints keep
+// saying so.
 func (s *mcpServer) executeDenialError(ctx context.Context, denial *agentops.Denial) *mcp.CallToolResult {
 	coded := denial.Err()
 	extra := map[string]any{"retryable": false}
@@ -406,25 +411,80 @@ func (s *mcpServer) executeDenialError(ctx context.Context, denial *agentops.Den
 	}
 	if coded.Actionable == "" {
 		// UX7's synthesized recovery, tool-flavored: no denial is a dead end.
-		coded.Actionable = synthesizedDenialHint(denial.Status)
+		coded.Actionable = synthesizedDenialHint(denial.Status, denial.ProblemType)
 	}
-	return s.softErrorExtra(ctx, coded, "whoami", extra)
+	return s.softErrorExtra(ctx, coded, denialNextTool(denial.ProblemType, denial.Directive), extra)
+}
+
+// provisioningProblemTypes are the problem+json types whose recovery
+// request_connection can start (theme-7 Phase 1b): a missing credential
+// binding where nothing is provisioned (no_credential_binding) and a
+// resolved-but-unprovisioned
+// credential (credential_not_provisioned, 424). Everything else — notably
+// action_denied (a permission rule forbids the op; connecting a fresh
+// credential must NOT be taught as a way around it),
+// credential_identity_mismatch and credential_undecryptable (operator fixes
+// the credential), and any unknown type — keeps whoami.
+var provisioningProblemTypes = map[string]bool{
+	"no_credential_binding":      true,
+	"credential_not_provisioned": true,
+	// Retired with the toolkit path in 0.41 (theme-5 Phase 6b), but a 0.40.x
+	// server on its legacy flag-off toolkit path still emits it — this CLI
+	// may talk to one mid-upgrade, so keep treating it as provisioning-shaped.
+	"no_toolkit_binding": true,
+}
+
+// denialNextTool picks the recovery pointer for a broker denial, keyed on the
+// problem+json type — never the bare HTTP status: 403 also covers
+// action_denied and credential_identity_mismatch, whose directives say the
+// opposite of "connect a credential", so a status-keyed fork would teach the
+// model to file connect sessions to route around permission rules. whoami is
+// the safe default for anything unrecognized.
+//
+// Even a provisioning-shaped denial points at request_connection only when the
+// broker's directive carries parameters.suggested_command — the broker sets it
+// exactly when the API maps onto a vendor-registry key. Off the registry (or
+// with no directive to name the vendor) request_connection is guaranteed to
+// fail as an unknown vendor, so the pointer stays on whoami and the directive's
+// operator hand-off.
+func denialNextTool(problemType string, directive *ux.Directive) string {
+	if provisioningProblemTypes[problemType] && directive != nil {
+		if cmd, _ := directive.Parameters["suggested_command"].(string); cmd != "" {
+			return "request_connection"
+		}
+	}
+	return "whoami"
 }
 
 // synthesizedDenialHint is the MCP counterpart of the CLI's status-keyed
 // denial recovery (ux.RenderSynthesizedDenialRecovery): same semantics,
 // phrased for a model that can call tools but must relay operator commands.
-func synthesizedDenialHint(status int) string {
+// The connect-flavored wording is gated on the provisioning-shaped problem
+// types, mirroring denialNextTool — an action_denied 403 must never be
+// answered with "start a connect session".
+func synthesizedDenialHint(status int, problemType string) string {
+	if provisioningProblemTypes[problemType] {
+		return "No credential binding covers this API for this agent. Call whoami to see your bindings. " +
+			"If nothing serves the API, call request_connection with the vendor's registry key to start " +
+			"connecting a credential yourself (your operator approves the approval_url); if a credential " +
+			"already serves it, ask your operator to bind you to it (dashboard) — binding is always a " +
+			"human action."
+	}
 	switch status {
 	case http.StatusForbidden:
-		return "This agent isn't bound to a toolkit serving this API. Call whoami to see your bindings, " +
-			"then ask your operator to grant access (`jentic access request --toolkit <vendor/name> --wait`)."
+		return "The broker denied this call. Call whoami to see your bindings and scopes; if a " +
+			"permission rule forbids this operation, ask your operator to adjust it — do not try to " +
+			"route around a rule by connecting a new credential."
+	case http.StatusConflict:
+		return "Multiple bound credentials cover this API. Resend the same call with the " +
+			"Jentic-Credential-Id header naming one of them (Jentic-Credential-Name also works " +
+			"when names are unique); whoami lists your bindings."
 	case http.StatusFailedDependency:
-		return "No credential is provisioned for this call. Ask your operator to provision one " +
-			"(`jentic access request --toolkit <vendor/name> --provision --wait`), then retry."
+		return "A stored credential dependency is unusable for this call. Ask your operator to " +
+			"re-provision the credential in the dashboard, then retry."
 	case http.StatusUnauthorized:
 		return "The stored upstream credential needs reconnecting. Ask your operator to re-provision it " +
-			"(`jentic access request --toolkit <vendor/name> --provision --wait`), then retry."
+			"in the dashboard, then retry."
 	default:
 		return "The broker denied this call before it reached the upstream API. Call whoami to check what you can run."
 	}
@@ -630,8 +690,9 @@ func executeInputSchema(withBody bool) map[string]any {
 	props := map[string]any{
 		"operation_id": map[string]any{
 			"type": "string",
-			"description": "The operation to execute (required; \"id\" and \"uuid\" are accepted aliases): a registry " +
-				"operation id from a search_apis hit, or a METHOD:url pair like \"GET:https://api.example.com/v1/things\".",
+			"description": "The operation to execute (required; \"id\" and \"uuid\" are accepted aliases): a METHOD:url " +
+				"pair like \"GET:https://api.example.com/v1/things\" — pass a search_apis hit's target verbatim. " +
+				"(A registry operation id also resolves, for compatibility — prefer METHOD:url.)",
 		},
 		"inputs": map[string]any{
 			"type": "object",
@@ -692,7 +753,7 @@ func (s *mcpServer) executeToolSpecs() []mcpToolSpec {
 					"this session. This is the final step of the flow (whoami → search_apis → " +
 					"inspect_operation → execute): always inspect the contract first, and never execute just " +
 					"to probe whether you have access (call whoami). " +
-					`Example: {"operation_id": "op_abc123", "inputs": {"petId": "42", "limit": 10}, ` +
+					`Example: {"operation_id": "POST:https://api.example.com/v1/pets", "inputs": {"petId": "42", "limit": 10}, ` +
 					`"body": {"name": "Bob"}}. ` +
 					"Returns {status, headers, body, execution_id}: any HTTP status, including upstream " +
 					"4xx/5xx, is the upstream's answer — a denial by the broker itself comes back as an " +
@@ -704,8 +765,7 @@ func (s *mcpServer) executeToolSpecs() []mcpToolSpec {
 				InputSchema: executeInputSchema(true),
 				Annotations: &mcp.ToolAnnotations{DestructiveHint: &destructive, OpenWorldHint: &openWorld},
 			},
-			handler:  s.handleExecute,
-			readOnly: false,
+			handler: s.handleExecute,
 		},
 		{
 			tool: &mcp.Tool{
@@ -719,8 +779,7 @@ func (s *mcpServer) executeToolSpecs() []mcpToolSpec {
 				InputSchema: executeInputSchema(false),
 				Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &openWorld},
 			},
-			handler:  s.handleExecuteRead,
-			readOnly: true,
+			handler: s.handleExecuteRead,
 		},
 		{
 			tool: &mcp.Tool{
@@ -735,8 +794,7 @@ func (s *mcpServer) executeToolSpecs() []mcpToolSpec {
 				InputSchema: getExecutionResultSchema,
 				Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 			},
-			handler:  s.handleGetExecutionResult,
-			readOnly: true,
+			handler: s.handleGetExecutionResult,
 		},
 	}
 }

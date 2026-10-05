@@ -22,8 +22,8 @@ from sqlalchemy import delete, update
 from jentic_one.admin.core.schema.access_tokens import AccessToken
 from jentic_one.admin.core.schema.actor_scope_grants import ActorScopeGrant
 from jentic_one.admin.core.schema.agents import Agent
+from jentic_one.admin.core.schema.oauth_clients import OAuthClient
 from jentic_one.admin.core.schema.refresh_tokens import RefreshToken
-from jentic_one.admin.core.schema.service_accounts import ServiceAccount
 from jentic_one.admin.core.schema.users import User
 from jentic_one.admin.repos.access_token_repo import AccessTokenRepository
 from jentic_one.admin.repos.actor_scope_grant_repo import ActorScopeGrantRepository
@@ -49,10 +49,8 @@ async def clean_access_tokens(admin_db: DatabaseSession) -> AsyncGenerator[None,
             await session.execute(delete(RefreshToken))
             await session.execute(delete(ActorScopeGrant))
             await session.execute(delete(Agent).where(Agent.created_by == _SEED_MARKER))
-            await session.execute(
-                delete(ServiceAccount).where(ServiceAccount.created_by == _SEED_MARKER)
-            )
             await session.execute(delete(User).where(User.created_by == _SEED_MARKER))
+            await session.execute(delete(OAuthClient).where(OAuthClient.created_by == _SEED_MARKER))
             await session.commit()
 
     await _truncate()
@@ -104,29 +102,13 @@ async def _seed_user_row(admin_db: DatabaseSession, user_id: str, *, active: boo
         await session.commit()
 
 
-async def _seed_service_account_row(
-    admin_db: DatabaseSession, sa_id: str, *, owner_id: str, status: str = "active"
-) -> None:
-    async with admin_db.session() as session:
-        session.add(
-            ServiceAccount(
-                id=sa_id,
-                name=f"e2e-{sa_id}",
-                owner_id=owner_id,
-                registered_by=owner_id,
-                created_by=_SEED_MARKER,
-                status=status,
-            )
-        )
-        await session.commit()
-
-
 async def _seed_opaque_token(
     admin_db: DatabaseSession,
     *,
     plaintext: str,
     actor_id: str = "agnt_opaque",
     actor_type: str = "agent",
+    oauth_client_id: str | None = None,
 ) -> None:
     token_hash = hashlib.sha256(plaintext.encode()).hexdigest()
     async with admin_db.session() as session:
@@ -140,6 +122,7 @@ async def _seed_opaque_token(
             expires_at=datetime.now(UTC) + timedelta(hours=1),
             created_by=actor_id,
             is_ephemeral=True,
+            oauth_client_id=oauth_client_id,
         )
         await session.commit()
 
@@ -199,7 +182,11 @@ async def test_jwt_without_actor_type_fails_closed(
 async def test_jwt_claiming_toolkit_actor_type_is_rejected(
     admin_db: DatabaseSession, clean_access_tokens: None
 ) -> None:
-    """A signed JWT can't mint a toolkit identity with zero DB backing (#868)."""
+    """A signed JWT can't mint a toolkit identity with zero DB backing (#868).
+
+    ``toolkit`` is retired from the actor-type enum (theme-5 Phase 4), so the
+    claim is refused as an unknown actor type — still a typed 401.
+    """
     exp = int((datetime.now(UTC) + timedelta(minutes=2)).timestamp())
     token = jwt.encode(
         {"sub": "tk_x", "exp": exp, "actor_type": "toolkit"},
@@ -207,7 +194,7 @@ async def test_jwt_claiming_toolkit_actor_type_is_rejected(
         algorithm="HS256",
     )
 
-    with pytest.raises(TokenValidationError, match="jwt_actor_type_not_allowed"):
+    with pytest.raises(TokenValidationError, match="jwt_actor_type_unknown"):
         await _dual(admin_db).validate(token)
 
 
@@ -370,25 +357,19 @@ async def test_user_token_follows_user_active_flag(
             await _dual(admin_db).validate("at_user_token")
 
 
-@pytest.mark.parametrize("sa_status,should_pass", [("active", True), ("disabled", False)])
-async def test_service_account_token_follows_sa_status(
-    admin_db: DatabaseSession, clean_access_tokens: None, sa_status: str, should_pass: bool
+async def test_residual_service_account_token_is_refused(
+    admin_db: DatabaseSession, clean_access_tokens: None
 ) -> None:
-    """The SQL's `service_account` CASE branch."""
-    await _seed_user_row(admin_db, "usr_sa_owner")
-    await _seed_service_account_row(
-        admin_db, "sva_broker", owner_id="usr_sa_owner", status=sa_status
-    )
+    """The SQL's `service_account` CASE branch fails closed: a residual SA
+    session row (theme-8 Phase 4 dropped the SA tables, not the tokens) never
+    resolves to a live identity: the resolver drops the row (the actor type is
+    no longer a member of ``ActorType``) and the broker sees an unknown token."""
     await _seed_opaque_token(
         admin_db, plaintext="at_sa_token", actor_id="sva_broker", actor_type="service_account"
     )
 
-    if should_pass:
-        resolved = await _dual(admin_db).validate("at_sa_token")
-        assert resolved.sub == "sva_broker"
-    else:
-        with pytest.raises(TokenValidationError, match="token_inactive"):
-            await _dual(admin_db).validate("at_sa_token")
+    with pytest.raises(TokenValidationError, match="unknown_token"):
+        await _dual(admin_db).validate("at_sa_token")
 
 
 async def test_disable_mid_life_kills_token_after_cache_ttl(
@@ -420,3 +401,89 @@ async def test_disable_mid_life_kills_token_after_cache_ttl(
     await asyncio.sleep(0.06)
     resolved = await validator.validate("at_kill_me")
     assert resolved.sub == "agnt_opaque"
+
+
+# --- client approval gate at the broker resolver (PR #1218 MAJOR-1) ---------
+
+
+async def _seed_oauth_client_row(
+    admin_db: DatabaseSession,
+    *,
+    client_id: str,
+    approval_status: str = "approved",
+    active: bool = True,
+) -> None:
+    async with admin_db.session() as session:
+        session.add(
+            OAuthClient(
+                id=f"oac_e2e_{client_id}"[:30],
+                client_id=client_id,
+                client_secret_hash=None,
+                token_endpoint_auth_method="none",
+                name=f"e2e-{client_id}",
+                redirect_uris=["https://client.e2e.test/cb"],
+                active=active,
+                approval_status=approval_status,
+                created_by=_SEED_MARKER,
+            )
+        )
+        await session.commit()
+
+
+async def _set_oauth_client_state(
+    admin_db: DatabaseSession, client_id: str, *, approval_status: str, active: bool
+) -> None:
+    async with admin_db.session() as session:
+        await session.execute(
+            update(OAuthClient)
+            .where(OAuthClient.client_id == client_id)
+            .values(approval_status=approval_status, active=active)
+        )
+        await session.commit()
+
+
+async def test_denied_client_token_rejected_even_if_active(
+    admin_db: DatabaseSession, clean_access_tokens: None
+) -> None:
+    """A token minted while its issuing client was approved must stop resolving
+    once the row is denied — even when ``active`` is somehow force-set true
+    (the deny → PATCH-active pincer from the #1218 review). The broker's raw
+    SQL gate checks approval_status independently of active."""
+    await _seed_agent(admin_db, "agnt_opaque")
+    await _seed_oauth_client_row(admin_db, client_id="oc_e2e_app")
+    await _seed_opaque_token(admin_db, plaintext="at_client_channel", oauth_client_id="oc_e2e_app")
+
+    # Sanity: resolves while the client is approved + active.
+    resolved = await _dual(admin_db).validate("at_client_channel")
+    assert resolved.sub == "agnt_opaque"
+
+    # Deny, but leave the kill switch armed (the invariant-violating state).
+    await _set_oauth_client_state(admin_db, "oc_e2e_app", approval_status="denied", active=True)
+    with pytest.raises(TokenValidationError, match="token_inactive"):
+        await _dual(admin_db).validate("at_client_channel")
+
+
+@pytest.mark.parametrize(
+    ("approval_status", "active"),
+    [
+        ("pending", True),
+        ("pending", False),
+        ("denied", False),
+        ("approved", False),
+    ],
+)
+async def test_client_gate_matrix_rejected_by_broker(
+    admin_db: DatabaseSession,
+    clean_access_tokens: None,
+    approval_status: str,
+    active: bool,
+) -> None:
+    """Every non-(approved+active) client state fails the broker gate closed."""
+    await _seed_agent(admin_db, "agnt_opaque")
+    await _seed_oauth_client_row(
+        admin_db, client_id="oc_e2e_gated", approval_status=approval_status, active=active
+    )
+    await _seed_opaque_token(admin_db, plaintext="at_gated_channel", oauth_client_id="oc_e2e_gated")
+
+    with pytest.raises(TokenValidationError, match="token_inactive"):
+        await _dual(admin_db).validate("at_gated_channel")

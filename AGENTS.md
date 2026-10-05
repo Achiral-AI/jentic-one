@@ -23,7 +23,7 @@ rest of this file is for changing the codebase.
 
 **Run Jentic One on a different machine from the agent.** An agent running as the same OS user
 can read the credential database and encryption key from disk, whatever the API-level controls
-allow. See `docs/security/hardening.md` before using real credentials.
+allow. See `docs/security/README.md` before using real credentials.
 
 **Register and reach a first call:**
 
@@ -34,14 +34,20 @@ allow. See `docs/security/hardening.md` before using real credentials.
    `http://127.0.0.1:8000`, and prompt for it on an interactive terminal.)
    Report the wait to the user: on a single-operator install they are the operator, and they
    approve the agent in the UI at `/app`.
-2. If no admin account exists yet, point the user to `/setup` (browser) or `jenticctl setup`
+2. If no admin account exists yet, point the user to `/app/setup` (browser) or `jenticctl setup`
    (terminal). This is a one-time step.
 3. Import an API from https://github.com/jentic/jentic-public-apis (e.g. `httpbin.org`, used in
    step 6), or register a private OpenAPI description of the user's own service.
-4. Store a credential for that API, once. It is encrypted at rest and is never returned.
-5. Request access: `jentic access request --toolkit <vendor/name>` files a reviewable request;
-   granting is always a human action. The operator binds the agent to a toolkit — access is
-   default-deny, and a rule-less binding still blocks everything.
+4. The operator stores a credential for that API, once (skip for a registry vendor — step 5's
+   connect flow creates it). It is encrypted at rest and is never returned.
+5. Get access: granting is always a human action. Access is default-deny — the operator binds
+   the agent to a stored credential in the console, and a rule-less binding still blocks
+   everything. For OAuth vendors in the deployment's vendor registry the agent can start the
+   flow itself with `jentic connect <vendor>` (`POST /integrations:connect`) and relay the
+   printed `approval_url`: a human approves it and consents inside the OAuth flow, the API is
+   imported automatically, and the credential, binding, and per-agent permissions land
+   together. For anything else — including a freshly imported API with no credential stored
+   yet — hand off to the operator: they store the credential and bind the agent in the console.
 6. `jentic execute GET:https://httpbin.org/get --json` runs a call through the Broker with the
    credential injected. Give `execute` the operation's full upstream URL (as returned by
    `jentic search`/`jentic inspect`) or its operation_id — the Broker is a forward proxy, not a
@@ -51,9 +57,11 @@ allow. See `docs/security/hardening.md` before using real credentials.
 
 - One governed upstream call per execution. Compose multi-step work yourself; the Broker does
   not orchestrate.
-- A self-hosted deployment serves no HTTP MCP endpoint. Integrate through the `jentic` CLI, the
-  skill it generates, the CLI's local MCP stdio server (an `mcp` subcommand shipping in the
-  next `jentic` release), or plain HTTP against the deployment's own API.
+- A self-hosted deployment serves an HTTP MCP endpoint (`/mcp`) only when its operator enabled
+  it (`server.mcp.enabled`, off by default — see
+  [docs/guides/mcp-http-endpoint.md](docs/guides/mcp-http-endpoint.md)). Otherwise integrate through the
+  `jentic` CLI, the skill it generates, the CLI's local MCP stdio server
+  (`jentic mcp`), or plain HTTP against the deployment's own API.
 - A running instance serves `/llms.txt` and `/.well-known/llms.txt` with that deployment's base
   URL. Once an instance exists, prefer those over this file for anything at runtime.
 - Never print, log or echo a stored credential. The Broker does not return them.

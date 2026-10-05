@@ -4,7 +4,7 @@
  *
  * The preferred input is the **catalog identity slug** (`catalog_api_id`,
  * e.g. `nytimes.com/article_search`) — persisted at import time and exposed on
- * API, credential, and toolkit-binding DTOs (#910) — because it is the only
+ * API, credential, and binding DTOs (#910) — because it is the only
  * identity form where the vendor and sub-API stay separable. Surfaces that
  * predate the column (or manually-imported APIs) fall back to humanising the
  * slugified `vendor`/`name` tuple.
@@ -237,18 +237,16 @@ export function apiRefDisplayName(input: {
 }
 
 /**
- * Toolkit-binding-row display name — same rule as {@link apiRefDisplayName}
- * keyed to the binding DTO's snake_case identity fields
- * (`ToolkitCredentialBindingResponse`).
+ * A version string as it reads on a card or tile. Registry versions arrive bare
+ * (`1.1.4`, `2024-01-01`) and need the `v`, or already prefixed (`v4`), which must
+ * not collect a second one. `null` for a blank version, so callers can drop the
+ * clause.
  */
-export function toolkitCredDisplayName(input: {
-	catalog_api_id?: string | null;
-	api_vendor?: string | null;
-	api_name?: string | null;
-}): string {
-	const apiId = input.catalog_api_id?.trim();
-	if (apiId) return titleFromApiId(apiId);
-	return tupleDisplayName(input.api_vendor ?? '', input.api_name ?? '');
+export function formatApiVersion(version: string | null | undefined): string | null {
+	const v = version?.trim();
+	if (!v) return null;
+	// Already a version label: `v` (or `V`) immediately followed by a digit.
+	return /^v\d/i.test(v) ? v : `v${v}`;
 }
 
 /**
@@ -274,4 +272,27 @@ export function apiIdentityTuple(input: {
 	}
 	if (vendor && name) return `${vendor}/${name}`;
 	return vendor || name;
+}
+
+/**
+ * Human-readable operation label for an execution record.
+ *
+ * Renders the record's `operation_method` + `operation_path` (the spec's HTTP
+ * method + path template, e.g. "GET /repos/{owner}/{repo}"). Returns null when
+ * the record carries no path (legacy rows) — deliberately NEVER the opaque
+ * `operation_id` (`op_…` hash): it is a machine key, meaningless to humans,
+ * and must not render anywhere in the UI. Callers show their own empty
+ * placeholder ("—") instead. The input is shaped after the wire
+ * `ExecutionResponse` fields so every surface that lists executions (Monitor,
+ * dashboard, agent activity) can pass its row straight through — or map
+ * camelCase fields into this shape.
+ */
+export function formatOperation(row: {
+	operation_path?: string | null;
+	operation_method?: string | null;
+}): string | null {
+	if (!row.operation_path) return null;
+	return row.operation_method
+		? `${row.operation_method} ${row.operation_path}`
+		: row.operation_path;
 }

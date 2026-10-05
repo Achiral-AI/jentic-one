@@ -13,13 +13,12 @@ import (
 // ExecuteEnvelope is the versioned success envelope for `jentic execute` (and
 // any other surface — e.g. an MCP handler — that relays a brokered upstream
 // response): {schema_version, status, headers, body, execution_id?}, matching
-// the agent-commands contract. It replaces the ad-hoc inline map the execute
-// command used to build, so the CLI and future callers share one struct.
+// the agent-commands contract. The CLI and future callers share this one struct.
 //
 // FIELD ORDER IS LOAD-BEARING: encoding/json emits struct fields in declaration
-// order, and the golden-pinned envelope was historically marshaled from a map —
-// alphabetical key order. The fields are declared alphabetically by JSON key so
-// the emitted document stays byte-identical to the frozen contract.
+// order, and the golden-pinned envelope uses alphabetical key order. The fields
+// are declared alphabetically by JSON key so the emitted document stays
+// byte-identical to the frozen contract.
 type ExecuteEnvelope struct {
 	// Body is the upstream response body: parsed JSON when it decodes, else the
 	// raw body as a string.
@@ -117,19 +116,22 @@ func RenderSynthesizedDenialRecovery(ctx context.Context, w io.Writer, status in
 	st := theme.StylesFromContext(ctx)
 	fmt.Fprintln(w, st.Warn.Render("Denied — recovery required:"))
 	switch status {
-	case http.StatusForbidden: // 403: have an identity, no access to this toolkit yet
-		fmt.Fprintln(w, "  This agent isn't bound to the toolkit you called. Check what you can run, then request access.")
-		fmt.Fprintln(w, "  run: "+st.Accent.Render("jentic access whoami"))
-		fmt.Fprintln(w, "  run: "+st.Accent.Render("jentic access request --toolkit <vendor/name> --wait"))
+	case http.StatusForbidden: // 403: have an identity, no credential binding for this API yet
+		fmt.Fprintln(w, "  This agent has no credential binding for the API you called. Check what you can run,")
+		fmt.Fprintln(w, "  then ask your operator to connect a credential for this API and bind you to it (dashboard).")
+		fmt.Fprintln(w, "  run: "+st.Accent.Render("jentic api GET /me"))
+	case http.StatusConflict: // 409: several bound credentials cover the API
+		fmt.Fprintln(w, "  Multiple bound credentials cover this API. Resend the same call naming one of them")
+		fmt.Fprintln(w, "  with the Jentic-Credential-Id header (Jentic-Credential-Name also works when names are unique).")
+		fmt.Fprintln(w, "  run: "+st.Accent.Render("jentic api GET /me"))
 	case http.StatusFailedDependency: // 424: no credential provisioned for the call
-		fmt.Fprintln(w, "  No credential is provisioned for this call. Provision one, then retry.")
-		fmt.Fprintln(w, "  run: "+st.Accent.Render("jentic access request --toolkit <vendor/name> --provision --wait"))
+		fmt.Fprintln(w, "  No credential is provisioned for this call. Ask your operator to connect one for this API")
+		fmt.Fprintln(w, "  in the dashboard, then retry.")
 	case http.StatusUnauthorized: // 401: credential expired / needs reconnecting
-		fmt.Fprintln(w, "  Your credential needs reconnecting. Re-run access to refresh it.")
-		fmt.Fprintln(w, "  run: "+st.Accent.Render("jentic access request --toolkit <vendor/name> --provision --wait"))
+		fmt.Fprintln(w, "  Your credential needs reconnecting. Ask your operator to re-provision it in the dashboard, then retry.")
 	default:
 		fmt.Fprintln(w, "  The broker denied this call. Check what you can run and your setup.")
-		fmt.Fprintln(w, "  run: "+st.Accent.Render("jentic access whoami"))
+		fmt.Fprintln(w, "  run: "+st.Accent.Render("jentic api GET /me"))
 	}
 	// Point at the read-only self-check as the catch-all when the specific hint
 	// above doesn't unblock (UX9).

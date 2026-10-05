@@ -13,18 +13,28 @@ from jentic_one.auth.services.errors import (
     AgentAlreadyOwnedError,
     ClaimActorNotAllowedError,
     ClaimTokenInvalidError,
+    CredentialBindingConflictError,
+    CredentialBindingNotFoundError,
+    CredentialNotVisibleError,
+    InvalidClientMetadataError,
     InvalidGrantError,
+    InvalidIntrospectionRequestError,
     InvalidOwnerError,
+    InvalidRevocationRequestError,
     InvalidTransitionError,
     NoApiKeyError,
+    OAuthGrantAccessDeniedError,
+    OAuthGrantNotFoundError,
     OperationNotSupportedError,
+    OwnerTransferForbiddenError,
     RateLimitExceededError,
     RegistrationAccessDeniedError,
-    ToolkitBindingConflictError,
-    ToolkitBindingNotFoundError,
+    ScopeNotGrantableError,
+    UnknownScopeError,
 )
 from jentic_one.shared.db.errors import DatabaseUnavailableError
 from jentic_one.shared.metrics import get_meter
+from jentic_one.shared.pagination import InvalidCursorError
 from jentic_one.shared.web.errors import make_service_error_handler
 
 _logger = structlog.get_logger(__name__)
@@ -40,14 +50,23 @@ _ERROR_MAP: dict[type[Exception], tuple[int, str]] = {
     ClaimActorNotAllowedError: (403, "claim_actor_not_allowed"),
     ClaimTokenInvalidError: (400, "invalid_claim_token"),
     InvalidGrantError: (400, "invalid_grant"),
+    InvalidClientMetadataError: (400, "invalid_client_metadata"),
+    InvalidIntrospectionRequestError: (400, "invalid_request"),
     InvalidOwnerError: (422, "invalid_owner"),
+    InvalidRevocationRequestError: (400, "invalid_request"),
     InvalidTransitionError: (409, "invalid_transition"),
     NoApiKeyError: (409, "no_api_key"),
-    ToolkitBindingConflictError: (409, "toolkit_binding_conflict"),
-    ToolkitBindingNotFoundError: (404, "toolkit_binding_not_found"),
+    OAuthGrantAccessDeniedError: (403, "oauth_grant_access_denied"),
+    OAuthGrantNotFoundError: (404, "oauth_grant_not_found"),
+    CredentialBindingConflictError: (409, "credential_binding_conflict"),
+    CredentialBindingNotFoundError: (404, "credential_binding_not_found"),
+    CredentialNotVisibleError: (404, "credential_not_found"),
     RateLimitExceededError: (429, "rate_limit_exceeded"),
     RegistrationAccessDeniedError: (401, "registration_access_denied"),
     OperationNotSupportedError: (403, "operation_not_supported"),
+    OwnerTransferForbiddenError: (403, "owner_transfer_forbidden"),
+    ScopeNotGrantableError: (403, "scope_not_grantable"),
+    UnknownScopeError: (422, "unknown_scope"),
 }
 
 
@@ -63,6 +82,17 @@ def _rate_limit_response_hook(
         response.headers["Retry-After"] = str(retry_after_s)
         _rate_limit_counter.add(1, {"path": request.url.path})
     return response
+
+
+def record_rate_limited_request(path: str) -> None:
+    """Bump the rate-limited-requests metric for a 429 built outside this handler.
+
+    The RFC 7009 form arm of ``POST /oauth/revoke`` reshapes its 429 into the
+    RFC 6749 §5.2 error dialect in the router (it must not answer Problem
+    Details), bypassing :func:`_rate_limit_response_hook` — this keeps the
+    metric consistent across both paths.
+    """
+    _rate_limit_counter.add(1, {"path": path})
 
 
 service_error_handler = make_service_error_handler(
@@ -87,3 +117,17 @@ _DB_SAFE_DETAILS: dict[type[Exception], str] = {
 }
 
 database_error_handler = make_service_error_handler(_DB_ERROR_MAP, safe_details=_DB_SAFE_DETAILS)
+
+# A tampered/garbage pagination cursor on `GET /agents/{id}/oauth-grants` is a
+# client fault, not a server one: map it to a 400 like the admin surface
+# (`admin/web/errors.py`) and the registry routers do. Registered as its own
+# handler because `InvalidCursorError` lives outside the `AuthServiceError`
+# hierarchy (it's a shared pagination error, ultimately a ValueError). Without
+# this, the standalone auth deployment 500s on `?cursor=garbage` — combined
+# mode was rescued only because the admin surface registers the handler on the
+# shared app.
+_CURSOR_ERROR_MAP: dict[type[Exception], tuple[int, str]] = {
+    InvalidCursorError: (400, "invalid_cursor"),
+}
+
+cursor_error_handler = make_service_error_handler(_CURSOR_ERROR_MAP)

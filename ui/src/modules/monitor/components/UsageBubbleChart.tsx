@@ -1,16 +1,16 @@
 /**
- * UsageBubbleChart — ported from jentic-mini's `ApiBubbleChart`.
+ * UsageBubbleChart.
  *
- * One bubble per api / toolkit / agent: bubble area encodes execution volume,
+ * One bubble per API / agent: bubble area encodes execution volume,
  * the partial ring around it encodes success rate, and hovering surfaces a
  * calls / success / latency tooltip. The segmented toggle flips between the
- * three lenses without refetching (the Overview pre-fetches all three
+ * two lenses without refetching (the Overview pre-fetches both
  * groupings).
  *
  * Differences from the mini original: no vendor-icon registry in jentic-one,
  * so every bubble renders an initials tile from a stable index palette, and
  * the tooltip drops the cross-entity "Used by" / "Top APIs" sections (the
- * usage endpoint doesn't expose per-toolkit top-API relations).
+ * usage endpoint doesn't expose per-credential top-API relations).
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
@@ -28,7 +28,6 @@ import type { EntityUsageRow } from '@/modules/monitor/lib/usage';
 
 interface UsageBubbleChartProps {
 	apis: EntityUsageRow[];
-	toolkits: EntityUsageRow[];
 	agents: EntityUsageRow[];
 	className?: string;
 }
@@ -44,18 +43,16 @@ interface BubbleNode {
 
 const LENS_TITLES: Record<UsageLens, string> = {
 	apis: 'API Usage',
-	toolkits: 'Toolkit Activity',
 	agents: 'Agent Activity',
 };
 
 const LENS_NOUNS: Record<UsageLens, string> = {
 	apis: 'API',
-	toolkits: 'toolkit',
 	agents: 'agent',
 };
 
 /**
- * Greedy circle packing (verbatim from jentic-mini): place biggest first at
+ * Greedy circle packing: place biggest first at
  * the centre, then spiral each next bubble outward to the closest free spot.
  */
 function packCircles(
@@ -124,7 +121,7 @@ function packCircles(
 	return placed;
 }
 
-export function UsageBubbleChart({ apis, toolkits, agents, className }: UsageBubbleChartProps) {
+export function UsageBubbleChart({ apis, agents, className }: UsageBubbleChartProps) {
 	const containerRef = useRef<HTMLDivElement>(null);
 	const [dimensions, setDimensions] = useState({ width: 600, height: 420 });
 	// Store only the hovered entity id, not the node: background refetches
@@ -157,7 +154,7 @@ export function UsageBubbleChart({ apis, toolkits, agents, className }: UsageBub
 		setHoveredId(null);
 	}, [lens]);
 
-	const items = lens === 'apis' ? apis : lens === 'toolkits' ? toolkits : agents;
+	const items = lens === 'apis' ? apis : agents;
 
 	const bubbles = useMemo(() => {
 		if (items.length === 0) return [];
@@ -207,7 +204,6 @@ export function UsageBubbleChart({ apis, toolkits, agents, className }: UsageBub
 				<SegmentedToggle
 					options={[
 						{ value: 'apis', label: 'APIs' },
-						{ value: 'toolkits', label: 'Toolkits' },
 						{ value: 'agents', label: 'Agents' },
 					]}
 					value={lens}

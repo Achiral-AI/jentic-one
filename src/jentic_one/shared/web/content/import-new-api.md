@@ -27,8 +27,8 @@ a company name is given, find its public API docs by searching for `<company> AP
 - No local jentic-public-apis checkout needed — the vendor-existence check runs against GitHub
   via `gh`.
 - For the optional local-first step only: a running Jentic control plane and a registered agent
-  identity (`jentic doctor` confirms a resolvable identity with a usable token; `jentic access
-  whoami` shows what you can do).
+  identity (`jentic doctor` confirms a resolvable identity with a usable token; `jentic api GET
+  /me` shows what you can do).
 
 ## Steps
 
@@ -97,12 +97,10 @@ If a local jentic-one instance is running, import the spec there **before** cont
 upstream — the user's agent can execute the API immediately instead of waiting on catalog
 review. Skip this step if `jentic doctor` reports the control plane unreachable.
 
-Local import needs the `apis:write` scope, which is not granted by default — request it once:
-
-```
-jentic access request --scope apis:write --reason "import a locally generated spec for <vendor>" --wait
-jentic access refresh
-```
+Local import needs the `apis:write` scope, which is not granted by default — ask your operator
+to grant it to this agent in the dashboard. Granted scopes bake into your token at mint time, so
+once they confirm run `jentic logout` (it clears only the cached token, not your identity) and the
+next call mints a fresh token carrying the scope; then continue.
 
 Import the spec with the CLI's own upload command — it reads the local file and sends it inline
 for you (async; prints a job id). Pass `--vendor`/`--name`/`--version` explicitly so attribution
@@ -128,7 +126,7 @@ jentic apis promote <vendor/name/version> <revision_id>
 ```
 
 **Verify**: `jentic search "<something the API does>"` returns one of its operations, and a
-known-safe `jentic execute <operation_id>` succeeds (credentials permitting — see the `jentic`
+known-safe `jentic execute <METHOD:URL from the search hit>` succeeds (credentials permitting — see the `jentic`
 skill). The user is now unblocked; the remaining steps contribute the spec to the community.
 
 ### 4. Publish the spec to the reusable `import-openapi-specs` repo

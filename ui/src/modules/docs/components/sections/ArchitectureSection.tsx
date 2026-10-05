@@ -45,14 +45,6 @@ const ACTORS = [
 		name: 'agent',
 		body: 'An autonomous identity (Ed25519 keypair) that brokers API calls on a human’s behalf.',
 	},
-	{
-		name: 'service_account',
-		body: 'A non-human programmatic identity for backend integrations; mints task tokens.',
-	},
-	{
-		name: 'toolkit',
-		body: 'A grouping that binds credentials and rides the agent token flow at execution time.',
-	},
 ];
 
 export function ArchitectureSection() {

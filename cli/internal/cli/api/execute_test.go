@@ -4,10 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -42,13 +47,13 @@ func TestBadFlagKV(t *testing.T) {
 }
 
 // TestExecuteMalformedHeaderWinsOverInsecureBroker freezes the doubly-invalid
-// precedence the agentops extraction changed (PR #1179 review #2): ParseKVs on
-// --header now runs BEFORE BuildRequest's SEC-1 secure-transport guard, so a
+// precedence: ParseKVs on
+// --header runs BEFORE BuildRequest's SEC-1 secure-transport guard, so a
 // malformed --header combined with a SEC-1-violating broker target (plaintext
-// http to a non-loopback host) surfaces MISSING_ARGUMENT — previously SEC-1 ran
-// first and TRANSPORT_ERROR won. Both codes map to exit 1 (ux/contract.go), so
+// http to a non-loopback host) surfaces MISSING_ARGUMENT, not
+// TRANSPORT_ERROR. Both codes map to exit 1 (ux/contract.go), so
 // exit parity holds; error_code is part of the closed machine contract (13
-// §3a), so the new order is pinned here as a decision, not an accident.
+// §3a), so the order is pinned here as a decision, not an accident.
 func TestExecuteMalformedHeaderWinsOverInsecureBroker(t *testing.T) {
 	app := testApp(t)
 	// Loopback control plane; never dialed — GET:/v1/pets short-circuits the
@@ -154,14 +159,14 @@ func TestExecuteCmdDeniedSurfacesDirectiveAndExits2(t *testing.T) {
 		w.Header().Set("Jentic-Error-Origin", "broker")
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = w.Write([]byte(`{
-			"type": "no_toolkit_binding",
-			"title": "No toolkit binding for this API",
+			"type": "no_credential_binding",
+			"title": "No credential binding for this API",
 			"status": 403,
 			"error_origin": "broker",
 			"agent_directive": {
 				"strategy": "prompt_human",
-				"parameters": {"suggested_command": "jentic access request --toolkit api.example.com --wait"},
-				"human_readable_instruction": "You are not bound to a toolkit for this API."
+				"parameters": {"api": "api.example.com"},
+				"human_readable_instruction": "You have no credential binding for this API. Ask your operator to connect a credential for api.example.com and bind this agent to it."
 			}
 		}`))
 	}))
@@ -189,11 +194,12 @@ func TestExecuteCmdDeniedSurfacesDirectiveAndExits2(t *testing.T) {
 	if !errors.As(err, &ec) || ec.ExitCode() != 2 {
 		t.Fatalf("expected exit code 2 on denial, got err=%v", err)
 	}
-	// The recovery directive must be surfaced on stderr, including the command.
-	if !strings.Contains(errBuf.String(), "jentic access request --toolkit api.example.com --wait") {
-		t.Errorf("stderr missing suggested_command; got: %s", errBuf.String())
+	// The recovery directive must be surfaced on stderr, including the
+	// operator instruction.
+	if !strings.Contains(errBuf.String(), "Ask your operator to connect a credential for api.example.com") {
+		t.Errorf("stderr missing the operator instruction; got: %s", errBuf.String())
 	}
-	if !strings.Contains(errBuf.String(), "not bound to a toolkit") {
+	if !strings.Contains(errBuf.String(), "no credential binding") {
 		t.Errorf("stderr missing instruction; got: %s", errBuf.String())
 	}
 	// The 403 envelope is still emitted on stdout for machine parsing.
@@ -261,7 +267,7 @@ func TestExecuteCmdDirectivelessDenialExits2(t *testing.T) {
 		w.WriteHeader(http.StatusForbidden) // 403, no agent_directive
 		_, _ = w.Write([]byte(`{
 			"type": "action_denied",
-			"title": "The requested operation is denied by a toolkit permission rule.",
+			"title": "The requested operation is denied by a permission rule.",
 			"status": 403,
 			"error_origin": "broker"
 		}`))
@@ -287,10 +293,10 @@ func TestExecuteCmdDirectivelessDenialExits2(t *testing.T) {
 		t.Fatalf("expected exit code 2 on directive-less denial, got err=%v", err)
 	}
 	// UX7: a directive-less denial must still hand the user a synthesized
-	// next-step keyed off the 403 (whoami + access request), not a dead end.
-	// UX9: it also points at the read-only self-check.
+	// next-step keyed off the 403 (identity check + ask-your-operator), not a
+	// dead end. UX9: it also points at the read-only self-check.
 	errOut := app.Err.(*bytes.Buffer).String()
-	for _, want := range []string{"jentic access whoami", "jentic access request", "jentic doctor"} {
+	for _, want := range []string{"jentic api GET /me", "operator", "jentic doctor"} {
 		if !strings.Contains(errOut, want) {
 			t.Errorf("synthesized 403 recovery missing %q; stderr:\n%s", want, errOut)
 		}
@@ -658,6 +664,346 @@ func TestExecuteCmdSendsBody(t *testing.T) {
 	}
 }
 
+// TestExecuteCmdMultipartBody exercises the --form/--form-file path (#1316):
+// the CLI must assemble a multipart/form-data body, stamp the boundary
+// Content-Type (NOT the JSON default), infer the file part's Content-Type from
+// its extension, honor the @@ literal-@ escape, and forward it all
+// byte-transparently.
+func TestExecuteCmdMultipartBody(t *testing.T) {
+	var gotContentType string
+	var gotField string
+	var gotHandle string
+	var gotFileName string
+	var gotFileBody string
+	var gotFileContentType string
+	var gotParts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/inspect" {
+			_, _ = w.Write([]byte(`{"method":"POST","url":"https://upstream.example/upload"}`))
+			return
+		}
+		gotContentType = r.Header.Get("Content-Type")
+		mediaType, params, perr := mime.ParseMediaType(gotContentType)
+		if perr != nil || mediaType != "multipart/form-data" {
+			t.Errorf("content-type = %q (parse err %v)", gotContentType, perr)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		mr := multipart.NewReader(r.Body, params["boundary"])
+		for {
+			part, err := mr.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Errorf("read part: %v", err)
+				return
+			}
+			gotParts++
+			data, _ := io.ReadAll(part)
+			switch part.FormName() {
+			case "demo":
+				gotField = string(data)
+			case "handle":
+				gotHandle = string(data)
+			case "images":
+				gotFileName = part.FileName()
+				gotFileBody = string(data)
+				gotFileContentType = part.Header.Get("Content-Type")
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id_search":"abc"}`))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	imgPath := filepath.Join(dir, "face.jpg")
+	if err := os.WriteFile(imgPath, []byte("JPEGBYTES"), 0o600); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+
+	app := testApp(t)
+	seedRegistered(t, app, "default", srv.URL)
+
+	out := new(bytes.Buffer)
+	app.Out = out
+	root := newAPIRootCmd(app.App)
+	root.SetOut(out)
+	root.SetErr(new(bytes.Buffer))
+	root.SetArgs([]string{
+		"execute", "uploadPic",
+		"--form", "demo=true",
+		"--form", "handle=@@lit", // doubled @ escapes to a literal leading @
+		"--form-file", "images=@" + imgPath,
+		"--json",
+		"--broker-scheme", "http",
+		"--broker-host", srv.Listener.Addr().String(),
+	})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if !strings.HasPrefix(gotContentType, "multipart/form-data") {
+		t.Errorf("content-type = %q; want multipart/form-data", gotContentType)
+	}
+	if gotParts != 3 {
+		t.Errorf("part count = %d; want 3", gotParts)
+	}
+	if gotField != "true" {
+		t.Errorf("form field demo = %q; want %q", gotField, "true")
+	}
+	if gotHandle != "@lit" {
+		t.Errorf("form field handle = %q; want %q", gotHandle, "@lit")
+	}
+	if gotFileName != "face.jpg" {
+		t.Errorf("file part name = %q; want %q", gotFileName, "face.jpg")
+	}
+	if gotFileBody != "JPEGBYTES" {
+		t.Errorf("file part body = %q; want %q", gotFileBody, "JPEGBYTES")
+	}
+	if gotFileContentType != "image/jpeg" {
+		t.Errorf("file part content-type = %q; want %q", gotFileContentType, "image/jpeg")
+	}
+}
+
+// TestExecuteCmdMultipartRejectsRawBody guards the mutual-exclusion: --form and
+// a raw byte body (--data/--data-file) cannot be combined.
+func TestExecuteCmdMultipartRejectsRawBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/inspect" {
+			_, _ = w.Write([]byte(`{"method":"POST","url":"https://upstream.example/upload"}`))
+			return
+		}
+		t.Errorf("broker should not be called when the body flags conflict")
+	}))
+	defer srv.Close()
+
+	app := testApp(t)
+	seedRegistered(t, app, "default", srv.URL)
+
+	out := new(bytes.Buffer)
+	app.Out = out
+	root := newAPIRootCmd(app.App)
+	root.SetOut(out)
+	root.SetErr(new(bytes.Buffer))
+	root.SetArgs([]string{
+		"execute", "uploadPic",
+		"--form", "demo=true",
+		"-d", `{"name":"Alice"}`,
+		"--broker-scheme", "http",
+		"--broker-host", srv.Listener.Addr().String(),
+	})
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected an error when --form is combined with --data")
+	}
+	var coded *ux.CodedError
+	if !errors.As(err, &coded) || coded.Code != ux.CodeMissingArgument {
+		t.Fatalf("err = %v; want CodedError with code %q", err, ux.CodeMissingArgument)
+	}
+}
+
+// TestExecuteCmdFormFileBadSpec rejects a --form-file value missing the @path
+// form.
+func TestExecuteCmdFormFileBadSpec(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/inspect" {
+			_, _ = w.Write([]byte(`{"method":"POST","url":"https://upstream.example/upload"}`))
+			return
+		}
+		t.Errorf("broker should not be called for an invalid --form-file spec")
+	}))
+	defer srv.Close()
+
+	app := testApp(t)
+	seedRegistered(t, app, "default", srv.URL)
+
+	out := new(bytes.Buffer)
+	app.Out = out
+	root := newAPIRootCmd(app.App)
+	root.SetOut(out)
+	root.SetErr(new(bytes.Buffer))
+	root.SetArgs([]string{
+		"execute", "uploadPic",
+		"--form-file", "images=face.jpg", // missing @
+		"--broker-scheme", "http",
+		"--broker-host", srv.Listener.Addr().String(),
+	})
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected an error for a --form-file value without @path")
+	}
+	var coded *ux.CodedError
+	if !errors.As(err, &coded) || coded.Code != ux.CodeMissingArgument {
+		t.Fatalf("err = %v; want CodedError with code %q", err, ux.CodeMissingArgument)
+	}
+}
+
+// TestExecuteCmdMultipartRejectsExplicitContentType pins the boundary guard: the
+// generated multipart Content-Type carries a per-invocation boundary that must
+// match the body bytes, so an explicit --header Content-Type is rejected rather
+// than merged (it could never carry the right boundary and would make the
+// upstream fail to parse the body).
+func TestExecuteCmdMultipartRejectsExplicitContentType(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/inspect" {
+			_, _ = w.Write([]byte(`{"method":"POST","url":"https://upstream.example/upload"}`))
+			return
+		}
+		t.Errorf("broker should not be called when --header Content-Type conflicts with --form")
+	}))
+	defer srv.Close()
+
+	app := testApp(t)
+	seedRegistered(t, app, "default", srv.URL)
+
+	out := new(bytes.Buffer)
+	app.Out = out
+	root := newAPIRootCmd(app.App)
+	root.SetOut(out)
+	root.SetErr(new(bytes.Buffer))
+	root.SetArgs([]string{
+		"execute", "uploadPic",
+		"--form", "demo=true",
+		"--header", "content-type=multipart/form-data", // any case must be caught
+		"--broker-scheme", "http",
+		"--broker-host", srv.Listener.Addr().String(),
+	})
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected an error when --header Content-Type is combined with --form")
+	}
+	var coded *ux.CodedError
+	if !errors.As(err, &coded) || coded.Code != ux.CodeMissingArgument {
+		t.Fatalf("err = %v; want CodedError with code %q", err, ux.CodeMissingArgument)
+	}
+}
+
+// TestExecuteCmdFormValueAtPrefixRejected guards the curl footgun: curl's -F
+// treats @value as a file reference, so a @-prefixed --form value is almost
+// always a mistaken file-upload attempt that would silently send the literal
+// string. It must fail closed and point at --form-file (a literal leading @ is
+// sent by doubling it — covered in TestExecuteCmdMultipartBody).
+func TestExecuteCmdFormValueAtPrefixRejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/inspect" {
+			_, _ = w.Write([]byte(`{"method":"POST","url":"https://upstream.example/upload"}`))
+			return
+		}
+		t.Errorf("broker should not be called for a @-prefixed --form value")
+	}))
+	defer srv.Close()
+
+	app := testApp(t)
+	seedRegistered(t, app, "default", srv.URL)
+
+	out := new(bytes.Buffer)
+	app.Out = out
+	root := newAPIRootCmd(app.App)
+	root.SetOut(out)
+	root.SetErr(new(bytes.Buffer))
+	root.SetArgs([]string{
+		"execute", "uploadPic",
+		"--form", "images=@face.jpg", // curl habit: file parts belong on --form-file
+		"--broker-scheme", "http",
+		"--broker-host", srv.Listener.Addr().String(),
+	})
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected an error for a @-prefixed --form value")
+	}
+	var coded *ux.CodedError
+	if !errors.As(err, &coded) || coded.Code != ux.CodeMissingArgument {
+		t.Fatalf("err = %v; want CodedError with code %q", err, ux.CodeMissingArgument)
+	}
+	if !strings.Contains(coded.Actionable, "--form-file") {
+		t.Errorf("actionable = %q; want a pointer at --form-file", coded.Actionable)
+	}
+}
+
+// TestExecuteCmdFormFileNotFound pins the missing-file error path: a wrong path
+// is agent-causable input (ARCH-4), so it must surface a machine error_code —
+// not a bare fmt.Errorf — and the broker must never be dialed.
+func TestExecuteCmdFormFileNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/inspect" {
+			_, _ = w.Write([]byte(`{"method":"POST","url":"https://upstream.example/upload"}`))
+			return
+		}
+		t.Errorf("broker should not be called when the --form-file path does not exist")
+	}))
+	defer srv.Close()
+
+	app := testApp(t)
+	seedRegistered(t, app, "default", srv.URL)
+
+	out := new(bytes.Buffer)
+	app.Out = out
+	root := newAPIRootCmd(app.App)
+	root.SetOut(out)
+	root.SetErr(new(bytes.Buffer))
+	root.SetArgs([]string{
+		"execute", "uploadPic",
+		"--form-file", "images=@" + filepath.Join(t.TempDir(), "missing.jpg"),
+		"--broker-scheme", "http",
+		"--broker-host", srv.Listener.Addr().String(),
+	})
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected an error for a missing --form-file path")
+	}
+	var coded *ux.CodedError
+	if !errors.As(err, &coded) || coded.Code != ux.CodeMissingArgument {
+		t.Fatalf("err = %v; want CodedError with code %q", err, ux.CodeMissingArgument)
+	}
+}
+
+// TestExecuteCmdFormFileDirectory rejects a directory path with a clear coded
+// error instead of failing mid-copy with a misleading read error.
+func TestExecuteCmdFormFileDirectory(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/inspect" {
+			_, _ = w.Write([]byte(`{"method":"POST","url":"https://upstream.example/upload"}`))
+			return
+		}
+		t.Errorf("broker should not be called when the --form-file path is a directory")
+	}))
+	defer srv.Close()
+
+	app := testApp(t)
+	seedRegistered(t, app, "default", srv.URL)
+
+	out := new(bytes.Buffer)
+	app.Out = out
+	root := newAPIRootCmd(app.App)
+	root.SetOut(out)
+	root.SetErr(new(bytes.Buffer))
+	root.SetArgs([]string{
+		"execute", "uploadPic",
+		"--form-file", "images=@" + t.TempDir(),
+		"--broker-scheme", "http",
+		"--broker-host", srv.Listener.Addr().String(),
+	})
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected an error for a --form-file path that is a directory")
+	}
+	var coded *ux.CodedError
+	if !errors.As(err, &coded) || coded.Code != ux.CodeMissingArgument {
+		t.Fatalf("err = %v; want CodedError with code %q", err, ux.CodeMissingArgument)
+	}
+	if !strings.Contains(coded.Msg, "directory") {
+		t.Errorf("msg = %q; want it to name the directory problem", coded.Msg)
+	}
+}
+
 func TestExecuteCmdQueryParams(t *testing.T) {
 	var gotQuery string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -777,6 +1123,41 @@ func TestExecuteCmdMethodPathDirect(t *testing.T) {
 	}
 }
 
+// TestExecuteCmdMethodPathRefusesTrace pins the TRACE refusal on the command's
+// real resolve path (app.resolveOperation → agentops.ResolveOperation) for the
+// broker-relative METHOD:/path short-circuit: the request must never be dialed,
+// and the failure is a coded RESOLVE_FAILED (exit 2) — not a 405 with exit 0.
+func TestExecuteCmdMethodPathRefusesTrace(t *testing.T) {
+	var dialed bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		dialed = true
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer srv.Close()
+
+	app := testApp(t)
+	seedRegistered(t, app, "default", srv.URL)
+
+	root := newAPIRootCmd(app.App)
+	root.SetOut(new(bytes.Buffer))
+	root.SetErr(new(bytes.Buffer))
+	root.SetArgs([]string{
+		"execute", "TRACE:/v1/debug",
+		"--json",
+		"--broker-scheme", "http",
+		"--broker-host", srv.Listener.Addr().String(),
+	})
+
+	err := root.Execute()
+	if dialed {
+		t.Fatal("TRACE:/path was sent to the broker; it must be refused at resolve time")
+	}
+	var coded *ux.CodedError
+	if !errors.As(err, &coded) || coded.Code != ux.CodeResolveFailed {
+		t.Fatalf("err = %T (%v), want *ux.CodedError with %q", err, err, ux.CodeResolveFailed)
+	}
+}
+
 func TestExecuteCmdMethodPathWithPathParams(t *testing.T) {
 	var gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -864,6 +1245,11 @@ func TestParseMethodPath(t *testing.T) {
 		{"post:/v1/users", "POST", "/v1/users"},
 		{"DELETE:/v1/items/{id}", "DELETE", "/v1/items/{id}"},
 		{"PATCH:/v1/pets/42", "PATCH", "/v1/pets/42"},
+		// TRACE is part of the OpenAPI method set the registry ingests, so the
+		// parser recognises it: whether execute will *serve* the method is a
+		// resolve-time policy call (agentops.ResolveOperation rejects TRACE),
+		// not something this grammar decides.
+		{"TRACE:/v1/debug", "TRACE", "/v1/debug"},
 		{"listPets", "", ""},
 		{"createUser", "", ""},
 		{"notamethod:/foo", "", ""},
@@ -1216,6 +1602,122 @@ func TestExecuteRemoteBrokerGuardHonoursExplicitLoopback(t *testing.T) {
 	if errors.As(err, &coded) && coded.Code == ux.CodeResolveFailed &&
 		strings.Contains(coded.Msg, "no broker is configured") {
 		t.Errorf("explicit loopback broker must be honoured, not refused by the guard: %v", err)
+	}
+}
+
+// TestExecuteCmdBrokerLegHonorsCAPin is the #1206 pin, modeled on
+// TestMCPExecute_BrokerLegHonorsCAPinAndHook (§3.7.2): the COBRA execute
+// path's broker leg must ride clictx's SEC-20 CA-pinned client — a default
+// un-pinned client would silently ignore the
+// environment's ca_cert_path. The broker here serves a cert only the
+// environment's bundle trusts, so success proves the pinned client carried the
+// request; the un-pinned default would fail TLS verification.
+func TestExecuteCmdBrokerLegHonorsCAPin(t *testing.T) {
+	var brokerHits int
+	broker := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		brokerHits++
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer broker.Close()
+
+	// Write the test server's own CA cert as the environment's bundle.
+	pemPath := filepath.Join(t.TempDir(), "ca.pem")
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: broker.Certificate().Raw})
+	if err := os.WriteFile(pemPath, pemBytes, 0o600); err != nil {
+		t.Fatalf("write ca bundle: %v", err)
+	}
+
+	state := &clictx.ActiveState{
+		ResolvedState: &sdkconfig.ResolvedState{
+			IdentityName:        "test-agent",
+			EnvironmentName:     "test",
+			BaseURL:             "https://127.0.0.1:8000", // loopback so the remote-broker guard stays quiet
+			BrokerURL:           broker.URL,
+			CACertPath:          pemPath,
+			InjectedBearerToken: "tok_abc",
+		},
+		Mode: clictx.ModeHuman,
+	}
+
+	app := testApp(t)
+	cmd := newExecuteCmd(app)
+	cmd.SetContext(clictx.WithActiveState(context.Background(), state))
+
+	// Default broker flags: the environment's broker_url (the TLS server) wins.
+	opts := &executeOptions{
+		brokerHost:   config.DefaultBrokerHost,
+		brokerScheme: config.DefaultBrokerScheme,
+		json:         true,
+	}
+	if err := app.executeE(cmd, opts, "GET:/v1/pets"); err != nil {
+		t.Fatalf("CA-pinned broker call must succeed against the pinned cert: %v", err)
+	}
+	if brokerHits != 1 {
+		t.Fatalf("broker hits = %d, want 1", brokerHits)
+	}
+
+	// SEC-20 fail-closed: a set-but-broken bundle is an error, never a silent
+	// fallback to system roots (which is exactly what an un-pinned default
+	// client would do).
+	state.CACertPath = filepath.Join(t.TempDir(), "missing.pem")
+	err := app.executeE(cmd, opts, "GET:/v1/pets")
+	if err == nil {
+		t.Fatal("a broken ca_cert_path must fail closed on the cobra execute broker leg")
+	}
+	if !strings.Contains(err.Error(), "ca_cert_path") {
+		t.Errorf("error %q must name the broken ca_cert_path", err)
+	}
+	if brokerHits != 1 {
+		t.Errorf("broker hits = %d after fail-closed error, want still 1 (no un-pinned fallback request)", brokerHits)
+	}
+}
+
+// TestExecuteCmdBrokerRedirectRefused is the cobra-path #1207 regression: a
+// broker answering with a 302 must not be followed (the redirect target never
+// receives a request) and must surface as a coded TRANSPORT_ERROR (exit 1)
+// naming the redirect — not as a confusing "HTTP 302" success envelope.
+func TestExecuteCmdBrokerRedirectRefused(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.URL.Path == "/internal-admin" {
+			_, _ = w.Write([]byte(`{"should":"never be seen"}`))
+			return
+		}
+		http.Redirect(w, r, "/internal-admin", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	app := testApp(t)
+	seedRegistered(t, app, "default", srv.URL)
+	app.Out = new(bytes.Buffer)
+	app.Err = new(bytes.Buffer)
+	root := newAPIRootCmd(app.App)
+	root.SetOut(app.Out)
+	root.SetErr(app.Err)
+	root.SetArgs([]string{
+		"execute", "GET:/v1/pets",
+		"--json",
+		"--broker-scheme", "http",
+		"--broker-host", srv.Listener.Addr().String(),
+	})
+
+	err := root.Execute()
+	var coded *ux.CodedError
+	if !errors.As(err, &coded) {
+		t.Fatalf("a broker redirect returned %T (%v), want *ux.CodedError", err, err)
+	}
+	if coded.Code != ux.CodeTransportError {
+		t.Errorf("code = %q, want %q", coded.Code, ux.CodeTransportError)
+	}
+	if coded.ExitCode() != 1 {
+		t.Errorf("exit = %d, want 1 (transport failure)", coded.ExitCode())
+	}
+	if !strings.Contains(coded.Msg, "redirect") {
+		t.Errorf("msg %q should name the refused redirect", coded.Msg)
+	}
+	if len(paths) != 1 || paths[0] != "/v1/pets" {
+		t.Errorf("requested paths = %v, want only the broker path (the redirect target must never be fetched)", paths)
 	}
 }
 

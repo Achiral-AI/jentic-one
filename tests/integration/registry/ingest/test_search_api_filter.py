@@ -1,9 +1,9 @@
 """Integration tests for the search ``apis`` filter identifier format (#1080).
 
 The CLI (and every other surface) references APIs by the canonical
-``vendor[/name[/version]]`` slug, but ``_resolve_api_filters`` historically
-parsed only a colon-separated form — so every documented ``--api`` invocation
-failed with 422 ``Unknown API filter``. These tests ingest two real specs and
+``vendor[/name[/version]]`` slug; ``_resolve_api_filters`` must accept it as
+well as the legacy colon-separated form — a slug-form ``--api`` invocation
+must not fail with 422 ``Unknown API filter``. These tests ingest two real specs and
 assert both separator forms resolve, raw (unslugified) spellings normalize the
 way ingest does, filters actually restrict results, ``revision_pins`` keys
 accept the same identifier forms, and an unknown filter still fails with a
@@ -80,8 +80,8 @@ async def two_ingested_apis(
         "alpha-example-com/alpha-api",
         "alpha-example-com",
         "alpha-example-com:alpha-api:1.2.3",  # legacy colon form stays supported
-        # Raw spellings slugify to the stored form, the same way ingest and the
-        # access-request path normalize them — a dotted domain must not 422.
+        # Raw spellings slugify to the stored form, the same way ingest
+        # normalizes them — a dotted domain must not 422.
         "alpha.example.com/alpha.api/1.2.3",
         "Alpha-Example-Com",
     ],

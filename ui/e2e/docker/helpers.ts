@@ -199,34 +199,6 @@ export function uniqueSuffix(): string {
 	return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
-/** POST /service-accounts → 201. Returns the created service-account id. */
-export async function createServiceAccount(
-	request: APIRequestContext,
-	name: string,
-	description = 'created by e2e',
-): Promise<string> {
-	const res = await request.post('/service-accounts', {
-		headers: authHeaders(),
-		data: { name, description },
-	});
-	expect(res.status(), `createServiceAccount failed: ${await res.text()}`).toBe(201);
-	return (await res.json()).id;
-}
-
-/** POST /toolkits → 201 (the body nests under `toolkit`). Returns the toolkit id. */
-export async function createToolkit(
-	request: APIRequestContext,
-	name: string,
-	description = 'created by e2e',
-): Promise<string> {
-	const res = await request.post('/toolkits', {
-		headers: authHeaders(),
-		data: { name, description },
-	});
-	expect(res.status(), `createToolkit failed: ${await res.text()}`).toBe(201);
-	return (await res.json()).toolkit.toolkit_id;
-}
-
 /**
  * POST /credentials → 201 (requires the credential-at-rest encryption keyset,
  * see config/local.yaml). Returns the credential id. Defaults to a bearer token.
@@ -333,17 +305,17 @@ export async function replaceAgentScopes(
 	return (await res.json()).scopes;
 }
 
-/** POST /agents/{id}/toolkits → 201. Binds a toolkit to an agent. Returns the binding id. */
-export async function bindToolkitToAgent(
+/** POST /agents/{id}/credentials → 201. Binds a credential directly to an agent. Returns the binding id. */
+export async function bindCredentialToAgent(
 	request: APIRequestContext,
 	agentId: string,
-	toolkitId: string,
+	credentialId: string,
 ): Promise<string> {
-	const res = await request.post(`/agents/${agentId}/toolkits`, {
+	const res = await request.post(`/agents/${agentId}/credentials`, {
 		headers: authHeaders(),
-		data: { toolkit_id: toolkitId },
+		data: { credential_id: credentialId },
 	});
-	expect(res.status(), `bindToolkitToAgent failed: ${await res.text()}`).toBe(201);
+	expect(res.status(), `bindCredentialToAgent failed: ${await res.text()}`).toBe(201);
 	return (await res.json()).id;
 }
 
@@ -409,34 +381,4 @@ export async function importInlineApi(
 			},
 		)
 		.toMatch(/succeeded|completed|done/);
-}
-
-/**
- * POST /access-requests → 202 (status: pending). Returns the request id.
- *
- * The backend dedups pending requests on (actor, resource_type, action,
- * resource_id), so concurrent specs that file the same resource_type+action
- * collide with 409 access_request_duplicate_pending. We default resource_id to
- * a unique value per call so each spec owns an independent pending request
- * (hermetic, no cross-spec coupling); callers can pin it for assertions.
- */
-export async function fileAccessRequest(
-	request: APIRequestContext,
-	opts: { reason?: string; resourceType?: string; action?: string; resourceId?: string } = {},
-): Promise<string> {
-	const res = await request.post('/access-requests', {
-		headers: authHeaders(),
-		data: {
-			reason: opts.reason ?? 'e2e access request',
-			items: [
-				{
-					resource_type: opts.resourceType ?? 'toolkit',
-					action: opts.action ?? 'bind',
-					resource_id: opts.resourceId ?? `e2e-res-${uniqueSuffix()}`,
-				},
-			],
-		},
-	});
-	expect(res.status(), `fileAccessRequest failed: ${await res.text()}`).toBe(202);
-	return (await res.json()).id;
 }

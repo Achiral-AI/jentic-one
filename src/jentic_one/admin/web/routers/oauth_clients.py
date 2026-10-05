@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Query, Response
 
 from jentic_one.admin.services.oauth_client_service import OAuthClientService
 from jentic_one.admin.services.schemas.oauth_clients import OAuthClientView
@@ -10,6 +10,7 @@ from jentic_one.admin.web.deps import get_oauth_client_service
 from jentic_one.admin.web.schemas.oauth_clients import (
     OAuthClientCreateRequest,
     OAuthClientCreateResponse,
+    OAuthClientDenyRequest,
     OAuthClientListResponse,
     OAuthClientResponse,
     OAuthClientRotateSecretResponse,
@@ -32,6 +33,12 @@ def _to_response(view: OAuthClientView) -> OAuthClientResponse:
         allowed_scopes=view.allowed_scopes,
         active=view.active,
         require_consent=view.require_consent,
+        token_endpoint_auth_method=view.token_endpoint_auth_method,
+        consent_model=view.consent_model,
+        registration_source=view.registration_source,
+        software_id=view.software_id,
+        approval_status=view.approval_status,
+        active_grant_count=view.active_grant_count,
         created_at=view.created_at,
         updated_at=view.updated_at,
         created_by=view.created_by,
@@ -55,6 +62,8 @@ async def create_oauth_client(
         redirect_uris=body.redirect_uris,
         require_consent=body.require_consent,
         allowed_scopes=body.allowed_scopes,
+        token_endpoint_auth_method=body.token_endpoint_auth_method,
+        consent_model=body.consent_model,
         identity=identity,
     )
     base = _to_response(result)
@@ -66,9 +75,17 @@ async def list_oauth_clients(
     identity: Identity = get_current_identity(required_permissions=["oauth-clients:read"]),
     svc: OAuthClientService = Depends(get_oauth_client_service),
     include_inactive: bool = False,
+    approval_status: str | None = Query(
+        default=None,
+        description=(
+            "Filter by approval lifecycle state: pending, approved, or denied. "
+            "Filtering on pending or denied implies include_inactive=true — "
+            "those rows are always inactive until approved."
+        ),
+    ),
 ) -> OAuthClientListResponse:
-    """List all registered OAuth clients."""
-    views = await svc.list_all(include_inactive=include_inactive)
+    """List all registered OAuth clients, optionally filtered by approval status."""
+    views = await svc.list_all(include_inactive=include_inactive, approval_status=approval_status)
     return OAuthClientListResponse(data=[_to_response(v) for v in views])
 
 
@@ -113,6 +130,44 @@ async def update_oauth_client(
 
 
 @router.post(
+    "/admin/oauth-clients/{id}:approve",
+    summary="Approve OAuth client",
+    responses=not_found(),
+)
+async def approve_oauth_client(
+    id: str,
+    identity: Identity = get_current_identity(required_permissions=["oauth-clients:write"]),
+    svc: OAuthClientService = Depends(get_oauth_client_service),
+) -> OAuthClientResponse:
+    """Approve an OAuth client — sets approval_status=approved and active=true.
+
+    Also re-approves a previously denied client (deny is reversible; rows are
+    never deleted, so the client's cached client_id becomes valid again).
+    """
+    view = await svc.approve(id, identity=identity)
+    return _to_response(view)
+
+
+@router.post(
+    "/admin/oauth-clients/{id}:deny",
+    summary="Deny OAuth client",
+    responses=not_found(),
+)
+async def deny_oauth_client(
+    id: str,
+    body: OAuthClientDenyRequest | None = None,
+    identity: Identity = get_current_identity(required_permissions=["oauth-clients:write"]),
+    svc: OAuthClientService = Depends(get_oauth_client_service),
+) -> OAuthClientResponse:
+    """Deny an OAuth client — sets approval_status=denied and active=false.
+
+    The row is retained so a later approve can reverse the decision.
+    """
+    view = await svc.deny(id, reason=body.reason if body else None, identity=identity)
+    return _to_response(view)
+
+
+@router.post(
     "/admin/oauth-clients/{id}/rotate-secret",
     summary="Rotate client secret",
     responses=not_found(),
@@ -133,7 +188,7 @@ async def rotate_oauth_client_secret(
 @router.delete(
     "/admin/oauth-clients/{id}",
     status_code=204,
-    summary="Deactivate OAuth client",
+    summary="Disable OAuth client",
     responses=not_found(),
 )
 async def deactivate_oauth_client(
@@ -141,9 +196,36 @@ async def deactivate_oauth_client(
     identity: Identity = get_current_identity(required_permissions=["oauth-clients:write"]),
     svc: OAuthClientService = Depends(get_oauth_client_service),
 ) -> Response:
-    """Soft-delete an OAuth client by setting active=False.
+    """Disable an OAuth client — the reversible kill switch (sets active=false).
 
-    Deactivated clients can no longer initiate authorization flows.
+    Disabled clients can no longer initiate authorization flows and their
+    outstanding tokens stop resolving. Re-enable by patching ``active: true``.
+    The row is kept; this is not a delete.
     """
     await svc.deactivate(id, identity=identity)
+    return Response(status_code=204)
+
+
+@router.post(
+    "/admin/oauth-clients/{id}:delete",
+    status_code=204,
+    summary="Delete OAuth client",
+    responses=not_found(),
+)
+async def delete_oauth_client(
+    id: str,
+    identity: Identity = get_current_identity(required_permissions=["oauth-clients:write"]),
+    svc: OAuthClientService = Depends(get_oauth_client_service),
+) -> Response:
+    """Permanently delete an OAuth client. This cannot be undone.
+
+    Terminal, unlike the reversible kill switch (``DELETE`` on this
+    resource, which only sets ``active=false``): every active grant is
+    revoked, every token carrying the client's lineage is revoked, and the
+    registration row is removed — connected applications are fully
+    disconnected. The audit trail survives. A client that later re-registers
+    via dynamic client registration is a NEW registration and re-enters the
+    approval queue as pending; it is never re-attached to the deleted one.
+    """
+    await svc.delete(id, identity=identity)
     return Response(status_code=204)

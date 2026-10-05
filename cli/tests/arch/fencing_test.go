@@ -17,10 +17,8 @@ import (
 // because without it a subcommand's own PersistentPreRunE would silently disable
 // the fencing hook for its whole subtree.
 //
-// This test was DORMANT until the fencing machinery (clitree.MustBeFenced) shipped
-// in Phase 2; it now walks the constructed command tree and asserts the contract.
-// As Phase 3 adds context/env/identity commands, they extend clitree.MustBeFenced
-// and this test covers them automatically.
+// This test walks the constructed command tree and asserts the contract;
+// commands added to clitree.MustBeFenced are covered automatically.
 func Test1C_SecurityFencing(t *testing.T) {
 	if len(clitree.MustBeFenced) == 0 {
 		t.Fatal("clitree.MustBeFenced is empty; the canonical fence set must list every host-mutating command")
@@ -88,6 +86,12 @@ var fencingExemptPrefixes = []string{
 	// Agent-facing self-check (read-only) and login/logout of the agent's own
 	// session (not an operator context switch).
 	"doctor", "whoami", "login", "logout",
+	// Agent-initiable credential provisioning (theme-7 Phase 1b): starts a
+	// connect session server-side (scope credentials:connect) and prints the
+	// approval_url — approval always blocks on a human in the browser, and no
+	// host management state is touched. It is the agent's own recovery
+	// surface, so fencing it would defeat the point.
+	"connect",
 	// The MCP stdio server: serves the agent's data-plane surface to a local
 	// MCP client. Read-only host-wise (it writes only its own log file), never
 	// prompts, never switches or reveals a non-active context; every backend

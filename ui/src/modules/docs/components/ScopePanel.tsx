@@ -16,17 +16,15 @@ import { cn } from '@/shared/lib/utils';
 
 /** "agent" | "operator" | "any" → human label. Advisory only. */
 const TYPICAL_CALLER_LABEL: Record<string, string> = {
-	agent: 'Agent / service-account / toolkit',
+	agent: 'Agent',
 	operator: 'Human operator / admin',
 	any: 'Any authenticated actor',
 };
 
-/** Actor-type token → short human label (matches the four OAuth actor schemes). */
+/** Actor-type token → short human label (matches the OAuth actor schemes). */
 const ACTOR_LABEL: Record<string, string> = {
 	user: 'User',
 	agent: 'Agent',
-	service_account: 'Service account',
-	toolkit: 'Toolkit',
 };
 
 export interface ScopePanelProps {
@@ -82,7 +80,7 @@ export function ScopePanel({ endpoint }: ScopePanelProps) {
 	);
 	const scopes = endpoint.required_scopes ?? [];
 	const actors = endpoint.actor_types ?? [];
-	const ALL_ACTORS = ['user', 'agent', 'service_account', 'toolkit'];
+	const ALL_ACTORS = ['user', 'agent'];
 	const allActors =
 		actors.length >= ALL_ACTORS.length && ALL_ACTORS.every((a) => actors.includes(a));
 
@@ -131,7 +129,7 @@ export function ScopePanel({ endpoint }: ScopePanelProps) {
 							<span className="text-foreground/75">
 								Any actor type{' '}
 								<span className="text-foreground/60 text-[11px]">
-									(user, agent, service account, toolkit)
+									(user, agent)
 								</span>
 							</span>
 						) : (

@@ -1,6 +1,6 @@
 package api
 
-// mcp_tools.go holds the PR 1-A tool handlers. get_started is the pre-auth
+// mcp_tools.go holds the session's core tool handlers. get_started is the pre-auth
 // diagnosis: it walks the same identity ladder the skill's step 1 teaches
 // (context → credential/registration → approval → instance reachability) and
 // returns the matching operator instruction VERBATIM from the skill/CLI
@@ -101,7 +101,7 @@ const (
 		"restart it with `jenticctl start` (then `jenticctl status` to confirm), and retry. " +
 		"This server never starts or stops the instance."
 	instructionReady = "You're set up. Call the `whoami` tool to see your identity, status, scopes, " +
-		"and toolkit bindings. Request access before executing anything new; discovery and " +
+		"and credential bindings. Request access before executing anything new; discovery and " +
 		"execution follow the search → inspect → execute flow."
 )
 
@@ -251,8 +251,8 @@ func (s *mcpServer) handleWhoami(ctx context.Context, req *mcp.CallToolRequest) 
 		s.logger.Warn("whoami failed", "error", redactedErr(err))
 		return s.softError(cctx, err), nil
 	}
-	// Envelope passthrough: the same GET /me agent object `jentic access
-	// whoami --json` prints, re-projected to a map so the instance stamp can
+	// Envelope passthrough: the verbatim GET /me agent object,
+	// re-projected to a map so the instance stamp can
 	// join it as a top-level sibling.
 	raw, err := json.Marshal(me)
 	if err != nil {

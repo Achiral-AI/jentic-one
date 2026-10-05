@@ -354,13 +354,13 @@ func (a *Cmd) createAgentAccount(ctx context.Context, operator string, fields ag
 		}
 	}
 
-	// We no longer force the operator's home to `chmod 700`. In-home confidentiality
-	// against the agent is now enforced per session by the process-confinement layer
+	// The operator's home is not chmod'd to 700. In-home confidentiality
+	// against the agent is enforced per session by the process-confinement layer
 	// (`jentic run` launches under sandbox-exec/bwrap and errors closed if that is
 	// unavailable), which also closes the sibling-traversal leak a blanket 700 could
 	// not. Real secrets keep their own 0700 modes regardless; the sensitivity rules
 	// (DangerReason) still gate what may be granted. See
-	// docs/security/local-agent/sandbox-exec-plan.md.
+	// docs/security/same-host/sandbox-confinement-design.md.
 
 	// Optional passwordless launch (per the operator's consent toggle): a scoped
 	// sudoers rule so `jentic run` need not prompt for the operator's password to

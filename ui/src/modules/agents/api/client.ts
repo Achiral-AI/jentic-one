@@ -15,35 +15,38 @@ import {
 	AgentsService,
 	AuditService,
 	AuditTargetType,
+	CredentialsService,
 	EventsService,
 	ExecutionsService,
 	GroupBy,
 	MonitoringService,
+	OAuthService,
 	PermissionsService,
-	ServiceAccountsService,
 	SystemService,
-	ToolkitsService,
 	type AgentResponse,
 	type AuditResponse,
+	type CredentialBindingResponse,
 	type EventResponse,
-	type ServiceAccountResponse,
+	type OAuthGrantResponse,
+	type PermissionRuleReadSchema,
+	type PermissionRuleSchema,
+	type PermissionTestRequest,
+	type PermissionTestResponse,
 } from '@/shared/api';
 import {
 	agentToEntity,
-	serviceAccountToEntity,
+	type AgentBindableCredential,
 	type AgentEntity,
 	type ApiKeyHistoryEntry,
 	type ApiKeyInfoEntity,
 	type ApiKeyResult,
+	type CredentialBindingEntity,
 	type InstanceIdentityEntity,
-	type LinkableToolkit,
 	type McpLastSeen,
 	type McpSessionEntity,
+	type OAuthGrantEntity,
 	type PermissionCatalogEntry,
-	type ServiceAccountEntity,
-	type ToolkitBindingEntity,
 } from '@/modules/agents/api/types';
-import { listAccessRequests, type AccessRequest } from '@/shared/lib';
 
 /**
  * Sentinel error for Agents repository calls. Hooks/components branch on
@@ -166,107 +169,201 @@ export async function archiveAgent(agentId: string): Promise<void> {
 	}
 }
 
-export async function listAgentToolkits(agentId: string): Promise<ToolkitBindingEntity[]> {
+// ---------------------------------------------------------------------------
+// Direct agent↔credential bindings (theme 5 phase 5a).
+//
+// The direct binding path: `GET/POST /agents/{id}/credentials` +
+// suspend/purge/resume, with per-binding permission rules living on the
+// credential-side `/credentials/{cid}/agents/{aid}/permissions` surface.
+// ---------------------------------------------------------------------------
+
+function bindingToEntity(r: CredentialBindingResponse): CredentialBindingEntity {
+	return {
+		id: r.id,
+		credentialId: r.credential_id,
+		name: r.name ?? null,
+		suspended: r.suspended,
+		suspendedReason: r.suspended_reason ?? null,
+		ruleSetId: r.rule_set_id ?? null,
+		boundAt: r.bound_at,
+		serves: (r.serves ?? []).map((s) => ({
+			vendor: s.api_vendor,
+			name: s.api_name ?? null,
+			version: s.api_version ?? null,
+		})),
+	};
+}
+
+/** The agent's direct credential bindings (`GET /agents/{id}/credentials`),
+ * suspended rows included with their flag set. */
+export async function listAgentCredentialBindings(
+	agentId: string,
+): Promise<CredentialBindingEntity[]> {
 	try {
-		const res = await AgentsService.listAgentToolkits({ agentId });
-		return res.data.map((b) => ({
-			id: b.id,
-			toolkitId: b.toolkit_id,
-			boundAt: b.bound_at,
+		const res = await AgentsService.listAgentCredentials({ agentId });
+		return res.data.map(bindingToEntity);
+	} catch (error) {
+		throw toAgentsError(error, 'Failed to load bound credentials.');
+	}
+}
+
+/**
+ * Bind a credential directly to an agent, with the operator's chosen initial
+ * grant.
+ *
+ * The phase-1 bind body carries ONLY `credential_id` — there is no inline
+ * `allow_all`/`permissions` field — so the "decide
+ * the grant at bind time" wizard composes two calls: the bind, then a rules
+ * PUT on the fresh binding. The seam between them is fail-CLOSED: a binding
+ * with zero rules default-denies everything, so if the PUT fails the agent
+ * has gained no access — we surface an honest "bound but blocked" error and
+ * the Access card's zero-rules warning points at the repair (edit rules).
+ * `rules === null` is the deliberate "start blocked" mode (bind only).
+ */
+export async function bindCredentialToAgent(
+	agentId: string,
+	credentialId: string,
+	rules: PermissionRuleSchema[] | null,
+): Promise<CredentialBindingEntity> {
+	let binding: CredentialBindingEntity;
+	try {
+		binding = bindingToEntity(
+			await AgentsService.bindAgentCredential({
+				agentId,
+				requestBody: { credential_id: credentialId },
+			}),
+		);
+	} catch (error) {
+		throw toAgentsError(error, 'Failed to bind the credential.');
+	}
+	if (rules != null && rules.length > 0) {
+		try {
+			await CredentialsService.replaceAgentCredentialPermissions({
+				credentialId,
+				agentId,
+				requestBody: rules,
+			});
+		} catch (error) {
+			throw toAgentsError(
+				error,
+				'The credential was bound, but saving its rules failed — the binding starts blocked (default deny). Edit its rules to grant access.',
+			);
+		}
+	}
+	return binding;
+}
+
+/**
+ * Unbind a credential from an agent. Default (`purge: false`) is a reversible
+ * SUSPEND — the binding row and its permission rules survive and `:resume`
+ * restores access. `purge: true` deletes the binding (and its rules) outright.
+ */
+export async function unbindCredentialFromAgent(
+	agentId: string,
+	credentialId: string,
+	purge: boolean,
+): Promise<void> {
+	try {
+		await AgentsService.unbindAgentCredential({ agentId, credentialId, purge });
+	} catch (error) {
+		throw toAgentsError(
+			error,
+			purge ? 'Failed to unbind the credential.' : 'Failed to suspend the binding.',
+		);
+	}
+}
+
+/** Lift a suspended binding (`POST …/credentials/{id}:resume`). */
+export async function resumeAgentCredentialBinding(
+	agentId: string,
+	credentialId: string,
+): Promise<CredentialBindingEntity> {
+	try {
+		return bindingToEntity(
+			await AgentsService.resumeAgentCredentialBinding({ agentId, credentialId }),
+		);
+	} catch (error) {
+		throw toAgentsError(error, 'Failed to resume the binding.');
+	}
+}
+
+/**
+ * Candidate credentials for the agent-side "Bind credential" picker. Reads the
+ * org-wide `GET /credentials` surface through the shared API (the agents
+ * module must not import the credentials page module) and projects to the
+ * minimal picker shape.
+ */
+export async function listBindableCredentialsForAgent(): Promise<AgentBindableCredential[]> {
+	try {
+		const res = await CredentialsService.listCredentials({ limit: 100 });
+		return res.data.map((c) => ({
+			credential_id: c.credential_id,
+			name: c.name,
+			type: c.type,
+			vendor: c.api?.vendor ?? null,
+			apiName: c.api?.name ?? null,
+			catalogApiId: c.catalog_api_id ?? null,
+			provider: c.provider ?? null,
+			createdBy: c.created_by ?? null,
 		}));
 	} catch (error) {
-		throw toAgentsError(error, 'Failed to load bound toolkits.');
+		throw toAgentsError(error, 'Failed to load credentials.');
+	}
+}
+
+/** The ordered PBAC rules on one direct binding
+ * (`GET /credentials/{cid}/agents/{aid}/permissions`). */
+export async function listAgentBindingPermissions(
+	agentId: string,
+	credentialId: string,
+): Promise<PermissionRuleReadSchema[]> {
+	try {
+		const res = await CredentialsService.listAgentCredentialPermissions({
+			credentialId,
+			agentId,
+		});
+		return res.data;
+	} catch (error) {
+		throw toAgentsError(error, 'Failed to load permission rules.');
+	}
+}
+
+/** Replace the full rule set on one direct binding (idempotent PUT). */
+export async function replaceAgentBindingPermissions(
+	agentId: string,
+	credentialId: string,
+	rules: PermissionRuleSchema[],
+): Promise<PermissionRuleReadSchema[]> {
+	try {
+		const res = await CredentialsService.replaceAgentCredentialPermissions({
+			credentialId,
+			agentId,
+			requestBody: rules,
+		});
+		return res.data;
+	} catch (error) {
+		throw toAgentsError(error, 'Failed to save permission rules.');
 	}
 }
 
 /**
- * Candidate toolkits for the agent-side "Bind toolkit" picker (#607). Reads the
- * org-wide ``GET /toolkits`` surface through the shared API — the agents module
- * must not import the toolkits module (module-boundary rule), so it maps the
- * shared ``ToolkitResponse`` into a small picker shape here.
- *
- * Paginates via ``cursor``/``has_more`` so a workspace with more than one page
- * of toolkits (default page size 50) still lists everything — a hardcoded
- * ``limit`` would silently drop the tail. A hard page cap
- * keeps a runaway/misconfigured backend from looping forever. Kill-switched
- * toolkits are *included* here (``active`` is carried through); the picker
- * itself refuses to select them so a broken binding can't be created — but
- * keeping them in the list lets callers show them as a
- * disabled row with a "suspended" affordance, which is easier to reason about
- * than a silently-missing toolkit.
- *
- * Defensive against a misbehaving backend: we break if a cursor repeats (a
- * pagination loop) and dedupe the accumulated rows by ``toolkitId`` so a page
- * that re-emits an earlier row can't produce duplicate picker entries.
+ * Broker dry-run against one direct binding's SAVED rules
+ * (`POST …/permissions:test`). There is no vendor
+ * pooling — the verdict is exactly this binding's first-match-wins policy.
  */
-export async function listLinkableToolkits(): Promise<LinkableToolkit[]> {
+export async function testAgentBindingPermissions(
+	agentId: string,
+	credentialId: string,
+	body: PermissionTestRequest,
+): Promise<PermissionTestResponse> {
 	try {
-		const out: LinkableToolkit[] = [];
-		const seenToolkitIds = new Set<string>();
-		const seenCursors = new Set<string>();
-		let cursor: string | null = null;
-		const MAX_PAGES = 20;
-		for (let page = 0; page < MAX_PAGES; page += 1) {
-			const res = await ToolkitsService.listToolkits({ cursor, limit: 100 });
-			for (const t of res.data) {
-				if (seenToolkitIds.has(t.toolkit_id)) continue;
-				seenToolkitIds.add(t.toolkit_id);
-				out.push({ toolkitId: t.toolkit_id, name: t.name, active: t.active });
-			}
-			if (!res.has_more || !res.next_cursor) break;
-			// A repeated cursor means the backend is looping — stop rather than
-			// re-fetch the same page until MAX_PAGES.
-			if (seenCursors.has(res.next_cursor)) break;
-			seenCursors.add(res.next_cursor);
-			cursor = res.next_cursor;
-		}
-		return out;
+		return await CredentialsService.testAgentCredentialPermissions({
+			credentialId,
+			agentId,
+			requestBody: body,
+		});
 	} catch (error) {
-		throw toAgentsError(error, 'Failed to load toolkits.');
-	}
-}
-
-/**
- * Resolve a single toolkit's human name (`GET /toolkits/{id}`). Powers the
- * per-row name lookup on the agent detail page's "Bound toolkits" card: the
- * binding response (`GET /agents/{id}/toolkits`) carries only the toolkit id,
- * so each bound row reads its own name here instead of the whole workspace
- * catalogue paying a paginated sweep on every page load.
- *
- * The name is BEST-EFFORT and purely cosmetic — the row always falls back to
- * the id, and no caller surfaces an error. So any real failure (a since-deleted
- * 404, a transient 5xx, or a network blip) simply returns ``null`` rather than
- * pushing the query into an error state over a display nicety. The ONE
- * exception is an ``AbortError``: React Query throws it to cancel an in-flight
- * request on unmount or key change, so it's re-thrown (not swallowed into a
- * spurious ``null`` result) to let cancellation propagate as intended.
- */
-export async function getToolkitName(toolkitId: string): Promise<string | null> {
-	try {
-		const res = await ToolkitsService.getToolkit({ toolkitId });
-		return res?.name ?? null;
-	} catch (e) {
-		if (e instanceof Error && e.name === 'AbortError') throw e;
-		return null;
-	}
-}
-
-/** Bind a toolkit to an agent (`POST /agents/{id}/toolkits`) — the agent-side
- * mirror of the toolkit page's "Link agent" (#607). */
-export async function bindToolkitToAgent(agentId: string, toolkitId: string): Promise<void> {
-	try {
-		await AgentsService.bindToolkit({ agentId, requestBody: { toolkit_id: toolkitId } });
-	} catch (error) {
-		throw toAgentsError(error, 'Failed to bind the toolkit.');
-	}
-}
-
-/** Unbind a toolkit from an agent (`DELETE /agents/{id}/toolkits/{toolkit_id}`). */
-export async function unbindToolkitFromAgent(agentId: string, toolkitId: string): Promise<void> {
-	try {
-		await AgentsService.unbindToolkit({ agentId, toolkitId });
-	} catch (error) {
-		throw toAgentsError(error, 'Failed to unbind the toolkit.');
+		throw toAgentsError(error, 'Failed to run the permission test.');
 	}
 }
 
@@ -368,141 +465,11 @@ export async function getAgentApiKeyHistory(agentId: string): Promise<ApiKeyHist
 	}
 }
 
-export async function generateServiceAccountApiKey(
-	serviceAccountId: string,
-): Promise<ApiKeyResult> {
-	try {
-		const res = await ServiceAccountsService.generateServiceAccountApiKey({
-			serviceAccountId,
-		});
-		return { key: res.key };
-	} catch (error) {
-		throw toAgentsError(error, 'Failed to generate API key.');
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Service accounts
-// ---------------------------------------------------------------------------
-
-export async function listServiceAccounts(params: {
-	status?: string | null;
-	cursor?: string | null;
-	limit?: number;
-}): Promise<ListResult<ServiceAccountEntity>> {
-	try {
-		const res = await ServiceAccountsService.listServiceAccounts({
-			status: params.status ?? null,
-			cursor: params.cursor ?? null,
-			limit: params.limit ?? 50,
-		});
-		return {
-			entities: res.data.map(serviceAccountToEntity),
-			hasMore: res.has_more,
-			nextCursor: res.next_cursor ?? null,
-		};
-	} catch (error) {
-		throw toAgentsError(error, 'Failed to load service accounts.');
-	}
-}
-
-export async function createServiceAccount(params: {
-	name: string;
-	description?: string | null;
-	scopes?: string[] | null;
-}): Promise<ServiceAccountEntity> {
-	try {
-		const res: ServiceAccountResponse = await ServiceAccountsService.createServiceAccount({
-			requestBody: {
-				name: params.name,
-				description: params.description ?? null,
-				// Optional initial grants (mirrors createAgent).
-				scopes: params.scopes?.length ? params.scopes : null,
-			},
-		});
-		return serviceAccountToEntity(res);
-	} catch (error) {
-		throw toAgentsError(error, 'Failed to create the service account.');
-	}
-}
-
-export async function getServiceAccount(serviceAccountId: string): Promise<ServiceAccountEntity> {
-	try {
-		return serviceAccountToEntity(
-			await ServiceAccountsService.getServiceAccount({
-				serviceAccountId,
-			}),
-		);
-	} catch (error) {
-		throw toAgentsError(error, 'Failed to load the service account.');
-	}
-}
-
-export async function approveServiceAccount(
-	serviceAccountId: string,
-): Promise<ServiceAccountEntity> {
-	try {
-		return serviceAccountToEntity(
-			await ServiceAccountsService.approveServiceAccount({
-				serviceAccountId,
-			}),
-		);
-	} catch (error) {
-		throw toAgentsError(error, 'Failed to approve the service account.');
-	}
-}
-
-export async function denyServiceAccount(
-	serviceAccountId: string,
-	reason: string,
-): Promise<ServiceAccountEntity> {
-	try {
-		return serviceAccountToEntity(
-			await ServiceAccountsService.denyServiceAccount({
-				serviceAccountId,
-				requestBody: { reason },
-			}),
-		);
-	} catch (error) {
-		throw toAgentsError(error, 'Failed to deny the service account.');
-	}
-}
-
-export async function disableServiceAccount(serviceAccountId: string): Promise<void> {
-	try {
-		await ServiceAccountsService.disableServiceAccount({
-			serviceAccountId,
-		});
-	} catch (error) {
-		throw toAgentsError(error, 'Failed to disable the service account.');
-	}
-}
-
-export async function enableServiceAccount(serviceAccountId: string): Promise<void> {
-	try {
-		await ServiceAccountsService.enableServiceAccount({
-			serviceAccountId,
-		});
-	} catch (error) {
-		throw toAgentsError(error, 'Failed to enable the service account.');
-	}
-}
-
-export async function archiveServiceAccount(serviceAccountId: string): Promise<void> {
-	try {
-		await ServiceAccountsService.archiveServiceAccount({
-			serviceAccountId,
-		});
-	} catch (error) {
-		throw toAgentsError(error, 'Failed to archive the service account.');
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Scopes (#615) — platform permission catalogue + per-actor scope grants.
 //
 // Two scope vocabularies exist in this codebase; these are the PLATFORM
-// permission scopes (`org:admin`, `service-accounts:write`, …) drawn from
+// permission scopes (`org:admin`, `agents:write`, …) drawn from
 // `GET /permissions` — NOT the OAuth2 provider scopes the credentials picker
 // uses. `PUT .../scopes` replaces the entire set (no partial grant/revoke), so
 // callers read the full list, edit it, and write it back.
@@ -543,95 +510,12 @@ export async function replaceAgentScopes(agentId: string, scopes: string[]): Pro
 	}
 }
 
-export async function getServiceAccountScopes(serviceAccountId: string): Promise<string[]> {
-	try {
-		const res = await ServiceAccountsService.getServiceAccountScopes({
-			serviceAccountId,
-		});
-		return res.scopes;
-	} catch (error) {
-		throw toAgentsError(error, "Failed to load the service account's scopes.");
-	}
-}
-
-export async function replaceServiceAccountScopes(
-	serviceAccountId: string,
-	scopes: string[],
-): Promise<string[]> {
-	try {
-		const res = await ServiceAccountsService.replaceServiceAccountScopes({
-			serviceAccountId,
-			requestBody: { scopes },
-		});
-		return res.scopes;
-	} catch (error) {
-		throw toAgentsError(error, "Failed to update the service account's scopes.");
-	}
-}
-
 // ---------------------------------------------------------------------------
-// Fleet usage (GET /monitoring/usage?group_by=agent)
+// Actor usage (GET /monitoring/usage)
 //
-// The same aggregate the Monitor page and the enterprise console read, sliced
-// per actor for the fleet table's activity columns. The endpoint is gated on
-// `org:admin`; a 403 is an expected outcome for non-admin operators, not an
-// error — the caller hides the columns entirely.
+// Gated on `org:admin`; a 403 is an expected outcome for non-admin operators,
+// not an error — the caller renders no stats.
 // ---------------------------------------------------------------------------
-
-/** One actor's execution stats over the query window. */
-export interface ActorUsage {
-	total: number;
-	success: number;
-	failed: number;
-	/** Executions per aggregate bucket, oldest → newest (sparkline-ready). */
-	trend: number[];
-}
-
-/**
- * Per-actor usage over the trailing `sinceDays` window, keyed by actor id.
- * Backend `top` keys are mechanical `actor_type/actor_id` strings; rows for
- * other actor types (users, unattributed NULLs) are dropped here. Returns
- * `null` on 403 — the caller renders no activity columns for non-admins.
- *
- * The aggregate is a top-N leaderboard capped at 50 by the backend
- * (`GET /monitoring/usage` validates `top_limit <= 50`), so actors absent
- * from the map are "not in the top 50", NOT "zero executions" — callers must
- * render the distinction (em-dash, not 0).
- */
-export async function fetchActorsUsage(
-	actorType: 'agent' | 'service_account',
-	sinceDays = 7,
-): Promise<Map<string, ActorUsage> | null> {
-	try {
-		// Window bounds ceiled to the next minute: the backend's aggregate uses
-		// a strict `started_at < until`, so a floored/now bound hides the
-		// current partial minute (#913); a fixed until also keeps the window an
-		// exact multiple of the bucket tier and the server cache key stable for
-		// a whole minute (a per-second `since` defeated it entirely).
-		const until = (Math.floor(Date.now() / 60_000) + 1) * 60;
-		const res = await MonitoringService.getUsageStats({
-			since: until - sinceDays * 86400,
-			until,
-			groupBy: GroupBy.AGENT,
-			topLimit: 50,
-		});
-		const prefix = `${actorType}/`;
-		const usage = new Map<string, ActorUsage>();
-		for (const row of res.top) {
-			if (!row.key?.startsWith(prefix)) continue;
-			usage.set(row.key.slice(prefix.length), {
-				total: row.total,
-				success: row.success,
-				failed: row.failed,
-				trend: row.trend,
-			});
-		}
-		return usage;
-	} catch (error) {
-		if (error instanceof ApiError && error.status === 403) return null;
-		throw toAgentsError(error, 'Failed to load usage statistics.');
-	}
-}
 
 /** One time bucket of an actor's execution volume. */
 export interface UsageBucketEntity {
@@ -656,8 +540,7 @@ export interface ActorUsageDetail {
 /**
  * One actor's usage over the trailing `sinceDays` window — the detail page's
  * KPI strip and Activity chart. `agent_id` is the endpoint's (misnamed) actor
- * filter: the backend maps it onto `actor_id`, so it works for service
- * accounts too. Same 403 contract as `fetchActorsUsage`: `null` means the
+ * filter: the backend maps it onto `actor_id`. `null` on 403 means the
  * viewer isn't an admin and the caller renders no stats — never an error.
  */
 export async function fetchActorUsageDetail(
@@ -665,9 +548,9 @@ export async function fetchActorUsageDetail(
 	sinceDays = 7,
 ): Promise<ActorUsageDetail | null> {
 	try {
-		// Next-minute-ceiled bounds — see fetchActorsUsage: includes the current
-		// partial minute (#913, the volume chart must never trail the
-		// executions feed) with a cache-stable, tier-exact window.
+		// Window bounds ceiled to the next minute: the aggregate uses a strict
+		// `started_at < until`, so a now-bound hides the current partial minute, and a
+		// fixed `until` keeps the server's cache key stable for a whole minute.
 		const until = (Math.floor(Date.now() / 60_000) + 1) * 60;
 		const res = await MonitoringService.getUsageStats({
 			since: until - sinceDays * 86400,
@@ -694,13 +577,65 @@ export async function fetchActorUsageDetail(
 	}
 }
 
+/** The aggregate's hard ceiling on `top` rows (`top_limit` is `ge=1, le=50`) —
+ * the widest leaderboard the endpoint answers, and why a result can truncate. */
+const CREDENTIAL_USAGE_TOP_LIMIT = 50;
+
+/** Per-credential call volume over one window, plus whether it is exhaustive. */
+export interface CredentialUsageTotals {
+	/** Credential id → calls brokered in the window. */
+	totals: ReadonlyMap<string, number>;
+	/** True when the leaderboard was NOT truncated, the only case in which a
+	 * missing credential proves "no traffic" rather than "unknown". */
+	complete: boolean;
+}
+
+/**
+ * Call volume per credential over the trailing `sinceDays` window, grouped
+ * server-side — ONE request for the whole inventory. Returns `null` on 403: the
+ * cards then carry no volume at all, which is the honest answer.
+ */
+export async function fetchCredentialUsageTotals(
+	sinceDays = 7,
+): Promise<CredentialUsageTotals | null> {
+	try {
+		// Same minute-ceiled bounds as `fetchActorUsageDetail`, for the same reasons:
+		// the strict `started_at < until`, and a cache key that lives for a minute.
+		const until = (Math.floor(Date.now() / 60_000) + 1) * 60;
+		const res = await MonitoringService.getUsageStats({
+			since: until - sinceDays * 86400,
+			until,
+			groupBy: GroupBy.CREDENTIAL,
+			topLimit: CREDENTIAL_USAGE_TOP_LIMIT,
+		});
+		const totals = new Map<string, number>();
+		for (const row of res.top) totals.set(row.key, row.total);
+		return { totals, complete: res.top.length < CREDENTIAL_USAGE_TOP_LIMIT };
+	} catch (error) {
+		if (error instanceof ApiError && error.status === 403) return null;
+		throw toAgentsError(error, 'Failed to load credential usage statistics.');
+	}
+}
+
 /** One row of an actor's execution feed (a trimmed `ExecutionResponse`). */
 export interface ActorExecutionEntity {
 	id: string;
 	status: string;
-	toolkitId: string;
+	/** The credential the broker injected (direct-binding path); null for
+	 * rows that predate direct bindings. */
+	credentialId: string | null;
+	credentialName: string | null;
+	/** Legacy toolkit attribution — read-only historical data (rows recorded
+	 * before toolkits were retired); direct-binding executions carry null. */
+	toolkitId: string | null;
 	toolkitName: string | null;
 	operationId: string | null;
+	/** Human-readable operation identity (spec path template + HTTP method);
+	 * null on rows predating the columns. The display then renders no
+	 * operation label at all — deliberately never the opaque operationId
+	 * (see formatOperation); the id stays here for deep-linking/debugging. */
+	operationPath: string | null;
+	operationMethod: string | null;
 	durationMs: number | null;
 	httpStatus: number | null;
 	error: string | null;
@@ -723,9 +658,13 @@ export async function fetchActorExecutions(
 			items: res.data.map((r) => ({
 				id: r.execution_id,
 				status: r.status,
-				toolkitId: r.toolkit_id,
+				credentialId: r.credential_id ?? null,
+				credentialName: r.credential_name ?? null,
+				toolkitId: r.toolkit_id ?? null,
 				toolkitName: r.toolkit_name ?? null,
 				operationId: r.operation_id ?? null,
+				operationPath: r.operation_path ?? null,
+				operationMethod: r.operation_method ?? null,
 				durationMs: r.duration_ms ?? null,
 				httpStatus: r.http_status ?? null,
 				error: r.error ?? null,
@@ -740,30 +679,6 @@ export async function fetchActorExecutions(
 }
 
 // ---------------------------------------------------------------------------
-// Access requests filed BY an actor (#619).
-//
-// An access request carries `actor_id` set to the filer's identity; for an
-// agent/service account that's the actor's own id. `GET /access-requests`
-// already filters by it, so the per-actor view is a thin read over the shared
-// access-request repository (`@/shared/lib`) — the same cross-cutting tier the
-// dashboard card and Agent Rail use. No new backend surface. The decide flow is
-// the shared `AccessRequestDialog`; this just lists what's still pending.
-// ---------------------------------------------------------------------------
-
-/** The access requests an actor has filed that are still in `status` (default pending). */
-export async function fetchActorAccessRequests(
-	actorId: string,
-	status: string | null = 'pending',
-): Promise<AccessRequest[]> {
-	try {
-		const page = await listAccessRequests({ actorId, status, limit: 50 });
-		return page.data;
-	} catch (error) {
-		throw toAgentsError(error, "Failed to load the actor's access requests.");
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Audit (read-only actor-scoped lens on the shared /audit endpoint).
 // ---------------------------------------------------------------------------
 
@@ -772,21 +687,15 @@ export async function fetchActorAccessRequests(
 export type ActorAuditEntry = AuditResponse;
 
 /**
- * Actor-scoped audit entries — the lifecycle trail recorded against this
- * agent / service account as the TARGET (register, approve/deny, disable/
- * enable, key rotation, toolkit grant/revoke). Mirrors the toolkit console's
- * `listToolkitAudit`. Requires `org:admin`; 401/403 map to an empty list so
+ * Agent-scoped audit entries — the lifecycle trail recorded against this
+ * agent as the TARGET (register, approve/deny, disable/
+ * enable, key rotation, binding grant/revoke). Requires `org:admin`; 401/403 map to an empty list so
  * the "Recent changes" panel degrades gracefully for non-admins.
  */
-export async function listActorAudit(
-	actorKind: 'agent' | 'service-account',
-	actorId: string,
-	limit = 25,
-): Promise<AuditResponse[]> {
+export async function listActorAudit(actorId: string, limit = 25): Promise<AuditResponse[]> {
 	try {
 		const res = await AuditService.listAuditEntries({
-			targetType:
-				actorKind === 'agent' ? AuditTargetType.AGENT : AuditTargetType.SERVICE_ACCOUNT,
+			targetType: AuditTargetType.AGENT,
 			targetId: actorId,
 			limit,
 		});
@@ -807,7 +716,7 @@ export async function listActorAudit(
 // `events:read`), last-active is the latest MCP-origin execution
 // (`GET /executions?origin=mcp&actor_id=…`), and instance identity is the
 // unauthenticated `GET /instance`. Event reads follow the enrichment degrade
-// contract (`fetchActorsUsage`): 401/403 resolve to `null` and the caller
+// contract (`fetchActorUsageDetail`): 401/403 resolve to `null` and the caller
 // hides the surface — a permission gate is not an error.
 // ---------------------------------------------------------------------------
 
@@ -922,8 +831,78 @@ export async function fetchInstanceIdentity(): Promise<InstanceIdentityEntity> {
 			backend: res.backend,
 			baseUrl: res.canonical_base_url,
 			host: res.host,
+			// Older backends predate the field; absent means the endpoint
+			// doesn't exist there either, so hiding the HTTP variant is right.
+			mcpEnabled: res.mcp_enabled ?? false,
+			// Absent (older backend) and null (backend withholds a loopback
+			// broker on a remote install) both mean "unknown" — the snippet
+			// keeps its placeholder either way.
+			brokerUrl: res.broker_url ?? null,
 		};
 	} catch (error) {
 		throw toAgentsError(error, 'Failed to load the instance identity.');
+	}
+}
+
+// ---------------------------------------------------------------------------
+// OAuth consent grants — the "Connected clients" panel.
+// ---------------------------------------------------------------------------
+
+function grantToEntity(r: OAuthGrantResponse): OAuthGrantEntity {
+	return {
+		id: r.id,
+		oauthClientId: r.oauth_client_id,
+		clientName: r.client_name ?? null,
+		clientOrigin: r.client_origin ?? null,
+		userId: r.user_id,
+		agentId: r.agent_id,
+		agentStatus: r.agent_status ?? null,
+		scopes: r.scopes,
+		status: r.status,
+		createdAt: r.created_at,
+		revokedAt: r.revoked_at ?? null,
+		lastUsedAt: r.last_used_at ?? null,
+		canRevoke: r.can_revoke,
+	};
+}
+
+/**
+ * The OAuth clients holding a consent→agent grant on this agent
+ * (`GET /agents/{id}/oauth-grants`, owner-or-admin). `status` narrows to
+ * active/revoked; null returns the full history. Cursor-paginated like the
+ * other list reads (`listAgents`): callers page through `nextCursor`.
+ */
+export async function listAgentOauthGrants(
+	agentId: string,
+	status: 'active' | 'revoked' | null = 'active',
+	params: { cursor?: string | null; limit?: number } = {},
+): Promise<ListResult<OAuthGrantEntity>> {
+	try {
+		const res = await AgentsService.listAgentOauthGrants({
+			agentId,
+			status,
+			cursor: params.cursor ?? null,
+			limit: params.limit ?? 50,
+		});
+		return {
+			entities: res.data.map(grantToEntity),
+			hasMore: res.has_more,
+			nextCursor: res.next_cursor ?? null,
+		};
+	} catch (error) {
+		throw toAgentsError(error, "Failed to load the agent's connected clients.");
+	}
+}
+
+/**
+ * Revoke one consent→agent grant (`POST /oauth-grants/{id}:revoke`) — the
+ * per-grant kill switch (§4.6). The backend also revokes every access/refresh
+ * token minted under the grant; the client's next token use fails closed.
+ */
+export async function revokeOauthGrant(grantId: string): Promise<void> {
+	try {
+		await OAuthService.revokeOauthGrant({ grantId });
+	} catch (error) {
+		throw toAgentsError(error, 'Failed to revoke the grant.');
 	}
 }

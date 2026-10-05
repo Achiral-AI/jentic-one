@@ -19,6 +19,11 @@ logger = structlog.get_logger(__name__)
 _TRACE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _ZERO_TRACE_ID = "0" * 32
 
+#: Width bound for any variable value an emitter interpolates into an event
+#: ``summary`` (``Event.summary`` is ``String(512)``). Error text and registry
+#: path templates are unbounded, and an oversized INSERT fails the emit.
+MAX_EVENT_SUMMARY_FIELD_LEN = 128
+
 
 def valid_trace_id_or_none(trace_id: str | None) -> str | None:
     """Coerce ``trace_id`` to ``None`` unless it is a valid 32-hex trace id.
@@ -190,8 +195,8 @@ async def settle_actionable_events(
     """Acknowledge outstanding actionable events once their action is taken.
 
     Actionable events (``requires_action=True``) prompt operators to review
-    something; when the review happens elsewhere (approving an agent, deciding
-    an access request), the prompt must be settled or it stays live on the
+    something; when the review happens elsewhere (e.g. approving an agent),
+    the prompt must be settled or it stays live on the
     rail/dashboard forever with a working-but-pointless action button.
 
     Matches on type + optional actor scoping via SQL, then on exact-equality
@@ -249,7 +254,7 @@ async def emit_credential_access(
     api_version: str,
     trace_id: str | None = None,
 ) -> str:
-    """Emit a credential-access audit event (§08 E3.4) and return its ID.
+    """Emit a credential-access audit event and return its ID.
 
     One record per resolve/decrypt of a stored credential, attributing the use
     to an actor. Called from the single resolve→decrypt→inject seam so each

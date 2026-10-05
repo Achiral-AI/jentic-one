@@ -1,9 +1,8 @@
 /**
  * Agent Rail — repository tier for the REAL platform event feed.
  *
- * The rail is no longer a mock: it consumes the same `/events` contract the
- * Monitor module consumes (STATUS.md [ui-agent-rail 2026-06-21] "make it real").
- * This module is the ONLY place the rail talks to `@/shared/api`; the provider
+ * The rail consumes the same real `/events` contract the Monitor module
+ * consumes. This module is the ONLY place the rail talks to `@/shared/api`; the provider
  * in `agentStream.tsx` and the rail components go through here.
  *
  *   GET   /events           — backlog (filter + cursor)            → listEvents
@@ -12,9 +11,9 @@
  *
  * The SSE call is hand-rolled over `fetch` + `ReadableStream` because the
  * backend requires `Authorization: Bearer <jwt>` and native `EventSource`
- * cannot set headers — this is a verbatim port of Monitor's proven client
- * (jentic-one-ui-monitor `modules/monitor/api/client.ts`), kept local to the
- * rail so the rail has no cross-module dependency.
+ * cannot set headers — this mirrors Monitor's proven client
+ * (`modules/monitor/api/client.ts`), kept local to the rail so the rail has
+ * no cross-module dependency.
  */
 import {
 	EventsService,
@@ -62,6 +61,9 @@ export interface ListEventsParams {
 	from?: string | null;
 	to?: string | null;
 	traceId?: string | null;
+	/** Narrow to one actor (`actor_id` + `actor_type`, e.g. a single agent). */
+	actorId?: string | null;
+	actorType?: string | null;
 	cursor?: string | null;
 	limit?: number;
 }
@@ -77,6 +79,8 @@ export async function listEvents(params: ListEventsParams = {}): Promise<EventLi
 			from: params.from ?? null,
 			to: params.to ?? null,
 			traceId: params.traceId ?? null,
+			actorId: params.actorId ?? null,
+			actorType: params.actorType ?? null,
 			cursor: params.cursor ?? null,
 			limit: params.limit ?? 25,
 		});
@@ -103,6 +107,8 @@ export interface StreamEventsParams {
 	severity?: EventSeverity[] | null;
 	requiresAction?: boolean | null;
 	traceId?: string | null;
+	actorId?: string | null;
+	actorType?: string | null;
 }
 
 export interface StreamEventsHandlers {
@@ -190,6 +196,8 @@ export function streamEvents(
 		if (params.requiresAction != null)
 			query.set('requires_action', String(params.requiresAction));
 		if (params.traceId) query.set('trace_id', params.traceId);
+		if (params.actorId) query.set('actor_id', params.actorId);
+		if (params.actorType) query.set('actor_type', params.actorType);
 		for (const t of params.eventType ?? []) query.append('event_type', t);
 		for (const s of params.severity ?? []) query.append('severity', s);
 		const qs = query.toString();

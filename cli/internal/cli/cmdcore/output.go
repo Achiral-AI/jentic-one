@@ -28,7 +28,7 @@ func StdoutIsTerminal() bool {
 
 // JSONOrPretty returns true when the caller should emit JSON output:
 //   - --json was explicitly set, or
-//   - the resolved mode is a fenced machine mode (agent/service-account), or
+//   - the resolved mode is a fenced machine mode (agent), or
 //   - mode is EXPLICITLY human → pretty, even piped (UX-5), or
 //   - otherwise: stdout is not a TTY (agent friendly by default).
 //
@@ -40,8 +40,8 @@ func StdoutIsTerminal() bool {
 //
 // The explicit-human rung (UX-5) is the inverse: --mode human (or
 // JENTIC_MODE=human / a persisted human context) says "render for a person",
-// so piping to `less`/`tee` keeps the pretty report — previously there was no
-// way to force it in a pipe. Only DEFAULT human (nothing set anywhere) falls
+// so piping to `less`/`tee` keeps the pretty report. Only DEFAULT human
+// (nothing set anywhere) falls
 // through to the TTY heuristic.
 func JSONOrPretty(cmd *cobra.Command, jsonFlag bool) bool {
 	if jsonFlag {

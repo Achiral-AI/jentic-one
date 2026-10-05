@@ -5,12 +5,15 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
-	"github.com/charmbracelet/x/term"
 	sdkclient "github.com/jentic/jentic-one/cli/client"
 	"github.com/jentic/jentic-one/cli/internal/agentops"
 	"github.com/jentic/jentic-one/cli/internal/cli/clictx"
@@ -37,6 +40,8 @@ type executeOptions struct {
 	headers        []string
 	data           string
 	dataFile       string
+	form           []string
+	formFile       []string
 	raw            bool
 	json           bool
 	brokerScheme   string
@@ -49,23 +54,27 @@ func newExecuteCmd(app *app) *cobra.Command {
 	opts := &executeOptions{}
 
 	cmd := &cobra.Command{
-		Use:   "execute <METHOD:url | METHOD:/path | operation_id>",
+		Use:   "execute <METHOD:url | METHOD:/path>",
 		Short: "Execute an operation through the Jentic broker",
 		Long: "execute sends an HTTP request through the Jentic broker. The broker\n" +
 			"authenticates the caller with their agent token and injects the stored\n" +
 			"upstream credential, so the agent token is never sent to the upstream\n" +
-			"API directly. The target can be specified in three ways:\n\n" +
+			"API directly. The target is the operation's method + URL:\n\n" +
 			"  1. METHOD:url — a discovered operation's full URL, the same form\n" +
-			"     `jentic search`/`jentic inspect` accept (e.g.\n" +
+			"     `jentic search`/`jentic inspect` print (e.g.\n" +
 			"     GET:https://rest.coincap.io/v3/markets). Resolved via inspect, then\n" +
 			"     routed through the broker. The space form (`GET <url>`) is also\n" +
 			"     accepted, but the colon form is canonical (it needs no shell quoting).\n" +
-			"  2. operation_id — resolve via inspect, then route through the broker.\n" +
-			"  3. METHOD:/path — a broker-relative path sent to --broker-host\n" +
+			"  2. METHOD:/path — a broker-relative path sent to --broker-host\n" +
 			"     verbatim (e.g. GET:/v1/pets); the caller supplies the broker path.\n\n" +
+			"(An opaque registry operation_id also still resolves, for compatibility\n" +
+			"with older scripts — prefer the METHOD:url form. A search hit whose\n" +
+			"target is an operation_id has a host-relative url — its spec declares no\n" +
+			"absolute server — so it is inspect-only: execute refuses it with\n" +
+			"RESOLVE_FAILED, since there is no upstream host to proxy to.)\n\n" +
 			"Path parameters, query parameters, headers, and a request body can be\n" +
 			"supplied via flags.\n\n" +
-			"When the broker denies the call (e.g. you are not bound to a toolkit\n" +
+			"When the broker denies the call (e.g. you have no credential binding\n" +
 			"for the API, or no credential is provisioned), it returns an\n" +
 			"agent_directive describing how to recover. execute surfaces that\n" +
 			"directive on stderr and exits 2 so a script can branch on the denial.\n\n" +
@@ -73,7 +82,7 @@ func newExecuteCmd(app *app) *cobra.Command {
 			"  0 — broker returned a non-denial HTTP response (incl. 2xx and upstream errors)\n" +
 			"  1 — local/transport failure (DNS, TLS, timeout, connection refused)\n" +
 			"  2 — denied by the broker (carries an agent_directive) or resolve failure\n" +
-			"      (inspect error, e.g. unknown operation_id)\n\n" +
+			"      (inspect error, e.g. an unknown operation)\n\n" +
 			"Broker target: resolved as built-in default (https://127.0.0.1:8100) <\n" +
 			"the active environment's broker_url < --broker-scheme/--broker-host. A\n" +
 			"local install serves the broker over plain HTTP, so `jentic register`\n" +
@@ -85,12 +94,13 @@ func newExecuteCmd(app *app) *cobra.Command {
 			"control plane you MUST set broker_url (or JENTIC_BROKER_URL); execute\n" +
 			"refuses with RESOLVE_FAILED rather than dialing the local default.",
 		Example: "  jentic execute GET:https://rest.coincap.io/v3/markets --json\n" +
-			"  jentic execute listPets --query limit=10 --json\n" +
+			"  jentic execute GET:https://api.example.com/v1/pets --query limit=10 --json\n" +
 			"  jentic execute GET:/v1/pets/{petId} --path petId=123 --raw\n" +
 			"  echo '{\"name\":\"Bob\"}' | jentic execute POST:/v1/users --json\n" +
+			"  jentic execute POST:https://api.example.com/v1/pics --form demo=true --form-file images=@face.jpg --json\n" +
 			"  # Local broker over http, one-off (usually unnecessary — register seeds broker_url):\n" +
-			"  jentic execute listPets --broker-scheme http --broker-host 127.0.0.1:8100",
-		Args: exactNamedArgs("<METHOD:url | METHOD:/path | operation_id>", "target"),
+			"  jentic execute GET:https://api.example.com/v1/pets --broker-scheme http --broker-host 127.0.0.1:8100",
+		Args: exactNamedArgs("<METHOD:url | METHOD:/path>", "target"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return app.executeE(cmd, opts, args[0])
 		},
@@ -101,6 +111,8 @@ func newExecuteCmd(app *app) *cobra.Command {
 	cmd.Flags().StringArrayVar(&opts.headers, "header", nil, "extra header as key=value (repeatable)")
 	cmd.Flags().StringVarP(&opts.data, "data", "d", "", "request body JSON (use - for stdin)")
 	cmd.Flags().StringVar(&opts.dataFile, "data-file", "", "read request body from this file")
+	cmd.Flags().StringArrayVar(&opts.form, "form", nil, "multipart/form-data text field as key=value (repeatable; cannot be combined with --data/--data-file; a piped stdin body is ignored)")
+	cmd.Flags().StringArrayVar(&opts.formFile, "form-file", nil, "multipart/form-data file part as key=@path (repeatable; cannot be combined with --data/--data-file; a piped stdin body is ignored)")
 	cmd.Flags().BoolVar(&opts.raw, "raw", false, "stream response body directly to stdout")
 	cmd.Flags().BoolVar(&opts.json, "json", false, "force JSON envelope output")
 	cmd.Flags().StringVar(&opts.brokerScheme, "broker-scheme", config.DefaultBrokerScheme, "broker target scheme (http or https)")
@@ -139,7 +151,7 @@ func (a *app) executeE(cmd *cobra.Command, opts *executeOptions, target string) 
 					st.EnvironmentName),
 			}
 		}
-		// SEC-21: in a machine mode (agent/service-account) the broker host is
+		// SEC-21: in machine (agent) mode the broker host is
 		// pinned to the environment's configured broker_url. An agent must not
 		// be able to redirect its bearer + injected upstream context at an
 		// arbitrary host via --broker-host/--broker-scheme. A human operator
@@ -216,29 +228,31 @@ func (a *app) executeE(cmd *cobra.Command, opts *executeOptions, target string) 
 
 	// Resolve request body (cobra-side by design: the stdin fallback must never
 	// move into agentops — under stdio MCP, stdin is the JSON-RPC wire).
-	var body io.Reader
-	switch {
-	case opts.data == "-" || (opts.data == "" && opts.dataFile == "" && !term.IsTerminal(os.Stdin.Fd())):
-		data, readErr := io.ReadAll(os.Stdin)
-		if readErr != nil {
-			return fmt.Errorf("read stdin: %w", readErr)
-		}
-		if len(data) > 0 {
-			body = bytes.NewReader(data)
-		}
-	case opts.dataFile != "":
-		data, readErr := os.ReadFile(opts.dataFile)
-		if readErr != nil {
-			return fmt.Errorf("read %s: %w", opts.dataFile, readErr)
-		}
-		body = bytes.NewReader(data)
-	case opts.data != "":
-		body = strings.NewReader(opts.data)
+	body, multipartContentType, err := resolveExecuteBody(opts)
+	if err != nil {
+		return err
 	}
 
 	headers, err := agentops.ParseKVs(opts.headers, func(v string) error { return badFlagKV("--header", v) })
 	if err != nil {
 		return err
+	}
+	if multipartContentType != "" {
+		// The generated boundary is inseparable from the multipart body bytes,
+		// so no caller-supplied Content-Type can ever be correct here — honoring
+		// an override would send a header whose boundary does not match the body
+		// (a silent upstream parse failure). Reject instead of merging; the
+		// generated Content-Type is appended last so it is authoritative.
+		for _, kv := range headers {
+			if strings.EqualFold(strings.TrimSpace(kv.Key), "Content-Type") {
+				return &ux.CodedError{
+					Code:       ux.CodeMissingArgument,
+					Msg:        "--header Content-Type cannot be combined with --form/--form-file: the multipart Content-Type carries a generated boundary that must match the body",
+					Actionable: "Drop the --header Content-Type flag; execute sets the multipart Content-Type (with its boundary) automatically.",
+				}
+			}
+		}
+		headers = append(headers, agentops.KV{Key: "Content-Type", Value: multipartContentType})
 	}
 
 	// Build phase (agentops.BuildRequest): path-param substitution, query
@@ -273,14 +287,79 @@ func (a *app) executeE(cmd *cobra.Command, opts *executeOptions, target string) 
 		return nil
 	}
 
-	// Send phase (agentops.Do): the SDK broker transport with its response
-	// policy, and a bounded body read into the UX-free result.
-	result, err := agentops.Do(req)
+	// Send phase (agentops.DoWith): the SDK broker transport with its response
+	// policy, and a bounded body read into the UX-free result. The broker leg
+	// rides clictx's SEC-20 CA-pinned client — fail closed on a broken
+	// ca_cert_path — with the context's TransportHook composed over it, exactly
+	// like the MCP path (§3.7.2). Resolved
+	// AFTER the dry-run gate: rendering a plan needs no transport, so --dry-run
+	// keeps working on a machine whose CA bundle is momentarily broken.
+	hc, err := clictx.BrokerHTTPClient(cmd.Context())
+	if err != nil {
+		return err
+	}
+	result, err := agentops.DoWith(hc, req)
 	if err != nil {
 		return err
 	}
 
 	return a.executeOutput(cmd, opts, result)
+}
+
+// resolveExecuteBody resolves the request body for execute. Two body modes are
+// mutually exclusive: a raw byte body (--data / --data-file / stdin, defaulting
+// to Content-Type application/json in agentops.BuildRequest) and a
+// multipart/form-data body assembled from --form/--form-file. When multipart is
+// requested, the returned contentType carries the generated boundary, which
+// suppresses the JSON default via BuildRequest's caller-header precedence
+// (#1316).
+func resolveExecuteBody(opts *executeOptions) (body io.Reader, multipartContentType string, err error) {
+	switch {
+	case len(opts.form) > 0 || len(opts.formFile) > 0:
+		// --form/--form-file cannot be combined with a raw byte body. Reject the
+		// explicit raw-body flags; the stdin auto-fallback is only taken when no
+		// body flag is set, so it cannot collide here.
+		if opts.data != "" || opts.dataFile != "" {
+			return nil, "", &ux.CodedError{
+				Code:       ux.CodeMissingArgument,
+				Msg:        "--form/--form-file cannot be combined with --data/--data-file",
+				Actionable: "Send either a multipart body (--form/--form-file) or a raw body (--data/--data-file), not both.",
+			}
+		}
+		mpBody, ct, mpErr := buildMultipartBody(opts.form, opts.formFile)
+		if mpErr != nil {
+			return nil, "", mpErr
+		}
+		return mpBody, ct, nil
+	case opts.data == "-":
+		// Explicit stdin body (`-d -`): the caller opted in, so block until EOF.
+		r, readErr := readStdinBody()
+		if readErr != nil {
+			return nil, "", readErr
+		}
+		return r, "", nil
+	case opts.data == "" && opts.dataFile == "" && stdinHasPipedBody(os.Stdin):
+		// Implicit stdin fallback (no body flag): taken only when stdin is a pipe
+		// or a non-empty regular file — a real `echo … | execute` or
+		// `execute < file`. A non-TTY stdin that is merely inherited and idle (a
+		// backgrounded process, or an agent/harness whose stdin is a socket/pty
+		// that never sends EOF) must not be read — draining it would block
+		// forever and hang every body-less execute (#1354).
+		r, readErr := readStdinBody()
+		if readErr != nil {
+			return nil, "", readErr
+		}
+		return r, "", nil
+	case opts.dataFile != "":
+		data, readErr := os.ReadFile(opts.dataFile)
+		if readErr != nil {
+			return nil, "", fmt.Errorf("read %s: %w", opts.dataFile, readErr)
+		}
+		return bytes.NewReader(data), "", nil
+	case opts.data != "":
+		return strings.NewReader(opts.data), "", nil
+	}
+	return nil, "", nil
 }
 
 // badFlagKV builds the coded error for a malformed key=value flag (ARCH-4). A
@@ -293,6 +372,109 @@ func badFlagKV(flag, value string) error {
 		Msg:        fmt.Sprintf("invalid %s value %q; expected key=value", flag, value),
 		Actionable: fmt.Sprintf("Pass %s as key=value (e.g. %s id=123).", flag, flag),
 	}
+}
+
+// buildMultipartBody assembles a multipart/form-data body from --form text
+// fields (key=value) and --form-file file parts (key=@path), returning the body
+// reader and the boundary-carrying Content-Type the broker must forward verbatim
+// (#1316). The broker is byte-transparent for the request body, so once the
+// boundary Content-Type is set the multipart bytes reach the upstream intact
+// with the credential still injected on the headers.
+func buildMultipartBody(form, formFile []string) (io.Reader, string, error) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+
+	for _, kv := range form {
+		key, value, ok := strings.Cut(kv, "=")
+		if !ok || strings.TrimSpace(key) == "" {
+			return nil, "", badFlagKV("--form", kv)
+		}
+		// curl's -F treats a leading @ as a file reference; here file parts live
+		// on --form-file, so a @-prefixed --form value is almost always a curl
+		// habit that would silently send the literal string as text. Fail closed;
+		// a doubled @@ is the escape hatch for an intentional literal leading @.
+		if strings.HasPrefix(value, "@@") {
+			value = value[1:]
+		} else if strings.HasPrefix(value, "@") {
+			return nil, "", &ux.CodedError{
+				Code:       ux.CodeMissingArgument,
+				Msg:        fmt.Sprintf("--form value for %q starts with @ (%q); --form sends the literal text, file parts use --form-file", key, value),
+				Actionable: fmt.Sprintf("Upload a file with --form-file %s=@path, or send a literal leading @ by doubling it (--form %s=@@…).", key, key),
+			}
+		}
+		if werr := w.WriteField(key, value); werr != nil {
+			return nil, "", fmt.Errorf("write form field %q: %w", key, werr)
+		}
+	}
+
+	for _, kv := range formFile {
+		key, spec, ok := strings.Cut(kv, "=")
+		path := strings.TrimPrefix(spec, "@")
+		if !ok || strings.TrimSpace(key) == "" || !strings.HasPrefix(spec, "@") || path == "" {
+			return nil, "", &ux.CodedError{
+				Code:       ux.CodeMissingArgument,
+				Msg:        fmt.Sprintf("invalid --form-file value %q; expected key=@path", kv),
+				Actionable: "Pass --form-file as key=@path (e.g. --form-file images=@face.jpg).",
+			}
+		}
+		f, oerr := os.Open(path) //nolint:gosec // operator-supplied upload path; same trust as --data-file.
+		if oerr != nil {
+			// A wrong path is agent-causable input (ARCH-4), so it surfaces a
+			// machine error_code like the malformed-spec branch above.
+			return nil, "", &ux.CodedError{
+				Code:       ux.CodeMissingArgument,
+				Msg:        fmt.Sprintf("cannot read --form-file %s: %v", path, oerr),
+				Actionable: fmt.Sprintf("Check that the file exists and is readable, then retry with --form-file %s=@<path>.", key),
+			}
+		}
+		if fi, serr := f.Stat(); serr == nil && fi.IsDir() {
+			_ = f.Close()
+			return nil, "", &ux.CodedError{
+				Code:       ux.CodeMissingArgument,
+				Msg:        fmt.Sprintf("--form-file %s is a directory; expected a file", path),
+				Actionable: fmt.Sprintf("Point --form-file %s=@<path> at a regular file.", key),
+			}
+		}
+		part, cerr := createFilePart(w, key, path)
+		if cerr != nil {
+			_ = f.Close()
+			return nil, "", fmt.Errorf("create form file %q: %w", key, cerr)
+		}
+		// Stream the file straight into the multipart part rather than reading
+		// it fully into a slice and copying again (uploads may be up to the
+		// broker's 50 MiB multipart cap). The body still accumulates in buf —
+		// a *bytes.Buffer keeps the request replayable for the SDK transport's
+		// retry rewind (GetBody), which an io.Pipe stream would break.
+		if _, werr := io.Copy(part, f); werr != nil {
+			_ = f.Close()
+			return nil, "", fmt.Errorf("read --form-file %s: %w", path, werr)
+		}
+		if cerr := f.Close(); cerr != nil {
+			return nil, "", fmt.Errorf("close --form-file %s: %w", path, cerr)
+		}
+	}
+
+	if err := w.Close(); err != nil {
+		return nil, "", fmt.Errorf("finalize multipart body: %w", err)
+	}
+	return &buf, w.FormDataContentType(), nil
+}
+
+// createFilePart creates the multipart part for a --form-file upload. Unlike
+// multipart.Writer.CreateFormFile — which hardcodes application/octet-stream —
+// the part Content-Type is inferred from the file extension so MIME-validating
+// upload APIs (image/jpeg, application/pdf, …) accept the part, falling back to
+// octet-stream for unknown extensions. Disposition escaping matches
+// CreateFormFile via multipart.FileContentDisposition.
+func createFilePart(w *multipart.Writer, key, path string) (io.Writer, error) {
+	contentType := mime.TypeByExtension(filepath.Ext(path))
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	h := make(textproto.MIMEHeader)
+	h.Set("Content-Disposition", multipart.FileContentDisposition(key, filepath.Base(path)))
+	h.Set("Content-Type", contentType)
+	return w.CreatePart(h)
 }
 
 // executePlanPayload summarizes the resolved outbound request for --dry-run/
@@ -349,8 +531,11 @@ func parseMethodPath(target string) (method, path string) {
 // through the agentops core over the apiClient Inspector seam.
 func (a *app) resolveOperation(ctx context.Context, target, revision string) (*agentops.Operation, error) {
 	// METHOD:/path → broker-relative direct send (uses --broker-host/scheme).
-	if method, path := parseMethodPath(target); method != "" {
-		return &agentops.Operation{Method: method, Path: path}, nil
+	// The agentops core owns the short-circuit — including its executable-
+	// method policy (TRACE is refused) — and never touches the Inspector for
+	// this form, so no session is resolved.
+	if method, _ := parseMethodPath(target); method != "" {
+		return agentops.ResolveOperation(ctx, nil, target, revision)
 	}
 
 	// METHOD URL / METHOD:URL (absolute) and opaque operation_id both resolve

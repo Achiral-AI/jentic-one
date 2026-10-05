@@ -10,30 +10,39 @@ from jentic.problem_details import Unauthorized
 
 from jentic_one.auth.services.errors import AuthServiceError
 from jentic_one.auth.services.token_service import ACCESS_TOKEN_PREFIX, TokenService
-from jentic_one.auth.web.errors import database_error_handler, service_error_handler
+from jentic_one.auth.web.errors import (
+    cursor_error_handler,
+    database_error_handler,
+    service_error_handler,
+)
 from jentic_one.auth.web.routers import (
     agents,
     authorize,
     discovery,
     identity,
+    local_login,
     oauth,
+    oauth_client_registration,
+    oauth_grants,
     registration,
-    service_accounts,
 )
 from jentic_one.shared.auth.api_key_resolver import (
     AGENT_API_KEY_PREFIX,
-    SERVICE_ACCOUNT_API_KEY_PREFIX,
+    RETIRED_SERVICE_ACCOUNT_KEY_DETAIL,
     ApiKeyResolver,
+    is_retired_service_account_key,
 )
 from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.auth.verify import resolve_permissions_for_actor, verify_token
 from jentic_one.shared.context import Context
 from jentic_one.shared.db.errors import DatabaseUnavailableError
 from jentic_one.shared.models import ActorType
+from jentic_one.shared.pagination import InvalidCursorError
 from jentic_one.shared.scopes import OIDC_PASSTHROUGH_SCOPES
 from jentic_one.shared.state import build_state_backend
 from jentic_one.shared.state.factory import BackendKind
 from jentic_one.shared.web.app_factory import create_surface_app
+from jentic_one.shared.web.container import AppContainer
 from jentic_one.shared.web.health import make_health_router
 
 logger = structlog.get_logger(__name__)
@@ -46,11 +55,19 @@ def get_routers() -> list[tuple[APIRouter, str, list[str]]]:
     return [
         (make_health_router("auth"), "/auth", []),
         (discovery.router, "", []),
+        # /mcp-scoped OAuth discovery: RFC 8414 + RFC 9728 docs,
+        # the root protected-resource alias, and the /mcp 401 challenge. All
+        # gated by server.mcp.oauth.enabled (404 when off).
+        (discovery.mcp_router, "", []),
         (authorize.router, "", []),
+        # Local-account login form on the /authorize flow. Gated by
+        # auth.local_login.enabled (404 when off).
+        (local_login.router, "", []),
         (identity.router, "", []),
         (agents.router, "", []),
-        (service_accounts.router, "", []),
         (oauth.router, "", []),
+        (oauth_client_registration.router, "", []),
+        (oauth_grants.router, "", []),
         (registration.router, "", []),
     ]
 
@@ -60,6 +77,9 @@ def get_exception_handlers() -> list[tuple[type[Exception], Any]]:
     return [
         (AuthServiceError, service_error_handler),
         (DatabaseUnavailableError, database_error_handler),
+        # A user-supplied `?cursor=` that fails to decode must 400, not 500 —
+        # the per-agent grant listing decodes it (see auth/web/errors.py).
+        (InvalidCursorError, cursor_error_handler),
     ]
 
 
@@ -89,7 +109,9 @@ def make_superset_verifier(ctx: Context) -> Any:
     """Build the full-taxonomy token verifier for combined/standalone apps.
 
     Resolves every platform token shape a signed-in caller can present:
-    agent/service-account API keys (``jak_``/``sak_``), opaque ``at_`` access
+    agent API keys (``jak_``; a retired ``sak_`` key is refused with a 401
+    naming the replacement, and a retired ``jntc_live_`` key is accepted only
+    by the broker), opaque ``at_`` access
     tokens (DB-resolved, live permissions), and HS256 web-session JWTs. This is
     the verifier a combined-app assembler should install so admin/enterprise
     routes accept ``at_`` regardless of surface ordering — the auth surface's
@@ -103,9 +125,14 @@ def _make_auth_verifier(ctx: Context) -> Any:
     api_key_resolver = ApiKeyResolver(ctx.admin_db)
 
     async def _verify(token: str, request: Request) -> Identity:
-        if token.startswith(AGENT_API_KEY_PREFIX) or token.startswith(
-            SERVICE_ACCOUNT_API_KEY_PREFIX
-        ):
+        if is_retired_service_account_key(token):
+            await api_key_resolver.resolve(token)  # logs the refusal; never resolves
+            raise Unauthorized(
+                detail=RETIRED_SERVICE_ACCOUNT_KEY_DETAIL,
+                instance=request.url.path,
+                type="unauthorized",
+            )
+        if token.startswith(AGENT_API_KEY_PREFIX):
             resolved = await api_key_resolver.resolve(token)
             if resolved is None or not resolved.active:
                 raise Unauthorized(
@@ -135,7 +162,7 @@ def _make_auth_verifier(ctx: Context) -> Any:
                 # the AGENT branch of resolve_permissions_for_actor is an
                 # unimplemented stub that returns [], which silently drops every
                 # granted scope — an approved capabilities:read then 403s and
-                # `jentic access refresh` can never take effect. This mirrors the
+                # a token re-mint can never take effect. This mirrors the
                 # broker's InProcessTokenResolver, which already reads row.scopes.
                 # parent_permissions (owner inheritance) is still resolved above.
                 permissions = list(resolved.permissions)
@@ -153,6 +180,7 @@ def _make_auth_verifier(ctx: Context) -> Any:
                 actor_type=resolved.actor_type,
                 parent_actor_id=resolved.parent_actor_id,
                 oauth_client_id=resolved.oauth_client_id,
+                oauth_grant_id=resolved.oauth_grant_id,
             )
         return await verify_token(
             token, secret=ctx.config.admin.auth.jwt_secret.get_secret_value(), ctx=ctx
@@ -161,10 +189,19 @@ def _make_auth_verifier(ctx: Context) -> Any:
     return _verify
 
 
-def create_app(ctx: Context) -> FastAPI:
-    """Create the auth FastAPI application for standalone deployment."""
+def create_app(ctx: Context, container: AppContainer | None = None) -> FastAPI:
+    """Create the auth FastAPI application for standalone deployment.
+
+    ``container`` lets the composition root ride its extras (notably the
+    ``/mcp`` discovery challenge placeholder on auth-sans-control shapes) on a
+    standalone auth process; ``None`` keeps the default wiring.
+    """
     app = create_surface_app(
-        ctx, title="jentic-one-auth", routers=get_routers(), enabled_apps={"auth"}
+        ctx,
+        title="jentic-one-auth",
+        routers=get_routers(),
+        enabled_apps={"auth"},
+        container=container,
     )
     install_on_app(app, ctx)
     for exc_class, handler in get_exception_handlers():

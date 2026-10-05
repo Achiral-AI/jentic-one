@@ -64,7 +64,7 @@ func TestMCPExecute_SuccessEnvelopeWithStamp(t *testing.T) {
 		t.Fatalf("handleExecute: %v", err)
 	}
 	if res.IsError {
-		t.Fatalf("unexpected soft error: %v", res.Content)
+		t.Fatalf("unexpected soft error: %s", toolResultText(res))
 	}
 
 	// The wire request: path param substituted, the leftover input as query,
@@ -109,7 +109,7 @@ func TestMCPExecute_DenialPassesDirectiveThrough(t *testing.T) {
 		w.Header().Set("Content-Type", "application/problem+json")
 		w.Header().Set("Jentic-Error-Origin", "broker")
 		w.WriteHeader(http.StatusForbidden)
-		_, _ = w.Write([]byte(`{"detail":"no toolkit binding","agent_directive":{"strategy":"prompt_human","parameters":{"suggested_command":"jentic access request --toolkit acme/pets --wait"},"human_readable_instruction":"Ask your operator to bind this agent to acme/pets."}}`))
+		_, _ = w.Write([]byte(`{"type":"no_credential_binding","detail":"no credential binding","agent_directive":{"strategy":"prompt_human","parameters":{"api":"acme/pets","suggested_command":"jentic connect acme"},"human_readable_instruction":"Run jentic connect acme to connect a credential for acme/pets."}}`))
 	}))
 	defer broker.Close()
 
@@ -129,8 +129,8 @@ func TestMCPExecute_DenialPassesDirectiveThrough(t *testing.T) {
 	if payload["retryable"] != false {
 		t.Errorf("retryable = %v, want false (non-retryable until access changes)", payload["retryable"])
 	}
-	if payload["next_tool"] != "whoami" {
-		t.Errorf("next_tool = %v, want whoami", payload["next_tool"])
+	if payload["next_tool"] != "request_connection" {
+		t.Errorf("next_tool = %v, want request_connection (a no_credential_binding denial is provisioning-shaped)", payload["next_tool"])
 	}
 	details, _ := payload["details"].(map[string]any)
 	if details["http_status"] != float64(http.StatusForbidden) {
@@ -145,11 +145,103 @@ func TestMCPExecute_DenialPassesDirectiveThrough(t *testing.T) {
 		t.Errorf("directive.strategy = %v, want prompt_human", directive["strategy"])
 	}
 	params, _ := directive["parameters"].(map[string]any)
-	if params["suggested_command"] != "jentic access request --toolkit acme/pets --wait" {
-		t.Errorf("directive.parameters = %v, want the suggested_command verbatim", directive["parameters"])
+	if params["api"] != "acme/pets" {
+		t.Errorf("directive.parameters = %v, want the parameters verbatim", directive["parameters"])
 	}
 	if step, _ := payload["actionable_step"].(string); !strings.Contains(step, "acme/pets") {
 		t.Errorf("actionable_step %q must relay the directive instruction", step)
+	}
+}
+
+// TestMCPExecute_DenialNextToolKeysOnProblemType pins the type→next_tool
+// mapping (theme-7 Phase 1b review M1): request_connection ONLY for the
+// provisioning-shaped problem types whose directive names a registry vendor
+// (parameters.suggested_command — off the registry the tool would fail as an
+// unknown vendor); action_denied / identity-mismatch /
+// unknown 403s keep whoami — a status-keyed fork would teach the model to
+// file connect sessions to route around permission rules.
+func TestMCPExecute_DenialNextToolKeysOnProblemType(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   int
+		body     string
+		wantTool string
+	}{
+		{
+			"no_credential_binding_no_directive", http.StatusForbidden,
+			`{"type":"no_credential_binding","detail":"denied"}`, "whoami",
+		},
+		{
+			// Still emitted by 0.40.x toolkit-path brokers; provisioning-shaped,
+			// but without a directive it keeps whoami.
+			"no_toolkit_binding_no_directive", http.StatusForbidden,
+			`{"type":"no_toolkit_binding","detail":"denied"}`, "whoami",
+		},
+		{
+			"credential_not_provisioned_off_registry", http.StatusFailedDependency,
+			`{"type":"credential_not_provisioned","detail":"denied","agent_directive":{"strategy":"prompt_human","parameters":{"vendor":"acme.com"},"human_readable_instruction":"Ask your operator to connect a credential."}}`, "whoami",
+		},
+		{
+			"no_credential_binding_registry_vendor", http.StatusForbidden,
+			`{"type":"no_credential_binding","detail":"denied","agent_directive":{"strategy":"prompt_human","parameters":{"suggested_command":"jentic connect acme"},"human_readable_instruction":"Run jentic connect acme (or request_connection) and relay the approval_url."}}`, "request_connection",
+		},
+		{
+			// A 0.40.x toolkit-path broker's twin of no_credential_binding.
+			"no_toolkit_binding_registry_vendor", http.StatusForbidden,
+			`{"type":"no_toolkit_binding","detail":"denied","agent_directive":{"strategy":"prompt_human","parameters":{"suggested_command":"jentic connect acme"},"human_readable_instruction":"Run jentic connect acme (or request_connection) and relay the approval_url."}}`, "request_connection",
+		},
+		{
+			"credential_not_provisioned_registry_vendor", http.StatusFailedDependency,
+			`{"type":"credential_not_provisioned","detail":"denied","agent_directive":{"strategy":"prompt_human","parameters":{"suggested_command":"jentic connect acme"},"human_readable_instruction":"Run jentic connect acme (or request_connection)."}}`, "request_connection",
+		},
+		{
+			"action_denied", http.StatusForbidden,
+			`{"type":"action_denied","detail":"a permission rule forbids this operation"}`, "whoami",
+		},
+		{
+			"credential_identity_mismatch", http.StatusForbidden,
+			`{"type":"credential_identity_mismatch","detail":"denied"}`, "whoami",
+		},
+		{
+			"credential_undecryptable", http.StatusFailedDependency,
+			`{"type":"credential_undecryptable","detail":"denied"}`, "whoami",
+		},
+		{"unknown_403", http.StatusForbidden, `{"detail":"denied"}`, "whoami"},
+		{"unparseable_403", http.StatusForbidden, `not json`, "whoami"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/problem+json")
+				w.Header().Set("Jentic-Error-Origin", "broker")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer broker.Close()
+
+			s := stampedTestMCPServer(t)
+			res, err := s.handleExecute(activeCtxWithBroker("http://127.0.0.1:8000", broker.URL),
+				callToolRequest("execute", `{"operation_id":"POST:/v1/pets"}`))
+			if err != nil {
+				t.Fatalf("a broker denial must be a soft error: %v", err)
+			}
+			if !res.IsError {
+				t.Fatalf("want IsError result for a broker denial")
+			}
+			payload := decodeToolJSON(t, res)
+			if payload["next_tool"] != tc.wantTool {
+				t.Errorf("next_tool = %v, want %q for problem type %s", payload["next_tool"], tc.wantTool, tc.name)
+			}
+			// Connect wording never rides a non-provisioning denial (a rule
+			// denial must not be answered with "start a connect session").
+			step, _ := payload["actionable_step"].(string)
+			if !provisioningProblemTypes[problemTypeOf(tc.body)] && strings.Contains(step, "request_connection") {
+				t.Errorf("actionable_step %q teaches request_connection on a non-provisioning denial", step)
+			}
+			if tc.wantTool == "request_connection" && !strings.Contains(step, "request_connection") {
+				t.Errorf("actionable_step %q must teach the connect leg on a registry-vendor denial", step)
+			}
+		})
 	}
 }
 
@@ -162,7 +254,7 @@ func TestMCPExecute_DenialRelaysUnknownDirectiveFields(t *testing.T) {
 		w.Header().Set("Content-Type", "application/problem+json")
 		w.Header().Set("Jentic-Error-Origin", "broker")
 		w.WriteHeader(http.StatusForbidden)
-		_, _ = w.Write([]byte(`{"detail":"no toolkit binding","agent_directive":{"strategy":"prompt_human",` +
+		_, _ = w.Write([]byte(`{"detail":"no credential binding","agent_directive":{"strategy":"prompt_human",` +
 			`"future_field":"must-survive","parameters":{"nested_unknown":{"keep":"me"}},` +
 			`"human_readable_instruction":"Ask your operator."}}`))
 	}))
@@ -231,7 +323,7 @@ func TestMCPExecute_UpstreamErrorIsNormalResult(t *testing.T) {
 		t.Fatalf("handleExecute: %v", err)
 	}
 	if res.IsError {
-		t.Fatalf("an upstream 4xx is a normal result, got soft error: %v", res.Content)
+		t.Fatalf("an upstream 4xx is a normal result, got soft error: %s", toolResultText(res))
 	}
 	payload := decodeToolJSON(t, res)
 	if payload["status"] != float64(http.StatusForbidden) {
@@ -258,7 +350,7 @@ func TestMCPExecute_HeldEnvelopePassesThrough(t *testing.T) {
 		t.Fatalf("handleExecute: %v", err)
 	}
 	if res.IsError {
-		t.Fatalf("a held (202) envelope is a normal result, got soft error: %v", res.Content)
+		t.Fatalf("a held (202) envelope is a normal result, got soft error: %s", toolResultText(res))
 	}
 	payload := decodeToolJSON(t, res)
 	if payload["status"] != float64(http.StatusAccepted) || payload["execution_id"] != "exec_held" {
@@ -498,7 +590,7 @@ func TestMCPExecute_TruncatesOversizedBody(t *testing.T) {
 		t.Fatalf("handleExecute: %v", err)
 	}
 	if res.IsError {
-		t.Fatalf("truncation is not an error: %v", res.Content)
+		t.Fatalf("truncation is not an error: %s", toolResultText(res))
 	}
 	payload := decodeToolJSON(t, res)
 	if payload["truncated"] != true {
@@ -606,7 +698,7 @@ func TestMCPExecute_CapsOversizedResponseHeaders(t *testing.T) {
 		t.Fatalf("handleExecute: %v", err)
 	}
 	if res.IsError {
-		t.Fatalf("header truncation is not an error: %v", res.Content)
+		t.Fatalf("header truncation is not an error: %s", toolResultText(res))
 	}
 	payload := decodeToolJSON(t, res)
 	if payload["headers_truncated"] != true {
@@ -671,7 +763,7 @@ func TestMCPExecute_NeverReadsStdin(t *testing.T) {
 		t.Fatalf("handleExecute: %v", err)
 	}
 	if res.IsError {
-		t.Fatalf("unexpected soft error: %v", res.Content)
+		t.Fatalf("unexpected soft error: %s", toolResultText(res))
 	}
 	if hadBody {
 		t.Errorf("broker received a body (%q); a bodyless tool call must send none", gotBody)
@@ -733,7 +825,7 @@ func TestMCPExecuteRead_AcceptsLowercaseRegistryMethod(t *testing.T) {
 		t.Fatalf("a lowercase registry method must not fail the GET/HEAD gate: %v", err)
 	}
 	if res.IsError {
-		t.Fatalf("unexpected soft error: %v", res.Content)
+		t.Fatalf("unexpected soft error: %s", toolResultText(res))
 	}
 	if gotMethod != http.MethodGet {
 		t.Errorf("method on the wire = %q, want the canonical GET", gotMethod)
@@ -766,7 +858,7 @@ func TestMCPExecuteRead_GetRoundTrip(t *testing.T) {
 		t.Fatalf("handleExecuteRead: %v", err)
 	}
 	if res.IsError {
-		t.Fatalf("unexpected soft error: %v", res.Content)
+		t.Fatalf("unexpected soft error: %s", toolResultText(res))
 	}
 	payload := decodeToolJSON(t, res)
 	if payload["status"] != float64(http.StatusOK) {
@@ -812,7 +904,7 @@ func TestMCPExecute_BrokerLegHonorsCAPinAndHook(t *testing.T) {
 		t.Fatalf("handleExecute: %v", err)
 	}
 	if res.IsError {
-		t.Fatalf("CA-pinned broker call must succeed against the pinned cert: %v", res.Content)
+		t.Fatalf("CA-pinned broker call must succeed against the pinned cert: %s", toolResultText(res))
 	}
 	if !strings.HasPrefix(gotUA, "jentic-mcp/") {
 		t.Errorf("broker User-Agent = %q, want the attribution hook composed onto the broker leg", gotUA)
@@ -859,7 +951,7 @@ func TestMCPGetExecutionResult_LiveRoutesRoundTrip(t *testing.T) {
 		t.Fatalf("handleGetExecutionResult: %v", err)
 	}
 	if res.IsError {
-		t.Fatalf("unexpected soft error: %v", res.Content)
+		t.Fatalf("unexpected soft error: %s", toolResultText(res))
 	}
 	payload := decodeToolJSON(t, res)
 	if payload["job_id"] != "job_9" || payload["status"] != "completed" || payload["execution_id"] != "exec_9" {
@@ -893,7 +985,7 @@ func TestMCPGetExecutionResult_PendingJobHasNoResult(t *testing.T) {
 		t.Fatalf("handleGetExecutionResult: %v", err)
 	}
 	if res.IsError {
-		t.Fatalf("a pending job is a normal result the model polls again: %v", res.Content)
+		t.Fatalf("a pending job is a normal result the model polls again: %s", toolResultText(res))
 	}
 	payload := decodeToolJSON(t, res)
 	if payload["status"] != "pending" {
@@ -1036,4 +1128,14 @@ func TestResolveMCPBrokerTarget(t *testing.T) {
 			t.Errorf("error %q must name the missing broker", err.Error())
 		}
 	})
+}
+
+// problemTypeOf extracts the problem+json type from a test body ("" when the
+// body is not a JSON object).
+func problemTypeOf(body string) string {
+	var env struct {
+		Type string `json:"type"`
+	}
+	_ = json.Unmarshal([]byte(body), &env)
+	return env.Type
 }

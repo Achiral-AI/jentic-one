@@ -24,48 +24,22 @@ export { AuditService } from '@/shared/api/generated/services/AuditService';
 export { JobsService } from '@/shared/api/generated/services/JobsService';
 export { SystemService } from '@/shared/api/generated/services/SystemService';
 
-// Toolkits domain (feat/ui-toolkits). Toolkit CRUD lives on `ToolkitsService`;
-// keys / credential bindings / permission rules were split per-tag into
-// Toolkit{Keys,Credentials,Permissions}Service; agent-side toolkit bindings
-// live on `AgentsService` (the /agents router, formerly `AuthService`).
-export { ToolkitsService } from '@/shared/api/generated/services/ToolkitsService';
-export { ToolkitKeysService } from '@/shared/api/generated/services/ToolkitKeysService';
-export { ToolkitCredentialsService } from '@/shared/api/generated/services/ToolkitCredentialsService';
-export { ToolkitPermissionsService } from '@/shared/api/generated/services/ToolkitPermissionsService';
+// Agents / dynamic registration. Agent-side credential
+// bindings live on `AgentsService` (the /agents router).
 export { AgentsService } from '@/shared/api/generated/services/AgentsService';
-export { ServiceAccountsService } from '@/shared/api/generated/services/ServiceAccountsService';
 export { AgentRegistrationService } from '@/shared/api/generated/services/AgentRegistrationService';
-export type { ToolkitResponse } from '@/shared/api/generated/models/ToolkitResponse';
-export type { ToolkitListResponse } from '@/shared/api/generated/models/ToolkitListResponse';
-export type { ToolkitCreateRequest } from '@/shared/api/generated/models/ToolkitCreateRequest';
-export type { ToolkitCreateResponse } from '@/shared/api/generated/models/ToolkitCreateResponse';
-export type { ToolkitUpdateRequest } from '@/shared/api/generated/models/ToolkitUpdateRequest';
-export type { ToolkitKeyResponse } from '@/shared/api/generated/models/ToolkitKeyResponse';
-export type { ToolkitKeyListResponse } from '@/shared/api/generated/models/ToolkitKeyListResponse';
-export type { ToolkitKeyCreateRequest } from '@/shared/api/generated/models/ToolkitKeyCreateRequest';
-export type { ToolkitKeyCreateResponse } from '@/shared/api/generated/models/ToolkitKeyCreateResponse';
-export type { ToolkitKeyUpdateRequest } from '@/shared/api/generated/models/ToolkitKeyUpdateRequest';
-export type { ToolkitCredentialBindingResponse } from '@/shared/api/generated/models/ToolkitCredentialBindingResponse';
-export type { ToolkitCredentialListResponse } from '@/shared/api/generated/models/ToolkitCredentialListResponse';
-export type { ToolkitCredentialBindRequest } from '@/shared/api/generated/models/ToolkitCredentialBindRequest';
-export type { ToolkitAgentResponse } from '@/shared/api/generated/models/ToolkitAgentResponse';
-export type { ToolkitAgentListResponse } from '@/shared/api/generated/models/ToolkitAgentListResponse';
 export type { PermissionRuleReadSchema } from '@/shared/api/generated/models/PermissionRuleReadSchema';
-// The codegen retag split the single `PermissionRuleSchema` model into two
-// tag-namespaced variants (access-requests vs toolkits). Toolkit permission
-// rules use the toolkit variant; re-export it under the stable public name so
-// downstream consumers stay unchanged.
-export type { jentic_one__control__web__schemas__toolkits__PermissionRuleSchema as PermissionRuleSchema } from '@/shared/api/generated/models/jentic_one__control__web__schemas__toolkits__PermissionRuleSchema';
-export { jentic_one__control__web__schemas__toolkits__PermissionRuleSchema as PermissionRuleSchemaNS } from '@/shared/api/generated/models/jentic_one__control__web__schemas__toolkits__PermissionRuleSchema';
+// The toolkit-era codegen retag namespaced `PermissionRuleSchema` per web
+// module; with the access-request schemas deleted (theme 7) the name no
+// longer collides, so the generator emits it un-namespaced. Re-exported under
+// the same stable public name so downstream consumers stay unchanged.
+export type { PermissionRuleSchema } from '@/shared/api/generated/models/PermissionRuleSchema';
+export { PermissionRuleSchema as PermissionRuleSchemaNS } from '@/shared/api/generated/models/PermissionRuleSchema';
 export type { PermissionRuleListResponse } from '@/shared/api/generated/models/PermissionRuleListResponse';
 export type { PermissionsPatchRequest } from '@/shared/api/generated/models/PermissionsPatchRequest';
 export type { PermissionTestRequest } from '@/shared/api/generated/models/PermissionTestRequest';
 export type { PermissionTestResponse } from '@/shared/api/generated/models/PermissionTestResponse';
-export type { BindingWarningSchema } from '@/shared/api/generated/models/BindingWarningSchema';
-export type { ToolkitBindingResponse } from '@/shared/api/generated/models/ToolkitBindingResponse';
-export type { ToolkitBindingListResponse } from '@/shared/api/generated/models/ToolkitBindingListResponse';
-export type { ToolkitBindRequest } from '@/shared/api/generated/models/ToolkitBindRequest';
-// Audit (read-only, toolkit-scoped lens on the shared /audit endpoint via AuditService).
+// Audit (read-only lens on the shared /audit endpoint via AuditService).
 export type { AuditResponse } from '@/shared/api/generated/models/AuditResponse';
 export type { AuditListResponse } from '@/shared/api/generated/models/AuditListResponse';
 export { AuditTargetType } from '@/shared/api/generated/models/AuditTargetType';
@@ -78,9 +52,9 @@ export type { ChangePasswordRequest } from '@/shared/api/generated/models/Change
 export type { RedeemInviteRequest } from '@/shared/api/generated/models/RedeemInviteRequest';
 export type { HealthResponse } from '@/shared/api/generated/models/HealthResponse';
 
-// Agents / service-accounts / dynamic registration (ui-agents module).
-// Note: AgentsService + ToolkitBinding* models are already exported above by
-// the toolkits module; agents reuses them and does not re-export to avoid dupes.
+// Agents / dynamic registration (ui-agents module).
+// Note: AgentsService is already exported above; agents reuses it and does
+// not re-export to avoid dupes.
 export type { AgentCreateRequest } from '@/shared/api/generated/models/AgentCreateRequest';
 export type { AgentResponse } from '@/shared/api/generated/models/AgentResponse';
 export type { ApiKeyResponse } from '@/shared/api/generated/models/ApiKeyResponse';
@@ -88,17 +62,15 @@ export type { ApiKeyInfoResponse } from '@/shared/api/generated/models/ApiKeyInf
 export type { ApiKeyHistoryResponse } from '@/shared/api/generated/models/ApiKeyHistoryResponse';
 export type { ApiKeyHistoryEntryResponse } from '@/shared/api/generated/models/ApiKeyHistoryEntryResponse';
 export type { AgentListResponse } from '@/shared/api/generated/models/AgentListResponse';
-export type { ServiceAccountResponse } from '@/shared/api/generated/models/ServiceAccountResponse';
-export type { ServiceAccountListResponse } from '@/shared/api/generated/models/ServiceAccountListResponse';
-export type { ServiceAccountCreateRequest } from '@/shared/api/generated/models/ServiceAccountCreateRequest';
 export type { RegisterRequest } from '@/shared/api/generated/models/RegisterRequest';
 export type { RegisterResponse } from '@/shared/api/generated/models/RegisterResponse';
-export type { jentic_one__auth__web__schemas__agents__DenyRequest as AgentDenyRequest } from '@/shared/api/generated/models/jentic_one__auth__web__schemas__agents__DenyRequest';
-export type { jentic_one__auth__web__schemas__service_accounts__DenyRequest as ServiceAccountDenyRequest } from '@/shared/api/generated/models/jentic_one__auth__web__schemas__service_accounts__DenyRequest';
+// The DenyRequest name no longer collides (the SA router is gone), so the
+// generator emits it un-namespaced; re-exported under the stable public name.
+export type { DenyRequest as AgentDenyRequest } from '@/shared/api/generated/models/DenyRequest';
 
 // Agent Rail — the persistent live-event rail consumes the REAL platform event
-// feed (`/events` + `/events/stream` SSE) via `EventsService` (formerly the
-// coarse `AdminService`). These models are already generated; re-exported here
+// feed (`/events` + `/events/stream` SSE) via `EventsService`. These models
+// are already generated; re-exported here
 // (append-only) so the rail's data layer in `shared/lib/agentStream` can stay
 // behind the facade like every other module.
 export type { EventResponse } from '@/shared/api/generated/models/EventResponse';
@@ -127,14 +99,13 @@ export type { ApiResponse } from '@/shared/api/generated/models/ApiResponse';
 export type { ApiReferenceResponse } from '@/shared/api/generated/models/ApiReferenceResponse';
 export type { ApiLinksResponse } from '@/shared/api/generated/models/ApiLinksResponse';
 
-// [ui-dashboard] Execution models the overview renders. The Event* models
-// (EventResponse/EventListResponse/EventSeverity) the Dashboard also needs are
-// already exported above by the Agent Rail block; re-exporting them here would
-// be a duplicate, so Dashboard reuses those and only adds the Execution models.
+// Execution models (Monitor's calls view, agent activity). The Event* models
+// (EventResponse/EventListResponse/EventSeverity) are already exported above by
+// the Agent Rail block, so only the Execution models are added here.
 export type { ExecutionResponse } from '@/shared/api/generated/models/ExecutionResponse';
 export type { ExecutionListResponse } from '@/shared/api/generated/models/ExecutionListResponse';
 
-// Credentials module (feat/ui-credentials).
+// Credentials module.
 export { CredentialsService } from '@/shared/api/generated/services/CredentialsService';
 export { CredentialType } from '@/shared/api/generated/models/CredentialType';
 export { CredentialLocation } from '@/shared/api/generated/models/CredentialLocation';
@@ -152,25 +123,20 @@ export type { APIReference } from '@/shared/api/generated/models/APIReference';
 export type { APIReferenceRequest } from '@/shared/api/generated/models/APIReferenceRequest';
 export type { RuntimeConfig } from '@/shared/api/generated/models/RuntimeConfig';
 export type { ConnectRequestBody } from '@/shared/api/generated/models/ConnectRequestBody';
-export type { ConnectChallengeResponse } from '@/shared/api/generated/models/ConnectChallengeResponse';
+// The `POST /credentials/{id}/connect` response is a Pydantic discriminated
+// union (authorization_code | device_code); the codegen collapses it to `any`.
+// The hand-authored `ConnectChallengeResponse` in `shared/credentials/api/types.ts`
+// is the source of truth for the wire shape — import from there.
 export type { CredentialCreateResponse } from '@/shared/api/generated/models/CredentialCreateResponse';
 export type { CredentialListResponse } from '@/shared/api/generated/models/CredentialListResponse';
 export type { CredentialRedactedResponse } from '@/shared/api/generated/models/CredentialRedactedResponse';
 export type { ProviderDiscoveryResponse } from '@/shared/api/generated/models/ProviderDiscoveryResponse';
 export type { ProviderDiscoveryEntryResponse } from '@/shared/api/generated/models/ProviderDiscoveryEntryResponse';
 
-// Agent Rail — access-request decisions (`POST /access-requests/{id}:decide`).
-// The access-request router (tag "Access Requests") is now exposed as a
-// generated `AccessRequestsService` after the codegen retag. The rail's
-// access-request repository (`shared/lib/accessRequests`) still issues its calls
-// through the low-level request primitive the generated services use, kept
-// behind the facade so the Bearer-JWT `OpenAPI` config still applies; switching
-// it to `AccessRequestsService` is a safe follow-up. Append-only, like the rest.
-export { AccessRequestsService } from '@/shared/api/generated/services/AccessRequestsService';
 export { OpenAPI } from '@/shared/api/generated/core/OpenAPI';
 export { request as apiRequest } from '@/shared/api/generated/core/request';
 
-// First-run setup (feat/no-credential-first-run). The one-time create-admin
+// First-run setup. The one-time create-admin
 // endpoint bootstraps the first operator account; CreateAdminRequest is its body.
 export type { CreateAdminRequest } from '@/shared/api/generated/models/CreateAdminRequest';
 // Shared react-query key for the first-run health/setup probe (SetupGate reads
@@ -183,18 +149,15 @@ export { HEALTH_QUERY_KEY } from '@/shared/api/health';
 // sibling's cache through this instead of a hand-synced raw key literal.
 export { sharedQueryKeys } from '@/shared/api/queryKeys';
 
-// Actor scopes (#615). The platform permission catalogue + the agent/service-
-// account scope grant endpoints. `AgentsService`/`ServiceAccountsService` are
-// already exported above (toolkits/agents blocks); these add the permission
-// catalogue service and the scope request/response models the agents module
-// wires into the Scopes card. Append-only.
+// Actor scopes (#615). The platform permission catalogue + the agent scope
+// grant endpoints. `AgentsService` is already exported above (agents block); these add the permission catalogue
+// service and the scope request/response models the agents module wires into
+// the Scopes card. Append-only.
 export { PermissionsService } from '@/shared/api/generated/services/PermissionsService';
 export type { PermissionResponse } from '@/shared/api/generated/models/PermissionResponse';
 export type { PermissionListResponse } from '@/shared/api/generated/models/PermissionListResponse';
 export type { AgentScopesRequest } from '@/shared/api/generated/models/AgentScopesRequest';
 export type { AgentScopesResponse } from '@/shared/api/generated/models/AgentScopesResponse';
-export type { ServiceAccountScopesRequest } from '@/shared/api/generated/models/ServiceAccountScopesRequest';
-export type { ServiceAccountScopesResponse } from '@/shared/api/generated/models/ServiceAccountScopesResponse';
 
 // --- Monitor module (executions / jobs / events / audit) -------------------
 // Re-exported through the facade so the Monitor repository tier consumes typed
@@ -203,17 +166,15 @@ export type { ServiceAccountScopesResponse } from '@/shared/api/generated/models
 // AdminService into per-tag services: Monitor's tabs use ExecutionsService /
 // JobsService / EventsService / AuditService — all exported above.
 // Note: Execution*, Event*, and Audit* models are already exported above (by the
-// dashboard, agent-rail, and toolkits blocks respectively); Monitor reuses them.
+// execution, agent-rail, and agents blocks respectively); Monitor reuses them.
 // Only the Job models are not yet re-exported, so add them here (append-only).
 export type { JobResponse } from '@/shared/api/generated/models/JobResponse';
 export type { JobListResponse } from '@/shared/api/generated/models/JobListResponse';
 
 // Monitor Overview parity: the enriched usage-aggregation endpoint
-// (GET /monitoring/usage, `MonitoringService.getUsageStats`) added by
-// jentic-one-internal#561; it superseded the coarser #386 stats endpoint
-// (GET /monitoring/executions), whose models are no longer consumed by the UI.
-// Powers the full jentic-mini Overview port — bubble chart, per-row sparkline
-// trends, latency pills, and the api/toolkit/agent grouping toggle. `GroupBy`
+// (GET /monitoring/usage, `MonitoringService.getUsageStats`).
+// Powers the Monitor Overview — bubble chart, per-row sparkline
+// trends, latency pills, and the api/credential/agent grouping toggle. `GroupBy`
 // is exported as a *value* because callers pass the enum members as the
 // `group_by` query param.
 export { MonitoringService } from '@/shared/api/generated/services/MonitoringService';
@@ -227,7 +188,7 @@ export type { UsageTopRow } from '@/shared/api/generated/models/UsageTopRow';
 // `ActorsService.listActors`) hydrates the actor picker shared across the
 // Executions/Events/Audit tabs. Also consumed by the shared actor-directory
 // hook (`useActorDirectory`) + `<ActorLabel>` to resolve raw `actor_id` values
-// into human-readable names across access-request and agent surfaces.
+// into human-readable names across monitor and agent surfaces.
 // `ActorType` is exported as a *value* (not just a type) because `<ActorLabel>`
 // reads the enum members for its subtle type prefix. Append-only.
 export { ActorsService } from '@/shared/api/generated/services/ActorsService';
@@ -244,14 +205,14 @@ export {
 } from '@/shared/api/token-store';
 export type { ClearTokenReason } from '@/shared/api/token-store';
 
-// Overlays (feat/overlay-base-digest-dedupe, #937). The overlay lifecycle
+// Overlays (#937). The overlay lifecycle
 // service backing the workspace OverlaysSection + the "close the overlay-update
 // loop" flow (list/get/confirm/rollback/deprecate). List/get responses are
 // typed `any` on the generated client; the workspace module re-types them in
 // its own `api/types.ts` + `adapters.ts`. Append-only, like the rest.
 export { OverlaysService } from '@/shared/api/generated/services/OverlaysService';
 
-// System version (feat/app-release-update-banner). The running vs. latest-
+// System version. The running vs. latest-
 // available app release, read by the shell's update banner + UserMenu version
 // line via `useVersionInfo`. `SystemService` is already exported above; only the
 // response model is added here. Append-only.
@@ -259,7 +220,9 @@ export type { VersionResponse } from '@/shared/api/generated/models/VersionRespo
 
 // OAuth client management (third-party application registrations). Append-only.
 export { OAuthClientsService } from '@/shared/api/generated/services/OAuthClientsService';
-export type { OAuthClientCreateRequest } from '@/shared/api/generated/models/OAuthClientCreateRequest';
+// Value export (not type-only): the create request carries enum namespaces
+// (`consent_model`, `token_endpoint_auth_method`) the form sheet needs.
+export { OAuthClientCreateRequest } from '@/shared/api/generated/models/OAuthClientCreateRequest';
 export type { OAuthClientCreateResponse } from '@/shared/api/generated/models/OAuthClientCreateResponse';
 export type { OAuthClientResponse } from '@/shared/api/generated/models/OAuthClientResponse';
 export type { OAuthClientRotateSecretResponse } from '@/shared/api/generated/models/OAuthClientRotateSecretResponse';
@@ -278,3 +241,28 @@ export type { InstanceIdentityResponse } from '@/shared/api/generated/models/Ins
 // session bundle as password login. Append-only, like the rest.
 export { getIdpDescriptor, exchangeAuthCode } from '@/shared/api/idp';
 export type { IdpDescriptor } from '@/shared/api/idp';
+
+// OAuth consent grants. The per-agent
+// "Connected clients" listing lives on `AgentsService.listAgentOauthGrants`
+// (already exported above); the grant kill switch (`POST
+// /oauth-grants/{id}:revoke`) and the admin cross-view (`GET
+// /admin/oauth-grants`) live on `OAuthService`. Append-only, like the rest.
+export { OAuthService } from '@/shared/api/generated/services/OAuthService';
+export type { OAuthGrantResponse } from '@/shared/api/generated/models/OAuthGrantResponse';
+export type { OAuthGrantListResponse } from '@/shared/api/generated/models/OAuthGrantListResponse';
+// Admin cross-view rows (`GET /admin/oauth-grants`) — the per-client grants
+// panel in the OAuth-clients detail sheet. Append-only, like the rest.
+export type { OAuthGrantAdminResponse } from '@/shared/api/generated/models/OAuthGrantAdminResponse';
+export type { OAuthGrantAdminListResponse } from '@/shared/api/generated/models/OAuthGrantAdminListResponse';
+
+// Direct agent↔credential bindings (theme 5 phase 1). The agent-side surface
+// (list/bind/unbind/resume) lives on `AgentsService`; the credential-side
+// reverse lookup and per-binding rule list / replace / dry-run live on
+// `CredentialsService` (both services already exported above) — only the
+// request/response models are added here. Append-only, like the rest.
+export type { CredentialBindRequest } from '@/shared/api/generated/models/CredentialBindRequest';
+export type { CredentialBindingResponse } from '@/shared/api/generated/models/CredentialBindingResponse';
+export type { CredentialBindingListResponse } from '@/shared/api/generated/models/CredentialBindingListResponse';
+export type { CredentialAgentResponse } from '@/shared/api/generated/models/CredentialAgentResponse';
+export type { CredentialAgentListResponse } from '@/shared/api/generated/models/CredentialAgentListResponse';
+export type { ServedApiRef } from '@/shared/api/generated/models/ServedApiRef';

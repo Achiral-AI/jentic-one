@@ -1,7 +1,7 @@
 /**
  * ActorLabel — resolve an opaque `actor_id` to a human-readable name.
  *
- * Executions, audit entries, the events feed, and access requests carry a raw
+ * Executions, audit entries, and the events feed carry a raw
  * `actor_id` (a KSUID like `agnt_6a3d3c62…`). Drop this anywhere one of those
  * ids would otherwise be rendered: it looks the actor up in the cached actor
  * directory (`useActorDirectory`) and shows its name, falling back to the raw
@@ -9,15 +9,15 @@
  * unknown. The raw id is always available on hover via `title`.
  *
  * Dependency-light by design — one shared hook, no module coupling — so any
- * surface (monitor, dashboard, agents, toolkits, access-requests) can use it.
+ * surface (monitor, rail, agents) can use it.
  *
- * Directory scope is `user` / `agent` / `service_account` — those are the only
- * actor types `GET /actors` returns (the backend UNION excludes toolkits;
- * "Toolkits are not platform actors"). A toolkit CAN still appear as the
- * `actor_id` of an execution/audit/event record with `actor_type === "toolkit"`
- * (a `jntc_live_…` key authenticating "as the toolkit" on the broker path), so
- * we render those gracefully with a "Toolkit" prefix + the raw `tk_…` id rather
- * than trying — and failing — to resolve a name that the directory never holds.
+ * Directory scope is `user` / `agent` — the only actor types `GET /actors`
+ * returns (toolkits and service accounts are retired actor types). Either can
+ * still appear as the `actor_id` of a HISTORICAL execution/audit/event record
+ * (`actor_type === "toolkit"` / `"service_account"`; live `jntc_live_…` keys
+ * now resolve as successor agents, `sak_…` keys are refused), so we render those
+ * gracefully with a type prefix + the raw `tk_…` / `sva_…` id rather than
+ * trying — and failing — to resolve a name that the directory never holds.
  *
  * Some attribution fields carry non-id SENTINELS rather than a KSUID — e.g.
  * `registered_by: "self"` (an agent self-registered via DCR). Those render as a
@@ -26,16 +26,28 @@
  */
 import { ActorType } from '@/shared/api';
 import { useActorDirectory } from '@/shared/hooks';
+import {
+	RETIRED_SERVICE_ACCOUNT_ACTOR_TYPE,
+	RETIRED_SERVICE_ACCOUNT_SUFFIX,
+	SERVICE_ACCOUNT_SUCCESSOR_REGISTRAR,
+} from '@/shared/lib/retiredActors';
 
-/** Subtle, human-friendly noun for each actor type. */
-const ACTOR_TYPE_LABEL: Partial<Record<ActorType, string>> = {
+/** Subtle, human-friendly noun for each actor type. Keyed by the wire string
+ * (not the enum) because historical rows persist the retired
+ * `actor_type='toolkit'` / `'service_account'` — the enum no longer carries
+ * them, but read paths must still label them rather than round-trip them
+ * through `ActorType`. */
+const ACTOR_TYPE_LABEL: Record<string, string> = {
 	[ActorType.USER]: 'User',
 	[ActorType.AGENT]: 'Agent',
-	[ActorType.SERVICE_ACCOUNT]: 'Service account',
-	// Toolkits are never in the actor directory, but they surface as the actor of
-	// broker-path executions/audit entries — label them so the raw `tk_…` id reads
-	// as a toolkit rather than an unexplained token.
-	[ActorType.TOOLKIT]: 'Toolkit',
+	// Retired actor types: neither mints new identities any more (their keys
+	// resolve as successor agents), but persisted executions/audit entries
+	// still carry the strings — label them so the raw `tk_…` / `sva_…` id reads
+	// as what it was rather than an unexplained token. (An unresolved
+	// `service_account` id renders with a "(retired service account)" suffix
+	// instead — see below.)
+	service_account: 'Service account',
+	toolkit: 'Toolkit',
 };
 
 /**
@@ -46,12 +58,14 @@ const ACTOR_TYPE_LABEL: Partial<Record<ActorType, string>> = {
 const ACTOR_SENTINEL_LABEL: Record<string, string> = {
 	self: 'Self',
 	system: 'System',
+	// `registered_by` on every successor agent the theme-8 migration minted.
+	[SERVICE_ACCOUNT_SUCCESSOR_REGISTRAR]: 'Service-account migration',
 };
 
 /** A subtle type prefix for a known `actor_type`, or undefined otherwise. */
 function typePrefix(actorType: ActorType | string | null | undefined): string | undefined {
 	if (actorType == null) return undefined;
-	return ACTOR_TYPE_LABEL[actorType as ActorType];
+	return ACTOR_TYPE_LABEL[actorType];
 }
 
 export interface ActorLabelProps {
@@ -92,6 +106,18 @@ export function ActorLabel({ actorId, actorType, resolvedName, className }: Acto
 		return (
 			<span className={className} title={actorId}>
 				{sentinel}
+			</span>
+		);
+	}
+
+	// Historical service-account actor (theme 8): nothing left to resolve or
+	// link to, so show the raw `sva_…` id marked as retired. Matches the Monitor
+	// usage label and the enterprise admin console.
+	if (actorType === RETIRED_SERVICE_ACCOUNT_ACTOR_TYPE) {
+		return (
+			<span className={className} title={actorId}>
+				<span className="font-mono">{actorId}</span>{' '}
+				<span className="text-muted-foreground">{RETIRED_SERVICE_ACCOUNT_SUFFIX}</span>
 			</span>
 		);
 	}

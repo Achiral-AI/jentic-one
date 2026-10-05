@@ -8,8 +8,8 @@ persistence, cobra wiring) lives in
 **only** one that performs privileged host mutation, and this one produces the
 `*exec.Cmd` values and pure data it runs.
 
-Operator-facing guide: [`docs/local-agent.md`](../../../docs/local-agent.md).
-Security design: [`docs/security/local-agent/`](../../../docs/security/local-agent/README.md).
+Operator-facing guide: [`docs/guides/local-agent.md`](../../../docs/guides/local-agent.md).
+Security design: [`docs/security/same-host/`](../../../docs/security/same-host/README.md).
 
 ## Layering contract
 
@@ -33,6 +33,8 @@ Security design: [`docs/security/local-agent/`](../../../docs/security/local-age
 | ---- | ------------- |
 | `localagent.go` | `Descriptor`/`Registry` (known agents), account lifecycle commands, the traverse-walk + rwx-leaf ACL grant model, config/provider seeding + secret scrubbing, `Classify` path bans, sudoers install/remove, trusted-workspace discovery |
 | `confine.go` | Per-session confinement: prereq probing (`AgentUserPrereqs`), `SessionAccess` (single source of truth for what a session reaches), SBPL profile builder (macOS), `bwrap` argv builder (Linux), `ConfineLaunchCmd` |
+| `serviceaccount.go` | The MCP service-account profile (`_jentic-<runtime>`): account + 0700 home creation, root-side context export, the argv-pinned MCP sudoers rule, teardown |
+| `servicebinary.go` | The root-owned jentic copy (`/usr/local/libexec/jentic/jentic`) the MCP sudoers rule and sudo-shim entry pin: atomic root-side install/refresh, removal, staleness check |
 | `validate.go` | The injection choke point: `ValidateAgentUser`, `ValidateHomeDir`, `ValidateGrantPath` — every operator-editable value is constrained here before it reaches a shell, sudoers line, ACL entry, or SBPL profile |
 | `operators_test.go` | Registry ↔ `internal/skillgen` parity guardrail, descriptor well-formedness, adversarial scrub-path containment |
 

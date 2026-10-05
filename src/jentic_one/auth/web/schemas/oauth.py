@@ -28,33 +28,39 @@ class TokenResponse(BaseModel):
     id_token: str | None = Field(default=None, json_schema_extra=SENSITIVE)
     token_type: str = "bearer"
     expires_in: int
-
-
-class MintRequest(BaseModel):
-    """Ephemeral token minting request."""
-
-    scope: str
-    target_agent_id: str
-    ttl_seconds: int | None = Field(default=None, ge=1, le=3600)
-
-
-class MintResponse(BaseModel):
-    """Ephemeral token minting response."""
-
-    access_token: str = Field(json_schema_extra=SENSITIVE)
-    token_type: str = "bearer"
-    expires_in: int
+    scope: str | None = Field(
+        default=None,
+        description="Space-delimited effective scopes of the minted access token "
+        "(RFC 6749 §3.3), computed the way the platform's resolvers enforce them "
+        "(live scope grants ∩ client ceiling ∩ consent-grant scopes for agent "
+        "tokens), so the granted set may be narrower than requested and clients "
+        "must not assume they got what they asked for. Present on every "
+        "response whose token carries at least one scope; OMITTED (never the "
+        "ABNF-invalid empty string) only when the effective set is empty — reachable "
+        "solely on legs where the client requested no scopes at the token endpoint "
+        "(the token request carries no scope parameter, and consent fails closed on "
+        "an empty intersection).",
+    )
 
 
 class RevokeRequest(BaseModel):
-    """Revocation endpoint request (form body)."""
+    """Revocation endpoint request (RFC 7009) — JSON or form-encoded.
+
+    ``token`` is required either way. ``token_type_hint``
+    (``access_token``/``refresh_token``) is a lookup-order optimization only —
+    the server falls through both types regardless (RFC 7009 §2.1).
+    ``client_id`` belongs to the form-encoded public-client arm (G11): the
+    secret-less client's lineage binding; ignored on the bearer-authenticated
+    JSON arm, where the platform identity scopes the revocation instead.
+    """
 
     token: str = Field(json_schema_extra=SENSITIVE)
     token_type_hint: str | None = None
+    client_id: str | None = None
 
 
 class IntrospectRequest(BaseModel):
-    """Introspection endpoint request (form body)."""
+    """Introspection endpoint request (RFC 7662) — JSON or form-encoded."""
 
     token: str = Field(json_schema_extra=SENSITIVE)
     token_type_hint: str | None = None

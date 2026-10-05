@@ -56,8 +56,10 @@ type Config struct {
 	// attached verbatim (file-less / bring-your-own-token mode).
 	InjectedBearerToken string
 
-	// HTTPClient overrides the transport used by BOTH planes. Optional; a nil value
-	// uses the generated clients' default. Supply one to inject timeouts, a custom
+	// HTTPClient overrides the transport used by BOTH planes AND the RFC 7523
+	// token exchange (the mint inherits it via credentials() — #1205). Optional;
+	// a nil value uses the generated clients' default and the auth package's
+	// default exchange client. Supply one to inject timeouts, a custom
 	// CA pool (env ca_cert), or test doubles.
 	HTTPClient *http.Client
 
@@ -74,6 +76,12 @@ func (c Config) credentials() auth.Credentials {
 		IdentityName:        c.IdentityName,
 		EnvironmentName:     c.EnvironmentName,
 		InjectedBearerToken: c.InjectedBearerToken,
+		// The caller's base client rides into the RFC 7523 token exchange, so a
+		// mint honors the same custom CA pool / attribution transport as every
+		// other call on this config (#1205). Deliberately the BASE client, not
+		// the retry-wrapped one httpClient() builds: the mint is what the retry
+		// policy's 401 arm invokes, so wrapping it in that policy could recurse.
+		HTTPClient: c.HTTPClient,
 	}
 }
 
@@ -156,7 +164,37 @@ func (c Config) httpClient() *http.Client {
 	}
 	wrapped := *hc
 	wrapped.Transport = newRetryTransport(hc.Transport, c.credentials())
+	wrapped.CheckRedirect = sameOriginRedirects(hc.CheckRedirect)
 	return &wrapped
+}
+
+// maxRedirects mirrors net/http's default redirect cap, which a custom
+// CheckRedirect replaces.
+const maxRedirects = 10
+
+// sameOriginRedirects is the redirect policy for the SDK's authenticated
+// clients: a redirect is followed only while it stays on the origin (scheme,
+// host, port) of the original request. A redirect anywhere else is not
+// followed — the 3xx is returned to the caller as-is — so neither the
+// caller's Authorization header (which net/http keeps for subdomains) nor a
+// re-exchanged bearer from the retry policy's 401 arm can reach another
+// origin. A caller-supplied policy still runs for the redirects we allow.
+func sameOriginRedirects(next func(*http.Request, []*http.Request) error) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) == 0 {
+			return nil
+		}
+		if !auth.SameOrigin(via[0].URL, req.URL) {
+			return http.ErrUseLastResponse
+		}
+		if next != nil {
+			return next(req, via)
+		}
+		if len(via) >= maxRedirects {
+			return fmt.Errorf("stopped after %d redirects", maxRedirects)
+		}
+		return nil
+	}
 }
 
 // NewControl builds the strictly-typed control-plane client, authenticated for the
@@ -277,6 +315,9 @@ func BrokerTransport(c Config) *http.Client {
 	}
 	wrapped := *hc
 	wrapped.Transport = newRetryTransport(hc.Transport, auth.Credentials{})
+	// execute's own bearer rides this client: never carry it off the broker's
+	// origin on a redirect.
+	wrapped.CheckRedirect = sameOriginRedirects(hc.CheckRedirect)
 	// Force CanReExchange=false without a real credential: execute owns its auth.
 	wrapped.Transport.(*retryTransport).reExchange = false
 	return &wrapped

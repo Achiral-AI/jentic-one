@@ -13,6 +13,7 @@
  *  - the native API reference renders an operation with its scope panel,
  *    enriched from the reference payload (the join the portal exists to show);
  *  - the Broker reference renders as its own section from its own spec;
+ *  - the Broker base URL is the one `/instance` advertises, else the spec's own;
  *  - a missing reference endpoint degrades to a graceful, retryable notice
  *    instead of a blank route;
  *  - no critical/serious a11y violations on the assembled page.
@@ -24,6 +25,7 @@ import {
 	renderWithProviders,
 	screen,
 	within,
+	waitFor,
 	checkA11y,
 	createErrorHandler,
 } from '@/__tests__/test-utils';
@@ -145,7 +147,15 @@ function seedDocsHandlers(overrides: { reference?: unknown } = {}) {
 		),
 		// Resolved relative to document.baseURI in the client; match by suffix.
 		http.get('*/cli-reference.json', () => HttpResponse.json(CLI)),
-		http.get('*/broker-openapi.json', () => HttpResponse.json(BROKER_SPEC)),
+		// Delayed on purpose: the Broker spec is a query independent of the main
+		// docs query, so its reference mounts strictly after the hero appears.
+		// The delay pins that ordering so the Broker test exercises the real
+		// "spec still loading when the page is already up" path every run
+		// instead of only under CI load (where it flaked before).
+		http.get('*/broker-openapi.json', async () => {
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			return HttpResponse.json(BROKER_SPEC);
+		}),
 	);
 }
 
@@ -191,8 +201,15 @@ describe('DocsPage', () => {
 		expect(screen.getByRole('heading', { name: 'Broker API' })).toBeInTheDocument();
 
 		// Its operation is lazily mounted under a namespaced anchor so it never
-		// collides with the control-plane reference; scroll it into view to mount.
+		// collides with the control-plane reference. The Broker spec resolves on
+		// its own query, strictly after the hero (the handler above delays it),
+		// so wait for the anchor placeholder to exist before scrolling — a
+		// one-shot scroll against a not-yet-rendered anchor silently no-ops and
+		// the operation never mounts (the pre-fix CI flake on main).
 		const brokerOpId = `broker-${operationAnchorId('POST', '/{upstream_url}')}`;
+		await waitFor(() => {
+			expect(document.getElementById(brokerOpId)).not.toBeNull();
+		});
 		await act(async () => {
 			document.getElementById(brokerOpId)?.scrollIntoView();
 		});
@@ -203,6 +220,34 @@ describe('DocsPage', () => {
 				{},
 				{ timeout: 3000 },
 			),
+		).toBeInTheDocument();
+	});
+
+	it('shows the broker URL advertised by /instance as the Broker base URL', async () => {
+		worker.use(
+			http.get('/instance', () =>
+				HttpResponse.json({
+					backend: 'local',
+					canonical_base_url: 'https://jentic.example.test',
+					host: 'jentic.example.test',
+					instance_id: 'inst_digest_1',
+					broker_url: 'https://broker.acme.test',
+				}),
+			),
+		);
+		renderWithProviders(<DocsPage />);
+
+		expect(
+			await screen.findByText('https://broker.acme.test', {}, { timeout: 3000 }),
+		).toBeInTheDocument();
+		expect(screen.queryByText('https://broker.example.com')).not.toBeInTheDocument();
+	});
+
+	it("keeps the Broker spec's own servers when /instance withholds a broker URL", async () => {
+		renderWithProviders(<DocsPage />);
+
+		expect(
+			await screen.findByText('https://broker.example.com', {}, { timeout: 3000 }),
 		).toBeInTheDocument();
 	});
 

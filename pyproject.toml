@@ -1,6 +1,6 @@
 [project]
 name = "jentic-one"
-version = "0.37.4"
+version = "0.41.0"
 description = "Jentic One"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -33,6 +33,8 @@ dependencies = [
     "h2>=4.4.1",
     "opentelemetry-instrumentation-httpx>=0.44b0",
     "python-multipart>=0.0.32",
+    "mcp>=2.1.1",
+    "publicsuffixlist>=1.0.2",
 ]
 
 [project.optional-dependencies]
@@ -167,6 +169,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "structlog.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "publicsuffixlist.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

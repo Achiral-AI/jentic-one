@@ -42,10 +42,31 @@ func ParseMethodPath(target string) (method, path string) {
 	m := strings.ToUpper(target[:idx])
 	switch m {
 	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch,
-		http.MethodDelete, http.MethodHead, http.MethodOptions:
+		http.MethodDelete, http.MethodHead, http.MethodOptions, http.MethodTrace:
 		return m, target[idx+1:]
 	default:
 		return "", ""
+	}
+}
+
+// ensureExecutableMethod rejects a resolved method the broker's proxy route does
+// not serve. TRACE belongs to the OpenAPI method set the registry ingests, so it
+// is discoverable and `jentic inspect` reads its contract — but the broker must
+// never proxy it: TRACE echoes the request back, which would reflect the
+// credentials the broker injects into the response body. Fail here so the agent
+// gets a coded resolve error locally instead of an opaque 405 from the data plane.
+//
+// recovery is the next step to offer: reading the contract (`jentic inspect`)
+// only works for an inspectable target, so the broker-relative METHOD:/path form
+// points back at discovery instead.
+func ensureExecutableMethod(method, target, recovery string) error {
+	if method != http.MethodTrace {
+		return nil
+	}
+	return &ux.CodedError{
+		Code:       ux.CodeResolveFailed,
+		Msg:        fmt.Sprintf("operation %q is a TRACE operation, which cannot be executed", target),
+		Actionable: recovery,
 	}
 }
 
@@ -56,6 +77,9 @@ func ParseMethodPath(target string) (method, path string) {
 // coded RESOLVE_FAILED so the caller's exit taxonomy maps them to exit 2.
 func ResolveOperation(ctx context.Context, ins Inspector, target, revision string) (*Operation, error) {
 	if method, path := ParseMethodPath(target); method != "" {
+		if err := ensureExecutableMethod(method, target, `jentic search "<what you want to do>"`); err != nil {
+			return nil, err
+		}
 		return &Operation{Method: method, Path: path}, nil
 	}
 
@@ -91,7 +115,33 @@ func ResolveOperation(ctx context.Context, ins Inspector, target, revision strin
 	// execute_read GET/HEAD gate, BuildRequest, logging — assumes the
 	// canonical uppercase form.
 	op.Method = strings.ToUpper(op.Method)
+	if err := ensureExecutableMethod(op.Method, target, fmt.Sprintf("jentic inspect %q", target)); err != nil {
+		return nil, err
+	}
+	if err := ensureAbsoluteUpstream(op.URL, target); err != nil {
+		return nil, err
+	}
 	return &op, nil
+}
+
+// ensureAbsoluteUpstream rejects an inspected operation whose url is
+// host-relative (e.g. "/pets": its spec declares no servers, or only a relative
+// one). The broker proxies to an absolute upstream URL and its URL index holds
+// no host-less entries, so sending it would fail opaquely at the data plane.
+// Such an operation's contract is still readable (`jentic inspect`); only
+// executing it is refused, locally, as a coded RESOLVE_FAILED.
+func ensureAbsoluteUpstream(upstream, target string) error {
+	if strings.HasPrefix(upstream, "http://") || strings.HasPrefix(upstream, "https://") {
+		return nil
+	}
+	return &ux.CodedError{
+		Code: ux.CodeResolveFailed,
+		Msg: fmt.Sprintf(
+			"operation %q has no upstream host (url %q): its spec declares no absolute server, so it cannot be executed",
+			target, upstream,
+		),
+		Actionable: `jentic search "<what you want to do>"`,
+	}
 }
 
 // BuildRequest assembles the outbound broker request from a resolved
@@ -235,6 +285,17 @@ func DoWith(hc *http.Client, req *http.Request) (*ExecuteResult, error) {
 	if base.Timeout == 0 {
 		base.Timeout = 60 * time.Second
 	}
+	// #1207: never follow a redirect on the broker leg. The CLI never
+	// legitimately expects the broker to redirect it, and following one would
+	// let a compromised/MITM'd broker 302 this request — bearer, correlation
+	// and attribution headers attached — at an arbitrary (possibly internal /
+	// link-local) address, the same SSRF primitive the hosted-skills fetch
+	// closed in #1192. The 3xx surfaces as the final response and is mapped to
+	// a coded error below (unless it is a mirrored UPSTREAM response — the
+	// transparent-proxy contract). Set here, at the single send choke point,
+	// so every execute surface (cobra, MCP, embedders, the nil-client default)
+	// carries the posture regardless of how its base client was built.
+	base.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	httpClient := sdkclient.BrokerTransport(sdkclient.Config{HTTPClient: &base})
 	// G704 (SSRF) is intentional, not a finding: dialing a caller-chosen broker
 	// target IS this function's contract. The URL is guarded upstream —
@@ -269,12 +330,46 @@ func DoWith(hc *http.Client, req *http.Request) (*ExecuteResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
-	return &ExecuteResult{
+	res := &ExecuteResult{
 		Status:      resp.StatusCode,
 		Headers:     resp.Header,
 		Body:        body,
 		ExecutionID: resp.Header.Get("Jentic-Execution-Id"),
-	}, nil
+	}
+	// #1207: a redirect the BROKER itself answered (CheckRedirect
+	// above surfaced it as the final response) must be a coded error, never a
+	// confusing "HTTP 302" success/pass-through the exit taxonomy reads as a
+	// non-denial response. A redirect the broker merely MIRRORED from the
+	// upstream (Jentic-Error-Origin: upstream) is a successfully proxied
+	// response and passes through untouched — the broker is a transparent
+	// forward proxy and the upstream's 3xx is the caller's data. Only the
+	// Location-following statuses count; a 304 conditional-read answer is not
+	// a redirect and keeps flowing as a normal result.
+	if brokerRedirect(res) {
+		return nil, &ux.CodedError{
+			Code: ux.CodeTransportError,
+			Msg: fmt.Sprintf("broker answered an unexpected redirect (HTTP %d to %q); redirects are never followed on the broker leg",
+				res.Status, res.Headers.Get("Location")),
+			Actionable: "The broker must answer directly. Verify the environment's broker_url points at the actual broker " +
+				"(no redirecting proxy in front): `jentic env add <env> --broker-url https://<broker-host>:<port> --force`.",
+		}
+	}
+	return res, nil
+}
+
+// brokerRedirect reports whether res is a Location-following redirect
+// (301/302/303/307/308) the broker itself emitted, as opposed to one it
+// mirrored from the upstream (Jentic-Error-Origin: upstream). A missing
+// origin header is treated as broker, matching IsBrokerDenial's fail-closed
+// disambiguation.
+func brokerRedirect(res *ExecuteResult) bool {
+	switch res.Status {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return errorOrigin(res) != errorOriginUpstream
+	default:
+		return false
+	}
 }
 
 // Execute is the one-call UX-free core (ExecuteRequest → ExecuteResult):

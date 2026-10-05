@@ -2,6 +2,7 @@ package cmdcore
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"time"
 
@@ -26,11 +27,10 @@ const LongRunningAnnotation = "long-running"
 // construct the Audience -> ENFORCE FENCING -> inject Audience + ActiveState into
 // the context. It preserves the existing banner/nudge side effects.
 //
-// SCOPE (Phase 2): this enforces fencing and makes the Audience/ActiveState
-// available in the context; the shipped commands still render through the legacy
-// output path (the strangler-fig cutover to aud.Render is Phase 3). Resolution
-// failures are non-fatal for everything except an explicit fenced-in-agent-mode
-// block, so V1 behavior is preserved on un-migrated machines.
+// SCOPE: this enforces fencing and makes the Audience/ActiveState available in
+// the context. Resolution failures are non-fatal for everything except an
+// explicit fenced-in-agent-mode block, so machines with no XDG config still
+// work and config-creating commands stay bootstrap-safe.
 func installInterceptor(app *App, root *cobra.Command) {
 	// agentTimeout bounds a single control-plane call in non-interactive mode so a
 	// wedged server can't hang an agent forever (F3, review round-3 #7 /
@@ -52,15 +52,15 @@ func installInterceptor(app *App, root *cobra.Command) {
 	}
 
 	root.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
-		// Preserve the shipped banner + update nudge (previously PersistentPreRun).
+		// Preserve the shipped banner + update nudge.
 		app.banner(cmd)
 		app.maybeNudgeUpdate(cmd)
 
 		// 1. Resolve active state (SDK + legacy adapter). On failure, degrade to a
-		// default state rather than aborting — Phase 2 must not regress V1 for users
-		// with no XDG config, and config-creating commands are bootstrap-safe. The
-		// --context/--mode/--theme root flags land in Phase 3; the env fallbacks
-		// ($JENTIC_CONTEXT here, $JENTIC_MODE inside resolveMode) keep working when
+		// default state rather than aborting — users with no XDG config must not be
+		// blocked, and config-creating commands are bootstrap-safe. The
+		// --context/--mode/--theme root flags take precedence; the env fallbacks
+		// ($JENTIC_CONTEXT here, $JENTIC_MODE inside resolveMode) apply when
 		// the flags are unset.
 		contextOverride := flagValue(cmd, "context")
 		if contextOverride == "" {
@@ -86,12 +86,12 @@ func installInterceptor(app *App, root *cobra.Command) {
 			}
 		}
 
-		// 2. Resolve theme. STAGE 0 — mode gate: agent/service-account force
+		// 2. Resolve theme. STAGE 0 — mode gate: agent mode forces
 		// no-color, beating --theme/JENTIC_THEME/NO_COLOR/config so machine output is
 		// never corrupted by ANSI. Human falls through to the normal ladder.
 		var palette ux.Palette
 		var themeName string
-		if state.Mode == clictx.ModeAgent || state.Mode == clictx.ModeServiceAccount {
+		if state.Mode == clictx.ModeAgent {
 			palette, themeName = theme.Themes["no-color"], "no-color"
 		} else {
 			palette, themeName = theme.ResolveThemeWithName(flagValue(cmd, "theme"), state.ThemeName)
@@ -105,18 +105,28 @@ func installInterceptor(app *App, root *cobra.Command) {
 		switch state.Mode {
 		case clictx.ModeHuman:
 			audience = ux.NewHumanUX(palette, assumeYes)
-		case clictx.ModeAgent, clictx.ModeServiceAccount:
+		case clictx.ModeAgent:
 			audience = ux.NewAgentUX(assumeYes)
 		default:
 			audience = ux.NewAgentUX(assumeYes)
 		}
 
 		// 3.5. Diagnostics bootstrap (impl/3.2 §2d): install the mode-dependent
-		// slog default (text for human, JSON for agent/service-account), always to
-		// stderr and redacted. This is the ONLY slog.SetDefault call in the process,
-		// so every later log line — including the SDK's via the default logger —
-		// carries the mode-appropriate, secret-scrubbed handler.
+		// slog default (text for human, JSON for agent), always to stderr and
+		// redacted. This is the ONLY slog.SetDefault call in the process, so every
+		// later log line — including the SDK's via the default logger — carries
+		// the mode-appropriate, secret-scrubbed handler.
 		setupSlog(app, state.Mode, boolFlag(cmd, "verbose"))
+
+		// An unknown mode (typo, or the retired `service-account` alias — 14
+		// BC-12) already failed closed to AgentUX above; say so on stderr only,
+		// so stdout stays one JSON document (13 §1).
+		if state.Mode != clictx.ModeHuman && state.Mode != clictx.ModeAgent {
+			slog.Warn("unknown mode; running in agent mode",
+				"code", "UNKNOWN_MODE",
+				"mode", state.Mode,
+				"actionable_step", "use --mode agent|human or JENTIC_MODE=agent|human; for a persisted context, set mode in config.yaml")
+		}
 
 		// 4. FENCING (guardrail; the enforced boundary is server-side scope + OS
 		// isolation). Block a fenced management command in a fenced mode.
@@ -146,7 +156,7 @@ func installInterceptor(app *App, root *cobra.Command) {
 		ctx = theme.WithThemeName(ctx, themeName)
 
 		// Non-interactive modes get a wall-clock deadline (F3, review round-3 #7):
-		// an agent/service-account orchestrating jentic against an unresponsive
+		// an agent orchestrating jentic against an unresponsive
 		// Control Plane would otherwise hang forever (the shared control client
 		// leaves http.Client.Timeout zero, deferring to per-call contexts that
 		// today carry no deadline). Human mode stays undeadlined so interactive
@@ -154,7 +164,7 @@ func installInterceptor(app *App, root *cobra.Command) {
 		// above) are exempt: their lifetime is caller-owned and they bound their
 		// own per-call contexts. The cancel is released in PersistentPostRunE
 		// above.
-		if (state.Mode == clictx.ModeAgent || state.Mode == clictx.ModeServiceAccount) &&
+		if state.Mode == clictx.ModeAgent &&
 			cmd.Annotations[LongRunningAnnotation] != "true" {
 			//nolint:gosec // G118: the cancel is stored in cancelTimeout and invoked in the root PersistentPostRunE above (one invocation runs one command to completion); a leaked timer would in any case be reclaimed at process exit.
 			ctx, cancelTimeout = context.WithTimeout(ctx, agentTimeout)

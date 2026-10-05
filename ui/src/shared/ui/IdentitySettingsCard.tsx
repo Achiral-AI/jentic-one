@@ -10,7 +10,7 @@ import { Textarea } from '@/shared/ui/Textarea';
 
 /**
  * IdentitySettingsCard — the Settings tab's "General" card shared by the
- * detail consoles (toolkit, agent, service account): the immutable, copyable
+ * detail consoles (agent, …): the immutable, copyable
  * entity id plus the editable name/description form.
  *
  * One grammar everywhere:
@@ -24,13 +24,13 @@ import { Textarea } from '@/shared/ui/Textarea';
  *     clobber an in-progress draft, but navigating to a sibling entity must
  *     reseed.
  *
- * Consoles without an update endpoint (service accounts today) omit `onSave`
+ * Consoles without an update endpoint omit `onSave`
  * and pass `readOnlyNote` — the card renders the id row plus the explanation
  * instead of a dead form.
  */
 
 export interface IdentitySettingsCardProps {
-	/** Label for the immutable id row ("Agent ID", "Toolkit ID", "Account ID"). */
+	/** Label for the immutable id row ("Agent ID", "Account ID"). */
 	idLabel: string;
 	idValue: string;
 	/** The entity's current (saved) name. */
