@@ -1,6 +1,8 @@
 name: Publish
 
-# Publish the Achiral Jentic Mini image to GHCR.
+# Publish the Achiral Jentic One image to GHCR. One image serves both
+# processes: JENTIC__APPS picks the app surfaces or the broker at deploy time.
+# (Until 2026-10 this published only the broker stage as jentic-mini.)
 # Rewired to gate on upstream's unified "CI" workflow (ci.yml) via workflow_run,
 # since the legacy ci-backend.yml / ci-docker.yml reusable workflows were removed
 # upstream (chore(oss): remove legacy jentic-mini content). workflow_dispatch is
@@ -74,7 +76,7 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: |
-            ghcr.io/achiral-ai/jentic-mini
+            ghcr.io/achiral-ai/jentic-one
           tags: |
             type=raw,value=sha-${{ steps.version.outputs.sha }}
             type=raw,value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.is_release }}
@@ -87,7 +89,7 @@ jobs:
         with:
           context: .
           file: deploy/docker/app.multiarch.Dockerfile
-          target: broker
+          target: app
           push: true
           platforms: linux/amd64,linux/arm64
           provenance: false
