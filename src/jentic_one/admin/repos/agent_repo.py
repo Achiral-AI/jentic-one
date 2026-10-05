@@ -23,7 +23,7 @@ class AgentRepository:
         session: AsyncSession,
         *,
         name: str,
-        owner_id: str,
+        owner_id: str | None,
         registered_by: str,
         description: str | None = None,
         parent_agent_id: str | None = None,

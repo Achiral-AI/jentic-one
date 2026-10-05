@@ -16,6 +16,7 @@ from jentic_one.auth.web.deps import get_agent_service
 from jentic_one.auth.web.errors import service_error_handler
 from jentic_one.auth.web.routers import agents
 from jentic_one.shared.auth.identity import Identity
+from jentic_one.shared.models import ActorType
 from jentic_one.shared.web.deps import resolve_identity
 
 
@@ -108,3 +109,40 @@ def test_create_agent_requires_agents_write(readonly_client: TestClient) -> None
 def test_create_agent_description_optional(client: TestClient) -> None:
     resp = client.post("/agents", json={"name": "minimal-bot"})
     assert resp.status_code == 201
+
+
+def _agent_identity() -> Identity:
+    return Identity(
+        sub="agnt_control",
+        permissions=["agents:write", "agents:read", "org:admin"],
+        actor_type=ActorType.AGENT,
+        parent_actor_id="usr_owner",
+    )
+
+
+def test_agent_created_by_an_agent_is_owned_by_its_owner(mock_agent_svc: MagicMock) -> None:
+    # agents.owner_id references users, so an agent caller cannot own the new
+    # agent; its owner does, and the caller is recorded as the parent agent.
+    app = FastAPI()
+    app.include_router(agents.router)
+    app.add_exception_handler(AuthServiceError, service_error_handler)
+    app.dependency_overrides[resolve_identity] = _agent_identity
+    app.dependency_overrides[get_agent_service] = lambda: mock_agent_svc
+    app.state.ctx = MagicMock()
+
+    resp = TestClient(app).post("/agents", json={"name": "sub-bot"})
+
+    assert resp.status_code == 201
+    kwargs = mock_agent_svc.create.await_args.kwargs
+    assert kwargs["owner_id"] == "usr_owner"
+    assert kwargs["parent_agent_id"] == "agnt_control"
+
+
+def test_agent_created_by_a_user_has_no_parent_agent(
+    client: TestClient, mock_agent_svc: MagicMock
+) -> None:
+    client.post("/agents", json={"name": "my-bot"})
+
+    kwargs = mock_agent_svc.create.await_args.kwargs
+    assert kwargs["owner_id"] == "usr_admin"
+    assert kwargs["parent_agent_id"] is None

@@ -63,9 +63,13 @@ async def create_agent(
     agent_svc: AgentService = Depends(get_agent_service),
 ) -> AgentResponse:
     """Create a new agent manually."""
+    # agents.owner_id references users: an agent caller's own owner owns the
+    # new agent, and the caller is recorded as its parent agent.
+    by_agent = identity.actor_type is ActorType.AGENT
     view = await agent_svc.create(
         AgentCreatePayload(name=body.name, description=body.description, scopes=body.scopes),
-        owner_id=identity.sub,
+        owner_id=identity.parent_actor_id if by_agent else identity.sub,
+        parent_agent_id=identity.sub if by_agent else None,
         identity=identity,
     )
     return _agent_response(view)

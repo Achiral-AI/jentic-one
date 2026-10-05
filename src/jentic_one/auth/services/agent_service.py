@@ -80,9 +80,10 @@ class AgentService:
         self,
         payload: AgentCreatePayload,
         *,
-        owner_id: str,
+        owner_id: str | None,
         identity: Identity,
         status: ActorStatus = ActorStatus.ACTIVE,
+        parent_agent_id: str | None = None,
     ) -> AgentView:
         """Create an agent for ``owner_id``; default posture is immediately ACTIVE.
 
@@ -113,6 +114,7 @@ class AgentService:
                 owner_id=owner_id,
                 registered_by=identity.sub,
                 description=payload.description,
+                parent_agent_id=parent_agent_id,
                 created_by=identity.sub,
                 status=status,
             )
