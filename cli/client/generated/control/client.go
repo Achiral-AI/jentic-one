@@ -650,16 +650,52 @@ func (e OAuthClientCreateRequestConsentModel) Valid() bool {
 
 // Defines values for OAuthClientCreateRequestTokenEndpointAuthMethod.
 const (
-	ClientSecretBasic OAuthClientCreateRequestTokenEndpointAuthMethod = "client_secret_basic"
-	None              OAuthClientCreateRequestTokenEndpointAuthMethod = "none"
+	OAuthClientCreateRequestTokenEndpointAuthMethodClientSecretBasic OAuthClientCreateRequestTokenEndpointAuthMethod = "client_secret_basic"
+	OAuthClientCreateRequestTokenEndpointAuthMethodNone              OAuthClientCreateRequestTokenEndpointAuthMethod = "none"
 )
 
 // Valid indicates whether the value is a known member of the OAuthClientCreateRequestTokenEndpointAuthMethod enum.
 func (e OAuthClientCreateRequestTokenEndpointAuthMethod) Valid() bool {
 	switch e {
-	case ClientSecretBasic:
+	case OAuthClientCreateRequestTokenEndpointAuthMethodClientSecretBasic:
 		return true
-	case None:
+	case OAuthClientCreateRequestTokenEndpointAuthMethodNone:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for OAuthClientOptionsTokenAuthMethod.
+const (
+	OAuthClientOptionsTokenAuthMethodClientSecretBasic OAuthClientOptionsTokenAuthMethod = "client_secret_basic"
+	OAuthClientOptionsTokenAuthMethodClientSecretPost  OAuthClientOptionsTokenAuthMethod = "client_secret_post"
+)
+
+// Valid indicates whether the value is a known member of the OAuthClientOptionsTokenAuthMethod enum.
+func (e OAuthClientOptionsTokenAuthMethod) Valid() bool {
+	switch e {
+	case OAuthClientOptionsTokenAuthMethodClientSecretBasic:
+		return true
+	case OAuthClientOptionsTokenAuthMethodClientSecretPost:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for OAuthClientOptionsTokenRequestEncoding.
+const (
+	Form OAuthClientOptionsTokenRequestEncoding = "form"
+	Json OAuthClientOptionsTokenRequestEncoding = "json"
+)
+
+// Valid indicates whether the value is a known member of the OAuthClientOptionsTokenRequestEncoding enum.
+func (e OAuthClientOptionsTokenRequestEncoding) Valid() bool {
+	switch e {
+	case Form:
+		return true
+	case Json:
 		return true
 	default:
 		return false
@@ -1979,6 +2015,7 @@ type OAuth2CreateRequest struct {
 	Api             APIReferenceRequest     `json:"api"`
 	AuthorizeUrl    *string                 `json:"authorize_url,omitempty"`
 	ClientId        *string                 `json:"client_id,omitempty"`
+	ClientOptions   *OAuthClientOptions     `json:"client_options,omitempty"`
 	ClientSecret    *string                 `json:"client_secret,omitempty"`
 	GrantType       *string                 `json:"grant_type,omitempty"`
 	Name            string                  `json:"name"`
@@ -2130,6 +2167,22 @@ type OAuthClientDenyRequest struct {
 type OAuthClientListResponse struct {
 	Data []OAuthClientResponse `json:"data"`
 }
+
+// OAuthClientOptions How to talk to one vendor's authorize and token endpoints.
+type OAuthClientOptions struct {
+	AuthorizeParams      *map[string]string                      `json:"authorize_params,omitempty"`
+	KeepTokenFields      *map[string]string                      `json:"keep_token_fields,omitempty"`
+	Pkce                 *bool                                   `json:"pkce,omitempty"`
+	RedirectUri          *string                                 `json:"redirect_uri,omitempty"`
+	TokenAuthMethod      *OAuthClientOptionsTokenAuthMethod      `json:"token_auth_method,omitempty"`
+	TokenRequestEncoding *OAuthClientOptionsTokenRequestEncoding `json:"token_request_encoding,omitempty"`
+}
+
+// OAuthClientOptionsTokenAuthMethod defines model for OAuthClientOptions.TokenAuthMethod.
+type OAuthClientOptionsTokenAuthMethod string
+
+// OAuthClientOptionsTokenRequestEncoding defines model for OAuthClientOptions.TokenRequestEncoding.
+type OAuthClientOptionsTokenRequestEncoding string
 
 // OAuthClientRegistrationRequest POST /oauth-clients request body (RFC 7591 client metadata subset).
 type OAuthClientRegistrationRequest struct {
