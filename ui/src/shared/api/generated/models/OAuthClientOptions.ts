@@ -6,6 +6,7 @@
  * How to talk to one vendor's authorize and token endpoints.
  */
 export type OAuthClientOptions = {
+    authorize_params?: Record<string, string>;
     keep_token_fields?: Record<string, string>;
     pkce?: boolean;
     redirect_uri?: (string | null);

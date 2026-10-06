@@ -138,6 +138,9 @@ class DirectOAuth2Provider(OAuth2Provider):
         # operator-only — misconfiguration is on the configurer.
         # Don't do it unless you really know what you're doing.
         params.update(self._authorize_extra_params)
+        # The credential's own vendor parameters come last; they cannot name
+        # the protocol parameters (OAuthClientOptions refuses those).
+        params.update(options.authorize_params)
 
         authorize_url = f"{occ.authorize_url}?{urlencode(params)}"
         return AuthCodeChallenge(authorize_url=authorize_url, state=signed_state)

@@ -5140,6 +5140,13 @@
         "additionalProperties": false,
         "description": "How to talk to one vendor's authorize and token endpoints.",
         "properties": {
+          "authorize_params": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Authorize Params",
+            "type": "object"
+          },
           "keep_token_fields": {
             "additionalProperties": {
               "type": "string"

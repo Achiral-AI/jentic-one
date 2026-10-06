@@ -18,6 +18,17 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 _MAX_KEPT_FIELDS = 20
 _SERVER_VARIABLE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 _FIELD_PATH = re.compile(r"^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+){0,4}$")
+# Set by the provider from the credential and the signed state.
+_PROTOCOL_PARAMS = frozenset(
+    {
+        "response_type",
+        "client_id",
+        "redirect_uri",
+        "state",
+        "code_challenge",
+        "code_challenge_method",
+    }
+)
 
 
 class OAuthClientOptions(BaseModel):
@@ -36,6 +47,9 @@ class OAuthClientOptions(BaseModel):
     # Non-secret token-response fields to keep as server variables:
     # dotted response path -> server variable name.
     keep_token_fields: dict[str, str] = Field(default_factory=dict)
+    # Extra authorize-URL parameters for this vendor (Atlassian's
+    # ``audience``); they win over the provider's authorize_extra_params.
+    authorize_params: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("redirect_uri")
     @classmethod
@@ -57,6 +71,14 @@ class OAuthClientOptions(BaseModel):
                 raise ValueError(f"keep_token_fields path {path!r} is not a dotted field path")
             if not _SERVER_VARIABLE_NAME.match(name):
                 raise ValueError(f"keep_token_fields name {name!r} is not a server variable name")
+        return value
+
+    @field_validator("authorize_params")
+    @classmethod
+    def _not_protocol_params(cls, value: dict[str, str]) -> dict[str, str]:
+        reserved = sorted(_PROTOCOL_PARAMS & value.keys())
+        if reserved:
+            raise ValueError(f"authorize_params may not set {', '.join(reserved)}")
         return value
 
     @classmethod

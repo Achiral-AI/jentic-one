@@ -998,3 +998,24 @@ def test_client_options_reject_unknown_values() -> None:
         OAuthClientOptions.model_validate({"token_request_encoding": "xml"})
     with pytest.raises(ValueError):
         OAuthClientOptions(redirect_uri="not a url")
+
+
+@pytest.mark.asyncio()
+async def test_a_credentials_authorize_params_are_added_after_the_provider_defaults() -> None:
+    params = _parse_authorize_url_params(
+        await _begin_with(
+            {"authorize_params": {"audience": "api.atlassian.com", "prompt": "login"}}
+        )
+    )
+
+    assert params["audience"] == ["api.atlassian.com"]
+    # The credential's value wins over the provider default (prompt=consent).
+    assert params["prompt"] == ["login"]
+    assert params["access_type"] == ["offline"]
+
+
+def test_authorize_params_cannot_replace_the_protocol_parameters() -> None:
+    with pytest.raises(ValueError):
+        OAuthClientOptions.model_validate(
+            {"authorize_params": {"redirect_uri": "https://evil.example"}}
+        )
