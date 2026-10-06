@@ -19,6 +19,7 @@ from jentic_one.broker.core.headers import (
 # Restore the scheme's doubled slash that Starlette collapses (``https:/x`` →
 # ``https://x``) — applied to the *raw* path only.
 _SCHEME_RE = re.compile(r"^(https?):/([^/])")
+_ENCODED_BRACE_RE = re.compile(r"%7([BbDd])")
 
 # Response headers that describe the *encoded* upstream body. httpx decompresses
 # the body before we see it, so these no longer match ``RunnerResult.body`` and
@@ -44,6 +45,13 @@ def reconstruct_upstream_url(scope: Mapping[str, Any]) -> str:
     url = _SCHEME_RE.sub(r"\1://\2", raw_path)
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
+    # HTTP clients percent-encode ``{``/``}``, but a templated server host
+    # (``{domain}.my.salesforce.com``) must reach discovery literally. Braces
+    # are never valid in a hostname, so decoding them in the host alone is safe.
+    scheme, rest = url.split("://", 1)
+    host, sep, path = rest.partition("/")
+    host = _ENCODED_BRACE_RE.sub(lambda m: "{" if m.group(1) in "Bb" else "}", host)
+    url = f"{scheme}://{host}{sep}{path}"
     if query_string:
         url = f"{url}?{query_string}"
     return url

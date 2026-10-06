@@ -42,3 +42,17 @@ def test_encoded_slash_survives() -> None:
 def test_encoded_question_mark_survives_in_path() -> None:
     url = reconstruct_upstream_url(_scope("/https://x/a%3Fb"))
     assert "%3F" in url
+
+
+def test_encoded_braces_in_host_are_decoded() -> None:
+    # HTTP clients percent-encode ``{``/``}``; a templated host must still
+    # reach discovery as the literal ``{domain}`` the URL index stores.
+    url = reconstruct_upstream_url(
+        _scope("/https://%7Bdomain%7D.my.salesforce.com/services/data/v59.0/query", "q=%7Bx%7D")
+    )
+    assert url == "https://{domain}.my.salesforce.com/services/data/v59.0/query?q=%7Bx%7D"
+
+
+def test_encoded_braces_in_path_survive() -> None:
+    url = reconstruct_upstream_url(_scope("/https://x/a%7Bb%7D"))
+    assert url == "https://x/a%7Bb%7D"
