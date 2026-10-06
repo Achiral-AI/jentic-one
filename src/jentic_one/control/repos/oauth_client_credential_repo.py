@@ -20,6 +20,7 @@ class OAuthClientCredentialRepository:
         encrypted_client_secret: str,
         authorize_url: str | None = None,
         scope: str | None = None,
+        client_options: dict[str, object] | None = None,
         created_by: str,
     ) -> OAuthClientCredential:
         row = OAuthClientCredential(
@@ -29,6 +30,7 @@ class OAuthClientCredentialRepository:
             encrypted_client_secret=encrypted_client_secret,
             authorize_url=authorize_url,
             scope=scope,
+            client_options=client_options,
             created_by=created_by,
         )
         session.add(row)

@@ -185,6 +185,7 @@ async def create_credential(
         client_id=getattr(body, "client_id", None),
         client_secret=getattr(body, "client_secret", None),
         scopes=getattr(body, "scopes", None),
+        client_options=getattr(body, "client_options", None),
         access_key_id=getattr(body, "access_key_id", None),
         secret_access_key=getattr(body, "secret_access_key", None),
         session_token=getattr(body, "session_token", None),

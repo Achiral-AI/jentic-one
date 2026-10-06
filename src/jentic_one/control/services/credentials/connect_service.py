@@ -152,6 +152,12 @@ class ConnectService:
 
                 if result.provider_account_ref is not None:
                     credential.provider_account_ref = result.provider_account_ref
+                if result.server_variables:
+                    # Reassign rather than mutate so the JSON column is marked dirty.
+                    credential.server_variables = {
+                        **(credential.server_variables or {}),
+                        **result.server_variables,
+                    }
 
                 # Always bump `updated_at` on the credential row when a connect
                 # completes, regardless of whether `provider_account_ref` changed.

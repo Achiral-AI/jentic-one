@@ -281,6 +281,11 @@ class CredentialService:
                             encrypted_client_secret=encrypted_secret or "",
                             authorize_url=validated_authorize_url,
                             scope=scope,
+                            client_options=(
+                                payload.client_options.model_dump(exclude_defaults=True)
+                                if payload.client_options
+                                else None
+                            ),
                             created_by=identity.sub,
                         )
 

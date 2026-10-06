@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from urllib.parse import urlencode
 
 from jentic_one.control.repos import CredentialRepository, OAuthClientCredentialRepository
@@ -21,13 +22,21 @@ from jentic_one.control.services.credentials.schemas.connect import (
     ConnectRequest,
     ConnectState,
 )
+from jentic_one.control.services.credentials.schemas.oauth_client_options import (
+    OAuthClientOptions,
+)
 from jentic_one.control.services.credentials.schemas.provision import (
     APIReference,
     OAuthTokenView,
     ProvisionResult,
     RefreshResult,
 )
-from jentic_one.control.services.credentials.state import encode_state, generate_nonce
+from jentic_one.control.services.credentials.state import (
+    encode_state,
+    generate_nonce,
+    pkce_challenge,
+    pkce_verifier,
+)
 from jentic_one.shared.config import DirectOAuth2ProviderConfig
 from jentic_one.shared.context import Context
 
@@ -83,12 +92,14 @@ class DirectOAuth2Provider(OAuth2Provider):
 
         scopes = request.scopes or self._default_scopes
         scope_str = " ".join(scopes) if scopes else (occ.scope or "")
+        options = OAuthClientOptions.from_stored(occ.client_options)
 
-        # Explicit config wins; otherwise use the callback URL the web layer
-        # derived for this request (public_base_url or request origin). The
-        # resolved value is embedded in the signed state so the token exchange
-        # replays it byte-identically (RFC 6749 §4.1.3).
-        redirect_uri = self._configured_redirect_uri or request.redirect_uri
+        # The credential's own redirect_uri wins, then explicit config, then
+        # the callback URL the web layer derived for this request
+        # (public_base_url or request origin). The resolved value is embedded
+        # in the signed state so the token exchange replays it byte-identically
+        # (RFC 6749 §4.1.3).
+        redirect_uri = options.redirect_uri or self._configured_redirect_uri or request.redirect_uri
         if not redirect_uri:
             raise ProviderError(
                 "No redirect_uri available: set providers.direct_oauth2.redirect_uri "
@@ -118,6 +129,9 @@ class DirectOAuth2Provider(OAuth2Provider):
         }
         if scope_str:
             params["scope"] = scope_str
+        if options.pkce:
+            params["code_challenge"] = pkce_challenge(pkce_verifier(state_secret, nonce))
+            params["code_challenge_method"] = "S256"
         # Apply config-supplied extras LAST so they win over every standard
         # parameter (including ``state`` and ``scope``). This is the only
         # knob general enough to accommodate non-standard IdPs, and it's
@@ -151,6 +165,7 @@ class DirectOAuth2Provider(OAuth2Provider):
                 )
 
         client_secret = ctx.encryption.decrypt(occ.encrypted_client_secret)
+        options = OAuthClientOptions.from_stored(occ.client_options)
 
         # Replay the exact redirect_uri the authorize request used (carried in
         # the signed state); RFC 6749 requires the token exchange to match. Fall
@@ -160,12 +175,16 @@ class DirectOAuth2Provider(OAuth2Provider):
         if not redirect_uri:
             raise ProviderError("Connect state is missing the redirect_uri")
 
-        token_data = await self._exchange_code(
-            token_url=occ.token_url,
-            code=callback.code,
-            client_id=occ.client_id,
-            client_secret=client_secret,
-            redirect_uri=redirect_uri,
+        payload = {
+            "grant_type": "authorization_code",
+            "code": callback.code,
+            "redirect_uri": redirect_uri,
+        }
+        if options.pkce:
+            state_secret = ctx.config.credentials.connect.state_secret.get_secret_value()
+            payload["code_verifier"] = pkce_verifier(state_secret, state.nonce)
+        token_data = await self._post_client_token(
+            occ.token_url, payload, occ.client_id, client_secret, options
         )
 
         expires_at = None
@@ -180,6 +199,7 @@ class DirectOAuth2Provider(OAuth2Provider):
             expires_at=expires_at,
             scope=token_data.get("scope"),
             provider_account_ref=None,
+            server_variables=_kept_fields(token_data, options.keep_token_fields),
         )
 
     async def refresh(
@@ -200,11 +220,12 @@ class DirectOAuth2Provider(OAuth2Provider):
         client_secret = ctx.encryption.decrypt(occ.encrypted_client_secret)
         refresh_token_value = await token.decrypt()
 
-        token_data = await self._refresh_token(
-            token_url=occ.token_url,
-            client_id=occ.client_id,
-            client_secret=client_secret,
-            refresh_token=refresh_token_value,
+        token_data = await self._post_client_token(
+            occ.token_url,
+            {"grant_type": "refresh_token", "refresh_token": refresh_token_value},
+            occ.client_id,
+            client_secret,
+            OAuthClientOptions.from_stored(occ.client_options),
         )
 
         expires_at = None
@@ -220,36 +241,32 @@ class DirectOAuth2Provider(OAuth2Provider):
             scope=token_data.get("scope"),
         )
 
-    async def _exchange_code(
+    async def _post_client_token(
         self,
-        *,
         token_url: str,
-        code: str,
+        payload: dict[str, str],
         client_id: str,
         client_secret: str,
-        redirect_uri: str,
-    ) -> dict[str, str]:
-        payload = {
-            "grant_type": "authorization_code",
-            "code": code,
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "redirect_uri": redirect_uri,
-        }
-        return await self._post_token(token_url, payload)
+        options: OAuthClientOptions,
+    ) -> dict[str, Any]:
+        """Call the token endpoint, authenticating the way the vendor expects."""
+        auth: tuple[str, str] | None = None
+        if options.token_auth_method == "client_secret_basic":
+            auth = (client_id, client_secret)
+        else:
+            payload = {**payload, "client_id": client_id, "client_secret": client_secret}
+        return await self._post_token(
+            token_url, payload, auth=auth, as_json=options.token_request_encoding == "json"
+        )
 
-    async def _refresh_token(
-        self,
-        *,
-        token_url: str,
-        client_id: str,
-        client_secret: str,
-        refresh_token: str,
-    ) -> dict[str, str]:
-        payload = {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": client_id,
-            "client_secret": client_secret,
-        }
-        return await self._post_token(token_url, payload)
+
+def _kept_fields(token_data: dict[str, Any], fields: dict[str, str]) -> dict[str, str] | None:
+    """The named token-response fields, as server variables; None when there are none."""
+    kept: dict[str, str] = {}
+    for path, name in fields.items():
+        value: object = token_data
+        for key in path.split("."):
+            value = value.get(key) if isinstance(value, dict) else None
+        if isinstance(value, str | int) and not isinstance(value, bool) and str(value):
+            kept[name] = str(value)
+    return kept or None

@@ -2978,6 +2978,10 @@ components:
           - type: string
           - type: 'null'
           title: Client Id
+        client_options:
+          anyOf:
+          - $ref: '#/components/schemas/OAuthClientOptions'
+          - type: 'null'
         client_secret:
           anyOf:
           - type: string
@@ -3337,6 +3341,40 @@ components:
       required:
       - data
       title: OAuthClientListResponse
+      type: object
+    OAuthClientOptions:
+      additionalProperties: false
+      description: How to talk to one vendor's authorize and token endpoints.
+      properties:
+        keep_token_fields:
+          additionalProperties:
+            type: string
+          title: Keep Token Fields
+          type: object
+        pkce:
+          default: false
+          title: Pkce
+          type: boolean
+        redirect_uri:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Redirect Uri
+        token_auth_method:
+          default: client_secret_post
+          enum:
+          - client_secret_post
+          - client_secret_basic
+          title: Token Auth Method
+          type: string
+        token_request_encoding:
+          default: form
+          enum:
+          - form
+          - json
+          title: Token Request Encoding
+          type: string
+      title: OAuthClientOptions
       type: object
     OAuthClientRegistrationRequest:
       description: POST /oauth-clients request body (RFC 7591 client metadata subset).

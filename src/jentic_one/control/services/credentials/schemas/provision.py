@@ -27,6 +27,8 @@ class ProvisionResult(BaseModel):
     expires_at: datetime | None = None
     scope: str | None = None
     provider_account_ref: str | None = None
+    # Non-secret token-response fields the credential keeps as server variables.
+    server_variables: dict[str, str] | None = None
 
 
 class RefreshResult(BaseModel):

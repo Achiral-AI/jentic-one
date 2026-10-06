@@ -8,6 +8,7 @@ from sqlalchemy import ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from jentic_one.shared.db.base import AuditableMixin, ControlBase
+from jentic_one.shared.db.types import json_variant
 
 if TYPE_CHECKING:
     from jentic_one.control.core.schema.credentials import Credential
@@ -28,5 +29,9 @@ class OAuthClientCredential(AuditableMixin, ControlBase):
     encrypted_client_secret: Mapped[str] = mapped_column(Text, nullable=False)
     authorize_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     scope: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # OAuthClientOptions (vendor quirks); NULL is the default client.
+    client_options: Mapped[dict[str, object] | None] = mapped_column(
+        json_variant(), nullable=True, default=None
+    )
 
     credential: Mapped[Credential] = relationship(back_populates="oauth_client_credential")

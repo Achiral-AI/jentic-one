@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 from contextlib import asynccontextmanager
@@ -28,11 +29,13 @@ from jentic_one.control.services.credentials.schemas.connect import (
     ConnectRequest,
     ConnectState,
 )
+from jentic_one.control.services.credentials.schemas.oauth_client_options import OAuthClientOptions
 from jentic_one.control.services.credentials.schemas.provision import (
     APIReference,
     OAuthTokenView,
+    ProvisionResult,
 )
-from jentic_one.control.services.credentials.state import decode_state
+from jentic_one.control.services.credentials.state import decode_state, pkce_verifier
 from jentic_one.shared.config import (
     AppConfig,
     ConnectConfig,
@@ -125,6 +128,7 @@ async def test_complete_connect_exchanges_code() -> None:
     class FakeOCC:
         token_url = "https://idp.example.com/token"
         client_id = "client-abc"
+        client_options = None
         encrypted_client_secret = encrypted_secret
         authorize_url = "https://idp.example.com/authorize"
         scope = "read write"
@@ -215,6 +219,7 @@ async def test_refresh_exchanges_refresh_token() -> None:
     class FakeOCC:
         token_url = "https://idp.example.com/token"
         client_id = "client-abc"
+        client_options = None
         encrypted_client_secret = encrypted_secret
 
     token_response = {
@@ -266,6 +271,7 @@ async def test_refresh_raises_invalid_grant() -> None:
     class FakeOCC:
         token_url = "https://idp.example.com/token"
         client_id = "client-abc"
+        client_options = None
         encrypted_client_secret = encrypted_secret
 
     async def fake_decrypt() -> str:
@@ -309,6 +315,7 @@ async def test_refresh_raises_token_exchange_error_on_other_failure() -> None:
     class FakeOCC:
         token_url = "https://idp.example.com/token"
         client_id = "client-abc"
+        client_options = None
         encrypted_client_secret = encrypted_secret
 
     async def fake_decrypt() -> str:
@@ -351,6 +358,7 @@ async def test_post_token_raises_on_non_json_response() -> None:
     class FakeOCC:
         token_url = "https://idp.example.com/token"
         client_id = "client-abc"
+        client_options = None
         encrypted_client_secret = encrypted_secret
         authorize_url = "https://idp.example.com/authorize"
         scope = "read"
@@ -396,6 +404,7 @@ def _begin_connect_api_ref() -> APIReference:
 
 class _FakeOCCForBegin:
     client_id = "client-abc"
+    client_options = None
     authorize_url = "https://idp.example.com/authorize"
     scope = "read"
 
@@ -572,6 +581,7 @@ async def test_begin_connect_raises_when_authorize_url_missing() -> None:
 
     class _NoAuthorizeURL:
         client_id = "client-abc"
+        client_options = None
         authorize_url = ""
         scope = None
 
@@ -715,6 +725,7 @@ async def test_complete_connect_replays_state_redirect_uri_in_exchange() -> None
     class FakeOCC:
         token_url = "https://idp.example.com/token"
         client_id = "client-abc"
+        client_options = None
         encrypted_client_secret = encrypted_secret
 
     state = ConnectState(
@@ -747,3 +758,243 @@ async def test_complete_connect_replays_state_redirect_uri_in_exchange() -> None
 
         sent_data = mock_client.post.await_args.kwargs["data"]
         assert sent_data["redirect_uri"] == "http://127.0.0.1:8020/credentials/oauth/callback"
+
+
+# --- Per-credential client options: token auth, encoding, PKCE, redirect, kept fields ---
+
+
+def _mock_token_client(response: httpx.Response) -> AsyncMock:
+    client = AsyncMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.post = AsyncMock(return_value=response)
+    return client
+
+
+def _occ_with_options(ctx: Context, options: dict[str, object] | None) -> MagicMock:
+    occ = MagicMock()
+    occ.token_url = "https://idp.example.com/token"
+    occ.client_id = "client-abc"
+    occ.encrypted_client_secret = ctx.encryption.encrypt("my-client-secret")
+    occ.authorize_url = "https://idp.example.com/authorize"
+    occ.scope = "read"
+    occ.client_options = options
+    return occ
+
+
+def _connect_state(**overrides: object) -> ConnectState:
+    values: dict[str, object] = {
+        "credential_id": "cred_123",
+        "provider": "direct_oauth2",
+        "actor_id": "user_1",
+        "issued_at": datetime.now(UTC),
+        "nonce": "nonce-1",
+        "redirect_uri": "https://app.example.com/credentials/oauth/callback",
+    }
+    values.update(overrides)
+    return ConnectState(**values)  # type: ignore[arg-type]
+
+
+async def _complete_with(
+    options: dict[str, object] | None,
+    token_response: dict[str, object],
+    state: ConnectState | None = None,
+) -> tuple[ProvisionResult, AsyncMock]:
+    provider = _make_provider()
+    ctx = Context(_make_config())
+    ctx._control_db = _mock_control_db()
+    client = _mock_token_client(httpx.Response(200, json=token_response))
+    with (
+        patch(
+            "jentic_one.control.repos.OAuthClientCredentialRepository.get_by_credential",
+            new_callable=AsyncMock,
+            return_value=_occ_with_options(ctx, options),
+        ),
+        patch("httpx.AsyncClient", return_value=client),
+    ):
+        result = await provider.complete_connect(
+            ctx, state=state or _connect_state(), callback=ConnectCallback(code="code-1")
+        )
+    return result, client
+
+
+@pytest.mark.asyncio()
+async def test_token_request_defaults_to_the_secret_in_a_form_body() -> None:
+    _, client = await _complete_with(None, {"access_token": "at"})
+
+    kwargs = client.post.call_args.kwargs
+    assert kwargs["data"]["client_secret"] == "my-client-secret"
+    assert kwargs["data"]["client_id"] == "client-abc"
+    assert "auth" not in kwargs or kwargs["auth"] is None
+    assert "code_verifier" not in kwargs["data"]
+
+
+@pytest.mark.asyncio()
+async def test_token_request_can_authenticate_with_http_basic() -> None:
+    _, client = await _complete_with(
+        {"token_auth_method": "client_secret_basic"}, {"access_token": "at"}
+    )
+
+    kwargs = client.post.call_args.kwargs
+    assert kwargs["auth"] == ("client-abc", "my-client-secret")
+    assert "client_secret" not in kwargs["data"]
+    assert "client_id" not in kwargs["data"]
+
+
+@pytest.mark.asyncio()
+async def test_token_request_can_send_json() -> None:
+    _, client = await _complete_with(
+        {"token_auth_method": "client_secret_basic", "token_request_encoding": "json"},
+        {"access_token": "at"},
+    )
+
+    kwargs = client.post.call_args.kwargs
+    assert kwargs["json"] == {
+        "grant_type": "authorization_code",
+        "code": "code-1",
+        "redirect_uri": "https://app.example.com/credentials/oauth/callback",
+    }
+    assert "data" not in kwargs
+
+
+@pytest.mark.asyncio()
+async def test_pkce_sends_the_verifier_derived_from_the_state_nonce() -> None:
+    _, client = await _complete_with({"pkce": True}, {"access_token": "at"})
+
+    verifier = client.post.call_args.kwargs["data"]["code_verifier"]
+    assert verifier == pkce_verifier("test-state-secret", "nonce-1")
+
+
+@pytest.mark.asyncio()
+async def test_named_token_fields_become_server_variables() -> None:
+    result, _ = await _complete_with(
+        {
+            "keep_token_fields": {
+                "instance_url": "instance_url",
+                "team.id": "team_id",
+                "absent": "x",
+            }
+        },
+        {
+            "access_token": "at",
+            "instance_url": "https://acme.my.salesforce.com",
+            "team": {"id": "T1"},
+        },
+    )
+
+    assert result.server_variables == {
+        "instance_url": "https://acme.my.salesforce.com",
+        "team_id": "T1",
+    }
+
+
+@pytest.mark.asyncio()
+async def test_no_server_variables_without_kept_fields() -> None:
+    result, _ = await _complete_with(None, {"access_token": "at", "instance_url": "https://x"})
+
+    assert result.server_variables is None
+
+
+@pytest.mark.asyncio()
+async def test_refresh_uses_the_credentials_token_auth_method() -> None:
+    provider = _make_provider()
+    ctx = Context(_make_config())
+    ctx._control_db = _mock_control_db()
+    client = _mock_token_client(httpx.Response(200, json={"access_token": "at2"}))
+
+    async def fake_decrypt() -> str:
+        return "rt"
+
+    token_view = OAuthTokenView(
+        credential_id="cred_123",
+        provider="direct_oauth2",
+        expires_at=datetime.now(UTC),
+        decrypt=fake_decrypt,
+    )
+    with (
+        patch(
+            "jentic_one.control.repos.OAuthClientCredentialRepository.get_by_credential",
+            new_callable=AsyncMock,
+            return_value=_occ_with_options(ctx, {"token_auth_method": "client_secret_basic"}),
+        ),
+        patch("httpx.AsyncClient", return_value=client),
+    ):
+        await provider.refresh(ctx, token=token_view)
+
+    kwargs = client.post.call_args.kwargs
+    assert kwargs["auth"] == ("client-abc", "my-client-secret")
+    assert kwargs["data"] == {"grant_type": "refresh_token", "refresh_token": "rt"}
+
+
+async def _begin_with(options: dict[str, object] | None) -> str:
+    provider = _make_provider()
+    ctx = Context(_make_config())
+    ctx._control_db = _mock_control_db()
+    with (
+        patch(
+            "jentic_one.control.repos.CredentialRepository.get_by_id",
+            new_callable=AsyncMock,
+            return_value=MagicMock(),
+        ),
+        patch(
+            "jentic_one.control.repos.OAuthClientCredentialRepository.get_by_credential",
+            new_callable=AsyncMock,
+            return_value=_occ_with_options(ctx, options),
+        ),
+    ):
+        challenge = await provider.begin_connect(
+            ctx, api=_begin_connect_api_ref(), request=_begin_connect_request()
+        )
+    return challenge.authorize_url
+
+
+@pytest.mark.asyncio()
+async def test_begin_connect_sends_an_s256_challenge_for_pkce() -> None:
+    url = await _begin_with({"pkce": True})
+    params = _parse_authorize_url_params(url)
+
+    state = decode_state("test-state-secret", params["state"][0])
+    verifier = pkce_verifier("test-state-secret", state.nonce)
+    expected = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    )
+    assert params["code_challenge"] == [expected]
+    assert params["code_challenge_method"] == ["S256"]
+
+
+@pytest.mark.asyncio()
+async def test_begin_connect_without_pkce_sends_no_challenge() -> None:
+    params = _parse_authorize_url_params(await _begin_with(None))
+
+    assert "code_challenge" not in params
+
+
+@pytest.mark.asyncio()
+async def test_a_credentials_redirect_uri_wins_and_is_replayed_from_the_state() -> None:
+    url = await _begin_with(
+        {"redirect_uri": "https://app.achiral.test/api/connectors/notion/callback"}
+    )
+    params = _parse_authorize_url_params(url)
+
+    assert params["redirect_uri"] == ["https://app.achiral.test/api/connectors/notion/callback"]
+    state = decode_state("test-state-secret", params["state"][0])
+    assert state.redirect_uri == "https://app.achiral.test/api/connectors/notion/callback"
+
+
+def test_pkce_verifier_is_stable_per_nonce_and_secret_bound() -> None:
+    first = pkce_verifier("secret", "nonce-a")
+    assert first == pkce_verifier("secret", "nonce-a")
+    assert first != pkce_verifier("secret", "nonce-b")
+    assert first != pkce_verifier("other-secret", "nonce-a")
+    # RFC 7636: 43-128 characters from the unreserved set.
+    assert 43 <= len(first) <= 128
+    assert all(c.isalnum() or c in "-._~" for c in first)
+
+
+def test_client_options_reject_unknown_values() -> None:
+    with pytest.raises(ValueError):
+        OAuthClientOptions.model_validate({"token_auth_method": "private_key_jwt"})
+    with pytest.raises(ValueError):
+        OAuthClientOptions.model_validate({"token_request_encoding": "xml"})
+    with pytest.raises(ValueError):
+        OAuthClientOptions(redirect_uri="not a url")

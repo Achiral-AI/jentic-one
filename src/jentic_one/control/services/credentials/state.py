@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import secrets
 from datetime import UTC, datetime, timedelta
 
@@ -51,6 +54,24 @@ class StateReplayedError(StateError):
 def generate_nonce() -> str:
     """Generate a cryptographically random nonce for state binding."""
     return secrets.token_urlsafe(24)
+
+
+def pkce_verifier(secret: str, nonce: str) -> str:
+    """The PKCE code verifier (RFC 7636) for one connect attempt.
+
+    Derived from the state secret and the state's one-shot nonce, so the
+    callback can rebuild it without storing it. The nonce travels in the
+    signed (not encrypted) state, but without the secret the verifier cannot
+    be computed from it.
+    """
+    digest = hmac.new(secret.encode(), f"pkce:{nonce}".encode(), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+
+def pkce_challenge(verifier: str) -> str:
+    """The S256 code challenge for a verifier."""
+    digest = hashlib.sha256(verifier.encode()).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
 
 def encode_state(secret: str, state: ConnectState, ttl_seconds: int) -> str:

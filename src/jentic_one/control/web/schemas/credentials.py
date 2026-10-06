@@ -8,6 +8,9 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
+from jentic_one.control.services.credentials.schemas.oauth_client_options import (
+    OAuthClientOptions,
+)
 from jentic_one.control.web.schemas.permission_rules import (
     PermissionRuleReadSchema,
     PermissionRuleSchema,
@@ -155,6 +158,9 @@ class OAuth2CreateRequest(BaseModel):
     client_id: str | None = None
     client_secret: str | None = Field(default=None, json_schema_extra=SENSITIVE)
     scopes: list[str] | None = None
+    # Vendor quirks: token auth method and encoding, PKCE, a relayed
+    # redirect_uri, token fields kept as server variables.
+    client_options: OAuthClientOptions | None = None
 
     _check_server_variables = field_validator("server_variables")(_validate_server_variables)
 

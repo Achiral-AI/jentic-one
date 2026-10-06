@@ -74,6 +74,7 @@ async def _attach_oauth_client(
     credential_id: str,
     *,
     authorize_url: str = "https://idp.example.com/authorize",
+    client_options: dict[str, object] | None = None,
 ) -> None:
     """Attach an OAuthClientCredential row for the given credential."""
     encrypted_secret = ctx.encryption.encrypt("test-client-secret")
@@ -85,6 +86,7 @@ async def _attach_oauth_client(
             token_url="https://idp.example.com/token",
             authorize_url=authorize_url,
             scope="read write",
+            client_options=client_options,
         )
         session.add(occ)
         await session.flush()
@@ -176,6 +178,46 @@ async def test_direct_oauth2_connect_and_callback_stores_tokens(
         # loop relies on it for direct_oauth2 (which returns no
         # `provider_account_ref`) to close the OAuth popup.
         assert credential.updated_at > updated_at_before
+
+
+async def test_direct_oauth2_connect_keeps_named_token_fields_as_server_variables(
+    integration_context: Context, clean_connect_tables: None
+) -> None:
+    ctx = integration_context
+    credential_id = await _create_oauth2_credential(ctx, provider="my_oauth")
+    async with ctx.control_db.transaction() as session:
+        credential = await CredentialRepository.get_by_id(session, credential_id)
+        assert credential is not None
+        credential.server_variables = {"region": "eu"}
+    provider = DirectOAuth2Provider(
+        DirectOAuth2ProviderConfig(
+            redirect_uri="https://app.example.com/credentials/oauth/callback"
+        )
+    )
+    _patch_provider_registry(ctx, "my_oauth", provider)
+    await _attach_oauth_client(
+        ctx, credential_id, client_options={"keep_token_fields": {"instance_url": "instance_url"}}
+    )
+    svc = ConnectService(ctx)
+    challenge = await svc.begin(credential_id, ConnectRequest(scopes=["read"]))
+    assert isinstance(challenge, AuthCodeChallenge)
+
+    token_response = {"access_token": "at", "instance_url": "https://acme.my.salesforce.com"}
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.post = AsyncMock(return_value=httpx.Response(200, json=token_response))
+        mock_client_cls.return_value = mock_client
+        await svc.complete(challenge.state, ConnectCallback(code="code"))
+
+    async with ctx.control_db.session() as session:
+        credential = await CredentialRepository.get_by_id(session, credential_id)
+        assert credential is not None
+        assert credential.server_variables == {
+            "region": "eu",
+            "instance_url": "https://acme.my.salesforce.com",
+        }
 
 
 async def test_direct_oauth2_derived_redirect_uri_round_trips(

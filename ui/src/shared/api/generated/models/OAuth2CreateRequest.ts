@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { APIReferenceRequest } from './APIReferenceRequest';
+import type { OAuthClientOptions } from './OAuthClientOptions';
 import type { RuntimeConfig } from './RuntimeConfig';
 /**
  * Create request for oauth2 credentials.
@@ -14,6 +15,7 @@ export type OAuth2CreateRequest = {
     api: APIReferenceRequest;
     authorize_url?: (string | null);
     client_id?: (string | null);
+    client_options?: (OAuthClientOptions | null);
     client_secret?: (string | null);
     grant_type?: string;
     name: string;

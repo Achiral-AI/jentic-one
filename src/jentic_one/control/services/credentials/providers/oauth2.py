@@ -20,6 +20,7 @@ shared ``_post_token`` scaffolding wouldn't apply.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 import httpx
 
@@ -97,7 +98,14 @@ class OAuth2Provider(ABC):
         token: OAuthTokenView,
     ) -> RefreshResult: ...
 
-    async def _post_token(self, token_url: str, payload: dict[str, str]) -> dict[str, str]:
+    async def _post_token(
+        self,
+        token_url: str,
+        payload: dict[str, str],
+        *,
+        auth: tuple[str, str] | None = None,
+        as_json: bool = False,
+    ) -> dict[str, Any]:
         """POST ``payload`` to ``token_url`` and parse the JSON response.
 
         Maps the two structured failure modes both concrete flows care
@@ -106,6 +114,10 @@ class OAuth2Provider(ABC):
         from a transient upstream fault; every other non-200 (or a body
         that isn't JSON) becomes ``TokenExchangeError`` carrying the raw
         HTTP status for logging.
+
+        ``auth`` sends HTTP Basic client authentication; ``as_json`` sends
+        the payload as a JSON body instead of a form (both for vendors that
+        require it).
         """
         # Defense-in-depth SSRF guard: ``token_url`` comes from the DB
         # (``oauth_client_credentials`` row created at credential-create time,
@@ -120,11 +132,11 @@ class OAuth2Provider(ABC):
             async with httpx.AsyncClient(
                 timeout=30.0, transport=build_strict_pinned_transport()
             ) as client:
-                response = await client.post(
-                    safe_url,
-                    data=payload,
-                    headers={"Accept": "application/json"},
-                )
+                request: dict[str, Any] = {"headers": {"Accept": "application/json"}}
+                request["json" if as_json else "data"] = payload
+                if auth is not None:
+                    request["auth"] = auth
+                response = await client.post(safe_url, **request)
         except ValueError as exc:
             # Raised by the pinning transport: the host re-resolved to a blocked
             # address or did not resolve at all.
@@ -137,7 +149,7 @@ class OAuth2Provider(ABC):
             raise TokenExchangeError(response.status_code, body)
 
         try:
-            data: dict[str, str] = response.json()
+            data: dict[str, Any] = response.json()
         except ValueError as exc:
             raise TokenExchangeError(response.status_code, response.text) from exc
         return data

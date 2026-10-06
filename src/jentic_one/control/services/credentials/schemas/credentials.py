@@ -6,6 +6,9 @@ from datetime import datetime
 
 from pydantic import BaseModel
 
+from jentic_one.control.services.credentials.schemas.oauth_client_options import (
+    OAuthClientOptions,
+)
 from jentic_one.control.services.credentials.schemas.provision import APIReference
 from jentic_one.shared.models.credentials import CredentialType
 
@@ -52,6 +55,7 @@ class CredentialCreate(BaseModel):
     client_id: str | None = None
     client_secret: str | None = None
     scopes: list[str] | None = None
+    client_options: OAuthClientOptions | None = None
 
     # sigv4 fields
     access_key_id: str | None = None

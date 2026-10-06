@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from jentic_one.admin.repos import AgentCredentialBindingRepository
+from jentic_one.control.repos import OAuthClientCredentialRepository
 from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.context import Context
 from jentic_one.shared.models import ActorType
@@ -119,6 +120,46 @@ def _create_oauth2(client: TestClient, *, grant_type: str, name: str) -> str:
     assert resp.status_code == 201, resp.text
     credential_id: str = resp.json()["credential"]["credential_id"]
     return credential_id
+
+
+async def test_oauth2_client_options_are_stored_without_defaults(
+    cred_writer_client: TestClient, web_context: Context
+) -> None:
+    """A credential's vendor quirks reach its OAuth client row; unknown keys are refused."""
+    payload: dict[str, object] = {
+        "type": "oauth2",
+        "name": "web-cred-options",
+        "api": {"vendor": "webtest-oauth.example", "name": "", "version": ""},
+        "provider": "static",
+        "grant_type": "authorization_code",
+        "token_url": "https://auth.example/token",
+        "authorize_url": "https://auth.example/authorize",
+        "client_id": "webtest-client",
+        "client_secret": "webtest-secret",
+        "client_options": {
+            "token_auth_method": "client_secret_basic",
+            "pkce": True,
+            "redirect_uri": "https://app.example/api/connectors/notion/callback",
+        },
+    }
+    resp = cred_writer_client.post("/credentials", json=payload)
+    assert resp.status_code == 201, resp.text
+    cred_id = resp.json()["credential"]["credential_id"]
+
+    async with web_context.control_db.session() as session:
+        row = await OAuthClientCredentialRepository.get_by_credential(session, cred_id)
+    assert row is not None
+    assert row.client_options == {
+        "token_auth_method": "client_secret_basic",
+        "pkce": True,
+        "redirect_uri": "https://app.example/api/connectors/notion/callback",
+    }
+
+    bad = cred_writer_client.post(
+        "/credentials",
+        json={**payload, "name": "web-cred-options-bad", "client_options": {"colour": "red"}},
+    )
+    assert bad.status_code == 422
 
 
 async def test_authorization_code_connected_flips_on_token(
