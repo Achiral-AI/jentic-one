@@ -34,7 +34,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 
-from sqlalchemy import inspect, select, text
+from sqlalchemy import Row, inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from jentic_one.control.core.schema.agent_permission_rules import AgentPermissionRule
@@ -234,9 +234,15 @@ class FlatteningControlRepository:
         ]
 
     @staticmethod
-    async def list_credentials(session: AsyncSession) -> list[Credential]:
-        result = await session.execute(select(Credential).order_by(Credential.id))
-        return list(result.scalars().all())
+    async def list_credentials(session: AsyncSession) -> list[Row[tuple[str, str, str | None]]]:
+        # Columns only: loading the entity eager-loads its credential subtypes, whose
+        # later columns are missing from the pre-drop schema this job runs against.
+        result = await session.execute(
+            select(Credential.id, Credential.api_vendor, Credential.created_by).order_by(
+                Credential.id
+            )
+        )
+        return list(result.all())
 
     @staticmethod
     async def list_inline_rules(
