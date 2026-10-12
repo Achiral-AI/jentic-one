@@ -97,7 +97,7 @@ test('Mark all as read clears the bell and holds across a reload', async ({ page
 	const opened = await openRequest(request);
 	test.skip(opened == null, 'this deployment refuses API-target connect sessions');
 	await page.goto('/app/agents');
-	const bell = page.getByRole('button', { name: /^Notifications \(\d+ unread\)$/ });
+	const bell = page.getByRole('button', { name: /^Notifications, \d+ unread$/ });
 	await expect(bell).toBeVisible();
 	await bell.click();
 	await page.getByRole('button', { name: 'Mark all as read' }).click();

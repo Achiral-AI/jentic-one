@@ -48,7 +48,10 @@ export function NotificationsMenu() {
 	const titleId = useId();
 
 	const urgent = items.some((i) => i.urgency === 3 && isUnread(i.key));
-	const label = unreadCount > 0 ? `Notifications (${unreadCount} unread)` : 'Notifications';
+	// The badge's figure sits outside any parentheses in the name (axe drops
+	// parentheticals) so the visible text is part of it (WCAG 2.5.3).
+	const badge = unreadCount > 99 ? '99+' : String(unreadCount);
+	const label = unreadCount > 0 ? `Notifications, ${badge} unread` : 'Notifications';
 
 	return (
 		<div ref={containerRef} className="relative">
@@ -73,7 +76,7 @@ export function NotificationsMenu() {
 						)}
 						aria-hidden="true"
 					>
-						{unreadCount > 99 ? '99+' : unreadCount}
+						{badge}
 					</span>
 				)}
 			</button>

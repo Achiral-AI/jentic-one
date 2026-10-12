@@ -23,7 +23,7 @@ document.documentElement.dataset.theme = 'light';
 configure({ asyncUtilTimeout: 5_000 });
 
 beforeAll(async () => {
-	await worker.start({ onUnhandledRequest: 'warn' });
+	await worker.start({ onUnhandledFrame: 'warn' });
 });
 
 afterEach(() => {
@@ -43,5 +43,7 @@ afterEach(() => {
 });
 
 afterAll(() => {
-	worker.stop();
+	// Fire-and-forget: awaiting would block on in-flight requests that some
+	// suites intentionally leave pending (e.g. never-resolving handlers).
+	void worker.stop();
 });
