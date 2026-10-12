@@ -831,6 +831,109 @@ describe('Monitor inter-linking', () => {
 		expect(within(badge).getByText('job_import_1')).toBeInTheDocument();
 	});
 
+	it('Job sheet shows who enqueued it from the job record, with no /audit lookup', async () => {
+		const user = userEvent.setup();
+		const calls = { audit: 0 };
+		const onRequest = ({ request }: { request: Request }) => {
+			if (new URL(request.url).pathname === '/audit') calls.audit += 1;
+		};
+		worker.events.on('request:start', onRequest);
+		try {
+			renderMonitor('/app/monitor?show=jobs');
+			await user.click(await screen.findByText('job_exec_3'));
+
+			const dialog = await screen.findByRole('dialog');
+			const label = await within(dialog).findByTitle('agent_billing');
+			// Rendered as an agent (type prefix from the job's actor_type), not a
+			// bare id or a "User …" label.
+			expect(within(label).getByText(/^Agent/)).toBeInTheDocument();
+			expect(within(dialog).queryByText(/No actor recorded/)).not.toBeInTheDocument();
+			// The removed audit fallback fired alongside GET /jobs/{id}; give any
+			// such request time to land before asserting none did.
+			await new Promise((r) => setTimeout(r, 500));
+			expect(calls.audit).toBe(0);
+		} finally {
+			worker.events.removeListener('request:start', onRequest);
+		}
+	});
+
+	it('Job sheet resolves the actor for a non-admin via the by-id lookup, no /audit', async () => {
+		const user = userEvent.setup();
+		const lookedUp = new Set<string>();
+		const calls = { audit: 0, actorsList: 0 };
+		const onRequest = ({ request }: { request: Request }) => {
+			const path = new URL(request.url).pathname;
+			if (path === '/audit') calls.audit += 1;
+			if (path === '/actors') calls.actorsList += 1;
+		};
+		worker.use(
+			// A jobs:read member: no org:admin, no audit:read, no users:read.
+			http.get('/users/me', () =>
+				HttpResponse.json({ ...MEMBER, permissions: ['events:read', 'jobs:read'] }),
+			),
+			http.get('/actors', () => new HttpResponse(null, { status: 403 })),
+			http.get('/actors/lookup', ({ request }) => {
+				const ids = new URL(request.url).searchParams.getAll('id');
+				ids.forEach((id) => lookedUp.add(id));
+				return HttpResponse.json({
+					data: ids.map((id) => ({
+						id,
+						actor_type: 'agent',
+						name: 'billing-agent',
+						active: true,
+					})),
+				});
+			}),
+		);
+		worker.events.on('request:start', onRequest);
+		try {
+			renderMonitor('/app/monitor?show=jobs');
+			await user.click(await screen.findByText('job_exec_3'));
+
+			const dialog = await screen.findByRole('dialog');
+			// The label shows the raw id while /actors/lookup is in flight; wait
+			// for the resolved name rather than reading the first render.
+			await waitFor(() =>
+				expect(within(dialog).getByTitle('agent_billing')).toHaveTextContent(
+					/^Agent\s+billing-agent$/,
+				),
+			);
+			expect(lookedUp.has('agent_billing')).toBe(true);
+			await new Promise((r) => setTimeout(r, 500));
+			expect(calls.audit).toBe(0);
+			expect(calls.actorsList).toBe(0);
+		} finally {
+			worker.events.removeListener('request:start', onRequest);
+		}
+	});
+
+	it('Job sheet without an actor says so without mentioning the audit log', async () => {
+		const user = userEvent.setup();
+		worker.use(
+			http.get('/jobs/:jobId', ({ params }) =>
+				HttpResponse.json({
+					_links: { self: `/jobs/${params.jobId}`, result: null, execution: null },
+					actor_id: null,
+					actor_type: 'user',
+					created_at: new Date().toISOString(),
+					error: null,
+					execution_id: null,
+					job_id: params.jobId,
+					kind: 'import',
+					status: 'completed',
+					updated_at: new Date().toISOString(),
+				}),
+			),
+		);
+		renderMonitor('/app/monitor?show=jobs');
+		await user.click(await screen.findByText('job_import_2'));
+
+		const dialog = await screen.findByRole('dialog');
+		expect(
+			await within(dialog).findByText('No actor recorded for this job.'),
+		).toBeInTheDocument();
+	});
+
 	it('clears an Audit log deep-link filter from its badge', async () => {
 		const user = userEvent.setup();
 		renderMonitor('/app/monitor?show=audit&target_type=job&target_id=job_import_1');

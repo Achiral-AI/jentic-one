@@ -26,6 +26,16 @@ class JobResponse(BaseModel):
     error: str | None = None
     created_at: datetime
     updated_at: datetime | None = None
+    actor_id: str | None = Field(
+        default=None,
+        description="Subject that enqueued the job. Null only for legacy rows with no actor.",
+    )
+    actor_type: str = Field(
+        description=(
+            "Kind of actor that enqueued the job: 'user' or 'agent'. Opaque string: "
+            "historical rows may carry a retired type such as 'service_account'."
+        )
+    )
     links: JobLinksResponse = Field(serialization_alias="_links")
 
 
