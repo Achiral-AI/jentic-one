@@ -276,17 +276,38 @@ async def enable_agent(
 @router.delete("/agents/{agent_id}", status_code=204)
 async def archive_agent(
     agent_id: AgentIdPath,
+    purge: bool = Query(
+        default=False,
+        description=(
+            "Default false: the agent is archived (terminal-but-kept; its row"
+            " stays for history). true hard-deletes the agent from any status,"
+            " together with its tokens, consent grants, permission grants and"
+            " rules, bindings and connect sessions, and cancels its queued and"
+            " running jobs. History (audit entries, events, execution records,"
+            " finished jobs, notes) and the credentials it created are kept;"
+            " once the agent is gone that history is visible to org:admin only."
+        ),
+        openapi_examples=ex.example(True),
+    ),
     identity: Identity = get_current_identity(required_permissions=["agents:write"]),
     agent_svc: AgentService = Depends(get_agent_service),
 ) -> Response:
-    """Archive an agent — terminal-but-kept.
+    """Archive an agent — or, with ``purge=true``, hard-delete it.
 
-    The row is retained for history, but the action is not reversible and
+    Archive keeps the row for history, but the action is not reversible and
     the agent's authority is swept: permission grants, credential bindings, and
     OAuth consent grants are revoked. For the reversible kill switch use
     ``:disable`` / ``:enable`` instead.
+
+    Purge removes the agent and its authority and session rows; it archives
+    first if needed, so the agent's authority is gone before any cleanup runs,
+    and a failed purge leaves the agent archived and can be retried. Archive
+    returns 409 for an already-archived agent; purge accepts any status.
     """
-    await agent_svc.archive(agent_id, identity=identity)
+    if purge:
+        await agent_svc.purge(agent_id, identity=identity)
+    else:
+        await agent_svc.archive(agent_id, identity=identity)
     return Response(status_code=204)
 
 
