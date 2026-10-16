@@ -27,7 +27,11 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -82,8 +86,9 @@ const skillProvenanceNote = " Served from the connected Jentic One backend when 
 // so the lane filter at registration time is also the read-time refusal:
 // skill://<name>/references/cli.md is never listed and never readable here,
 // while the same bytes stay public over the backend's HTTP routes. The URIs
-// stay valid whatever the backend serves; a hosted set that has drifted from
-// this binary shows up in the index read, not in resources/list.
+// stay valid whatever the backend serves; a hosted set that has outgrown
+// this binary makes the index read fall back to the bundled manifest
+// (validateHostedIndex), never grows resources/list.
 func (s *mcpServer) registerResources() {
 	for _, name := range skillgen.BundledNames() {
 		raw, err := skillgen.RawBundled(name)
@@ -102,10 +107,7 @@ func (s *mcpServer) registerResources() {
 			Description: meta.Description + skillProvenanceNote,
 			MIMEType:    skillMarkdownMIME,
 		}, s.handleSkillResource)
-		for _, ref := range skillgen.BundledReferences(name) {
-			if ref == skillgen.CLIOnlyReference {
-				continue
-			}
+		for _, ref := range mcpSkillReferences(name) {
 			s.server.AddResource(&mcp.Resource{
 				URI:   skillURIScheme + name + "/references/" + ref,
 				Name:  name + "/references/" + ref,
@@ -131,6 +133,90 @@ func (s *mcpServer) registerResources() {
 			skillProvenanceNote,
 		MIMEType: skillIndexMIME,
 	}, s.handleSkillIndexResource)
+}
+
+// mcpSkillReferences is the reference files this server registers for one
+// bundled skill: the shipped set minus the CLI-lane file. registerResources
+// and servableSkillURIs both read it, so the listed surface and the hosted
+// pointer gate can never disagree about what resolves.
+func mcpSkillReferences(name string) []string {
+	refs := skillgen.BundledReferences(name)
+	out := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		if ref != skillgen.CLIOnlyReference {
+			out = append(out, ref)
+		}
+	}
+	return out
+}
+
+// servableSkillURIs is the exact skill:// URI set registerResources declares
+// — every URI this binary's resources/read can answer. The surface is fixed
+// at build time (go:embed), so it is computed once.
+var servableSkillURIs = sync.OnceValue(func() map[string]struct{} {
+	uris := map[string]struct{}{skillIndexURI: {}}
+	for _, name := range skillgen.BundledNames() {
+		uris[skillURIScheme+name] = struct{}{}
+		for _, ref := range mcpSkillReferences(name) {
+			uris[skillURIScheme+name+"/references/"+ref] = struct{}{}
+		}
+	}
+	return uris
+})
+
+// skillPointerRE matches one skill:// pointer in a document body: a skill
+// name followed by zero or more path segments. Segments are dot-separated
+// word runs, so trailing sentence punctuation ("…/mcp.md.") is never part of
+// the match, and placeholder prose like "skill://<name>" never matches.
+var skillPointerRE = regexp.MustCompile(`skill://[a-z0-9][a-z0-9-]*(?:/[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)*`)
+
+// relativeReferenceRE matches one document-relative reference pointer
+// ("references/<path>", the form a SKILL.md router uses). The target grammar
+// is the full reference-path shape — "/"-separated segments, each a
+// dot-separated word run with any (or no) extension, optionally preceded by
+// "./" or "../" traversal segments — so a nested ("references/v2/mcp.md"),
+// non-markdown ("references/schema.json"), or traversal pointer is matched
+// and checked, never skipped: a pointer the gate cannot see is a pointer it
+// cannot refuse. Shipped references are flat *.md files, so any such pointer
+// fails the shipped-set lookup and the bundled copy serves. The final segment
+// ends on a word character, so trailing sentence punctuation ("…/mcp.md.",
+// "see references/.") is never part of the match. The leading group refuses
+// a path character before "references/", so the tail of an absolute skill://
+// pointer or an unrelated "docs/references/x.md" path is never read as a
+// relative pointer.
+var relativeReferenceRE = regexp.MustCompile(
+	`(?:^|[^A-Za-z0-9_/.:-])references/((?:(?:\.\.?|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)/)*[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)`)
+
+// unservablePointer returns the first pointer in skill name's raw document
+// that this binary cannot serve, or "" when every pointer resolves. This is
+// the version-skew gate (#1343): a backend newer than this binary can host a
+// skill router that sends the session to references this binary does not
+// ship, and serving it would hand the model dead-end pointers. Two forms are
+// checked:
+//
+//   - absolute skill:// pointers must be a URI this server registers
+//     (servableSkillURIs);
+//   - relative references/<path> pointers must be a reference this binary
+//     ships for name. Any lane counts: the router names the CLI-lane file for
+//     CLI sessions, and the binary ships it, so it is coherent even though
+//     this MCP server deliberately never lists it.
+//
+// The check is the precise capability test — a frontmatter-version ceiling
+// would also discard newer hosted revisions this binary serves coherently.
+func unservablePointer(name string, raw []byte) string {
+	servable := servableSkillURIs()
+	for _, m := range skillPointerRE.FindAll(raw, -1) {
+		if _, ok := servable[string(m)]; !ok {
+			return string(m)
+		}
+	}
+	shipped := skillgen.BundledReferences(name)
+	for _, m := range relativeReferenceRE.FindAllSubmatch(raw, -1) {
+		if !slices.Contains(shipped, string(m[1])) {
+			return "references/" + string(m[1])
+		}
+	}
+	return ""
 }
 
 // skillDoc is one resolved skill document: the exact bytes to serve plus the
@@ -196,28 +282,47 @@ func (s *mcpServer) handleSkillReferenceResource(_ context.Context, req *mcp.Rea
 // otherwise (source bundled). A hosted failure is never an error — offline is
 // a supported state — but it is logged so version-skew debugging has a trail.
 //
-// A 200 body only counts as the hosted document when it is shape-valid: the
-// frontmatter must parse and its `name` must be the requested skill. Anything
-// else (a captive portal's HTML, a proxy error page, the wrong document) is
-// treated exactly like a non-200 — logged, then the bundled copy serves.
-// Without this gate, ParseDocMeta would happily label arbitrary bytes as a
-// hosted skill at fabricated version "1".
+// A 200 body only counts as the hosted document when it is shape-valid and
+// self-consistent with this binary: the frontmatter must parse, its `name`
+// must be the requested skill, and every skill:// or relative references/
+// pointer in it must resolve to a document this binary serves
+// (unservablePointer). Anything else
+// (a captive portal's HTML, a proxy error page, the wrong document, a newer
+// backend's router pointing at references this binary does not ship) is
+// treated exactly like a non-200 — logged once with the reason, then the
+// bundled copy serves. Without the shape gate, ParseDocMeta would happily
+// label arbitrary bytes as a hosted skill at fabricated version "1"; without
+// the pointer gate, a version-skewed session would follow the hosted router
+// into resource-not-found.
 func (s *mcpServer) skillDocFor(ctx context.Context, name string) (skillDoc, error) {
 	hosted, err := s.fetchHostedSkill(ctx, "/skills/"+name+".md")
 	if err == nil {
-		if meta := skillgen.ParseDocMeta(hosted); meta.Name == name {
-			return skillDoc{raw: hosted, source: skillgen.SourceHosted, version: meta.Version}, nil
+		err = validateHostedSkill(name, hosted)
+		if err == nil {
+			return skillDoc{raw: hosted, source: skillgen.SourceHosted, version: skillgen.ParseDocMeta(hosted).Version}, nil
 		}
-		err = fmt.Errorf("hosted body is not skill %q (missing or mismatched frontmatter name)", name)
 	}
 	if !errors.Is(err, errNoBackend) {
-		s.logger.Info("skill resource: hosted fetch failed, serving bundled", "skill", name, "error", err)
+		s.logger.Info("skill resource: hosted copy unusable, serving bundled", "skill", name, "error", err)
 	}
 	raw, err := skillgen.RawBundled(name)
 	if err != nil {
 		return skillDoc{}, fmt.Errorf("bundled skill %q: %w", name, err)
 	}
 	return skillDoc{raw: raw, source: skillgen.SourceBundled, version: skillgen.ParseDocMeta(raw).Version}, nil
+}
+
+// validateHostedSkill is the gate a fetched hosted body must pass before it
+// serves as skill name (see skillDocFor). It reads only the bytes already in
+// hand — no extra network calls.
+func validateHostedSkill(name string, raw []byte) error {
+	if got := skillgen.ParseDocMeta(raw).Name; got != name {
+		return fmt.Errorf("hosted body is not skill %q (missing or mismatched frontmatter name)", name)
+	}
+	if ptr := unservablePointer(name, raw); ptr != "" {
+		return fmt.Errorf("hosted skill %q points at %s, which this binary does not serve (backend newer than this CLI?)", name, ptr)
+	}
+	return nil
 }
 
 // handleSkillIndexResource reads skill://index: the backend's own manifest
@@ -231,22 +336,31 @@ func (s *mcpServer) skillDocFor(ctx context.Context, name string) (skillDoc, err
 // documented tell for which source produced the manifest.
 //
 // A hosted 200 body only serves when it is shape-valid — well-formed JSON
-// whose top level is an array (the manifest's row list). Anything else is
-// treated exactly like a non-200: logged, then the bundled manifest serves.
+// whose top level is an array (the manifest's row list) — and describes a
+// surface this server can serve (unservableIndexEntry). Anything else is
+// treated exactly like a non-200: logged once with the reason, then the
+// bundled manifest serves. The surface check is the index's half of the
+// #1343 version-skew gate: a backend newer than this binary ships skills or
+// references the embed lacks, and its routers are then refused by the
+// document gate (skillDocFor) — so a manifest listing those extra entries
+// would advertise hosted versions and digests for documents this server
+// serves bundled. Refusing it keeps skill://index on the same source as the
+// documents it indexes, from the bytes already in hand (no per-document
+// fetch).
 func (s *mcpServer) handleSkillIndexResource(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
 	cctx, cancel := s.callContext(ctx)
 	defer cancel()
 
 	hosted, err := s.fetchHostedSkill(cctx, "/skills/index.json")
 	if err == nil {
-		if validSkillIndex(hosted) {
+		err = validateHostedIndex(hosted)
+		if err == nil {
 			s.logger.Info("skill index read", "source", skillgen.SourceHosted)
 			return skillReadResult(req.Params.URI, skillIndexMIME, skillDoc{raw: hosted, source: skillgen.SourceHosted}), nil
 		}
-		err = errors.New("hosted body is not a JSON-array manifest")
 	}
 	if !errors.Is(err, errNoBackend) {
-		s.logger.Info("skill index: hosted fetch failed, serving bundled manifest", "error", err)
+		s.logger.Info("skill index: hosted copy unusable, serving bundled manifest", "error", err)
 	}
 
 	raw, err := bundledSkillIndex()
@@ -255,6 +369,53 @@ func (s *mcpServer) handleSkillIndexResource(ctx context.Context, req *mcp.ReadR
 	}
 	s.logger.Info("skill index read", "source", skillgen.SourceBundled)
 	return skillReadResult(req.Params.URI, skillIndexMIME, skillDoc{raw: raw, source: skillgen.SourceBundled}), nil
+}
+
+// hostedIndexRow is the slice of a hosted manifest row the surface check
+// reads: the skill name and its reference filenames. Every other key is
+// ignored, so a newer backend adding row fields never trips the gate.
+type hostedIndexRow struct {
+	Name       string `json:"name"`
+	References []struct {
+		Name string `json:"name"`
+	} `json:"references"`
+}
+
+// validateHostedIndex is the gate a fetched hosted manifest must pass before
+// it serves as skill://index (see handleSkillIndexResource).
+func validateHostedIndex(raw []byte) error {
+	if !validSkillIndex(raw) {
+		return errors.New("hosted body is not a JSON-array manifest")
+	}
+	var rows []hostedIndexRow
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		return fmt.Errorf("hosted manifest rows are malformed: %w", err)
+	}
+	if entry := unservableIndexEntry(rows); entry != "" {
+		return fmt.Errorf("hosted manifest lists %s, which this binary does not serve (backend newer than this CLI?)", entry)
+	}
+	return nil
+}
+
+// unservableIndexEntry returns the first manifest entry this binary does not
+// ship — a skill outside BundledNames, or a reference outside that skill's
+// BundledReferences — or "" when the manifest's surface is a subset of the
+// embed's. Any reference lane counts (the hosted manifest lists the CLI-lane
+// file too, and the binary ships it), matching unservablePointer.
+func unservableIndexEntry(rows []hostedIndexRow) string {
+	names := skillgen.BundledNames()
+	for _, row := range rows {
+		if !slices.Contains(names, row.Name) {
+			return "skill " + strconv.Quote(row.Name)
+		}
+		shipped := skillgen.BundledReferences(row.Name)
+		for _, ref := range row.References {
+			if !slices.Contains(shipped, ref.Name) {
+				return "reference " + strconv.Quote(row.Name+"/references/"+ref.Name)
+			}
+		}
+	}
+	return ""
 }
 
 // validSkillIndex is the shape gate for a hosted index body: well-formed JSON
