@@ -9,7 +9,9 @@ signing so it cannot travel further or land in a repr.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 from collections.abc import AsyncIterator
+from dataclasses import replace
 
 import pytest
 
@@ -185,3 +187,32 @@ async def test_stream_signs_request() -> None:
     assert inner.seen is not None
     assert "authorization" in inner.seen.headers
     assert inner.seen.signing is None
+
+
+@pytest.mark.asyncio()
+async def test_json_protocol_headers_survive_signing() -> None:
+    # CloudTrail LookupEvents: the caller's X-Amz-Target and content-type go
+    # upstream unchanged next to the signature.
+    inner = _CapturingRunner()
+    body = b'{"MaxResults": 5}'
+    req = RunnerRequest(
+        method="POST",
+        url="https://cloudtrail.us-east-1.amazonaws.com/",
+        headers={
+            "Content-Type": "application/x-amz-json-1.1",
+            "X-Amz-Target": "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101.LookupEvents",
+        },
+        body=body,
+        signing=replace(_MATERIAL, service="cloudtrail"),
+    )
+
+    await SigV4SigningRunner(inner).run(req)
+
+    assert inner.seen is not None
+    headers = inner.seen.headers
+    assert headers["X-Amz-Target"] == (
+        "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101.LookupEvents"
+    )
+    assert headers["Content-Type"] == "application/x-amz-json-1.1"
+    assert "/us-east-1/cloudtrail/aws4_request" in headers["authorization"]
+    assert headers["x-amz-content-sha256"] == hashlib.sha256(body).hexdigest()

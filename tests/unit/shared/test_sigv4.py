@@ -409,3 +409,122 @@ def test_secret_never_appears_in_output_headers() -> None:
         now=_FIXED_NOW,
     )
     assert _MATERIAL.secret_access_key not in "".join(headers.values())
+
+
+def _reference_signature(
+    material: SigV4Material, canonical_request: str, amz_date: str, date_stamp: str
+) -> str:
+    """Sign a hand-written canonical request with the spec's key chain."""
+    scope = f"{date_stamp}/{material.region}/{material.service}/aws4_request"
+    sts = "\n".join(
+        [
+            "AWS4-HMAC-SHA256",
+            amz_date,
+            scope,
+            hashlib.sha256(canonical_request.encode()).hexdigest(),
+        ]
+    )
+
+    def _h(key: bytes, msg: str) -> bytes:
+        return hmac.new(key, msg.encode(), hashlib.sha256).digest()
+
+    k = _h(f"AWS4{material.secret_access_key}".encode(), date_stamp)
+    k = _h(k, material.region)
+    k = _h(k, material.service)
+    k = _h(k, "aws4_request")
+    return hmac.new(k, sts.encode(), hashlib.sha256).hexdigest()
+
+
+def test_cloudtrail_lookup_events_json_post() -> None:
+    # JSON 1.1 protocol: POST / with the operation in X-Amz-Target. The target
+    # and content-type ride unsigned (as in the AWS Marketplace client), so the
+    # signature covers host, the body hash and the date.
+    material = SigV4Material(
+        access_key_id="AKIDEXAMPLE",
+        secret_access_key="wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",  # pragma: allowlist secret
+        region="us-east-1",
+        service="cloudtrail",
+    )
+    body = b'{"MaxResults": 5}'
+    body_hash = hashlib.sha256(body).hexdigest()
+    canonical_request = "\n".join(
+        [
+            "POST",
+            "/",
+            "",
+            (
+                "host:cloudtrail.us-east-1.amazonaws.com\n"
+                f"x-amz-content-sha256:{body_hash}\n"
+                "x-amz-date:20150830T123600Z\n"
+            ),
+            "host;x-amz-content-sha256;x-amz-date",
+            body_hash,
+        ]
+    )
+
+    headers = sign_request(
+        method="POST",
+        url="https://cloudtrail.us-east-1.amazonaws.com/",
+        body=body,
+        material=material,
+        now=_FIXED_NOW,
+    )
+
+    expected = _reference_signature(material, canonical_request, "20150830T123600Z", "20150830")
+    assert headers["authorization"] == (
+        "AWS4-HMAC-SHA256 "
+        "Credential=AKIDEXAMPLE/20150830/us-east-1/cloudtrail/aws4_request, "
+        "SignedHeaders=host;x-amz-content-sha256;x-amz-date, "
+        f"Signature={expected}"
+    )
+    assert headers["x-amz-content-sha256"] == body_hash
+
+
+def test_cloudwatch_describe_alarms_query_get_with_session_token() -> None:
+    # Query protocol: GET with Action/Version in the query string, signed in
+    # sorted order, and a temporary credential's session token signed too. A
+    # space must arrive as %20: a literal "+" is signed as "+" (see
+    # _canonical_query).
+    material = SigV4Material(
+        access_key_id="ASIAEXAMPLE",
+        secret_access_key="wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",  # pragma: allowlist secret
+        region="eu-west-1",
+        service="monitoring",
+        session_token="FwoGZXIvYXdzEXAMPLE",
+    )
+    empty_hash = hashlib.sha256(b"").hexdigest()
+    canonical_request = "\n".join(
+        [
+            "GET",
+            "/",
+            "Action=DescribeAlarms&AlarmNamePrefix=prod%20api&MaxRecords=10&Version=2010-08-01",
+            (
+                "host:monitoring.eu-west-1.amazonaws.com\n"
+                f"x-amz-content-sha256:{empty_hash}\n"
+                "x-amz-date:20150830T123600Z\n"
+                "x-amz-security-token:FwoGZXIvYXdzEXAMPLE\n"
+            ),
+            "host;x-amz-content-sha256;x-amz-date;x-amz-security-token",
+            empty_hash,
+        ]
+    )
+
+    headers = sign_request(
+        method="GET",
+        url=(
+            "https://monitoring.eu-west-1.amazonaws.com/"
+            "?Version=2010-08-01&Action=DescribeAlarms&MaxRecords=10&AlarmNamePrefix=prod%20api"
+        ),
+        body=None,
+        material=material,
+        now=_FIXED_NOW,
+    )
+
+    expected = _reference_signature(material, canonical_request, "20150830T123600Z", "20150830")
+    assert headers["authorization"] == (
+        "AWS4-HMAC-SHA256 "
+        "Credential=ASIAEXAMPLE/20150830/eu-west-1/monitoring/aws4_request, "
+        "SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token, "
+        f"Signature={expected}"
+    )
+    assert headers["x-amz-security-token"] == "FwoGZXIvYXdzEXAMPLE"
