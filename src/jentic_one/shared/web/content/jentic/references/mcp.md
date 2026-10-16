@@ -170,17 +170,30 @@ execute {"operation_id": "POST:https://api.example.com/v1/things", "inputs": {"l
 execute_read {"operation_id": "GET:https://sheets.googleapis.com/v4/spreadsheets/{id}/values/{range}", "inputs": {"id": "ABC", "range": "A1:Z10"}}
 ```
 
-**The job-poll idiom.** A held or async execution does not answer inline: a
-202 HELD response (human approval required) or a tracked import returns a
-**job envelope** (`{job_id, status, …}`). Poll it with the job id until the
-status is terminal (`completed`, `failed`, `cancelled`, `dead_letter`):
+**The poll idiom.** A held or async execution does not answer inline. A
+202 HELD response (human approval required) returns a `held_execution_id`;
+an async execution or a tracked import returns a **job envelope**
+(`{job_id, status, …}`). For a held call, the most important step is to
+**show the user its `review_url`** — a reviewer signs in there to approve or
+deny it — and end your turn so the user sees the link. **Do not call
+`get_execution_result` until the user replies**; then call it **once** with
+the `held_execution_id`; it waits up to 30 seconds (`timeout`, in seconds,
+at most 30) and returns early once the call has finished (`completed`,
+`failed`, `cancelled`). If it is still held, the answer repeats the
+`review_url`: show the user the link again and end your turn again. A
+`failed` held call carries the permission-denied problem (denied or expired)
+as its result. A tracked import is polled the same way with its `job_id`:
 
 ```
-get_execution_result {"job_id": "<id from the held response>"}
+get_execution_result {"held_execution_id": "<id from the held response>"}
+get_execution_result {"job_id": "<id from an async or import response>"}
 ```
 
-**Never re-send the original call while a job is pending** — approval
-happens out-of-band, and re-sending duplicates the side effect.
+**Never re-send the original call while it is pending** — approval
+happens out-of-band, and re-sending duplicates the side effect. A client
+that supports URL-mode elicitation may instead be asked to open the review
+page for the user; its accept only means the link was opened — the
+reviewer still decides on that page.
 
 **The recovery mapping.** What the CLI lane surfaces as a stderr
 `agent_directive` + exit codes arrives on MCP as a **coded error envelope**:

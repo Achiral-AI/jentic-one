@@ -53,7 +53,7 @@ function renderCard(
 	} = {},
 ) {
 	const {
-		rules = { total: 2, allow: 2, deny: 0 },
+		rules = { total: 2, allow: 2, ask: 0, deny: 0 },
 		agentServing = true,
 		expanded = false,
 		onOpen = () => {},
@@ -94,9 +94,9 @@ describe('ApiCard', () => {
 
 	it('derives its status with the same deriveTileStatus the rows use', () => {
 		for (const rules of [
-			{ total: 2, allow: 2, deny: 0 },
-			{ total: 0, allow: 0, deny: 0 },
-			{ total: 2, allow: 0, deny: 2 },
+			{ total: 2, allow: 2, ask: 0, deny: 0 },
+			{ total: 0, allow: 0, ask: 0, deny: 0 },
+			{ total: 2, allow: 0, ask: 0, deny: 2 },
 		] as const) {
 			const { unmount } = renderCard(makeTile(), { rules });
 			const expected = deriveTileStatus({
@@ -111,7 +111,7 @@ describe('ApiCard', () => {
 	});
 
 	it('shows the Blocked caution word when the binding has no rules', () => {
-		renderCard(makeTile(), { rules: { total: 0, allow: 0, deny: 0 } });
+		renderCard(makeTile(), { rules: { total: 0, allow: 0, ask: 0, deny: 0 } });
 		expect(card()).toHaveAttribute('data-status', 'blocked-no-rules');
 		expect(screen.getByTestId('card-status')).toHaveTextContent('Blocked');
 	});
@@ -146,14 +146,18 @@ describe('ApiCard', () => {
 
 	it('names the full status in its tooltip and accessible name, not the one word', async () => {
 		const user = userEvent.setup();
-		const { unmount } = renderCard(makeTile(), { rules: { total: 0, allow: 0, deny: 0 } });
+		const { unmount } = renderCard(makeTile(), {
+			rules: { total: 0, allow: 0, ask: 0, deny: 0 },
+		});
 		expect(screen.getByTestId('card-status')).toHaveTextContent(/^Blocked$/);
 		expect(card()).toHaveAccessibleName(/— Blocked · no rules\. Open access details\.$/);
 		await user.hover(screen.getByTestId('card-status'));
 		expect(await screen.findByRole('tooltip')).toHaveTextContent(/^Blocked · no rules$/);
 		unmount();
 
-		renderCard(makeTile({ suspended: true }), { rules: { total: 3, allow: 2, deny: 1 } });
+		renderCard(makeTile({ suspended: true }), {
+			rules: { total: 3, allow: 2, ask: 0, deny: 1 },
+		});
 		expect(screen.getByTestId('card-status')).toHaveTextContent(/^Paused$/);
 		expect(card()).toHaveAccessibleName(/— Suspended · not serving\. Open access details\.$/);
 		await user.hover(screen.getByTestId('card-status'));

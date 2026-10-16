@@ -27,6 +27,9 @@ type ExecuteEnvelope struct {
 	ExecutionID string `json:"execution_id,omitempty"`
 	// Headers is the single-value projection of the upstream response headers.
 	Headers map[string]string `json:"headers"`
+	// HeldExecutionID names the held execution whose outcome this is, when
+	// the call was held for human approval and followed to its end.
+	HeldExecutionID string `json:"held_execution_id,omitempty"`
 	// SchemaVersion pins the machine-contract envelope shape (AGT-23). Use
 	// NewExecuteEnvelope so it is always stamped: this envelope is written via
 	// the legacy WriteJSON path (its body is arbitrary upstream data), which —
@@ -149,4 +152,116 @@ func RenderSynthesizedDenialRecovery(ctx context.Context, w io.Writer, status in
 	// Point at the read-only self-check as the catch-all when the specific hint
 	// above doesn't unblock (UX9).
 	fmt.Fprintln(w, "  stuck? "+st.Accent.Render("jentic doctor"))
+}
+
+// HeldNotice describes a call the broker held for human approval, for
+// RenderHeld.
+type HeldNotice struct {
+	HeldExecutionID string
+	ReviewURL       string
+	ExpiresAt       string
+	// Waiting is true when the command goes on to wait for the decision
+	// (`execute --wait`), false when it stops at the hold.
+	Waiting bool
+}
+
+// RenderHeld writes the held-call notice to w (the caller's stderr): the
+// held execution, the review link a person must open to approve or deny the
+// call, when the hold expires, and how to collect the result.
+func RenderHeld(ctx context.Context, w io.Writer, n HeldNotice) {
+	st := theme.StylesFromContext(ctx)
+	fmt.Fprintln(w, st.Warn.Render("Held — this call needs human approval before it runs:"))
+	fmt.Fprintln(w, "  held execution: "+n.HeldExecutionID)
+	fmt.Fprintln(w, "  Show the user this link; they approve or deny the call there.")
+	fmt.Fprintln(w, "  open: "+st.Accent.Render(n.ReviewURL))
+	if n.ExpiresAt != "" {
+		fmt.Fprintln(w, "  expires: "+n.ExpiresAt)
+	}
+	if n.Waiting {
+		fmt.Fprintln(w, "  waiting for the decision …")
+		return
+	}
+	fmt.Fprintln(w, "  then: "+st.Accent.Render(heldPollCommand(n.HeldExecutionID))+" (do not re-send the call)")
+}
+
+// RenderHeldUnfinished writes the notice for a followed held call that has
+// not finished — still held at the timeout, or the poll itself failed — to w
+// (the caller's stderr): headline, the held execution, the review link (when
+// known) and the poll command to run next.
+func RenderHeldUnfinished(ctx context.Context, w io.Writer, n HeldNotice, headline string) {
+	st := theme.StylesFromContext(ctx)
+	fmt.Fprintln(w, st.Warn.Render(headline))
+	fmt.Fprintln(w, "  held execution: "+n.HeldExecutionID)
+	if n.ReviewURL != "" {
+		fmt.Fprintln(w, "  Show the user this link again if they have not decided; they approve or deny the call there.")
+		fmt.Fprintln(w, "  open: "+st.Accent.Render(n.ReviewURL))
+	}
+	if n.ExpiresAt != "" {
+		fmt.Fprintln(w, "  expires: "+n.ExpiresAt)
+	}
+	fmt.Fprintln(w, "  then: "+st.Accent.Render(heldPollCommand(n.HeldExecutionID))+" (do not re-send the call)")
+}
+
+// RenderHeldFinished names the held execution a finished outcome belongs to
+// on w (the caller's stderr): a dim one-line note with outcome, or — empty
+// outcome, following a never-ran notice — an indented "held execution:" line.
+func RenderHeldFinished(ctx context.Context, w io.Writer, heldExecutionID, outcome string) {
+	if outcome == "" {
+		fmt.Fprintln(w, "  held execution: "+heldExecutionID)
+		return
+	}
+	st := theme.StylesFromContext(ctx)
+	fmt.Fprintln(w, st.Dim.Render("held execution "+heldExecutionID+": "+outcome))
+}
+
+func heldPollCommand(heldExecutionID string) string {
+	return "jentic executions poll " + heldExecutionID
+}
+
+// Problem types of a held call that never ran: the reviewer denied it, its
+// hold expired undecided, or the worker running it stopped mid-run.
+const (
+	ApprovalDeniedType       = "approval_denied"
+	ApprovalExpiredType      = "approval_expired"
+	ApprovalResumeFailedType = "approval_resume_failed"
+	ApprovalRequiredType     = "approval_required"
+)
+
+// RenderApprovalOutcome writes the recovery for a held call's terminal
+// approval problem (problemType, one of the Approval*Type values) to w (the
+// caller's stderr). detail is the problem's own detail line (a deny reason
+// rides there). It reports false for any other problem type, leaving the
+// caller's generic denial rendering in place.
+func RenderApprovalOutcome(ctx context.Context, w io.Writer, problemType, detail string) bool {
+	st := theme.StylesFromContext(ctx)
+	var lines []string
+	switch problemType {
+	case ApprovalDeniedType:
+		lines = []string{
+			"Denied by a reviewer — the call never ran.",
+			"Tell the user it was denied; do not re-send it unless they ask you to.",
+		}
+	case ApprovalExpiredType:
+		lines = []string{
+			"Expired — nobody decided the approval in time, so the call never ran.",
+			"Re-send it only if the user still wants it; that files a new approval.",
+		}
+	case ApprovalResumeFailedType:
+		lines = []string{
+			"Approved, but the worker running it stopped mid-run; it is not re-run.",
+			"The upstream may have received it: check `jentic history` before sending it again.",
+		}
+	case ApprovalRequiredType:
+		lines = []string{"A permission rule requires approval for this call and it carries none; it never ran."}
+	default:
+		return false
+	}
+	fmt.Fprintln(w, st.Warn.Render(lines[0]))
+	if detail != "" {
+		fmt.Fprintln(w, "  "+detail)
+	}
+	for _, l := range lines[1:] {
+		fmt.Fprintln(w, "  "+l)
+	}
+	return true
 }

@@ -67,6 +67,13 @@ class PermissionRule:
     methods: frozenset[str] | None
     path: PathMatcher | None
     operations: tuple[str, ...] | None
+    # The rule row's primary key, so a ``require-approval`` hold can record
+    # which rule held the call.
+    rule_id: str | None = None
+
+
+#: Effects a rule may only carry when it constrains methods, path, or operations.
+CONDITION_REQUIRED_EFFECTS = frozenset({"allow", "require-approval"})
 
 
 def normalize_methods(raw: Sequence[str] | None) -> frozenset[str] | None:
@@ -109,16 +116,18 @@ def first_matching_rule(
     warning for a diagnostic re-evaluation of the same rule list.
     """
     for idx, rule in enumerate(rules):
-        # Defense-in-depth: a condition-less `allow` is an unrestricted grant
-        # (matches everything) and should have been rejected at the API schema.
-        # If one reaches evaluation it is a misconfiguration — skip it rather
-        # than honour blanket access. A condition-less `deny` keeps its
-        # legitimate match-all catch-all behaviour.
-        if is_condition_less(rule) and rule.effect.lower() == "allow":
+        # Defense-in-depth: a condition-less `allow` would grant blanket access
+        # and a condition-less `require-approval` would hold every call for
+        # review. The API schema rejects both, so one reaching evaluation is a
+        # misconfiguration — skip it rather than honour it. A condition-less
+        # `deny` keeps its legitimate match-all catch-all behaviour.
+        effect = rule.effect.lower()
+        if is_condition_less(rule) and effect in CONDITION_REQUIRED_EFFECTS:
             if warn:
                 _logger.warning(
-                    "Ignoring misconfigured condition-less 'allow' permission rule "
-                    "(matches all requests); skipping to next rule",
+                    "Ignoring misconfigured condition-less 'allow' or 'require-approval' "
+                    "permission rule (matches all requests); skipping to next rule",
+                    effect=effect,
                     binding=binding,
                 )
             continue
@@ -128,8 +137,20 @@ def first_matching_rule(
 
 
 def is_allowed(rules: Sequence[PermissionRule], idx: int | None) -> bool:
-    """The verdict for a :func:`first_matching_rule` result."""
+    """Whether a :func:`first_matching_rule` result runs the call straight away."""
     return idx is not None and rules[idx].effect.lower() == "allow"
+
+
+def rule_verdict(rules: Sequence[PermissionRule], idx: int | None) -> str:
+    """The effect a :func:`first_matching_rule` result applies.
+
+    ``allow`` or ``require-approval`` from the deciding rule; ``deny`` for an
+    explicit deny, an unknown effect, or no match (default-deny).
+    """
+    if idx is None:
+        return "deny"
+    effect = rules[idx].effect.lower()
+    return effect if effect in CONDITION_REQUIRED_EFFECTS else "deny"
 
 
 def evaluate_rules(
@@ -156,6 +177,9 @@ class DivergenceKind(StrEnum):
     #: A ``deny`` rule matches the full upstream path but not the
     #: spec-relative one — the request is now **allowed** by a later rule.
     LEGACY_DENY_NO_LONGER_MATCHES = "legacy_deny_no_longer_matches"
+    #: A ``require-approval`` rule matches the full upstream path but not the
+    #: spec-relative one — the request is no longer held for approval.
+    LEGACY_ASK_NO_LONGER_MATCHES = "legacy_ask_no_longer_matches"
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,14 +225,16 @@ def base_path_divergence(
     up_idx = first_matching_rule(
         rules, method=method, path=upstream_path, operation_id=operation_id, warn=False
     )
-    if up_idx is None or is_allowed(rules, rel_idx) == is_allowed(rules, up_idx):
+    if up_idx is None or rule_verdict(rules, rel_idx) == rule_verdict(rules, up_idx):
         return None
     rule = rules[up_idx]
     if rule_matches(rule, method=method, path=relative_path, operation_id=operation_id):
         return None
-    kind = (
-        DivergenceKind.LEGACY_ALLOW_NO_LONGER_MATCHES
-        if rule.effect.lower() == "allow"
-        else DivergenceKind.LEGACY_DENY_NO_LONGER_MATCHES
-    )
+    effect = rule.effect.lower()
+    if effect == "allow":
+        kind = DivergenceKind.LEGACY_ALLOW_NO_LONGER_MATCHES
+    elif effect == "require-approval":
+        kind = DivergenceKind.LEGACY_ASK_NO_LONGER_MATCHES
+    else:
+        kind = DivergenceKind.LEGACY_DENY_NO_LONGER_MATCHES
     return PathDivergence(kind=kind, rule_index=up_idx, rule_path=_matcher_source(rule.path))

@@ -384,6 +384,49 @@ describe('MonitorPage', () => {
 		expect(within(row).queryByText('Acknowledged')).toBeNull();
 	});
 
+	it('opens the review page, not an execution, from an approval-request row', async () => {
+		const user = userEvent.setup();
+		worker.use(
+			http.get('/events', () =>
+				HttpResponse.json({
+					data: [
+						{
+							_links: {
+								self: '/events/evt_held_1',
+								execution: '/executions/exec_held_1',
+								job: '/jobs/job_held_1',
+							},
+							created_at: new Date().toISOString(),
+							data: { held_execution_id: 'held_held_1', agent_id: 'agnt_1' },
+							detail: null,
+							event_id: 'evt_held_1',
+							requires_action: true,
+							severity: 'warning',
+							summary: 'Agent agnt_1 wants to POST /v1/charges',
+							trace_id: 'a'.repeat(32),
+							type: 'execution.approval_requested',
+						},
+					],
+					has_more: false,
+					next_cursor: null,
+				}),
+			),
+		);
+		renderMonitor('/app/monitor?view=activity');
+
+		await user.click(
+			await screen.findByRole('link', { name: /Agent agnt_1 wants to POST \/v1\/charges/ }),
+		);
+
+		await waitFor(() =>
+			expect(screen.getByTestId('location-path')).toHaveTextContent(
+				'/agents/approvals/held_held_1',
+			),
+		);
+		expect(currentParams().get('execution_id')).toBeNull();
+		expect(currentParams().get('trace_id')).toBeNull();
+	});
+
 	it('folds a run of successful calls into one expandable row', async () => {
 		const user = userEvent.setup();
 		const now = Date.now();
@@ -557,6 +600,82 @@ describe('MonitorPage', () => {
 		expect(
 			await within(dialog).findByRole('button', { name: 'Cancel job' }),
 		).toBeInTheDocument();
+	});
+
+	it('offers the Approvals page, not Cancel, for a held execution', async () => {
+		const held = {
+			_links: {
+				self: '/jobs/job_exec_held',
+				result: null,
+				execution: '/executions/exec_held',
+			},
+			created_at: new Date().toISOString(),
+			error: null,
+			execution_id: 'exec_held',
+			job_id: 'job_exec_held',
+			kind: 'execution',
+			status: 'held',
+			updated_at: null,
+		};
+		worker.use(
+			http.get('/jobs', () =>
+				HttpResponse.json({ data: [held], has_more: false, next_cursor: null }),
+			),
+			http.get('/jobs/job_exec_held', () => HttpResponse.json(held)),
+		);
+		const user = userEvent.setup();
+		renderMonitor('/app/monitor?show=jobs');
+
+		await user.click(await screen.findByText('job_exec_held'));
+		const dialog = await screen.findByRole('dialog');
+		const open = await within(dialog).findByRole('button', { name: 'Open approvals' });
+		expect(
+			within(dialog).queryByRole('button', { name: 'Cancel job' }),
+		).not.toBeInTheDocument();
+		// The held call has no execution record yet, so no execution link either.
+		expect(within(dialog).queryByLabelText('Open execution exec_held')).not.toBeInTheDocument();
+
+		await user.click(open);
+		await waitFor(() =>
+			expect(screen.getByTestId('location-path')).toHaveTextContent('/agents/approvals'),
+		);
+	});
+
+	it('opens the review page, not the job, from a decided approval row', async () => {
+		const user = userEvent.setup();
+		worker.use(
+			http.get('/events', () =>
+				HttpResponse.json({
+					data: [
+						{
+							_links: { self: '/events/evt_decided_1', job: '/jobs/job_held_1' },
+							created_at: new Date().toISOString(),
+							data: { held_execution_id: 'held_held_1', agent_id: 'agnt_1' },
+							detail: null,
+							event_id: 'evt_decided_1',
+							requires_action: false,
+							severity: 'info',
+							summary: 'Held call held_held_1 approved',
+							trace_id: null,
+							type: 'execution.approval_decided',
+						},
+					],
+					has_more: false,
+					next_cursor: null,
+				}),
+			),
+		);
+		renderMonitor('/app/monitor?view=activity');
+
+		await user.click(
+			await screen.findByRole('link', { name: /Held call held_held_1 approved/ }),
+		);
+		await waitFor(() =>
+			expect(screen.getByTestId('location-path')).toHaveTextContent(
+				'/agents/approvals/held_held_1',
+			),
+		);
+		expect(currentParams().get('job_id')).toBeNull();
 	});
 
 	it('switches to the Audit log source and shows actors', async () => {

@@ -598,8 +598,8 @@ def transport_error(exc: Exception, *, retry_safe: bool) -> ToolError:
         "reached the upstream",
         actionable="Do not re-send this call blindly: it may have executed. Verify the "
         "effect with a read (execute_read) first, or re-send with an idempotency_key so "
-        "the broker de-duplicates the retry. If the execute returned a held (202) job, "
-        "poll it with get_execution_result — never re-send.",
+        "the broker de-duplicates the retry. If the execute returned a held (202) call, "
+        "poll it with get_execution_result using its held_execution_id — never re-send.",
         next_tool="get_started",
         extra={"retryable": False},
     )
@@ -620,6 +620,23 @@ def _cap_headers(headers: dict[str, str], budget: int) -> tuple[dict[str, str], 
         used += cost
         capped[key] = headers[key]
     return capped, True
+
+
+def held_envelope(status: int, parsed_body: Any) -> dict[str, Any] | None:
+    """The broker's held (202) envelope, or ``None`` for any other response.
+
+    A held envelope is a 202 whose body carries ``status: "held"``, the
+    ``held_execution_id`` to poll and the ``review_url`` a person opens.
+    """
+    if status != 202 or not isinstance(parsed_body, dict):
+        return None
+    if parsed_body.get("status") != "held":
+        return None
+    if not isinstance(parsed_body.get("held_execution_id"), str) or not isinstance(
+        parsed_body.get("review_url"), str
+    ):
+        return None
+    return parsed_body
 
 
 def execute_result_payload(

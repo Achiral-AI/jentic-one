@@ -12,7 +12,10 @@ package broker
 func (AgentDirective) RequiredFields() []string {
 	return []string{"human_readable_instruction", "parameters", "strategy"}
 }
-func (AsyncQueuedResponse) RequiredFields() []string { return []string{"_links", "job_id"} }
+func (AsyncQueuedResponse) RequiredFields() []string { return []string{"_links", "job_id", "status"} }
 func (CredentialCandidate) RequiredFields() []string { return []string{"id", "last4", "name"} }
 func (HealthResponse) RequiredFields() []string      { return []string{"status"} }
-func (ReadinessResponse) RequiredFields() []string   { return []string{"status"} }
+func (HeldExecutionAcceptedResponse) RequiredFields() []string {
+	return []string{"_links", "agent_directive", "expires_at", "held_execution_id", "review_url", "status"}
+}
+func (ReadinessResponse) RequiredFields() []string { return []string{"status"} }

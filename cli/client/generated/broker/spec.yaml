@@ -927,13 +927,22 @@ components:
         collect the upstream response body once `status` is
         `completed`.
       examples:
-        - job_id: job_abc123
+        - status: queued
+          job_id: job_abc123
           _links:
             self: https://control.your-instance.example/jobs/job_abc123
       required:
+        - status
         - job_id
         - _links
       properties:
+        status:
+          type: string
+          title: Status
+          description: Always `queued` on this body; a call held for approval answers `held` instead.
+          enum: [queued]
+          examples:
+            - queued
         job_id:
           type: string
           title: Job Id
@@ -959,6 +968,72 @@ components:
               description: Absolute URL of the control-plane job record. Poll this for status and result links.
               examples:
                 - https://control.your-instance.example/jobs/job_abc123
+    HeldExecutionAcceptedResponse:
+      type: object
+      title: HeldExecutionAcceptedResponse
+      summary: Handle returned when a permission rule holds the call for human approval.
+      description: |
+        Returned as the `202` body when the call matches a permission rule
+        with `effect: require-approval`. The call has not run: it waits
+        until a reviewer (the agent's owner or an `org:admin`) approves or
+        denies it on `review_url`, or it expires. Follow `_links.self`
+        (`/executions/holds/{held_execution_id}`) to see where it stands;
+        once it has finished, `_links.result` returns the upstream response,
+        or the problem explaining why it never ran (denied, expired, or
+        refused at run time). To abandon the call, `POST` to
+        `_links.withdraw`. Never re-send the call: an identical call while
+        one is pending joins the same held execution.
+      required:
+        - status
+        - held_execution_id
+        - review_url
+        - expires_at
+        - agent_directive
+        - _links
+      properties:
+        status:
+          type: string
+          enum: [held]
+          description: Always `held`.
+        held_execution_id:
+          type: string
+          description: The held execution.
+          examples:
+            - held_abc123
+        review_url:
+          type: string
+          format: uri
+          description: Review page; the reviewer signs in to decide. Carries no credential.
+          examples:
+            - https://your-instance.example/app/agents/approvals/held_abc123
+        expires_at:
+          type: string
+          format: date-time
+          description: When the call expires undecided and fails.
+        agent_directive:
+          type: string
+          description: What the calling agent should do next.
+        _links:
+          type: object
+          required: [self, result, withdraw]
+          properties:
+            self:
+              type: string
+              description: The held execution — its decision and where the call stands.
+              examples:
+                - https://control.your-instance.example/executions/holds/held_abc123
+            result:
+              type: string
+              description: The call's outcome, once it has finished.
+              examples:
+                - https://control.your-instance.example/executions/holds/held_abc123/result
+            withdraw:
+              type: string
+              description: |
+                `POST` here to withdraw the call before it is decided (only
+                the agent that made the call may). The call never runs.
+              examples:
+                - https://control.your-instance.example/executions/holds/held_abc123:withdraw
     HealthResponse:
       type: object
       title: HealthResponse
@@ -1116,10 +1191,12 @@ components:
                 explicit: false
     ExecuteAsync:
       description: |
-        Execution queued. Follow `_links.self` to the control plane
-        to poll the job and collect the upstream response body once
-        `status` is `completed`. The body is delivered once and then
-        evicted from the platform's pickup buffer.
+        Execution queued — or held for human approval when a
+        `require-approval` permission rule matched (`status: held`; see
+        `HeldExecutionAcceptedResponse`). For a queued call, follow
+        `_links.self` to the control plane to poll the job and collect the
+        upstream response body once `status` is `completed`. The body is
+        delivered once and then evicted from the platform's pickup buffer.
       headers:
         Preference-Applied:
           description: RFC 7240 — confirms which processing preference was applied.
@@ -1158,14 +1235,40 @@ components:
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/AsyncQueuedResponse"
+            oneOf:
+              - $ref: "#/components/schemas/AsyncQueuedResponse"
+              - $ref: "#/components/schemas/HeldExecutionAcceptedResponse"
+            discriminator:
+              propertyName: status
+              mapping:
+                queued: "#/components/schemas/AsyncQueuedResponse"
+                held: "#/components/schemas/HeldExecutionAcceptedResponse"
           examples:
             queued:
               summary: Freshly queued async execution.
               value:
+                status: queued
                 job_id: job_abc123
                 _links:
                   self: https://control.your-instance.example/jobs/job_abc123
+            held:
+              summary: Call held for human approval by a require-approval rule.
+              value:
+                status: held
+                held_execution_id: held_abc123
+                review_url: https://your-instance.example/app/agents/approvals/held_abc123
+                expires_at: "2026-10-06T12:00:00Z"
+                agent_directive: >-
+                  This call needs human approval. Most important: show the user the review_url,
+                  since they cannot approve it without that link, and end your turn so they see it.
+                  Do not call get_execution_result until the user replies; then call it once with
+                  held_execution_id. It waits up to 30 seconds (timeout, at most 30). If it is
+                  still held, show the user the review_url again and end your turn again. Do not
+                  re-send the call.
+                _links:
+                  self: https://control.your-instance.example/executions/holds/held_abc123
+                  result: https://control.your-instance.example/executions/holds/held_abc123/result
+                  withdraw: https://control.your-instance.example/executions/holds/held_abc123:withdraw
     BadRequest:
       description: |
         Request rejected before reaching the upstream — malformed JSON,

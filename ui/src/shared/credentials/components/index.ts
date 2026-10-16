@@ -43,6 +43,7 @@ export {
 	MatchedRuleText,
 	RuleRequestTester,
 	VerdictChip,
+	verdictOutcome,
 } from '@/shared/credentials/components/RuleRequestTester';
 export type { RuleRequestTesterProps } from '@/shared/credentials/components/RuleRequestTester';
 export {

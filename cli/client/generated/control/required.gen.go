@@ -116,7 +116,8 @@ func (CurrentUserResponse) RequiredFields() []string {
 func (DailyExecutionBucket) RequiredFields() []string {
 	return []string{"date", "failed", "success", "total"}
 }
-func (DenyRequest) RequiredFields() []string { return []string{"reason"} }
+func (DecideHeldExecutionRequest) RequiredFields() []string { return []string{"decision"} }
+func (DenyRequest) RequiredFields() []string                { return []string{"reason"} }
 func (DeviceAuthorizationRegistrationCreateRequest) RequiredFields() []string {
 	return []string{"api_vendor", "authorization_endpoint", "catalog_api_id", "client_id", "display_name", "flow_kind", "name", "token_endpoint"}
 }
@@ -142,6 +143,15 @@ func (GovernedHostsResponse) RequiredFields() []string { return []string{"data",
 func (HealthResponse) RequiredFields() []string {
 	return []string{"setup_required", "status", "surface"}
 }
+func (HeldExecutionDetailResponse) RequiredFields() []string {
+	return []string{"_links", "agent_id", "api_name", "api_vendor", "api_version", "created_at", "credential_id", "expires_at", "id", "method", "path", "review_url", "state"}
+}
+func (HeldExecutionLinksResponse) RequiredFields() []string { return []string{"self"} }
+func (HeldExecutionListResponse) RequiredFields() []string  { return []string{"data", "has_more"} }
+func (HeldExecutionResponse) RequiredFields() []string {
+	return []string{"_links", "agent_id", "api_name", "api_vendor", "api_version", "created_at", "credential_id", "expires_at", "id", "method", "path", "review_url", "state"}
+}
+func (HeldRequestResponse) RequiredFields() []string { return []string{"method", "url"} }
 func (InstanceIdentityResponse) RequiredFields() []string {
 	return []string{"backend", "canonical_base_url", "host"}
 }

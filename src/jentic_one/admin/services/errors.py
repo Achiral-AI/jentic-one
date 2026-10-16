@@ -65,6 +65,54 @@ class EventNotFoundError(NotFoundError):
         self.event_id = event_id
 
 
+class HeldExecutionNotFoundError(NotFoundError):
+    """Raised when an execution approval does not exist."""
+
+    def __init__(self, approval_id: str) -> None:
+        super().__init__(f"Held execution '{approval_id}' not found")
+        self.approval_id = approval_id
+
+
+class HeldExecutionAlreadyDecidedError(AdminServiceError):
+    """Raised when a decide action targets a non-pending approval."""
+
+
+class HeldExecutionJobNotHeldError(AdminServiceError):
+    """Raised when a pending approval's job is no longer ``held``.
+
+    The decision (or withdrawal) is rolled back: an approval never settles
+    without its job, so an ``approved`` row always has a released job.
+    """
+
+    def __init__(self, approval_id: str, job_id: str) -> None:
+        super().__init__(
+            f"Held execution '{approval_id}' cannot settle: its call is no longer held"
+        )
+        self.approval_id = approval_id
+        self.job_id = job_id
+
+
+class HeldExecutionForbiddenError(AdminServiceError):
+    """Raised when a caller is not permitted to decide an approval (e.g. agent actor)."""
+
+
+class HeldExecutionResultNotReadyError(AdminServiceError):
+    """Raised when a held execution has not finished, so it has no result yet."""
+
+    def __init__(self, approval_id: str, status: str) -> None:
+        super().__init__(f"Held execution '{approval_id}' has no result yet: its call is {status}")
+        self.approval_id = approval_id
+        self.status = status
+
+
+class HeldExecutionResultExpiredError(AdminServiceError):
+    """Raised when a held execution's result has passed its retention window."""
+
+    def __init__(self, approval_id: str) -> None:
+        super().__init__(f"Held execution '{approval_id}' result is no longer available")
+        self.approval_id = approval_id
+
+
 class ConflictError(AdminServiceError):
     """Raised when an operation conflicts with existing state."""
 
@@ -184,6 +232,17 @@ class JobNotCancellableError(AdminServiceError):
 
     def __init__(self, job_id: str) -> None:
         super().__init__(f"Job '{job_id}' is not cancellable")
+        self.job_id = job_id
+
+
+class JobAwaitingApprovalError(JobNotCancellableError):
+    """Raised when ``:cancel`` targets a held execution, which awaits its approval.
+
+    Such a job settles only through its approval (decide, withdraw or expiry).
+    """
+
+    def __init__(self, job_id: str) -> None:
+        AdminServiceError.__init__(self, f"Job '{job_id}' is awaiting execution approval")
         self.job_id = job_id
 
 

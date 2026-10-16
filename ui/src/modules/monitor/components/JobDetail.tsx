@@ -7,9 +7,17 @@
  * job is still queued or running.
  */
 import { useState } from 'react';
+import { useNavigate } from 'react-router';
 import { ArrowUpRight } from 'lucide-react';
+import { ROUTES } from '@/shared/app/routes';
 import { ActorLabel, AppLink, Button, ErrorAlert, LoadingState, ConfirmDialog } from '@/shared/ui';
-import { isTerminalJobStatus, toJobStatus, useCancelJob, useJob } from '@/modules/monitor/api';
+import {
+	isCancellableJob,
+	isTerminalJobStatus,
+	toJobStatus,
+	useCancelJob,
+	useJob,
+} from '@/modules/monitor/api';
 import { DetailRow, DetailSection } from '@/modules/monitor/components/Detail';
 import {
 	DetailFrame,
@@ -30,8 +38,15 @@ export function JobDetail({ jobId, frame }: { jobId: string; frame: DetailFrameC
 
 	const job = query.data;
 	const status = job ? toJobStatus(job.status) : null;
-	const canCancel = isAdmin && status != null && !isTerminalJobStatus(status);
+	const canCancel =
+		isAdmin && job != null && status != null && isCancellableJob(status, job.kind);
 	const span = job ? formatSpan(job.created_at, job.updated_at) : null;
+	const navigate = useNavigate();
+	// A held execution settles through its review on the Approvals page, never
+	// by cancelling the job.
+	const heldExecution = status === 'held' && job?.kind === 'execution';
+	// A held call's execution record is written only once it runs.
+	const hasExecutionRecord = status !== 'held';
 
 	const confirmCancel = () => {
 		if (!job) return;
@@ -46,7 +61,16 @@ export function JobDetail({ jobId, frame }: { jobId: string; frame: DetailFrameC
 			id={jobId}
 			idLabel="job id"
 			actions={
-				canCancel && job ? (
+				heldExecution ? (
+					<Button
+						variant="primary"
+						size={frame.mode === 'pane' ? 'sm' : undefined}
+						onClick={() => navigate(ROUTES.approvals)}
+						className={frame.mode === 'sheet' ? 'flex-1' : undefined}
+					>
+						Open approvals
+					</Button>
+				) : canCancel && job ? (
 					<Button
 						variant="danger"
 						size={frame.mode === 'pane' ? 'sm' : undefined}
@@ -123,7 +147,7 @@ export function JobDetail({ jobId, frame }: { jobId: string; frame: DetailFrameC
 					<DetailSection title="Ids">
 						<IdRow label="Job id" value={job.job_id} />
 						<DetailRow label="Raw kind" value={job.kind} mono />
-						{job.execution_id && (
+						{job.execution_id && hasExecutionRecord && (
 							<DetailRow
 								label="Execution"
 								value={

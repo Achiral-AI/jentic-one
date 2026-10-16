@@ -161,7 +161,7 @@ function matcherMatches(m: PathMatcher, requestPath: string): boolean {
 }
 
 interface CompiledRule {
-	effect: 'allow' | 'deny';
+	effect: PermissionRule['effect'];
 	methods: Set<string> | null;
 	path: PathMatcher | null;
 	operations: Set<string> | null;
@@ -196,10 +196,27 @@ function ruleMatches(
 	return true;
 }
 
+/** The effect an ordered rule list resolves to for one request. */
+export type RuleOutcome = PermissionRule['effect'];
+
+/**
+ * Evaluate an ordered rule list against a request triple and return the
+ * effect of the first matching rule: ``allow`` runs the call, ``deny``
+ * refuses it, ``require-approval`` holds it for a reviewer. Default-deny
+ * when nothing matches.
+ */
+export function evaluateRuleEffect(
+	rules: readonly PermissionRule[],
+	req: { method: string; path: string; operation_id: string | null },
+): RuleOutcome {
+	return explainRules(rules, req).effect;
+}
+
 /**
  * Evaluate an ordered rule list against a request triple. Returns
- * ``true`` iff a matching ``allow`` rule fires before any matching
- * ``deny``. Default-deny when nothing matches.
+ * ``true`` iff a matching ``allow`` rule fires first — a matching
+ * ``deny`` refuses and a matching ``require-approval`` holds the call for a
+ * reviewer, so neither runs it outright. Default-deny when nothing matches.
  */
 export function evaluateRules(
 	rules: readonly PermissionRule[],
@@ -209,28 +226,35 @@ export function evaluateRules(
 }
 
 /** {@link evaluateRules}' verdict plus which rule decided it — the shape of the
- * broker's `permissions:test` answer (`matched` / `rule_index`). */
+ * broker's `permissions:test` answer (`matched` / `rule_index` / `effect`). */
 export interface RuleVerdict {
 	allowed: boolean;
+	/** The deciding rule's effect; `deny` when nothing matched (default-deny). */
+	effect: RuleOutcome;
 	/** False = nothing matched, so the default deny decided. */
 	matched: boolean;
 	/** Index into `rules` of the deciding rule; null when nothing matched. */
 	ruleIndex: number | null;
 }
 
-/** Evaluate like {@link evaluateRules}, and say which rule decided. */
+/** Evaluate like {@link evaluateRuleEffect}, and say which rule decided. */
 export function explainRules(
 	rules: readonly PermissionRule[],
 	req: { method: string; path: string; operation_id: string | null },
 ): RuleVerdict {
 	for (let i = 0; i < rules.length; i += 1) {
 		const compiled = compileRule(rules[i]!);
-		if (isConditionLess(compiled) && compiled.effect === 'allow') continue;
+		if (isConditionLess(compiled) && compiled.effect !== 'deny') continue;
 		if (ruleMatches(compiled, req)) {
-			return { allowed: compiled.effect === 'allow', matched: true, ruleIndex: i };
+			return {
+				allowed: compiled.effect === 'allow',
+				effect: compiled.effect,
+				matched: true,
+				ruleIndex: i,
+			};
 		}
 	}
-	return { allowed: false, matched: false, ruleIndex: null };
+	return { allowed: false, effect: 'deny', matched: false, ruleIndex: null };
 }
 
 /**

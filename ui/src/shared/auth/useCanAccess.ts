@@ -23,6 +23,8 @@ export const AGENTS_WRITE = 'agents:write';
 export const APIS_READ = 'apis:read';
 /** Read the async job queue (`GET /jobs`). */
 export const JOBS_READ = 'jobs:read';
+/** Cancel jobs (`POST /jobs/{id}:cancel`). */
+export const JOBS_WRITE = 'jobs:write';
 /** Read the audit log (`GET /audit`). */
 export const AUDIT_READ = 'audit:read';
 /** Read every credential (`GET /credentials`). */

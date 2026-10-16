@@ -49,6 +49,7 @@ export const ROUTES = {
 	agents: '/agents',
 	monitor: '/monitor',
 	docs: '/docs',
+	approvals: '/agents/approvals',
 } as const;
 
 /**
@@ -98,6 +99,12 @@ export const ROUTE_PATHS = {
 	 */
 	agentTab: (agentId: string) => `${ROUTES.agents}?agent=${encodeURIComponent(agentId)}`,
 	/**
+	 * One held execution's review page, a subsection of Agents. The broker
+	 * builds the same path into a held call's `review_url`.
+	 */
+	approval: (heldExecutionId: string) =>
+		`${ROUTES.approvals}/${encodeURIComponent(heldExecutionId)}`,
+	/**
 	 * An agent's connect request opened for approval — the address the backend
 	 * mints as the session's `approval_url` (`?approve=<sid>`, no poll token:
 	 * the agent's owner or an org admin acts without it). With `agentId`, the
@@ -118,6 +125,13 @@ export const ROUTE_PATHS = {
 	 * can't import from each other. Monitor's own richer builder is
 	 * `modules/monitor/lib/links`.
 	 */
+	/**
+	 * One execution record opened in Monitor's API-calls view — where a held
+	 * call's review page sends the reviewer once the approved call has run.
+	 * Same param vocabulary as `monitorExecutions`.
+	 */
+	monitorExecution: (executionId: string) =>
+		`${ROUTES.monitor}?${new URLSearchParams({ show: 'calls', execution_id: executionId }).toString()}`,
 	monitorExecutions: (filter?: {
 		actorId?: string;
 		actorType?: 'agent' | 'user';

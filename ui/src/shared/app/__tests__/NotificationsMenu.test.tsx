@@ -82,6 +82,37 @@ function connectRow(
 let approved: string[];
 let connectRows: ReturnType<typeof connectRow>[];
 let credentialRows: unknown[];
+let approvalRows: ReturnType<typeof heldCall>[];
+let requiresActionEvents: EventResponse[];
+
+/** A pending held execution: an agent's call an Ask rule holds. */
+function heldCall(overrides: Record<string, unknown> = {}) {
+	const id = (overrides.id as string | undefined) ?? 'held_1';
+	return {
+		id,
+		agent_id: 'agnt_scout',
+		credential_id: 'cred_stripe',
+		api_vendor: 'api.stripe.com',
+		api_name: 'payments',
+		api_version: '2024-01-01',
+		operation_id: null,
+		method: 'POST',
+		path: '/v1/charges',
+		matched_rule_id: 'apr_1',
+		state: 'pending',
+		execution_status: 'held',
+		expires_at: new Date(Date.now() + 60 * 60_000).toISOString(),
+		decided_at: null,
+		decided_by: null,
+		decision_reason: null,
+		trace_id: null,
+		execution_id: null,
+		created_at: new Date(Date.now() - 15 * 60_000).toISOString(),
+		updated_at: null,
+		_links: { self: `/executions/holds/${id}`, withdraw: `/executions/holds/${id}:withdraw` },
+		...overrides,
+	};
+}
 
 beforeEach(() => {
 	window.localStorage.clear();
@@ -89,7 +120,13 @@ beforeEach(() => {
 	approved = [];
 	connectRows = [];
 	credentialRows = [];
+	approvalRows = [];
+	requiresActionEvents = [failure];
 	worker.use(
+		http.get('/executions/holds', ({ request }) => {
+			const state = new URL(request.url).searchParams.get('state');
+			return HttpResponse.json(page(approvalRows.filter((r) => !state || r.state === state)));
+		}),
 		http.get('/connect-sessions', ({ request }) => {
 			const state = new URL(request.url).searchParams.get('state');
 			return HttpResponse.json(page(connectRows.filter((r) => !state || r.state === state)));
@@ -103,7 +140,7 @@ beforeEach(() => {
 			const url = new URL(request.url);
 			if (url.searchParams.get('requires_action') !== 'true')
 				return HttpResponse.json(page([]));
-			return HttpResponse.json(page([failure]));
+			return HttpResponse.json(page(requiresActionEvents));
 		}),
 		http.get('/agents', () =>
 			HttpResponse.json(page(approved.includes(pendingAgent.id) ? [] : [pendingAgent])),
@@ -329,6 +366,69 @@ describe('NotificationsMenu', () => {
 			expect(
 				within(dialog).getByText('scout-bot is waiting for you to connect GitHub'),
 			).toBeInTheDocument();
+		});
+	});
+
+	describe('agents waiting on a held call', () => {
+		it("collapses an agent's held calls into one approval row linking to the oldest", async () => {
+			approvalRows = [
+				heldCall({
+					id: 'held_new',
+					created_at: new Date(Date.now() - 60_000).toISOString(),
+				}),
+				heldCall({ id: 'held_old', path: '/v1/refunds' }),
+			];
+			// The request event mirrors the live row; the row wins, so it is not
+			// listed (or counted) twice.
+			requiresActionEvents = [
+				failure,
+				{
+					_links: { self: '/events/evt_held' },
+					event_id: 'evt_held',
+					type: 'execution.approval_requested',
+					severity: 'warning' as EventResponse['severity'],
+					summary: 'Agent agnt_scout wants to POST /v1/charges',
+					created_at: new Date(Date.now() - 60_000).toISOString(),
+					requires_action: true,
+					data: { held_execution_id: 'held_new', agent_id: 'agnt_scout' },
+				},
+			];
+			const user = userEvent.setup();
+			renderMenu();
+			await user.click(await screen.findByRole('button', { name: /^Notifications, 3/ }));
+			const dialog = screen.getByRole('dialog', { name: /Notifications/ });
+			const approvals = within(dialog).getByRole('region', { name: 'Approvals' });
+			const row = await within(approvals).findByText(
+				'scout-bot is waiting for you to approve 2 calls',
+			);
+			expect(within(dialog).queryByText(/wants to POST/)).toBeNull();
+
+			const item = row.closest('li')!;
+			expect(item).toHaveTextContent('2 held calls');
+			await user.click(within(item).getByRole('link', { name: 'Review' }));
+			expect(screen.getByTestId('location')).toHaveTextContent('/agents/approvals/held_old');
+		});
+
+		it('names a single held call and drops one whose window lapsed', async () => {
+			approvalRows = [
+				heldCall(),
+				heldCall({
+					id: 'held_lapsed',
+					agent_id: 'agnt_other',
+					expires_at: new Date(Date.now() - 60_000).toISOString(),
+				}),
+			];
+			const user = userEvent.setup();
+			renderMenu();
+			await user.click(await screen.findByRole('button', { name: /^Notifications, 3/ }));
+			const dialog = screen.getByRole('dialog', { name: /Notifications/ });
+			const row = await within(dialog).findByText(
+				'scout-bot is waiting for you to approve a call to api.stripe.com/payments',
+			);
+			expect(row.closest('li')).toHaveTextContent(
+				'POST /v1/charges on api.stripe.com/payments',
+			);
+			expect(within(dialog).queryByText(/agnt_other/)).toBeNull();
 		});
 	});
 });

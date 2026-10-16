@@ -75,11 +75,13 @@ describe('draftRulesForPreset + explainRules — the dry run of an unsaved choic
 		const rules = draftRulesForPreset('read', []);
 		expect(ask(rules, 'GET', '/repos/x')).toEqual({
 			allowed: true,
+			effect: 'allow',
 			matched: true,
 			ruleIndex: 0,
 		});
 		expect(ask(rules, 'POST', '/repos/x')).toEqual({
 			allowed: false,
+			effect: 'deny',
 			matched: false,
 			ruleIndex: null,
 		});
@@ -98,11 +100,13 @@ describe('draftRulesForPreset + explainRules — the dry run of an unsaved choic
 		]);
 		expect(ask(rules, 'GET', '/repos/secret/1')).toEqual({
 			allowed: false,
+			effect: 'deny',
 			matched: true,
 			ruleIndex: 0,
 		});
 		expect(ask(rules, 'GET', '/repos/open')).toEqual({
 			allowed: true,
+			effect: 'allow',
 			matched: true,
 			ruleIndex: 1,
 		});

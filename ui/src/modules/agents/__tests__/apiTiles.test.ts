@@ -346,7 +346,7 @@ describe('tileStats / agentSetupGapCount', () => {
 		}
 		// Beside a Ready tile, the figure is only a floor.
 		const rules = new Map<string, BindingRulesState>([
-			['cred_a', { total: 1, allow: 1, deny: 0 }],
+			['cred_a', { total: 1, allow: 1, ask: 0, deny: 0 }],
 			['cred_b', 'error'],
 		]);
 		expect(tileStats(tiles, (t) => rules.get(t.credentialId))).toMatchObject({
@@ -376,8 +376,8 @@ describe('tileStats / agentSetupGapCount', () => {
 		];
 		const tiles = composeApiTiles(bindings, credentials, apis);
 		const rules = new Map([
-			['cred_a', { total: 1, allow: 1, deny: 0 }],
-			['cred_b', { total: 0, allow: 0, deny: 0 }],
+			['cred_a', { total: 1, allow: 1, ask: 0, deny: 0 }],
+			['cred_b', { total: 0, allow: 0, ask: 0, deny: 0 }],
 		]);
 		expect(tileStats(tiles, (t) => rules.get(t.credentialId))).toEqual({
 			configured: 2,
@@ -418,7 +418,9 @@ describe('tileStats / agentSetupGapCount', () => {
 		const rules = new Map(
 			plan.map(([id, , blocked]) => [
 				id,
-				blocked ? { total: 0, allow: 0, deny: 0 } : { total: 1, allow: 1, deny: 0 },
+				blocked
+					? { total: 0, allow: 0, ask: 0, deny: 0 }
+					: { total: 1, allow: 1, ask: 0, deny: 0 },
 			]),
 		);
 		const tiles = composeApiTiles(bindings, credentials, apis);
@@ -426,7 +428,7 @@ describe('tileStats / agentSetupGapCount', () => {
 		expect(stats.blockedBindings).toBe(5);
 		// GitHub's two credentials are both Blocked: the one fully blocked API.
 		expect(stats.fullyBlockedApis).toBe(1);
-		rules.set('g2', { total: 1, allow: 1, deny: 0 });
+		rules.set('g2', { total: 1, allow: 1, ask: 0, deny: 0 });
 		const relaxed = tileStats(tiles, (t) => rules.get(t.credentialId));
 		expect(relaxed.blockedBindings).toBe(4);
 		expect(relaxed.fullyBlockedApis).toBe(0);
@@ -442,7 +444,7 @@ describe('tileStats / agentSetupGapCount', () => {
 		];
 		const tiles = composeApiTiles(bindings, [makeCredential()], apis);
 		expect(tiles).toHaveLength(2);
-		const stats = tileStats(tiles, () => ({ total: 0, allow: 0, deny: 0 }));
+		const stats = tileStats(tiles, () => ({ total: 0, allow: 0, ask: 0, deny: 0 }));
 		expect(stats.blockedBindings).toBe(1);
 		expect(stats.fullyBlockedApis).toBe(2);
 	});

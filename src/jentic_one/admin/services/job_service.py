@@ -8,13 +8,14 @@ from jentic_one.admin.core.schema.jobs import Job
 from jentic_one.admin.repos import AuditRepository, JobRepository
 from jentic_one.admin.scoping.filters import build_access_filters
 from jentic_one.admin.services._support.pagination import Page, decode_cursor, encode_cursor
-from jentic_one.admin.services.errors import JobNotFoundError
+from jentic_one.admin.services.errors import JobAwaitingApprovalError, JobNotFoundError
 from jentic_one.admin.services.metrics import audit_events_counter
 from jentic_one.admin.services.schemas.jobs import JobFilter, JobView
 from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.context import Context
 from jentic_one.shared.models.actors import actor_type_label_from_id
 from jentic_one.shared.models.audit import AuditAction, AuditTargetType
+from jentic_one.shared.models.jobs import JobKind, JobStatus
 
 
 def _job_actor_type(created_by: str | None, stored: str) -> str:
@@ -97,6 +98,11 @@ class JobService:
             job = await JobRepository.get_by_id(session, job_id, filters=access_filters)
             if job is None:
                 raise JobNotFoundError(job_id)
+            if job.status == JobStatus.HELD and job.kind == JobKind.EXECUTION:
+                # A held execution settles only through its hold (decide,
+                # withdraw or expiry): cancelling the job here would strand the
+                # hold. Held jobs of any other kind cancel normally.
+                raise JobAwaitingApprovalError(job_id)
 
             cancelled = await JobRepository.cancel_if_active(
                 session, job_id, filters=access_filters

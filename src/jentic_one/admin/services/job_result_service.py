@@ -48,10 +48,10 @@ class JobResultService:
             if result.available_until is not None and result.available_until < datetime.now(UTC):
                 raise JobResultExpiredError(job_id)
 
-        return self._to_view(result)
+        return self.to_view(result)
 
     @staticmethod
-    def _to_view(result: Any) -> JobResultView:
+    def to_view(result: Any) -> JobResultView:
         raw_body: bytes | None = None
         if hasattr(result, "content_type") and result.content_type:
             raw_body = json.dumps(result.body).encode() if result.body else b""

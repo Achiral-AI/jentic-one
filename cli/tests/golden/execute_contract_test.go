@@ -3,6 +3,7 @@ package golden
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -14,6 +15,8 @@ import (
 //	resolve ok   × upstream 4xx pass-through   → envelope, exit 0 (origin: upstream)
 //	resolve ok   × broker denial + directive   → envelope + recovery stderr, exit 2
 //	resolve ok   × broker denial, no directive → envelope + synthesized stderr, exit 2
+//	resolve ok   × held for approval           → held envelope + review link, exit 3
+//	resolve ok   × held, --wait, denied        → denial envelope + reviewer reason, exit 2
 //	resolve ok   × transport failure           → coded TRANSPORT_ERROR, exit 1
 //	resolve fail (404 / backend error)         → coded RESOLVE_FAILED, exit 2
 //
@@ -155,12 +158,48 @@ func TestGolden_ExecuteContract(t *testing.T) {
 		}`))
 	}
 
+	// A call a require-approval rule held: the 202 held envelope (held
+	// execution, review link, directive, links) instead of a run.
+	brokerHeld := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header()["Date"] = nil
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Preference-Applied", "respond-async")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"status":"held","held_execution_id":"held_held1",` +
+			`"review_url":"https://console.example/app/agents/approvals/held_held1",` +
+			`"expires_at":"2026-10-10T12:00:00Z","agent_directive":"This call needs human approval.",` +
+			`"_links":{"self":"https://console.example/executions/holds/held_held1",` +
+			`"result":"https://console.example/executions/holds/held_held1/result",` +
+			`"withdraw":"https://console.example/executions/holds/held_held1:withdraw"}}`))
+	}
+	// The held execution's control-plane routes once a reviewer denied it:
+	// the call failed and its result is the approval_denied problem.
+	holdsDenied := func(w http.ResponseWriter, r *http.Request) {
+		w.Header()["Date"] = nil
+		if r.URL.Path == "/executions/holds/held_held1/result" {
+			w.Header().Set("Content-Type", "application/problem+json")
+			_, _ = w.Write([]byte(`{"type":"approval_denied","title":"Execution approval denied","status":403,` +
+				`"detail":"A reviewer denied this held execution: not today","error_origin":"broker",` +
+				`"held_execution":{"id":"held_held1","state":"denied"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"held_held1","state":"denied","execution_status":"failed",` +
+			`"agent_id":"agt_1","api_vendor":"example.com","api_name":"orders","api_version":"1",` +
+			`"credential_id":"cred_1","method":"POST","path":"/v1/orders","execution_id":"exec_held1",` +
+			`"expires_at":"2026-10-10T12:00:00Z","created_at":"2026-10-09T12:00:00Z",` +
+			`"_links":{"self":"/executions/holds/held_held1","result":"/executions/holds/held_held1/result"}}`))
+	}
+
 	cases := []struct {
 		name    string
 		target  string
 		flags   []string // appended after the broker flags
 		inspect http.HandlerFunc
 		broker  http.HandlerFunc
+		// holds plays the control plane's /executions/holds routes (--wait on
+		// a held call).
+		holds http.HandlerFunc
 		// fixedBroker overrides the mock's address with a static broker target
 		// (the SEC-1 transport case must not depend on an ephemeral port).
 		fixedBroker []string
@@ -211,6 +250,18 @@ func TestGolden_ExecuteContract(t *testing.T) {
 			fixedBroker: []string{"--broker-scheme", "http", "--broker-host", "203.0.113.9:8100"},
 		},
 		{
+			name:   "execute_held_json",
+			target: "POST:/v1/orders",
+			broker: brokerHeld,
+		},
+		{
+			name:   "execute_held_wait_denied_json",
+			target: "POST:/v1/orders",
+			flags:  []string{"--wait"},
+			broker: brokerHeld,
+			holds:  holdsDenied,
+		},
+		{
 			name:    "execute_resolve_not_found_json",
 			target:  "nonexistentOp",
 			inspect: inspectNotFound,
@@ -232,6 +283,15 @@ func TestGolden_ExecuteContract(t *testing.T) {
 						return
 					}
 					tc.inspect(w, r)
+					return
+				}
+				if strings.HasPrefix(r.URL.Path, "/executions/holds/") {
+					if tc.holds == nil {
+						t.Errorf("unexpected %s call in case %s", r.URL.Path, tc.name)
+						w.WriteHeader(http.StatusNotFound)
+						return
+					}
+					tc.holds(w, r)
 					return
 				}
 				if tc.broker == nil {

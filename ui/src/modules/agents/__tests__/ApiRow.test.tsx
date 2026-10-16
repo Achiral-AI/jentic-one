@@ -109,7 +109,7 @@ interface RowsProps {
 function Rows({
 	tiles,
 	width = 1100,
-	rules = { total: 2, allow: 2, deny: 0 },
+	rules = { total: 2, allow: 2, ask: 0, deny: 0 },
 	activity = QUIET,
 	onOpen = () => {},
 	onOpenRules,
@@ -256,7 +256,7 @@ describe('ApiRow at rest', () => {
 
 	it('reads a blocked row as a button to the rules, without a summary', () => {
 		const onOpenRules = vi.fn();
-		renderRow(makeTile(), { rules: { total: 0, allow: 0, deny: 0 }, onOpenRules });
+		renderRow(makeTile(), { rules: { total: 0, allow: 0, ask: 0, deny: 0 }, onOpenRules });
 
 		expect(screen.queryByTestId('tile-rules-summary')).toBeNull();
 		expect(screen.getByTestId('row-metric')).toHaveTextContent('No calls · blocked');
@@ -602,7 +602,11 @@ describe('ApiRow controls', () => {
 	it('Manage access on a Blocked row opens the sheet on its rules', () => {
 		const onOpen = vi.fn();
 		const onOpenRules = vi.fn();
-		renderRow(makeTile(), { rules: { total: 0, allow: 0, deny: 0 }, onOpen, onOpenRules });
+		renderRow(makeTile(), {
+			rules: { total: 0, allow: 0, ask: 0, deny: 0 },
+			onOpen,
+			onOpenRules,
+		});
 		fireEvent.click(manageButton('Slack'));
 		expect(onOpenRules).toHaveBeenCalledWith('Slack');
 		expect(onOpen).not.toHaveBeenCalled();
@@ -704,7 +708,7 @@ describe('ApiRow controls', () => {
 	});
 
 	it('a quiet blocked row says why it has no calls', async () => {
-		renderRow(makeTile(), { rules: { total: 0, allow: 0, deny: 0 } });
+		renderRow(makeTile(), { rules: { total: 0, allow: 0, ask: 0, deny: 0 } });
 		fireEvent.click(chevron('Slack'));
 		const reveal = await screen.findByTestId('api-row-reveal');
 		expect(reveal).toHaveTextContent('default-deny refuses every call');
@@ -712,7 +716,7 @@ describe('ApiRow controls', () => {
 });
 
 describe('ApiRow controls are a hover dead zone', () => {
-	const BLOCKED = { total: 0, allow: 0, deny: 0 } as const;
+	const BLOCKED = { total: 0, allow: 0, ask: 0, deny: 0 } as const;
 	const mouse = { pointerType: 'mouse' } as const;
 	const statusButton = () => within(rowOf('Slack')).getByTestId('tile-status-blocked');
 	const zones: [string, () => HTMLElement][] = [

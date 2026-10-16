@@ -29,8 +29,10 @@ import json
 import time
 import uuid as uuid_mod
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import mcp.types as mcp_types
 import structlog
@@ -38,10 +40,16 @@ from jentic.problem_details import Forbidden, Unauthorized
 from mcp.shared.exceptions import MCPError
 from pydantic import ValidationError
 
-from jentic_one.admin.services.errors import JobNotFoundError
+from jentic_one.admin.services.errors import (
+    HeldExecutionNotFoundError,
+    HeldExecutionResultNotReadyError,
+    JobNotCompletedError,
+    JobNotFoundError,
+)
+from jentic_one.admin.services.held_execution_service import HeldExecutionService
 from jentic_one.admin.services.job_result_service import JobResultService
 from jentic_one.admin.services.job_service import JobService
-from jentic_one.admin.services.schemas.jobs import JobView
+from jentic_one.admin.services.schemas.jobs import JobResultView, JobView
 from jentic_one.admin.services.user_service import UserService
 from jentic_one.auth.services.agent_service import AgentService
 from jentic_one.auth.web.routers.identity import _resolve_agent, _resolve_user
@@ -72,6 +80,7 @@ from jentic_one.control.services.vendors.service import (
 )
 from jentic_one.control.web.routers.integrations import _CONNECT_BURST, _CONNECT_RPM
 from jentic_one.control.web.schemas.permission_rules import PermissionRuleSchema
+from jentic_one.mcp import approvals
 from jentic_one.mcp import execute as ex
 from jentic_one.mcp.envelopes import (
     CODE_BROKER_DENIED,
@@ -111,6 +120,11 @@ from jentic_one.shared.catalog.protocols import (
     SecuritySchemesLookupProtocol,
 )
 from jentic_one.shared.context import Context
+from jentic_one.shared.jobs.hold import (
+    HELD_AGENT_DIRECTIVE,
+    STILL_HELD_AGENT_DIRECTIVE,
+    review_page_path,
+)
 from jentic_one.shared.models import ActorType
 from jentic_one.shared.pagination import InvalidCursorError, InvalidSearchCursorError
 from jentic_one.shared.redaction import redact_value
@@ -135,6 +149,16 @@ class CallEnv:
     base_url: str
     #: sanitized ``X-Jentic-Session-Id`` when the inbound request carried one.
     session_id: str | None
+    #: this request's declared ``_meta`` client capabilities (per request —
+    #: there is no session to remember them).
+    client_capabilities: dict[str, Any] = field(default_factory=dict)
+    #: this request's ``_meta`` clientInfo, for logging only.
+    client_name: str | None = None
+    client_version: str | None = None
+    #: the ``requestState`` a multi-round-trip retry echoes back, if any.
+    request_state: str | None = None
+    #: the protocol version this request was served under (``None`` when unknown).
+    protocol_version: str | None = None
     #: the process-level catalog auto-importer the HTTP connect route threads
     #: into ``ConnectSessionService`` (``app.state.catalog_auto_importer``);
     #: ``None`` when this process does not serve the registry.
@@ -146,7 +170,9 @@ class CallEnv:
     security_schemes_lookup: SecuritySchemesLookupProtocol | None = None
 
 
-Handler = Callable[[CallEnv, dict[str, Any]], Awaitable[mcp_types.CallToolResult]]
+ToolCallResult = mcp_types.CallToolResult | mcp_types.InputRequiredResult
+
+Handler = Callable[[CallEnv, dict[str, Any]], Awaitable[ToolCallResult]]
 
 
 def invalid_params(message: str) -> MCPError:
@@ -641,6 +667,11 @@ _JOB_COMPLETED = "completed"
 #: the job kind the catalog import loop rides (``JobKind.IMPORT``).
 _JOB_KIND_IMPORT = "import"
 
+#: execution jobs that end ``failed`` may carry their problem body as the
+#: result (a denied or expired held execution).
+_JOB_KIND_EXECUTION = "execution"
+_JOB_FAILED = "failed"
+
 
 def validate_api_id(api_id: str) -> None:
     """Syntactic guard on the catalog entry id (Go: ``validateAPIID``).
@@ -993,17 +1024,17 @@ _EXECUTE_PARAMS = [
 ]
 
 
-async def handle_execute(env: CallEnv, arguments: dict[str, Any]) -> mcp_types.CallToolResult:
+async def handle_execute(env: CallEnv, arguments: dict[str, Any]) -> ToolCallResult:
     return await _execute_tool(env, arguments, read_only_variant=False)
 
 
-async def handle_execute_read(env: CallEnv, arguments: dict[str, Any]) -> mcp_types.CallToolResult:
+async def handle_execute_read(env: CallEnv, arguments: dict[str, Any]) -> ToolCallResult:
     return await _execute_tool(env, arguments, read_only_variant=True)
 
 
 async def _execute_tool(
     env: CallEnv, arguments: dict[str, Any], *, read_only_variant: bool
-) -> mcp_types.CallToolResult:
+) -> ToolCallResult:
     """The shared execute/execute_read handler (Go: ``executeTool``).
 
     Resolve → build → send → classify, with the broker leg proxied
@@ -1014,6 +1045,10 @@ async def _execute_tool(
     and never re-sends.
     """
     tool_name = "execute_read" if read_only_variant else "execute"
+    if env.request_state is not None:
+        # A multi-round-trip retry of a held call: never re-send it — read the
+        # job the sealed state names.
+        return await _resume_held(env, env.request_state)
     args = normalize_tool_args(arguments, _EXECUTE_PARAMS)
     target = args.get("operation_id", "")
     if not target:
@@ -1101,8 +1136,63 @@ async def _execute_tool(
         raise denial
     if (resolve_failure := ex.classify_broker_error(status, response_headers, raw)) is not None:
         raise resolve_failure
-    return tool_result(
-        env.ctx, ex.execute_result_payload(status, response_headers, raw, execution_id)
+    payload = ex.execute_result_payload(status, response_headers, raw, execution_id)
+    held = ex.held_envelope(status, payload.get("body"))
+    if held is not None:
+        return await _answer_held(env, held, payload, method, urlsplit(upstream).path or "/")
+    return tool_result(env.ctx, payload)
+
+
+async def _answer_held(
+    env: CallEnv, envelope: dict[str, Any], payload: dict[str, Any], method: str, path: str
+) -> ToolCallResult:
+    """Shape a held (202) call for this client: URL elicitation, else the held result at once."""
+    door = approvals.front_door(env.client_capabilities, env.protocol_version)
+    _log_front_door(env, door, envelope)
+    if door == approvals.FRONT_DOOR_URL_ELICITATION:
+        state = approvals.seal_request_state(
+            env.ctx.encryption, envelope=envelope, agent_id=env.identity.sub
+        )
+        return approvals.url_elicitation_result(
+            review_url=envelope["review_url"],
+            message=approvals.review_message(method, path),
+            request_state=state,
+        )
+    return tool_result(env.ctx, payload)
+
+
+async def _resume_held(env: CallEnv, token: str) -> ToolCallResult:
+    """A URL-elicitation retry: the call's result if finished, else short wait then held result.
+
+    The elicitation response the client sends back is consent to open the
+    review page only — it never decides the approval.
+    """
+    state = approvals.open_request_state(env.ctx.encryption, token, agent_id=env.identity.sub)
+    if state is None:
+        raise invalid_params("Invalid or expired requestState")
+    _log_front_door(env, "url_elicitation_retry", {"held_execution_id": state["held_execution_id"]})
+    terminal = await approvals.short_wait(_held_poller(env), state["held_execution_id"])
+    if terminal is not None:
+        return tool_result(env.ctx, terminal)
+    envelope = approvals.envelope_from_state(state, HELD_AGENT_DIRECTIVE)
+    return tool_result(env.ctx, approvals.held_result_payload(envelope))
+
+
+def _poller(env: CallEnv) -> Callable[[str], Awaitable[dict[str, Any]]]:
+    async def poll(job_id: str) -> dict[str, Any]:
+        return await job_poll_payload(env, job_id)
+
+    return poll
+
+
+def _log_front_door(env: CallEnv, door: str, envelope: dict[str, Any]) -> None:
+    logger.info(
+        "mcp_held_execution_front_door",
+        front_door=door,
+        held_execution_id=envelope.get("held_execution_id"),
+        client_name=env.client_name,
+        client_version=env.client_version,
+        actor_id=env.identity.sub,
     )
 
 
@@ -1123,20 +1213,133 @@ def _header_kvs(obj: dict[str, Any] | None) -> list[tuple[str, str]]:
 
 # ── get_execution_result ──────────────────────────────────────────────────────
 
-_GET_EXECUTION_RESULT_PARAMS = [ParamSpec("job_id", "string", ("id", "job"))]
+_GET_EXECUTION_RESULT_PARAMS = [
+    ParamSpec("held_execution_id", "string", ("held_execution",)),
+    ParamSpec("job_id", "string", ("id", "job")),
+    ParamSpec("timeout", "int"),
+]
+
+#: get_execution_result's ``timeout`` in seconds when the caller sets none, and
+#: its cap (Go: ``defaultPollTimeoutSeconds`` / ``maxPollTimeoutSeconds``).
+DEFAULT_POLL_TIMEOUT_SECONDS = 30
+MAX_POLL_TIMEOUT_SECONDS = 30
 
 
 async def handle_get_execution_result(
     env: CallEnv, arguments: dict[str, Any]
 ) -> mcp_types.CallToolResult:
-    """GET /jobs/{id} (+ /result) in-process (Go: ``handleGetExecutionResult``)."""
+    """Poll a held execution, or an async execution's job (Go: ``handleGetExecutionResult``).
+
+    ``held_execution_id`` (from a held 202) reads through the held execution
+    itself; ``job_id`` (from an async 202) reads the job. It re-polls until the
+    call has finished or ``timeout`` seconds lapse — 30 when absent, and at most
+    30; ``0`` polls once and answers at once.
+    """
     args = normalize_tool_args(arguments, _GET_EXECUTION_RESULT_PARAMS)
+    held_execution_id = args.get("held_execution_id", "")
     job_id = args.get("job_id", "")
-    if not job_id:
+    if bool(held_execution_id) == bool(job_id):
         raise invalid_params(
-            'get_execution_result requires "job_id" (aliases: "id", "job"): the job id '
-            "from a held (202) execute response"
+            'get_execution_result requires exactly one of "held_execution_id" (from a held '
+            '202 execute response) or "job_id" (aliases: "id", "job"; from an async one)'
         )
+    timeout = min(
+        max(int(args.get("timeout", DEFAULT_POLL_TIMEOUT_SECONDS)), 0), MAX_POLL_TIMEOUT_SECONDS
+    )
+    if held_execution_id:
+        poll = _held_poller(env)
+        target = held_execution_id
+    else:
+        poll = _poller(env)
+        target = job_id
+    return tool_result(env.ctx, await _poll_until_finished(poll, target, float(timeout)))
+
+
+async def _poll_until_finished(
+    poll: Callable[[str], Awaitable[dict[str, Any]]], target: str, wait: float
+) -> dict[str, Any]:
+    """Poll ``target``, re-polling until finished or ``wait`` seconds lapse; zero polls once."""
+    deadline = time.monotonic() + wait
+    while True:
+        payload = await poll(target)
+        if payload.get("status") in approvals.TERMINAL_JOB_STATUSES:
+            return payload
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return payload
+        await asyncio.sleep(min(approvals.SHORT_WAIT_POLL_SECONDS, remaining))
+
+
+async def held_execution_poll_payload(env: CallEnv, held_execution_id: str) -> dict[str, Any]:
+    """The poll payload for one held execution.
+
+    ``{held_execution_id, state, status, review_url, expires_at,
+    execution_id?, result?, agent_directive?}`` — ``state`` is the decision,
+    ``status`` where the call stands, and the result rides once the call has
+    finished: the upstream response, or the problem explaining why it never
+    ran. Every poll names the held execution and its review page; until the
+    call has finished it also carries the directive to show that page again.
+    Needs no ``jobs:*`` permission: visibility is the held execution's own (the
+    filing agent, its owner, or ``org:admin``).
+    """
+    _require_db(env.ctx, "admin", "held execution polling")
+    svc = HeldExecutionService(env.ctx)
+    try:
+        view = await svc.get(held_execution_id, identity=env.identity)
+    except HeldExecutionNotFoundError:
+        raise ToolError(
+            CODE_RESOLVE_FAILED,
+            f"held execution {held_execution_id!r} not found",
+            actionable="Re-check the id — it is the held_execution_id of the held (202) "
+            "execute response — and call get_execution_result again with the exact value.",
+            next_tool="get_execution_result",
+        ) from None
+    payload: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "held_execution_id": view.id,
+        "state": view.state,
+        "status": view.execution_status,
+        "review_url": env.base_url.rstrip("/") + review_page_path(view.id),
+        "expires_at": _rfc3339(view.expires_at),
+    }
+    if view.execution_id:
+        payload["execution_id"] = view.execution_id
+    if view.execution_status not in approvals.TERMINAL_JOB_STATUSES:
+        payload["agent_directive"] = STILL_HELD_AGENT_DIRECTIVE
+        return payload
+    if view.execution_status in (_JOB_COMPLETED, _JOB_FAILED):
+        try:
+            result = await svc.get_result(held_execution_id, identity=env.identity)
+        except HeldExecutionResultNotReadyError:
+            return payload
+        except Exception as exc:
+            payload["result_error"] = (
+                f"the call finished but its result could not be fetched: {exc}"
+            )
+            return payload
+        _attach_result_view(result, payload)
+    return payload
+
+
+def _rfc3339(when: datetime) -> str:
+    """UTC RFC 3339 with ``Z`` and no trailing fraction zeros (Go: ``time.RFC3339Nano``)."""
+    text = when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f").rstrip("0").rstrip(".")
+    return f"{text}Z"
+
+
+def _held_poller(env: CallEnv) -> Callable[[str], Awaitable[dict[str, Any]]]:
+    async def poll(held_execution_id: str) -> dict[str, Any]:
+        return await held_execution_poll_payload(env, held_execution_id)
+
+    return poll
+
+
+async def job_poll_payload(env: CallEnv, job_id: str) -> dict[str, Any]:
+    """The poll payload for one job (Go: ``handleGetExecutionResult`` body).
+
+    ``{job_id, kind, status, error?, execution_id?, result?}`` — the result
+    rides once the job is ``completed``.
+    """
     require_permissions(env.identity, ["jobs:read"])
     _require_db(env.ctx, "admin", "job polling")
 
@@ -1146,7 +1349,7 @@ async def handle_get_execution_result(
         raise ToolError(
             CODE_RESOLVE_FAILED,
             f"job {job_id!r} not found",
-            actionable="Re-check the job id — it is carried by the held (202) execute "
+            actionable="Re-check the job id — it is carried by the async (202) execute "
             "response — and call get_execution_result again with the exact value.",
             next_tool="get_execution_result",
         ) from None
@@ -1167,7 +1370,7 @@ async def handle_get_execution_result(
         # job that failed once with the duplicate message and succeeded on a
         # later attempt carries the stale fragment — its completed result is
         # always more honest than its residual error.
-        return tool_result(env.ctx, _already_imported_payload(job.id))
+        return _already_imported_payload(job.id)
 
     payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -1181,7 +1384,7 @@ async def handle_get_execution_result(
         payload["execution_id"] = job.execution_id
     if job.status == _JOB_COMPLETED:
         await _attach_job_result(env, job_id, payload)
-    return tool_result(env.ctx, payload)
+    return payload
 
 
 async def _attach_job_result(env: CallEnv, job_id: str, payload: dict[str, Any]) -> None:
@@ -1192,9 +1395,17 @@ async def _attach_job_result(env: CallEnv, job_id: str, payload: dict[str, Any])
     """
     try:
         view = await JobResultService(env.ctx).get(job_id, identity=env.identity)
+    except JobNotCompletedError:
+        # A failed job without a recorded problem body has no result to attach.
+        return
     except Exception as exc:
         payload["result_error"] = f"the job completed but its result could not be fetched: {exc}"
         return
+    _attach_result_view(view, payload)
+
+
+def _attach_result_view(view: JobResultView, payload: dict[str, Any]) -> None:
+    """Attach a result document, size-capped: the upstream body, or JSON for other kinds."""
     raw: bytes
     if view.kind == "execution" and view.content_type and view.raw_body is not None:
         raw = view.raw_body
@@ -1711,6 +1922,21 @@ HANDLERS: dict[str, Handler] = {
 async def dispatch_tool_call(
     env: CallEnv, name: str, arguments: dict[str, Any] | None
 ) -> mcp_types.CallToolResult:
+    """Route one tools/call whose caller declared no input-required support.
+
+    Only a held execute for a client declaring ``elicitation.url`` answers
+    with an input-required result, and ``env`` carries the capabilities, so a
+    caller passing none always gets a plain tool result.
+    """
+    result = await dispatch_mcp_tool_call(env, name, arguments)
+    if not isinstance(result, mcp_types.CallToolResult):
+        raise MCPError(mcp_types.INTERNAL_ERROR, "tool answered with input required")
+    return result
+
+
+async def dispatch_mcp_tool_call(
+    env: CallEnv, name: str, arguments: dict[str, Any] | None
+) -> ToolCallResult:
     """Route one authenticated tools/call to its handler.
 
     ``ToolError`` renders as the coded ``isError`` result (diagnosable

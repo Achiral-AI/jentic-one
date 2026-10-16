@@ -412,9 +412,17 @@ function RecentCall({ agentId, call }: { agentId: string; call: ActorExecutionEn
 	);
 }
 
+/** The word a rule chip leads with, per effect. */
+const EFFECT_WORD: Record<string, string> = {
+	allow: 'Allow',
+	'require-approval': 'Ask',
+	deny: 'Deny',
+};
+
 /** "Allow GET, POST /repos/*" — one rule as a chip's words. */
 function ruleWords(rule: BindingPermissionRule): { effect: string; scope: string } {
-	const effect = String(rule.effect) === 'deny' ? 'Deny' : 'Allow';
+	// An effect this chip doesn't know reads as allow, the editor's default.
+	const effect = EFFECT_WORD[String(rule.effect)] ?? 'Allow';
 	const bits: string[] = [];
 	bits.push(rule.methods?.length ? rule.methods.join(', ') : 'Any');
 	if (rule.operations?.length) {

@@ -25,6 +25,11 @@ import {
 	seedExtraAgents,
 	selfRegisterAgent,
 } from '@/modules/agents/mocks/handlers';
+import {
+	clearApprovalsStore,
+	resetApprovalsStore,
+	seedMockApproval,
+} from '@/modules/agents/mocks/approvalsHandlers';
 import { dismissFirstRun } from '@/modules/agents/lib/firstRun';
 import {
 	makeMockCredential,
@@ -45,7 +50,12 @@ import { resetOrphanPurgeAttemptsForTest } from '@/modules/agents/api/hooks';
 /** Surfaces the router's current search string so specs can assert `?agent=`. */
 function LocationProbe() {
 	const location = useLocation();
-	return <div data-testid="location-search">{location.search}</div>;
+	return (
+		<>
+			<div data-testid="location-search">{location.search}</div>
+			<div data-testid="location-path">{location.pathname}</div>
+		</>
+	);
 }
 
 /** Serve `GET /users/me` for the test token, so an `AuthProvider` resolves a
@@ -205,6 +215,16 @@ describe('AgentsPage — flat agents surface', () => {
 			screen.queryByRole('button', { name: 'New service account' }),
 		).not.toBeInTheDocument();
 		expect(screen.getByRole('tablist', { name: 'Agents' })).toBeInTheDocument();
+	});
+
+	it('opens the Approvals subsection from the page header', async () => {
+		const user = userEvent.setup();
+		renderPage();
+		await screen.findAllByText('inbox-triage-bot');
+		await user.click(screen.getByRole('button', { name: /^Approvals/ }));
+		await waitFor(() =>
+			expect(screen.getByTestId('location-path')).toHaveTextContent('/agents/approvals'),
+		);
 	});
 
 	it('renders every agent as a strip pill and names the longest-waiting in the banner', async () => {
@@ -2611,11 +2631,14 @@ describe('AgentsPage — agents waiting on a connect request', () => {
 		seedComposedStores();
 		resetOrphanPurgeAttemptsForTest();
 		resetConnectSessionsStore();
+		// Held calls share the section; none here, so it shows connect requests only.
+		clearApprovalsStore();
 	});
 
 	afterEach(() => {
 		vi.restoreAllMocks();
 		resetConnectSessionsStore();
+		resetApprovalsStore();
 	});
 
 	function waitingSection() {
@@ -2708,5 +2731,106 @@ describe('AgentsPage — agents waiting on a connect request', () => {
 			expect(params.get('agent')).toBe('agnt_active_1');
 		});
 		expect(seeded.poll_token).toBeTruthy();
+	});
+});
+
+describe('AgentsPage — held calls waiting on the viewer', () => {
+	beforeEach(async () => {
+		await page.viewport(1280, 900);
+		setToken('test-token');
+		window.localStorage.clear();
+		resetAgentsStore();
+		seedComposedStores();
+		resetOrphanPurgeAttemptsForTest();
+		resetConnectSessionsStore();
+		clearApprovalsStore();
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		resetConnectSessionsStore();
+		resetApprovalsStore();
+	});
+
+	function waitingSection() {
+		return screen.findByRole('region', { name: 'Waiting for you' });
+	}
+
+	it("collapses an agent's held calls into one row, each linking to its review page", async () => {
+		const charge = seedMockApproval({
+			created_at: new Date(Date.now() - 50 * 60_000).toISOString(),
+		});
+		const refund = seedMockApproval({ path: '/v1/refunds' });
+		renderPage();
+
+		const section = await waitingSection();
+		// The agent's name resolves through the actor directory, read alongside.
+		await waitFor(() => expect(section).toHaveTextContent('support-agent'));
+		const rows = within(section).getAllByRole('listitem');
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toHaveTextContent('support-agent');
+		expect(rows[0]).toHaveTextContent('wants to make 2 calls');
+		const links = within(rows[0]).getAllByRole('link');
+		expect(links.map((l) => l.textContent)).toEqual([
+			'Review POST /v1/charges for support-agent',
+			'Review POST /v1/refunds for support-agent',
+		]);
+		expect(links[0].getAttribute('href')).toBe(`/agents/approvals/${charge.id}`);
+		expect(links[1].getAttribute('href')).toBe(`/agents/approvals/${refund.id}`);
+		await checkA11y(section);
+	});
+
+	it('badges the Approvals entry with the pending count', async () => {
+		seedMockApproval();
+		seedMockApproval({ path: '/v1/refunds' });
+		renderPage();
+		expect(
+			await screen.findByRole('button', {
+				name: /^Approvals 2 calls awaiting your approval/,
+			}),
+		).toBeInTheDocument();
+	});
+
+	it('lists a held call and a connect request for the same agent side by side', async () => {
+		seedMockApproval();
+		seedMockAgentConnectSession({ agent_id: 'agnt_active_1', vendor_key: 'github' });
+		renderPage();
+		const section = await waitingSection();
+		await waitFor(() => expect(within(section).getAllByRole('listitem')).toHaveLength(2));
+		expect(section).toHaveTextContent('wants to make a call to api.stripe.com/payments');
+		expect(section).toHaveTextContent('wants to connect github');
+	});
+
+	it('drops a held call whose approval window already lapsed', async () => {
+		seedMockApproval({ expires_at: new Date(Date.now() - 60_000).toISOString() });
+		renderPage();
+		await screen.findAllByText('inbox-triage-bot');
+		await new Promise((r) => setTimeout(r, 300));
+		expect(screen.queryByRole('region', { name: 'Waiting for you' })).not.toBeInTheDocument();
+	});
+
+	it('lists held calls to a viewer with no jobs permission', async () => {
+		seedMockApproval();
+		seedViewer(['agents:read', 'agents:write']);
+		renderPage('/', { withAuth: true });
+		expect(await waitingSection()).toHaveTextContent(
+			'wants to make a call to api.stripe.com/payments',
+		);
+	});
+
+	it('shows nothing when the server shows the viewer no held call', async () => {
+		let reads = 0;
+		worker.use(
+			http.get('/executions/holds', () => {
+				reads += 1;
+				return HttpResponse.json({ data: [], has_more: false, next_cursor: null });
+			}),
+		);
+		seedViewer(['agents:read', 'agents:write', 'jobs:read', 'jobs:write']);
+		renderPage('/', { withAuth: true });
+		await screen.findAllByText('inbox-triage-bot');
+		await waitFor(() => expect(reads).toBeGreaterThan(0));
+		expect(screen.queryByRole('region', { name: 'Waiting for you' })).not.toBeInTheDocument();
+		expect(screen.getByRole('button', { name: 'Approvals' })).toBeInTheDocument();
 	});
 });

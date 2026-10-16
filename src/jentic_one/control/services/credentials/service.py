@@ -774,9 +774,9 @@ class CredentialService:
         shared ``permission_rule_set`` the set's list is what gets evaluated —
         inline rules are dormant while a set is attached, and the dry-run must
         not lie about that. Default-deny when nothing matches. The broker's
-        condition-less-``allow`` skip is honoured so a bare ``allow`` with no
-        constraints doesn't unlock a dry-run any more than it unlocks a real
-        request.
+        condition-less skip is honoured so a bare ``allow`` or
+        ``require-approval`` with no constraints matches a dry-run no more than
+        it matches a real request.
         """
         binding = await self._require_visible_binding(credential_id, agent_id, identity=identity)
         async with self._ctx.control_db.session() as session:

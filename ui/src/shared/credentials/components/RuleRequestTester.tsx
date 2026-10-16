@@ -44,21 +44,38 @@ export interface RuleRequestTesterProps {
 	paths?: readonly string[];
 }
 
-/** Shared chip shell so allow and deny read as the same kind of answer. */
-export function VerdictChip({ allowed, children }: { allowed: boolean; children: ReactNode }) {
+/** What a test answers: the call runs, is held for a reviewer, or is refused. */
+export type VerdictOutcome = 'allowed' | 'approval' | 'denied';
+
+const VERDICT_CHIP: Record<VerdictOutcome, { label: string; className: string }> = {
+	allowed: { label: 'Allowed', className: 'bg-success/15 text-success' },
+	approval: { label: 'Ask', className: 'bg-warning/15 text-warning' },
+	denied: { label: 'Denied', className: 'bg-danger/15 text-danger' },
+};
+
+/** The outcome a matched rule's effect gives; `deny` covers no match too. */
+export function verdictOutcome(effect: string | null | undefined): VerdictOutcome {
+	if (effect === 'allow') return 'allowed';
+	if (effect === 'require-approval') return 'approval';
+	return 'denied';
+}
+
+/** Shared chip shell so every outcome reads as the same kind of answer. */
+export function VerdictChip({
+	outcome,
+	children,
+}: {
+	outcome: VerdictOutcome;
+	children: ReactNode;
+}) {
+	const chip = VERDICT_CHIP[outcome];
 	return (
 		<p
 			className="bg-surface-sheet flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md px-2.5 py-2 text-xs"
 			data-testid="rule-verdict"
 		>
-			<span
-				className={
-					allowed
-						? 'bg-success/15 text-success rounded-[5px] px-2 py-0.5 text-xs font-semibold'
-						: 'bg-danger/15 text-danger rounded-[5px] px-2 py-0.5 text-xs font-semibold'
-				}
-			>
-				{allowed ? 'Allowed' : 'Denied'}
+			<span className={`rounded-[5px] px-2 py-0.5 text-xs font-semibold ${chip.className}`}>
+				{chip.label}
 			</span>{' '}
 			<span className="text-foreground-sub min-w-0">{children}</span>
 		</p>
@@ -256,7 +273,11 @@ export function DraftRuleTester({ rules, describeMatch, paths, disabled }: Draft
 	// one that answers a click.
 	const spoken =
 		result && request
-			? `${request.method} ${request.path}: ${result.allowed ? 'allowed' : 'denied'}`
+			? `${request.method} ${request.path}: ${
+					{ allowed: 'allowed', approval: 'held for approval', denied: 'denied' }[
+						verdictOutcome(result.effect)
+					]
+				}`
 			: '';
 
 	let verdict: ReactNode = null;
@@ -268,13 +289,13 @@ export function DraftRuleTester({ rules, describeMatch, paths, disabled }: Draft
 		);
 		if (!result.matched || result.ruleIndex == null) {
 			verdict = (
-				<VerdictChip allowed={false}>{asked} — no rule matched (default deny)</VerdictChip>
+				<VerdictChip outcome="denied">{asked} — no rule matched (default deny)</VerdictChip>
 			);
 		} else {
 			const index = result.ruleIndex;
 			const rule = rules[index];
 			verdict = (
-				<VerdictChip allowed={result.allowed}>
+				<VerdictChip outcome={verdictOutcome(result.effect)}>
 					{asked}{' '}
 					{describeMatch ? (
 						describeMatch(index)

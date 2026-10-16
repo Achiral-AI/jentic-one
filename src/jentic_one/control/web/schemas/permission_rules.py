@@ -76,12 +76,16 @@ class BasePermissionRuleSchema(BaseModel):
     def _reject_condition_less_allow(self) -> BasePermissionRuleSchema:
         # A condition-less ``allow`` matches every request under the broker's
         # first-match-wins evaluation — an unrestricted grant. Reject it so a
-        # binding can never grant blanket access by accident. Empty-string
-        # ``path`` cannot slip past here because ``_validate_path`` above
-        # already rejects it in every mode.
+        # binding can never grant blanket access by accident. A condition-less
+        # ``require-approval`` likewise holds every request without constraint,
+        # which creates an operator bottleneck; require at least one condition
+        # for both effects. Empty-string ``path`` cannot slip past here because
+        # ``_validate_path`` above already rejects it in every mode.
         effect = getattr(self, "effect", None)
-        if effect == "allow" and not (self.methods or self.path or self.operations):
-            msg = "An 'allow' rule must constrain at least one of methods, path, or operations"
+        if effect in ("allow", "require-approval") and not (
+            self.methods or self.path or self.operations
+        ):
+            msg = f"A '{effect}' rule must constrain at least one of methods, path, or operations"
             raise ValueError(msg)
         return self
 
@@ -94,8 +98,11 @@ class PermissionRuleSchema(BasePermissionRuleSchema):
     operations — users must explicitly add at least one allow rule.
     """
 
-    effect: Literal["allow", "deny"] = Field(
-        description="Whether this rule allows or denies the matched request.",
+    effect: Literal["allow", "deny", "require-approval"] = Field(
+        description=(
+            "Whether this rule allows the matched request, denies it, "
+            "or holds it for human approval before the broker executes it."
+        ),
         examples=["allow"],
     )
 
@@ -103,8 +110,9 @@ class PermissionRuleSchema(BasePermissionRuleSchema):
 class PermissionRuleReadSchema(BaseModel):
     """Permission rule response (includes system fields)."""
 
-    effect: Literal["allow", "deny"] = Field(
-        description="Whether this rule allows or denies the matched request.",
+    effect: Literal["allow", "deny", "require-approval"] = Field(
+        description="Whether this rule allows, denies, or holds the matched request for "
+        "human approval (`require-approval`).",
         examples=["allow"],
     )
     methods: list[str] | None = Field(

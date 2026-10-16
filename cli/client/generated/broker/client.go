@@ -6,6 +6,7 @@ package broker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -46,6 +47,21 @@ func (e AgentDirectiveStrategy) Valid() bool {
 	}
 }
 
+// Defines values for AsyncQueuedResponseStatus.
+const (
+	Queued AsyncQueuedResponseStatus = "queued"
+)
+
+// Valid indicates whether the value is a known member of the AsyncQueuedResponseStatus enum.
+func (e AsyncQueuedResponseStatus) Valid() bool {
+	switch e {
+	case Queued:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for BrokerProblemErrorOrigin.
 const (
 	Broker   BrokerProblemErrorOrigin = "broker"
@@ -76,6 +92,21 @@ func (e HealthResponseStatus) Valid() bool {
 	case NotEntitled:
 		return true
 	case Ok:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for HeldExecutionAcceptedResponseStatus.
+const (
+	Held HeldExecutionAcceptedResponseStatus = "held"
+)
+
+// Valid indicates whether the value is a known member of the HeldExecutionAcceptedResponseStatus enum.
+func (e HeldExecutionAcceptedResponseStatus) Valid() bool {
+	switch e {
+	case Held:
 		return true
 	default:
 		return false
@@ -159,7 +190,7 @@ type AgentDirectiveStrategy string
 // collect the upstream response body once `status` is
 // `completed`.
 //
-// Examples: {"_links":{"self":"https://control.your-instance.example/jobs/job_abc123"},"job_id":"job_abc123"}
+// Examples: {"_links":{"self":"https://control.your-instance.example/jobs/job_abc123"},"job_id":"job_abc123","status":"queued"}
 type AsyncQueuedResponse struct {
 	// UnderscoreLinks HAL-style link relations for the queued job. `self` always
 	// points at the control-plane job record; the broker does
@@ -178,7 +209,17 @@ type AsyncQueuedResponse struct {
 	//
 	// Examples: job_abc123
 	JobId string `json:"job_id"`
+
+	// Status Always `queued` on this body; a call held for approval answers `held` instead.
+	//
+	// Examples: queued
+	Status AsyncQueuedResponseStatus `json:"status"`
 }
+
+// AsyncQueuedResponseStatus Always `queued` on this body; a call held for approval answers `held` instead.
+//
+// Examples: queued
+type AsyncQueuedResponseStatus string
 
 // BrokerProblem RFC 9457 Problem Details body for every Broker error. Extends the
 // shared Jentic `ProblemDetails` schema with the Broker's
@@ -340,6 +381,59 @@ type HealthResponse struct {
 // Examples: ok
 type HealthResponseStatus string
 
+// HeldExecutionAcceptedResponse Returned as the `202` body when the call matches a permission rule
+// with `effect: require-approval`. The call has not run: it waits
+// until a reviewer (the agent's owner or an `org:admin`) approves or
+// denies it on `review_url`, or it expires. Follow `_links.self`
+// (`/executions/holds/{held_execution_id}`) to see where it stands;
+// once it has finished, `_links.result` returns the upstream response,
+// or the problem explaining why it never ran (denied, expired, or
+// refused at run time). To abandon the call, `POST` to
+// `_links.withdraw`. Never re-send the call: an identical call while
+// one is pending joins the same held execution.
+type HeldExecutionAcceptedResponse struct {
+	UnderscoreLinks struct {
+		// Result The call's outcome, once it has finished.
+		//
+		// Examples: https://control.your-instance.example/executions/holds/held_abc123/result
+		Result string `json:"result"`
+
+		// Self The held execution — its decision and where the call stands.
+		//
+		// Examples: https://control.your-instance.example/executions/holds/held_abc123
+		Self string `json:"self"`
+
+		// Withdraw `POST` here to withdraw the call before it is decided (only
+		// the agent that made the call may). The call never runs.
+		//
+		//
+		// Examples: https://control.your-instance.example/executions/holds/held_abc123:withdraw
+		Withdraw string `json:"withdraw"`
+	} `json:"_links"`
+
+	// AgentDirective What the calling agent should do next.
+	AgentDirective string `json:"agent_directive"`
+
+	// ExpiresAt When the call expires undecided and fails.
+	ExpiresAt time.Time `json:"expires_at"`
+
+	// HeldExecutionId The held execution.
+	//
+	// Examples: held_abc123
+	HeldExecutionId string `json:"held_execution_id"`
+
+	// ReviewUrl Review page; the reviewer signs in to decide. Carries no credential.
+	//
+	// Examples: https://your-instance.example/app/agents/approvals/held_abc123
+	ReviewUrl string `json:"review_url"`
+
+	// Status Always `held`.
+	Status HeldExecutionAcceptedResponseStatus `json:"status"`
+}
+
+// HeldExecutionAcceptedResponseStatus Always `held`.
+type HeldExecutionAcceptedResponseStatus string
+
 // ReadinessResponse Body returned by `GET /ready`. `status: ready` (HTTP `200`) means the
 // instance is below the saturation threshold; `status: unready` (HTTP
 // `503`) means in-flight load is at/near the admission cap and the load
@@ -442,16 +536,10 @@ type CredentialNotProvisioned = BrokerProblem
 // Examples: {"detail":"No credential binding for this API","error_origin":"broker","instance":"/api.example.com/v1/users","status":403,"title":"No credential binding for this API","type":"no_credential_binding"}
 type Default = BrokerProblem
 
-// ExecuteAsync Returned as the `202` body on async executions. The Broker
-// does not expose a polling surface of its own; `_links.self`
-// is an absolute URL into the platform's control plane, where
-// the queued work surfaces as a `kind: execution` job. Poll
-// that URL for status, and follow its `_links.result` to
-// collect the upstream response body once `status` is
-// `completed`.
-//
-// Examples: {"_links":{"self":"https://control.your-instance.example/jobs/job_abc123"},"job_id":"job_abc123"}
-type ExecuteAsync = AsyncQueuedResponse
+// ExecuteAsync defines model for ExecuteAsync.
+type ExecuteAsync struct {
+	union json.RawMessage
+}
 
 // Forbidden RFC 9457 Problem Details body for every Broker error. Extends the
 // shared Jentic `ProblemDetails` schema with the Broker's
@@ -965,6 +1053,107 @@ type ExecutePutParams struct {
 	// upstream. The same header name is also emitted on responses to
 	// attribute the credential used.
 	JenticCredentialId *JenticCredentialId `json:"Jentic-Credential-Id,omitempty"`
+}
+
+// AsAsyncQueuedResponse returns the union data inside the ExecuteAsync as a AsyncQueuedResponse
+func (t ExecuteAsync) AsAsyncQueuedResponse() (AsyncQueuedResponse, error) {
+	var body AsyncQueuedResponse
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromAsyncQueuedResponse overwrites any union data inside the ExecuteAsync as the provided AsyncQueuedResponse
+func (t *ExecuteAsync) FromAsyncQueuedResponse(v AsyncQueuedResponse) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"status":"queued"}`))
+	t.union = b
+	return err
+}
+
+// MergeAsyncQueuedResponse performs a merge with any union data inside the ExecuteAsync, using the provided AsyncQueuedResponse
+func (t *ExecuteAsync) MergeAsyncQueuedResponse(v AsyncQueuedResponse) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"status":"queued"}`))
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsHeldExecutionAcceptedResponse returns the union data inside the ExecuteAsync as a HeldExecutionAcceptedResponse
+func (t ExecuteAsync) AsHeldExecutionAcceptedResponse() (HeldExecutionAcceptedResponse, error) {
+	var body HeldExecutionAcceptedResponse
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromHeldExecutionAcceptedResponse overwrites any union data inside the ExecuteAsync as the provided HeldExecutionAcceptedResponse
+func (t *ExecuteAsync) FromHeldExecutionAcceptedResponse(v HeldExecutionAcceptedResponse) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"status":"held"}`))
+	t.union = b
+	return err
+}
+
+// MergeHeldExecutionAcceptedResponse performs a merge with any union data inside the ExecuteAsync, using the provided HeldExecutionAcceptedResponse
+func (t *ExecuteAsync) MergeHeldExecutionAcceptedResponse(v HeldExecutionAcceptedResponse) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"status":"held"}`))
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t ExecuteAsync) Discriminator() (string, error) {
+	var discriminator struct {
+		Discriminator string `json:"status"`
+	}
+	err := json.Unmarshal(t.union, &discriminator)
+	return discriminator.Discriminator, err
+}
+
+func (t ExecuteAsync) ValueByDiscriminator() (interface{}, error) {
+	discriminator, err := t.Discriminator()
+	if err != nil {
+		return nil, err
+	}
+	switch discriminator {
+	case "held":
+		return t.AsHeldExecutionAcceptedResponse()
+	case "queued":
+		return t.AsAsyncQueuedResponse()
+	default:
+		return nil, errors.New("unknown discriminator value: " + discriminator)
+	}
+}
+
+func (t ExecuteAsync) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	return b, err
+}
+
+func (t *ExecuteAsync) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	return err
 }
 
 // RequestEditorFn is the function signature for the RequestEditor callback function

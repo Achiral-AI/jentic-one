@@ -35,13 +35,14 @@ import structlog
 from sqlalchemy import text
 
 from jentic_one.broker.core.singleflight import SingleFlight
-from jentic_one.shared.broker.protocols import RuleEvaluation
+from jentic_one.shared.broker.protocols import RuleEvaluation, RuleVerdict
 from jentic_one.shared.db import DatabaseSession
 from jentic_one.shared.permissions.evaluation import (
     PermissionRule,
     base_path_divergence,
-    evaluate_rules,
+    first_matching_rule,
     normalize_methods,
+    rule_verdict,
 )
 from jentic_one.shared.permissions.matching import PathMatcher, compile_matcher
 
@@ -76,8 +77,10 @@ def _coerce_json_list(value: object) -> list[str] | None:
 
 
 # Inline per-binding rules. No credential/vendor join — the binding is the key.
+# ``id`` is selected so the hold path can record which rule triggered the hold
+# as ``matched_rule_id`` on the ``held_executions`` row.
 _BINDING_RULES_QUERY = text(
-    "SELECT effect, methods, path, operations, match_mode "
+    "SELECT id, effect, methods, path, operations, match_mode "
     "FROM agent_permission_rules "
     "WHERE agent_id = :agent_id AND credential_id = :credential_id "
     "ORDER BY sequence ASC"
@@ -86,7 +89,7 @@ _BINDING_RULES_QUERY = text(
 # Shared rule-set rules — evaluated *instead of* the inline rows when the
 # binding carries a rule_set_id (the attach API enforces this precedence).
 _RULE_SET_RULES_QUERY = text(
-    "SELECT effect, methods, path, operations, match_mode "
+    "SELECT id, effect, methods, path, operations, match_mode "
     "FROM permission_rule_set_rules "
     "WHERE rule_set_id = :rule_set_id "
     "ORDER BY sequence ASC"
@@ -168,20 +171,20 @@ class AgentRuleEvaluator:
     ) -> RuleEvaluation:
         """Evaluate the binding's (or its rule set's) rules for the request.
 
-        Returns a :class:`RuleEvaluation` — ``allowed`` plus the rule count so
-        the router can distinguish "no rules configured for this binding"
-        (rules_loaded == 0) from "loaded but nothing matched" in the deny
-        problem detail (#578 twin). With ``upstream_path`` (the normalized
-        full upstream path) it also reports a verdict change caused by a rule
-        still written with the server base path; that never alters
-        ``allowed``.
+        Returns a :class:`RuleEvaluation` carrying the tri-state verdict, the
+        rule count (so the router can distinguish "no rules configured for this
+        binding" (rules_loaded == 0) from "loaded but nothing matched" in the
+        deny problem detail — #578 twin) and the matched rule id for the hold
+        path. With ``upstream_path`` (the normalized full upstream path) it also
+        reports a verdict change caused by a rule still written with the server
+        base path; that never alters the verdict.
         """
         rules = await self._get_rules(
             agent_id=agent_id, credential_id=credential_id, rule_set_id=rule_set_id
         )
         if not rules:
-            return RuleEvaluation(allowed=False, rules_loaded=0)
-        allowed = evaluate_rules(
+            return RuleEvaluation(verdict=RuleVerdict.DENY, rules_loaded=0)
+        idx = first_matching_rule(
             rules,
             method=method,
             path=path,
@@ -201,7 +204,12 @@ class AgentRuleEvaluator:
             if upstream_path is not None
             else None
         )
-        return RuleEvaluation(allowed=allowed, rules_loaded=len(rules), divergence=divergence)
+        return RuleEvaluation(
+            verdict=RuleVerdict(rule_verdict(rules, idx)),
+            rules_loaded=len(rules),
+            matched_rule_id=rules[idx].rule_id if idx is not None else None,
+            divergence=divergence,
+        )
 
     async def _get_rules(
         self, *, agent_id: str, credential_id: str, rule_set_id: str | None
@@ -244,12 +252,14 @@ class AgentRuleEvaluator:
         )
         async with self._control_db.session() as session:
             rows = (await session.execute(query, params)).all()
+        # Row columns: id(0), effect(1), methods(2), path(3), operations(4), match_mode(5)
         return [
             PermissionRule(
-                effect=row[0],
-                methods=normalize_methods(_coerce_json_list(row[1])),
-                path=_compile_path(row[2], str(row[4] or "regex"), binding=binding_label),
-                operations=(tuple(ops) if (ops := _coerce_json_list(row[3])) is not None else None),
+                rule_id=str(row[0]) if row[0] is not None else None,
+                effect=row[1],
+                methods=normalize_methods(_coerce_json_list(row[2])),
+                path=_compile_path(row[3], str(row[5] or "regex"), binding=binding_label),
+                operations=(tuple(ops) if (ops := _coerce_json_list(row[4])) is not None else None),
             )
             for row in rows
         ]

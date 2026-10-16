@@ -407,6 +407,79 @@ describe('agentStream — wire adaptation + pure helpers', () => {
 		expect(actions[0]?.href?.(ev)).toBe('/agents?agent=agt_42');
 	});
 
+	it('adaptEvent lifts the held execution id, falling back to the review_url', () => {
+		const ev = adaptEvent(
+			wireEvent({
+				event_id: 'evt_held',
+				type: 'execution.approval_requested',
+				data: { held_execution_id: 'held_1' },
+			}),
+		);
+		expect(ev.tokens.held_execution_id).toBe('held_1');
+		const fromUrl = adaptEvent(
+			wireEvent({
+				event_id: 'evt_held2',
+				type: 'execution.approval_requested',
+				data: { review_url: 'http://127.0.0.1:8000/app/agents/approvals/held_2' },
+			}),
+		);
+		expect(fromUrl.tokens.held_execution_id).toBe('held_2');
+	});
+
+	it('inlineActionsFor offers Review (never View execution) for an approval request', () => {
+		const ev = makeEvent({
+			type: 'execution.approval_requested',
+			kind: 'execution',
+			severity: 'warning',
+			requiresAction: true,
+			tokens: {
+				held_execution_id: 'held_1',
+				execution_id: 'exec_held',
+				job_id: 'job_held',
+				trace_id: 'a'.repeat(32),
+			},
+		});
+		const actions = inlineActionsFor(ev);
+		expect(actions.map((a) => a.kind)).toEqual(['view_approval']);
+		expect(actions[0]?.label).toBe('Review');
+		expect(actions[0]?.href?.(ev)).toBe('/agents/approvals/held_1');
+		expect(primaryDestinationFor(ev)).toBe('/agents/approvals/held_1');
+	});
+
+	it('routes decided/withdrawn/expired approval events to the review page, never the job', () => {
+		for (const type of [
+			'execution.approval_decided',
+			'execution.approval_withdrawn',
+			'execution.approval_expired',
+		]) {
+			const ev = makeEvent({
+				type,
+				kind: 'execution',
+				tokens: { held_execution_id: 'held_1', job_id: 'job_held', execution_id: 'exec_1' },
+			});
+			const actions = inlineActionsFor(ev);
+			expect(actions.map((a) => a.kind)).toEqual(['view_approval']);
+			expect(actions[0]?.href?.(ev)).toBe('/agents/approvals/held_1');
+			expect(primaryDestinationFor(ev)).toBe('/agents/approvals/held_1');
+			// Without a held execution id there is no record to open: never the job.
+			const bare = makeEvent({ type, kind: 'execution', tokens: { job_id: 'job_held' } });
+			expect(inlineActionsFor(bare)).toEqual([]);
+			expect(primaryDestinationFor(bare)).toBeNull();
+		}
+	});
+
+	it('buildGroupKey keeps distinct approvals from one agent apart', () => {
+		const a = makeEvent({
+			type: 'execution.approval_requested',
+			tokens: { held_execution_id: 'held_1', agent_id: 'agt_1' },
+		});
+		const b = makeEvent({
+			type: 'execution.approval_requested',
+			tokens: { held_execution_id: 'held_2', agent_id: 'agt_1' },
+		});
+		expect(buildGroupKeyForTest(a)).not.toBe(buildGroupKeyForTest(b));
+	});
+
 	it('primaryDestinationFor routes agent events to the agent on the Agents page', () => {
 		const ev = makeEvent({
 			type: 'agent.self_registered',
@@ -712,6 +785,45 @@ describe('AgentRail — shell-mounted Activity surface', () => {
 		await user.click(row);
 		await waitFor(() =>
 			expect(screen.getByTestId('location')).toHaveTextContent('/agents?agent=agnt_curl_1'),
+		);
+	});
+
+	it("routes an approval request's Review to the review page, never the execution", async () => {
+		const user = userEvent.setup();
+		worker.use(
+			http.get('/events', () =>
+				HttpResponse.json({
+					data: [
+						wireEvent({
+							event_id: 'evt_held',
+							type: 'execution.approval_requested',
+							severity: 'warning' as EventResponse['severity'],
+							requires_action: true,
+							summary: 'Agent agnt_1 wants to POST /v1/charges',
+							trace_id: 'a'.repeat(32),
+							_links: {
+								self: '/events/evt_held',
+								execution: '/executions/exec_held',
+								job: '/jobs/job_held',
+							},
+							data: {
+								held_execution_id: 'held_1',
+								agent_id: 'agnt_1',
+								review_url: 'http://127.0.0.1:8000/app/agents/approvals/held_1',
+							},
+						}),
+					],
+					has_more: false,
+					next_cursor: null,
+				}),
+			),
+		);
+		renderRail(<AgentRail />);
+		const review = await screen.findByRole('button', { name: 'Review' });
+		expect(screen.queryByRole('button', { name: 'View execution' })).not.toBeInTheDocument();
+		await user.click(review);
+		await waitFor(() =>
+			expect(screen.getByTestId('location')).toHaveTextContent('/agents/approvals/held_1'),
 		);
 	});
 

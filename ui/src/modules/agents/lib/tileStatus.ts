@@ -62,7 +62,8 @@ type BlockedStatus = 'blocked-no-rules' | 'blocked-all-denied';
 export function rulesBlock(rules: BindingRuleSummary | undefined): BlockedStatus | null {
 	if (!rules) return null;
 	if (rules.total === 0) return 'blocked-no-rules';
-	if (rules.allow === 0) return 'blocked-all-denied';
+	// An Ask rule still lets its calls through, once a reviewer approves.
+	if (rules.allow + rules.ask === 0) return 'blocked-all-denied';
 	return null;
 }
 
@@ -109,7 +110,7 @@ export const BLOCKED_HINT: Record<BlockedStatus, string> = {
 };
 
 /**
- * The binding's rules in one line — "2 access rules · 1 deny", led by the
+ * The binding's rules in one line — "3 access rules · 1 ask · 1 deny", led by the
  * shared rule set when one governs it ("Rule set Support · …") — or null while
  * the rules are unknown. The row prints it under its marker; the card's status
  * tooltip carries it.
@@ -120,5 +121,9 @@ export function rulesSummaryText(rules: BindingRulesState | undefined): string |
 	const prefix = summary.ruleSet ? `Rule set ${summary.ruleSet.name} · ` : '';
 	if (summary.total === 0) return `${prefix}No rules — all calls blocked`;
 	const count = summary.total === 1 ? '1 access rule' : `${summary.total} access rules`;
-	return `${prefix}${summary.deny > 0 ? `${count} · ${summary.deny} deny` : count}`;
+	const splits = [
+		summary.ask > 0 ? `${summary.ask} ask` : null,
+		summary.deny > 0 ? `${summary.deny} deny` : null,
+	].filter(Boolean);
+	return `${prefix}${[count, ...splits].join(' · ')}`;
 }

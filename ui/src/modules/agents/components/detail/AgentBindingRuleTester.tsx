@@ -13,6 +13,7 @@ import {
 	MatchedRuleText,
 	RuleRequestTester,
 	VerdictChip,
+	verdictOutcome,
 } from '@/shared/credentials/components';
 
 /**
@@ -75,13 +76,14 @@ function Verdict({
 	savedRules: BindingPermissionRule[];
 }) {
 	if (!result.matched) {
-		return <VerdictChip allowed={false}>— no rule matched (default deny)</VerdictChip>;
+		return <VerdictChip outcome="denied">— no rule matched (default deny)</VerdictChip>;
 	}
-	const allowed = result.allowed;
+	const outcome = verdictOutcome(result.effect);
 	const { anchor, summary } = resolveMatch(result, savedRules);
-	const effectWord = allowed ? 'allow' : 'deny';
+	const effectWord =
+		outcome === 'allowed' ? 'allow' : outcome === 'approval' ? 'require-approval' : 'deny';
 	return (
-		<VerdictChip allowed={allowed}>
+		<VerdictChip outcome={outcome}>
 			{result.is_system ? (
 				<>— matched a platform system safety rule</>
 			) : (

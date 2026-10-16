@@ -482,6 +482,21 @@ OPENAPI_TAGS: list[dict[str, str]] = [
         ),
     },
     {
+        "name": "Held Executions",
+        "description": (
+            "Executions held for human approval. When a call matches a permission rule with "
+            "`effect: require-approval`, the broker does not run it: it answers `202` with a "
+            "held execution (`held_…`) and a review link. A reviewer, the agent's owner or any "
+            "`org:admin`, calls `POST /executions/holds/{id}:decide` to approve or deny it.\n\n"
+            "An approved call runs once; `GET /executions/holds/{id}` reports where it stands and "
+            "`GET /executions/holds/{id}/result` returns the call's execution document, or the problem "
+            "explaining why it never ran (denied, expired or refused at run time). A held execution nobody "
+            "decides expires after the configured window. Agents may never decide; the agent "
+            "that filed one may withdraw it. Each caller sees only the held executions it may "
+            "review or filed."
+        ),
+    },
+    {
         "name": "Events",
         "description": (
             "Curated, severity-tagged event stream surfaced to dashboards and operators. Each "
@@ -718,6 +733,7 @@ X_TAG_GROUPS: list[dict[str, Any]] = [
             "Actors",
             "Permissions",
             "Executions",
+            "Held Executions",
             "Jobs",
             "Events",
             "Audit",
@@ -971,6 +987,7 @@ _TAG_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^/lookup"), "Lookup"),
     (re.compile(r"^/notes"), "Notes"),
     (re.compile(r"^/monitoring"), "Monitoring"),
+    (re.compile(r"^/executions/holds"), "Held Executions"),
     (re.compile(r"^/executions"), "Executions"),
     (re.compile(r"^/jobs"), "Jobs"),
     (re.compile(r"^/events"), "Events"),

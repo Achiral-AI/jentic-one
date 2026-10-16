@@ -15,6 +15,11 @@ import ast
 
 import pytest
 
+from jentic_one.admin.core.schema.held_executions import HeldExecution
+from jentic_one.admin.core.schema.jobs import Job
+from jentic_one.admin.scoping.filters import (
+    _OWNED_AGENT_ACTOR_MODELS as _ADMIN_OWNED_AGENT_ACTOR_MODELS,
+)
 from jentic_one.admin.scoping.filters import _OWNER_MODELS as _ADMIN_OWNER_MODELS
 from jentic_one.control.scoping.filters import (
     _DELEGATION_PERMISSIONS as _CONTROL_DELEGATION_PERMISSIONS,
@@ -118,3 +123,19 @@ def test_admin_scoping_model_completeness() -> None:
     covered_names = {cls.__name__ for cls in _ADMIN_OWNER_MODELS}
     missing = [m for m in imported_models if m not in covered_names]
     assert not missing, f"Models imported but not in scoping dicts: {missing}"
+
+
+@pytest.mark.arch
+def test_admin_owned_agent_actor_models_are_owner_scoped() -> None:
+    """The admin owned-agent axis only widens models that already have an owner column."""
+    stray = [m.__name__ for m in _ADMIN_OWNED_AGENT_ACTOR_MODELS if m not in _ADMIN_OWNER_MODELS]
+    assert not stray, f"Owned-agent actor models missing from _OWNER_MODELS: {stray}"
+
+
+@pytest.mark.arch
+def test_held_executions_are_scoped_like_their_jobs() -> None:
+    """A held call's approval is as visible as its job: to the filing agent, the
+    agent's owner and org:admin. It names the held request (method, path,
+    credential), so it must never be readable more widely than the job."""
+    assert _ADMIN_OWNER_MODELS[HeldExecution] is HeldExecution.agent_id
+    assert {Job, HeldExecution} <= _ADMIN_OWNED_AGENT_ACTOR_MODELS

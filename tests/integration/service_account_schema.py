@@ -37,6 +37,8 @@ _RENAME_HEAD = "e3f4a5b6c7d8"  # pragma: allowlist secret
 _ACK_DROP_HEAD = "d2e3f4a5b6c7"  # pragma: allowlist secret
 #: The access-request scope mapping, stacked on the acknowledgement drop.
 _SCOPE_MAP_HEAD = "6ae76df5ece5"  # pragma: allowlist secret
+#: The execution-approvals table, stacked on the scope mapping.
+_APPROVALS_HEAD = "3306fb9172f1"  # pragma: allowlist secret
 
 
 def _create_tables(op: Operations, *, pg: bool) -> None:
@@ -203,6 +205,7 @@ def restore_pre_sa_drop_admin(integration_config: AppConfig) -> None:
         [_RENAME_HEAD],
         [_ACK_DROP_HEAD],
         [_SCOPE_MAP_HEAD],
+        [_APPROVALS_HEAD],
     ), f"extend restore_pre_sa_drop_admin for new heads {heads}"
     if not asyncio.run(_has_service_account_tables(db_config)):
         command.downgrade(cfg, _SA_DROP)

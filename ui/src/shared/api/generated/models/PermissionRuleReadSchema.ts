@@ -15,7 +15,7 @@ export type PermissionRuleReadSchema = {
      */
     _system?: boolean;
     /**
-     * Whether this rule allows or denies the matched request.
+     * Whether this rule allows, denies, or holds the matched request for human approval (`require-approval`).
      */
     effect: PermissionRuleReadSchema.effect;
     /**
@@ -37,11 +37,12 @@ export type PermissionRuleReadSchema = {
 };
 export namespace PermissionRuleReadSchema {
     /**
-     * Whether this rule allows or denies the matched request.
+     * Whether this rule allows, denies, or holds the matched request for human approval (`require-approval`).
      */
     export enum effect {
         ALLOW = 'allow',
         DENY = 'deny',
+        REQUIRE_APPROVAL = 'require-approval',
     }
     /**
      * How `path` is interpreted: `regex` (full-match), `prefix` or `exact`.
