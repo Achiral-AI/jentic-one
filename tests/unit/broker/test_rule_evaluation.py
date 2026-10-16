@@ -9,14 +9,10 @@ from __future__ import annotations
 
 import structlog.testing
 
-from jentic_one.broker.repos.agent_rule_evaluator import (
-    PermissionRule,
-    _coerce_json_list,
-    _compile_path,
-    _normalize_methods,
-    _rule_matches,
-    evaluate_rules,
-)
+from jentic_one.broker.repos.agent_rule_evaluator import _coerce_json_list, _compile_path
+from jentic_one.shared.permissions.evaluation import PermissionRule, evaluate_rules
+from jentic_one.shared.permissions.evaluation import normalize_methods as _normalize_methods
+from jentic_one.shared.permissions.evaluation import rule_matches as _rule_matches
 from jentic_one.shared.permissions.matching import compile_matcher
 
 # ---------------------------------------------------------------------------
@@ -264,6 +260,16 @@ def test_condition_less_allow_warning_names_the_binding() -> None:
         evaluate_rules(rules, method="GET", path="/x", operation_id=None, binding="agnt_1:cred_1")
     (entry,) = [e for e in logs if "condition-less 'allow'" in e["event"]]
     assert entry["log_level"] == "warning"
+    assert entry["binding"] == "agnt_1:cred_1"
+
+
+def test_condition_less_require_approval_warning_names_the_binding() -> None:
+    """A condition-less require-approval is skipped with the same named warning."""
+    rules = [PermissionRule(effect="require-approval", methods=None, path=None, operations=None)]
+    with structlog.testing.capture_logs() as logs:
+        evaluate_rules(rules, method="GET", path="/x", operation_id=None, binding="agnt_1:cred_1")
+    (entry,) = [e for e in logs if "condition-less" in e["event"]]
+    assert entry["effect"] == "require-approval"
     assert entry["binding"] == "agnt_1:cred_1"
 
 

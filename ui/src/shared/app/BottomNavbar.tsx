@@ -8,6 +8,7 @@ import { AppLink } from '@/shared/ui/AppLink';
 import { Button } from '@/shared/ui/Button';
 import { useDismissable } from '@/shared/ui/Menu';
 import { usePendingAgentsCount } from '@/shared/hooks';
+import { usePendingApprovalsCount } from '@/shared/approvals';
 import { cn } from '@/shared/lib/utils';
 
 const BOTTOM_NAV_SPRING = { type: 'spring' as const, stiffness: 500, damping: 35 };
@@ -16,18 +17,25 @@ const BOTTOM_NAV_SPRING = { type: 'spring' as const, stiffness: 500, damping: 35
 const TILE_LIMIT = 5;
 
 /**
- * Pending-agents count badge for the Agents tile — a persistent "N waiting"
- * signal so a newly-registered agent awaiting approval is visible on mobile
- * too (#652).
+ * Pending count badge for the Agents tile — a persistent "N waiting" signal so
+ * a newly-registered agent awaiting approval (#652), or a held call awaiting
+ * the viewer's decision, is visible on mobile too. The tile has room for one
+ * badge, so it sums the two.
  */
 function TilePendingAgentsBadge() {
-	const { count, atLeast } = usePendingAgentsCount();
+	const agents = usePendingAgentsCount();
+	const approvals = usePendingApprovalsCount();
+	const count = agents.count + approvals.count;
 	if (count <= 0) return null;
-	const label = atLeast ? `${count}+` : `${count}`;
+	const label = agents.atLeast || approvals.atLeast ? `${count}+` : `${count}`;
 	return (
 		<span
 			className="bg-warning text-background absolute top-1.5 right-1/2 z-20 inline-flex h-4 min-w-4 translate-x-4 items-center justify-center rounded-full px-1 text-[9px] font-bold tabular-nums"
-			aria-label={`${label} agents awaiting approval`}
+			aria-label={
+				approvals.count === 0
+					? `${label} agents awaiting approval`
+					: `${label} waiting for you`
+			}
 		>
 			{label}
 		</span>
@@ -127,7 +135,7 @@ export function BottomNavbar() {
 				// Its own view-transition layer, like the top bar: it holds still
 				// while pages fade underneath instead of blinking out with them.
 				style={{ viewTransitionName: 'app-bottom-nav' }}
-				className="border-border bg-background/95 supports-[backdrop-filter]:bg-background/60 fixed right-0 bottom-0 left-0 z-50 border-t backdrop-blur md:hidden"
+				className="border-hairline bg-background/95 supports-[backdrop-filter]:bg-background/60 fixed right-0 bottom-0 left-0 z-50 border-t backdrop-blur md:hidden"
 			>
 				<div className="flex h-16 items-stretch">
 					{primary.map((item) => (
@@ -170,13 +178,13 @@ export function BottomNavbar() {
 			{sheetOpen && (
 				<>
 					<div
-						className="fixed inset-0 z-50 bg-black/50 md:hidden"
+						className="bg-scrim fixed inset-0 z-50 md:hidden"
 						onClick={closeSheet}
 						aria-hidden="true"
 					/>
 					<div
 						ref={sheetRef}
-						className="border-border bg-background fixed inset-x-0 bottom-0 z-50 rounded-t-xl border-t pb-[env(safe-area-inset-bottom)] md:hidden"
+						className="bg-surface-sheet fixed inset-x-0 bottom-0 z-50 rounded-t-xl pb-[env(safe-area-inset-bottom)] md:hidden"
 					>
 						<div className="flex items-center justify-between px-4 py-3">
 							<span className="text-foreground text-sm font-semibold">More</span>
@@ -202,7 +210,7 @@ export function BottomNavbar() {
 											'relative flex flex-col items-center gap-2 rounded-xl p-3 text-center transition-colors duration-150',
 											isActive
 												? 'bg-muted text-foreground'
-												: 'text-muted-foreground hover:bg-muted hover:text-foreground',
+												: 'text-muted-foreground hover:bg-tint-2 hover:text-foreground',
 										)}
 									>
 										<TileBadge navId={item.id} />

@@ -3,19 +3,37 @@
  *
  * Before this hook, four surfaces each counted attention their own way (the
  * Notifications bell, the Agents nav badge, the rail's failure pill, Monitor's
- * "Unacknowledged" filter) and the bell double-counted a self-registered agent
+ * "Flagged" filter) and the bell double-counted a self-registered agent
  * (once as a pending agent, once as its `agent.self_registered` alert). Every
  * surface that shows an attention count or list now reads this hook, so the
  * numbers agree by construction.
  *
- * Sources, each its own query so one failing endpoint degrades only its rows:
- *   - agents awaiting approval      (`GET /agents?status=pending`, drained)
+ * Sources, each its own query so one failing endpoint degrades only its rows.
+ * A source the caller has no permission for is skipped (no request, not
+ * reported as failed); a source that is read and fails is always reported:
+ *   - agents awaiting approval      (`GET /agents?status=pending`, drained, `agents:read`)
  *   - OAuth clients awaiting review (`GET /admin/oauth-clients?approval_status=pending`, org:admin)
- *   - unacknowledged action events  (`GET /events?requires_action=true&acknowledged=false`)
- *   - credentials whose OAuth sign-in never finished (joined from the credential list)
+ *   - recent action events          (`GET /events?requires_action=true&from=<24h ago>`,
+ *                                    `events:read`)
+ *   - credentials whose OAuth sign-in never finished (joined from the credential list,
+ *                                    `credentials:read` or `owner:credentials:read`)
+ *   - agents waiting on a connect request (`GET /connect-sessions`, `created` /
+ *                                    `awaiting_app` / `polling`, collapsed per agent;
+ *                                    listed only to approvers — `org:admin`, or
+ *                                    `credentials:write` and `agents:write`)
+ *   - agents waiting on a held call (`GET /executions/holds?state=pending`,
+ *                                    collapsed per agent; no permission gate —
+ *                                    scoped server-side to the agents the viewer
+ *                                    owns, or every agent for `org:admin`)
  *
  * Events that merely MIRROR a queue item (an agent's self-registration, a DCR
- * client's registration) are dropped — the queue row is the actionable one.
+ * client's registration, a held call's approval request) are dropped — the queue row is the actionable one —
+ * as are catalog updates, whose current state lives on the Workspace page.
+ *
+ * Events are append-only history, so nothing clears an alert's
+ * `requires_action`; the alert source is bounded to the last
+ * {@link ALERT_WINDOW_MS} instead, so alerts age out of the inbox rather than
+ * accumulating forever.
  */
 import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
@@ -28,13 +46,30 @@ import {
 	type OAuthClientResponse,
 } from '@/shared/api';
 import { usePendingAgentsCount } from '@/shared/hooks/usePendingAgentsCount';
-import { useAllCredentials } from '@/shared/credentials/api';
+import { useAllCredentials, useOpenConnectRequests } from '@/shared/credentials/api';
+import {
+	groupConnectRequestsByAgent,
+	summariseConnectTargets,
+	useCanApproveConnectRequests,
+} from '@/shared/credentials/lib/connectRequests';
+import {
+	describeHeldCall,
+	groupApprovalsByAgent,
+	summariseHeldCalls,
+	useCanDecideApprovals,
+	usePendingApprovals,
+} from '@/shared/approvals';
+import { useActorDirectory } from '@/shared/hooks/useActorDirectory';
+import { ROUTE_PATHS } from '@/shared/app/routes';
 import { credentialAwaitsConsent } from '@/shared/credentials/lib/credentialIdentity';
 import { adaptEvent, primaryDestinationFor, severityForWire } from '@/shared/lib/agentStream';
 import { useOptionalCurrentUser } from '@/shared/auth/AuthContext';
 import { ORG_ADMIN } from '@/shared/auth/usePermission';
+import { useCanReadEvents } from '@/shared/auth/useCanReadEvents';
+import { CREDENTIALS_READ, OWNER_CREDENTIALS_READ, useCanAccess } from '@/shared/auth/useCanAccess';
 
-export type AttentionKind = 'agent' | 'oauth_client' | 'credential' | 'event';
+export type AttentionKind =
+	'agent' | 'oauth_client' | 'connect_request' | 'held_execution' | 'credential' | 'event';
 
 /** Higher sorts first. Failures outrank approvals; approvals outrank setup nags. */
 export type AttentionUrgency = 3 | 2 | 1;
@@ -72,19 +107,41 @@ export const attentionKeys = {
 
 const REFETCH_MS = 45_000;
 
-/** Event types that duplicate a queue row — the queue row wins. */
-const MIRRORED_EVENT_TYPES = new Set(['agent.self_registered', 'oauth_client.registered']);
+/** How far back the alert source reads `requires_action` events. */
+export const ALERT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Event types the inbox skips. Registrations and a held call's approval request
+ * duplicate a live queue row (the queue row wins, and clears once decided). A catalog update's outstanding-ness lives on the API's
+ * Workspace page, not in the event — listing it here would keep an adopted
+ * update counted until it aged out.
+ */
+const SKIPPED_EVENT_TYPES = new Set([
+	'agent.self_registered',
+	'oauth_client.registered',
+	'execution.approval_requested',
+	'catalog.update_available',
+	'catalog.update_conflicts_overlay',
+]);
 
 export function useAttentionItems(): AttentionState {
 	// Optional-auth read (not `usePermission`) so shell chrome that mounts this
 	// hook — the Activity rail — also renders in tests without an AuthProvider.
 	const isAdmin = useOptionalCurrentUser()?.permissions?.includes(ORG_ADMIN) ?? false;
 	const pendingAgents = usePendingAgentsCount();
+	// A caller who cannot read events has no event alerts to miss, so the source
+	// is off rather than reported as failed.
+	const canReadEvents = useCanReadEvents();
 
 	const events = useQuery({
 		queryKey: attentionKeys.events,
 		queryFn: () =>
-			EventsService.listEvents({ requiresAction: true, acknowledged: false, limit: 50 }),
+			EventsService.listEvents({
+				requiresAction: true,
+				from: new Date(Date.now() - ALERT_WINDOW_MS).toISOString(),
+				limit: 50,
+			}),
+		enabled: canReadEvents,
 		staleTime: 30_000,
 		refetchInterval: REFETCH_MS,
 	});
@@ -97,7 +154,26 @@ export function useAttentionItems(): AttentionState {
 		refetchInterval: REFETCH_MS,
 	});
 
-	const credentials = useAllCredentials();
+	const canReadCredentials = useCanAccess(CREDENTIALS_READ, OWNER_CREDENTIALS_READ);
+	const credentials = useAllCredentials({ enabled: canReadCredentials });
+	// Read for every credentials reader (an open request's pending credential
+	// is not a separate unfinished sign-in), listed only to approvers.
+	const canApproveConnectRequests = useCanApproveConnectRequests();
+	const connectRequests = useOpenConnectRequests({ enabled: canReadCredentials });
+	const connectGroups = useMemo(
+		() => groupConnectRequestsByAgent(connectRequests.data ?? []),
+		[connectRequests.data],
+	);
+	const canDecideApprovals = useCanDecideApprovals();
+	const pendingApprovals = usePendingApprovals({ enabled: canDecideApprovals });
+	const approvalGroups = useMemo(
+		() => groupApprovalsByAgent(pendingApprovals.data?.approvals ?? []),
+		[pendingApprovals.data],
+	);
+	const actors = useActorDirectory([
+		...connectGroups.map((g) => g.agentId),
+		...approvalGroups.map((g) => g.agentId),
+	]);
 
 	const items = useMemo<AttentionItem[]>(() => {
 		const out: AttentionItem[] = [];
@@ -128,9 +204,55 @@ export function useAttentionItems(): AttentionState {
 			});
 		}
 
+		// One row per agent, however many accounts it asked for: the agent is
+		// blocked either way, and the row's link opens its longest-waiting ask.
+		const connectCredentialIds = new Set<string>();
+		for (const group of connectGroups) {
+			for (const session of group.sessions) connectCredentialIds.add(session.credential_id);
+			if (!canApproveConnectRequests) continue;
+			const oldest = group.sessions[0];
+			const name = actors.resolve(group.agentId) ?? group.agentId;
+			out.push({
+				key: `connect_request:${group.agentId}`,
+				kind: 'connect_request',
+				urgency: 2,
+				title: `${name} is waiting for you to connect ${summariseConnectTargets(group.sessions)}`,
+				detail:
+					group.sessions.length > 1
+						? `${group.sessions.length} requests`
+						: (oldest.reason ?? null),
+				since: group.since,
+				href: ROUTE_PATHS.connectApproval(oldest.session_id, group.agentId),
+			});
+		}
+
+		// Likewise one row per agent with held calls; the link opens the
+		// longest-waiting one.
+		if (canDecideApprovals) {
+			for (const group of approvalGroups) {
+				const oldest = group.approvals[0];
+				const name = actors.resolve(group.agentId) ?? group.agentId;
+				out.push({
+					key: `held_execution:${group.agentId}`,
+					kind: 'held_execution',
+					urgency: 2,
+					title: `${name} is waiting for you to approve ${summariseHeldCalls(group.approvals)}`,
+					detail:
+						group.approvals.length > 1
+							? `${group.approvals.length} held calls`
+							: describeHeldCall(oldest),
+					since: group.since,
+					href: ROUTE_PATHS.approval(oldest.id),
+				});
+			}
+		}
+
 		if (credentials.complete) {
 			for (const credential of credentials.items) {
 				if (!credentialAwaitsConsent(credential)) continue;
+				// An open request's pending credential is that request's row, not
+				// a separate unfinished sign-in.
+				if (connectCredentialIds.has(credential.credential_id)) continue;
 				out.push({
 					key: `credential:${credential.credential_id}`,
 					kind: 'credential',
@@ -144,7 +266,7 @@ export function useAttentionItems(): AttentionState {
 		}
 
 		for (const event of events.data?.data ?? []) {
-			if (MIRRORED_EVENT_TYPES.has(event.type)) continue;
+			if (SKIPPED_EVENT_TYPES.has(event.type)) continue;
 			const severity = severityForWire(event.severity);
 			out.push({
 				key: `event:${event.event_id}`,
@@ -164,21 +286,34 @@ export function useAttentionItems(): AttentionState {
 	}, [
 		pendingAgents.agents,
 		oauthClients.data,
+		connectGroups,
+		canApproveConnectRequests,
+		approvalGroups,
+		canDecideApprovals,
+		actors,
 		credentials.complete,
 		credentials.items,
 		events.data,
 	]);
 
 	const failedSources = [
+		pendingAgents.isError && 'agent approvals',
 		events.isError && 'alerts',
 		oauthClients.isError && 'OAuth client queue',
 		credentials.error != null && 'credentials',
+		connectRequests.isError && 'connect requests',
+		pendingApprovals.isError && 'held calls',
 	].filter((s): s is string => typeof s === 'string');
 
 	return {
 		items,
 		count: items.length,
-		isLoading: events.isLoading || (isAdmin && oauthClients.isLoading),
+		isLoading:
+			pendingAgents.isLoading ||
+			events.isLoading ||
+			oauthClients.isLoading ||
+			connectRequests.isLoading ||
+			pendingApprovals.isLoading,
 		failedSources,
 	};
 }

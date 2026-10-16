@@ -15,16 +15,32 @@ The contract is the same on every install shape; only the commands differ.
    `docker run --rm --env-file … <image> python -m jentic_one.migrations.run`,
    or the compose file's `migrate` service. Appending `--check` inspects
    without modifying: it prints an
-   `OVERALL current|uninitialized|pending` verdict and exits non-zero unless
-   `OVERALL current`, so scripts can branch on it. A full run (all databases,
-   no `--target`) also performs the release's one-shot **upgrade steps** —
-   data changes that span databases (0.41 ships none; the 0.40 toolkit →
-   direct-binding cutover is done by the time 0.41 installs) — and prints
-   an `==> upgrade step <name>: <action>` line for each.
+   `OVERALL current|uninitialized|pending|unknown` verdict and exits `0` for
+   `current`, `3` for `uninitialized` or `pending`, and `5` for `unknown`
+   (the step ledger could not be read), so scripts can branch on it. A full run (all
+   databases, no `--target`) also performs the release's **upgrade steps** —
+   data changes that span databases — and prints an
+   `==> upgrade step <name>: <action>` line for each. Most steps run once per
+   install (`already_done` afterwards); a repeatable step runs on every full
+   upgrade. `rule_sets_mark_curated` is repeatable: it marks the shared
+   permission rule sets an `org:admin` or a system job created as curated
+   (so they stay attachable by every credential writer), including sets an
+   older release created after the step last ran (for example while that
+   release was redeployed on the newer schema).
    A step that leaves blocking work undone exits `4`: fix the logged cause
    and re-run before starting the new version (`--skip-upgrade-step <name>`
    defers one step deliberately; on Helm, via `migrate.extraArgs`).
-   Non-blocking follow-ups print as `==> WARNING` lines — read them. The run
+   Non-blocking follow-ups print as `==> WARNING` lines — read them (see
+   [Cross-owner rule set attachments](#cross-owner-rule-set-attachments)).
+   A step that has never run — after `--skip-upgrade-steps`, or a partial
+   run such as `--db control` — is reported by a `--check` that covers the
+   control and admin databases (the default) as a
+   `STATUS upgrade-step:<name> pending` line and `OVERALL pending` (exit
+   `3`), once every database is at head; a full run clears it. If the
+   schemas are at head but the step ledger cannot be read, `--check` prints
+   `OVERALL unknown` and exits `5`. `jenticctl start` refuses to start
+   while a step is pending, naming `jenticctl update --stack-only`, and
+   carries on when the verdict is `unknown`. The run
    lock these steps take is a Postgres session-level advisory lock, so point
    the migration at the database directly, not through a transaction-mode
    pooler (pgbouncer `pool_mode=transaction`).
@@ -73,6 +89,100 @@ emptied schemas, then re-run the migration with the cause fixed. Do not
 re-run blind: a run that died inside a `CONCURRENTLY` revision can fail its
 retry with `column already exists`, which is the signature of exactly this
 state — restore, don't patch.
+
+## Cross-owner rule set attachments
+
+Only a shared permission rule set's creator or an `org:admin` may attach a
+set that is not curated, because the creator can edit its rules — and so the
+policy of every binding attached to it. An attachment made before that rule
+existed, or one an `org:admin` made, is left in place. Every full upgrade
+lists each binding on a non-curated set created by someone other than the
+agent or its owner as `==> WARNING (rule_sets_mark_curated)` lines on
+stderr: a summary with the remediation, then one line per binding (the
+first 50, then `...and N more`) naming the binding, agent (id and name), the
+agent's owner, the credential, the rule set (id and name) and the set's
+creator. The full count is `cross_owner_bindings` in the step's JSON
+summary. Nothing is detached automatically; resolve each binding with one of:
+
+- the agent's owner attaches a set they created or a curated set, or
+  detaches the set so the binding's inline rules apply;
+- an `org:admin` attaches a curated set (one an `org:admin` created);
+- an `org:admin` marks the set curated, after which only an `org:admin` can
+  edit it. There is no API for this; in the control database (`control` is
+  your control `schema_name`; drop the prefix on SQLite):
+  `UPDATE control.permission_rule_sets SET curated = true WHERE id = '<rule set id>';`
+  A raw-SQL change leaves no audit record — note it in your change log.
+
+For an agent with no owner only the `org:admin` options apply. The warning
+repeats on each full upgrade until no such binding remains. If the listing
+itself fails (for example a query error on the admin database), the step
+still marks the sets, prints one `could not list cross-owner bindings`
+warning, and reports `cross_owner_bindings: null`; the upgrade does not
+fail on it.
+
+## Binding rules written against the full upstream path
+
+The broker evaluates binding permission rules on the request path relative
+to the API's server URL — the spec's path, which the rule editor, its
+preview and `permissions:test` all show. A `prefix`/`exact` rule written with
+the server's base path included (`/api/v3/pet` for a server
+`https://host/api/v3`, `/eu/widgets` for a server `http://host/{region}`)
+matches nothing on that basis. That cuts both ways:
+
+- an **`allow`** rule stops allowing — those calls fail with `403
+  action_denied`;
+- a **`deny`** rule stops denying — a later, broader `allow` (for example
+  `allow /`) now **lets those calls through**.
+
+**Run the rewrite job before (or immediately after) upgrading** any
+deployment whose rules include a server base path. Preview first:
+
+```sh
+jentic_one rewrite-rule-base-paths --diff-only --report rewrite-preview.jsonl
+jentic_one rewrite-rule-base-paths --report rewrite.jsonl
+```
+
+The broker also flags affected rules as calls hit them: a
+`rule_written_with_server_base_path` warning (at most once per rule per five
+minutes) names the binding (`agent_id`, `credential_id`, `rule_set_id`), the
+rule's position and pattern, and a `kind` — `legacy_allow_no_longer_matches`
+(now denied) or `legacy_deny_no_longer_matches` (now **allowed**). The
+`broker.authorization.base_path_divergence` counter counts every occurrence.
+
+The job rewrites a rule only when stripping one of the bound API's **static**
+server base paths gives a path that applies to a real operation and the
+rule's current path applies to none. Each rewrite is audited against the
+binding (or rule set) — if the audit write fails the rule is left unchanged —
+and a re-run changes nothing. The command exits `1` while any rule still
+needs manual review. Report lines with `"category": "skipped"` need a manual
+fix in the rule editor; their `reason` says why:
+
+| `reason` | Meaning |
+| -------- | ------- |
+| `server_variable_base` | The base path has a server variable (`/{region}`). `/eu/widgets` allowed only `eu`; `/widgets` would allow every region, so this is never automatic. Rules can't express a server-variable value — scope the region with the credential's server variables instead, then write the rule as `/widgets`. |
+| `spec_path_or_base_qualified` | The path fits an operation as written **and** after stripping the base (e.g. `prefix /api/v3` against `/{owner}/{repo}`). Decide which you meant. |
+| `regex_not_rewritable` | `regex` rules are never rewritten; check whether the pattern includes the base path. |
+| `matches_no_operation` | Stripping the base path leaves a path no operation uses. |
+| `ambiguous_base` | More than one server base path fits, with different results. |
+| `rule_set_mixed_apis` | A shared rule set is attached to bindings on APIs that need different rewrites. |
+| `rule_set_not_attached` | The rule set is attached to no binding, so there is no API to judge it against. |
+| `binding_not_found` | An inline rule whose agent↔credential binding no longer exists (it is never evaluated). |
+| `credential_not_api_scoped` | The credential is vendor-wide (no single API), so there is no base path to strip. |
+| `credential_not_found` | The rule's credential no longer exists. |
+| `api_not_found` | The bound credential's API has no live revision in the registry. |
+
+A `"category": "conflict"` line means the rule was edited while the job ran
+(`changed_concurrently`) or the write and its audit entry failed together
+(`write_failed`); re-run it.
+
+### Encoded path traversal is refused
+
+Rule enforcement no longer decodes `%2F` / `%5C`, and a request whose path
+spells a dot segment with escapes or a backslash (`/admin%2F..%2Fusers`,
+`/admin/%2e%2e/users`, `/admin\..\users`)
+is denied with `403 action_denied` (`reason: ambiguous_path`): different
+upstream servers resolve such a path differently, so no rule check on it is
+sound.
 
 ## Where the commands live, per install
 

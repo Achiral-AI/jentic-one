@@ -23,14 +23,24 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from jentic_one.shared.config import AppConfig, DatabaseConfig
 from jentic_one.shared.db.session import get_database_url
-from tests.integration.conftest import _alembic_config_for
+from tests.harness.postgres import alembic_config_for
 
 #: The revision just below the drop, and the drop itself.
 ADMIN_PRE_SA_DROP = "d1e2f3a4b5c6"  # pragma: allowlist secret
 _SA_DROP = "e2f3a4b5c6d7"  # pragma: allowlist secret
-#: The reversible admin revision stacked on the drop (execution-record
-#: operation path/method); walked back with a real downgrade before the restore.
+#: The reversible admin revisions stacked on the drop (execution-record
+#: operation path/method, then the actor_scope_grants→actor_permission_grants
+#: rename); walked back with a real downgrade before the restore.
 _ADMIN_HEAD_ABOVE_SA_DROP = "0679072d60eb"  # pragma: allowlist secret
+_RENAME_HEAD = "e3f4a5b6c7d8"  # pragma: allowlist secret
+#: The event-acknowledgement drop, stacked on the rename head.
+_ACK_DROP_HEAD = "d2e3f4a5b6c7"  # pragma: allowlist secret
+#: The access-request scope mapping, stacked on the acknowledgement drop.
+_SCOPE_MAP_HEAD = "6ae76df5ece5"  # pragma: allowlist secret
+#: The execution-approvals table, stacked on the scope mapping.
+_APPROVALS_HEAD = "3306fb9172f1"  # pragma: allowlist secret
+#: The credential-keyed repeated-failure index, stacked on the approvals table.
+_REPEATED_FAILURE_INDEX_HEAD = "c00de2f5d777"  # pragma: allowlist secret
 
 
 def _create_tables(op: Operations, *, pg: bool) -> None:
@@ -186,14 +196,20 @@ def restore_pre_sa_drop_admin(integration_config: AppConfig) -> None:
     code.
     """
     db_config = integration_config.databases.admin
-    cfg = _alembic_config_for("admin", db_config)
+    cfg = alembic_config_for("admin", db_config)
     heads = ScriptDirectory.from_config(cfg).get_heads()
     # Stamping skips downgrades, so every revision above the drop must be
     # reversible: walk those back with a real downgrade first, then snapshot-
     # restore the drop itself. Extend this list when a new head lands.
-    assert heads in ([_SA_DROP], [_ADMIN_HEAD_ABOVE_SA_DROP]), (
-        f"extend restore_pre_sa_drop_admin for new heads {heads}"
-    )
+    assert heads in (
+        [_SA_DROP],
+        [_ADMIN_HEAD_ABOVE_SA_DROP],
+        [_RENAME_HEAD],
+        [_ACK_DROP_HEAD],
+        [_SCOPE_MAP_HEAD],
+        [_APPROVALS_HEAD],
+        [_REPEATED_FAILURE_INDEX_HEAD],
+    ), f"extend restore_pre_sa_drop_admin for new heads {heads}"
     if not asyncio.run(_has_service_account_tables(db_config)):
         command.downgrade(cfg, _SA_DROP)
     if asyncio.run(_restore_tables(db_config)):

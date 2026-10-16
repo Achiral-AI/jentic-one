@@ -12,31 +12,33 @@ export {
 	useJobs,
 	useJob,
 	useCancelJob,
-	useAcknowledgeEvent,
 	useEventStream,
 	useEventFeed,
 	useAudit,
 	useActorForTrace,
-	useActorForJob,
 	useActors,
 	monitorKeys,
 } from '@/modules/monitor/api/hooks';
 export type { LiveStreamStatus } from '@/modules/monitor/api/hooks';
 
-export { MonitorApiError } from '@/modules/monitor/api/client';
-export type {
-	ListExecutionsParams,
-	ListJobsParams,
-	ListEventsParams,
-	ListAuditParams,
-	ListActorsParams,
-	UsageStatsParams,
-} from '@/modules/monitor/api/client';
+// Usage-window plumbing for `useUsageStats` / `UsageCharts` call sites, so
+// every screen shares one clock step, window shape, and top-N (one cache key).
+export {
+	USAGE_TOP_LIMIT,
+	USAGE_WINDOW_STEP_MS,
+	useCoarseNowSec,
+	useUsageWindow,
+	usageWindowBounds,
+} from '@/modules/monitor/api/usageWindow';
+
+export { MonitorApiError, isMonitorAccessDenied } from '@/modules/monitor/api/client';
+export type { ListAuditParams } from '@/modules/monitor/api/client';
 
 export {
 	ACTIVITY_SOURCES,
 	toExecutionStatus,
 	toJobStatus,
+	isCancellableJob,
 	isTerminalJobStatus,
 } from '@/modules/monitor/api/types';
 export type {
@@ -44,26 +46,10 @@ export type {
 	ActivitySource,
 	ExecutionStatusUi,
 	JobStatusUi,
-	AuditActor,
 } from '@/modules/monitor/api/types';
 
 // Re-export the generated models the views render, so view components consume
 // them through the module's api barrel rather than reaching into the
 // @/shared/api facade directly (which the layering ESLint rule forbids).
-export type {
-	ExecutionResponse,
-	ExecutionListResponse,
-	UsageResponse,
-	UsageStatsBlock,
-	UsageBucket,
-	UsageTopRow,
-	JobResponse,
-	JobListResponse,
-	EventResponse,
-	EventListResponse,
-	AuditResponse,
-	AuditListResponse,
-	ActorSummaryResponse,
-	ActorListResponse,
-} from '@/shared/api';
+export type { ExecutionResponse, UsageResponse, EventResponse, AuditResponse } from '@/shared/api';
 export { EventSeverity, AuditTargetType, GroupBy } from '@/shared/api';

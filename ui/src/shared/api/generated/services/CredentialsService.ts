@@ -40,8 +40,17 @@ export class CredentialsService {
         limit = 50,
         vendor,
     }: {
+        /**
+         * Opaque cursor from a previous page's next_cursor; omit for the first page.
+         */
         cursor?: (string | null),
+        /**
+         * Maximum number of credentials to return (1-200, default 50).
+         */
         limit?: number,
+        /**
+         * Filter to credentials for this API vendor (exact match).
+         */
         vendor?: (string | null),
     }): CancelablePromise<CredentialListResponse> {
         return __request(OpenAPI, {
@@ -71,6 +80,9 @@ export class CredentialsService {
     public static createCredential({
         requestBody,
     }: {
+        /**
+         * Request payload for the `createCredential` operation.
+         */
         requestBody: (BearerTokenCreateRequest | ApiKeyCreateRequest | BasicAuthCreateRequest | OAuth2CreateRequest | NoAuthCreateRequest | Sigv4CreateRequest),
     }): CancelablePromise<CredentialCreateResponse> {
         return __request(OpenAPI, {
@@ -82,56 +94,6 @@ export class CredentialsService {
                 400: `Bad Request`,
                 401: `Unauthorized`,
                 403: `Forbidden`,
-                422: `Unprocessable Entity`,
-                500: `Internal Server Error`,
-                503: `Service Unavailable`,
-            },
-        });
-    }
-    /**
-     * OAuth connect callback
-     * Handle the OAuth callback from the IdP.
-     *
-     * This endpoint is intentionally unauthenticated — it receives redirects
-     * from external IdPs where the user has no session cookie. Security
-     * binding is provided by the signed, time-limited state JWT which ties
-     * the callback to a specific credential and caller.
-     *
-     * Redirects the popup the SPA opened to a public SPA route
-     * (``/app/oauth/connected``) that owns the user-facing "you can close this"
-     * experience and self-closes. Two variants, distinguished only by a coarse
-     * ``status`` query param:
-     *
-     * * Success: ``?status=ok``.
-     * * Failure: ``?status=error`` — no protocol or provider detail is
-     * exposed in the redirect URL.
-     *
-     * The parent SPA still learns the real outcome by polling
-     * ``GET /credentials/{id}`` — never from this redirect. The actual cause
-     * (missing state, connect failure, provider error, etc.) is recorded via
-     * structured logging for operators.
-     * @returns any Successful Response
-     * @throws ApiError
-     */
-    public static oauthCallback({
-        code,
-        state,
-        error,
-    }: {
-        code?: (string | null),
-        state?: (string | null),
-        error?: (string | null),
-    }): CancelablePromise<any> {
-        return __request(OpenAPI, {
-            method: 'GET',
-            url: '/credentials/oauth/callback',
-            query: {
-                'code': code,
-                'state': state,
-                'error': error,
-            },
-            errors: {
-                400: `Bad Request`,
                 422: `Unprocessable Entity`,
                 500: `Internal Server Error`,
                 503: `Service Unavailable`,
@@ -167,6 +129,9 @@ export class CredentialsService {
     public static deleteCredential({
         credentialId,
     }: {
+        /**
+         * ID of the credential.
+         */
         credentialId: string,
     }): CancelablePromise<void> {
         return __request(OpenAPI, {
@@ -195,6 +160,9 @@ export class CredentialsService {
     public static getCredential({
         credentialId,
     }: {
+        /**
+         * ID of the credential.
+         */
         credentialId: string,
     }): CancelablePromise<CredentialRedactedResponse> {
         return __request(OpenAPI, {
@@ -224,7 +192,13 @@ export class CredentialsService {
         credentialId,
         requestBody,
     }: {
+        /**
+         * ID of the credential.
+         */
         credentialId: string,
+        /**
+         * Request payload for the `updateCredential` operation.
+         */
         requestBody: (BearerTokenUpdateRequest | ApiKeyUpdateRequest | BasicAuthUpdateRequest | OAuth2UpdateRequest | Sigv4UpdateRequest),
     }): CancelablePromise<CredentialRedactedResponse> {
         return __request(OpenAPI, {
@@ -250,10 +224,11 @@ export class CredentialsService {
      * List agents bound to credential
      * List agents directly bound to a credential with cursor-based pagination.
      *
-     * The reverse lookup for the credential-detail "Agents" view (theme 5
-     * phase 1) — the direct-binding successor of the removed
-     * ``GET /toolkits/{id}/agents``.
-     * Suspended bindings are included with their flag set.
+     * The reverse lookup for the credential-detail "Agents" view: every agent
+     * whose direct binding points at this credential, filtered to the agents
+     * the caller may see.
+     * Suspended bindings are included with their flag set and, when known, the
+     * reason (`api_deleted` when the credential's API was deleted).
      * @returns CredentialAgentListResponse Successful Response
      * @throws ApiError
      */
@@ -262,8 +237,17 @@ export class CredentialsService {
         cursor,
         limit = 50,
     }: {
+        /**
+         * ID of the credential.
+         */
         credentialId: string,
+        /**
+         * Opaque cursor from a previous page's next_cursor; omit for the first page.
+         */
         cursor?: (string | null),
+        /**
+         * Maximum number of agents to return (1-200, default 50).
+         */
         limit?: number,
     }): CancelablePromise<CredentialAgentListResponse> {
         return __request(OpenAPI, {
@@ -297,7 +281,13 @@ export class CredentialsService {
         credentialId,
         agentId,
     }: {
+        /**
+         * ID of the credential.
+         */
         credentialId: string,
+        /**
+         * ID of the agent bound to the credential.
+         */
         agentId: string,
     }): CancelablePromise<PermissionRuleListResponse> {
         return __request(OpenAPI, {
@@ -329,8 +319,17 @@ export class CredentialsService {
         agentId,
         requestBody,
     }: {
+        /**
+         * ID of the credential.
+         */
         credentialId: string,
+        /**
+         * ID of the agent bound to the credential.
+         */
         agentId: string,
+        /**
+         * Patch permission rules — add and/or remove.
+         */
         requestBody: PermissionsPatchRequest,
     }): CancelablePromise<PermissionRuleListResponse> {
         return __request(OpenAPI, {
@@ -364,8 +363,17 @@ export class CredentialsService {
         agentId,
         requestBody,
     }: {
+        /**
+         * ID of the credential.
+         */
         credentialId: string,
+        /**
+         * ID of the agent bound to the credential.
+         */
         agentId: string,
+        /**
+         * Request payload for the `replaceAgentCredentialPermissions` operation.
+         */
         requestBody: Array<PermissionRuleSchema>,
     }): CancelablePromise<PermissionRuleListResponse> {
         return __request(OpenAPI, {
@@ -403,8 +411,17 @@ export class CredentialsService {
         agentId,
         requestBody,
     }: {
+        /**
+         * ID of the credential.
+         */
         credentialId: string,
+        /**
+         * ID of the agent bound to the credential.
+         */
         agentId: string,
+        /**
+         * Request body for :test — dry-run a request shape against the binding's rules.
+         */
         requestBody: PermissionTestRequest,
     }): CancelablePromise<PermissionTestResponse> {
         return __request(OpenAPI, {
@@ -439,7 +456,13 @@ export class CredentialsService {
         credentialId,
         agentId,
     }: {
+        /**
+         * ID of the credential.
+         */
         credentialId: string,
+        /**
+         * ID of the agent bound to the credential.
+         */
         agentId: string,
     }): CancelablePromise<void> {
         return __request(OpenAPI, {
@@ -466,7 +489,11 @@ export class CredentialsService {
      *
      * While attached, the set's ordered list is the binding's effective policy
      * and its inline rules are dormant — `permissions:test` evaluates the set.
-     * The set must exist (404 `rule_set_not_found`).
+     * The set must exist (404 `rule_set_not_found`). The caller must be the
+     * set's creator or an org admin, unless the set is curated (created by an
+     * org admin), which any caller who may write the binding's rules can
+     * attach; otherwise 403 `rule_set_attach_denied`. Re-attaching the set the
+     * binding already points at is a no-op.
      * @returns void
      * @throws ApiError
      */
@@ -475,8 +502,17 @@ export class CredentialsService {
         agentId,
         requestBody,
     }: {
+        /**
+         * ID of the credential.
+         */
         credentialId: string,
+        /**
+         * ID of the agent bound to the credential.
+         */
         agentId: string,
+        /**
+         * Point a direct agent↔credential binding at a shared rule set.
+         */
         requestBody: RuleSetAttachRequest,
     }): CancelablePromise<void> {
         return __request(OpenAPI, {
@@ -514,7 +550,13 @@ export class CredentialsService {
         credentialId,
         requestBody,
     }: {
+        /**
+         * ID of the credential.
+         */
         credentialId: string,
+        /**
+         * Request body for initiating a credential connect flow.
+         */
         requestBody: ConnectRequestBody,
     }): CancelablePromise<any> {
         return __request(OpenAPI, {

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Annotated
 
 import structlog
-from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi import APIRouter, Depends, Path, Query, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import Field
 
@@ -82,6 +82,7 @@ from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.context import Context
 from jentic_one.shared.models.credentials import CredentialType
 from jentic_one.shared.web import get_ctx, get_current_identity
+from jentic_one.shared.web import openapi_examples as ex
 from jentic_one.shared.web.links import public_base_url
 from jentic_one.shared.web.openapi_responses import conflict, not_found, with_responses
 from jentic_one.shared.web.static import SPA_MOUNT_PATH
@@ -119,6 +120,8 @@ def _to_redacted_response(view: CredentialRedactedView) -> CredentialRedactedRes
         updated_at=view.updated_at,
         details=details.model_dump(exclude_none=True) if details else None,
         server_variables=view.server_variables,
+        oauth_app_registration_id=view.oauth_app_registration_id,
+        oauth_app_registration_name=view.oauth_app_registration_name,
     )
 
 
@@ -205,12 +208,14 @@ async def create_credential(
         catalog_api_id=result.catalog_api_id,
         provider=result.provider,
         active=result.active,
+        created_by=result.created_by,
         created_at=result.created_at,
         server_variables=result.server_variables,
     )
     return CredentialCreateResponse(
         credential=redacted,
         secret=result.secret.model_dump(),
+        warnings=result.warnings,
     )
 
 
@@ -220,9 +225,23 @@ async def list_credentials(
         required_permissions=["credentials:read", "owner:credentials:read"]
     ),
     svc: CredentialService = Depends(get_credential_service),
-    cursor: str | None = None,
-    limit: int = Query(default=50, ge=1, le=200),
-    vendor: str | None = Query(default=None),
+    cursor: str | None = Query(
+        default=None,
+        description="Opaque cursor from a previous page's next_cursor; omit for the first page.",
+        openapi_examples=ex.example(ex.CURSOR),
+    ),
+    limit: int = Query(
+        default=50,
+        ge=1,
+        le=200,
+        description="Maximum number of credentials to return (1-200, default 50).",
+        openapi_examples=ex.example(25),
+    ),
+    vendor: str | None = Query(
+        default=None,
+        description="Filter to credentials for this API vendor (exact match).",
+        openapi_examples=ex.example(ex.API_VENDOR),
+    ),
 ) -> CredentialListResponse:
     """List credentials with cursor-based pagination."""
     page = await svc.list_all(cursor=cursor, limit=limit, vendor=vendor, identity=identity)
@@ -267,11 +286,23 @@ def _oauth_callback_error() -> RedirectResponse:
     return RedirectResponse(f"{_CONNECT_RETURN_PATH}?status=error", status_code=303)
 
 
-@router.get(OAUTH_CALLBACK_PATH, summary="OAuth connect callback")
+@router.get(OAUTH_CALLBACK_PATH, summary="OAuth connect callback", include_in_schema=False)
 async def oauth_callback(
-    code: str | None = Query(default=None),
-    state: str | None = Query(default=None),
-    error: str | None = Query(default=None),
+    code: str | None = Query(
+        default=None,
+        description="Authorization code issued by the identity provider.",
+        openapi_examples=ex.example(ex.AUTHORIZATION_CODE),
+    ),
+    state: str | None = Query(
+        default=None,
+        description="Signed state value issued when the connect flow began.",
+        openapi_examples=ex.example(ex.OAUTH_STATE),
+    ),
+    error: str | None = Query(
+        default=None,
+        description="OAuth error code from the identity provider when authorization failed.",
+        openapi_examples=ex.example("access_denied"),
+    ),
     ctx: Context = Depends(get_ctx),
     svc: ConnectService = Depends(get_connect_service),
     session_svc: ConnectSessionService = Depends(get_connect_session_service),
@@ -397,7 +428,10 @@ async def oauth_callback(
 
 @router.get("/credentials/{credential_id}", summary="Get credential", responses=not_found())
 async def get_credential(
-    credential_id: str,
+    credential_id: Annotated[
+        str,
+        Path(description="ID of the credential.", openapi_examples=ex.example(ex.CREDENTIAL_ID)),
+    ],
     identity: Identity = get_current_identity(
         required_permissions=["credentials:read", "owner:credentials:read"]
     ),
@@ -414,20 +448,34 @@ async def get_credential(
     responses=not_found(),
 )
 async def list_credential_agents(
-    credential_id: str,
+    credential_id: Annotated[
+        str,
+        Path(description="ID of the credential.", openapi_examples=ex.example(ex.CREDENTIAL_ID)),
+    ],
     identity: Identity = get_current_identity(
         required_permissions=["credentials:read", "owner:credentials:read"]
     ),
     svc: CredentialService = Depends(get_credential_service),
-    cursor: str | None = None,
-    limit: int = Query(default=50, ge=1, le=200),
+    cursor: str | None = Query(
+        default=None,
+        description="Opaque cursor from a previous page's next_cursor; omit for the first page.",
+        openapi_examples=ex.example(ex.CURSOR),
+    ),
+    limit: int = Query(
+        default=50,
+        ge=1,
+        le=200,
+        description="Maximum number of agents to return (1-200, default 50).",
+        openapi_examples=ex.example(25),
+    ),
 ) -> CredentialAgentListResponse:
     """List agents directly bound to a credential with cursor-based pagination.
 
-    The reverse lookup for the credential-detail "Agents" view (theme 5
-    phase 1) — the direct-binding successor of the removed
-    ``GET /toolkits/{id}/agents``.
-    Suspended bindings are included with their flag set.
+    The reverse lookup for the credential-detail "Agents" view: every agent
+    whose direct binding points at this credential, filtered to the agents
+    the caller may see.
+    Suspended bindings are included with their flag set and, when known, the
+    reason (`api_deleted` when the credential's API was deleted).
     """
     data, has_more, next_cursor = await svc.list_agents(
         credential_id, cursor=cursor, limit=limit, identity=identity
@@ -440,6 +488,7 @@ async def list_credential_agents(
                 status=row.agent_status,
                 bound_at=row.bound_at,
                 suspended=row.suspended,
+                suspended_reason=row.suspended_reason,
                 rule_set_id=row.rule_set_id,
             )
             for row in data
@@ -473,8 +522,17 @@ def _to_permission_rule(rule: AgentPermissionRule) -> PermissionRuleReadSchema:
     responses=not_found(),
 )
 async def list_agent_permissions(
-    credential_id: str,
-    agent_id: str,
+    credential_id: Annotated[
+        str,
+        Path(description="ID of the credential.", openapi_examples=ex.example(ex.CREDENTIAL_ID)),
+    ],
+    agent_id: Annotated[
+        str,
+        Path(
+            description="ID of the agent bound to the credential.",
+            openapi_examples=ex.example(ex.AGENT_ID),
+        ),
+    ],
     identity: Identity = get_current_identity(
         required_permissions=["credentials:read", "owner:credentials:read"]
     ),
@@ -492,8 +550,17 @@ async def list_agent_permissions(
     responses=not_found(),
 )
 async def replace_agent_permissions(
-    credential_id: str,
-    agent_id: str,
+    credential_id: Annotated[
+        str,
+        Path(description="ID of the credential.", openapi_examples=ex.example(ex.CREDENTIAL_ID)),
+    ],
+    agent_id: Annotated[
+        str,
+        Path(
+            description="ID of the agent bound to the credential.",
+            openapi_examples=ex.example(ex.AGENT_ID),
+        ),
+    ],
     body: Annotated[list[PermissionRuleSchema], Field(max_length=100)],
     identity: Identity = get_current_identity(required_permissions=["credentials:write"]),
     svc: CredentialService = Depends(get_credential_service),
@@ -513,8 +580,17 @@ async def replace_agent_permissions(
     responses=not_found(),
 )
 async def patch_agent_permissions(
-    credential_id: str,
-    agent_id: str,
+    credential_id: Annotated[
+        str,
+        Path(description="ID of the credential.", openapi_examples=ex.example(ex.CREDENTIAL_ID)),
+    ],
+    agent_id: Annotated[
+        str,
+        Path(
+            description="ID of the agent bound to the credential.",
+            openapi_examples=ex.example(ex.AGENT_ID),
+        ),
+    ],
     body: PermissionsPatchRequest,
     identity: Identity = get_current_identity(required_permissions=["credentials:write"]),
     svc: CredentialService = Depends(get_credential_service),
@@ -536,8 +612,17 @@ async def patch_agent_permissions(
     responses=not_found(),
 )
 async def test_agent_permissions(
-    credential_id: str,
-    agent_id: str,
+    credential_id: Annotated[
+        str,
+        Path(description="ID of the credential.", openapi_examples=ex.example(ex.CREDENTIAL_ID)),
+    ],
+    agent_id: Annotated[
+        str,
+        Path(
+            description="ID of the agent bound to the credential.",
+            openapi_examples=ex.example(ex.AGENT_ID),
+        ),
+    ],
     body: PermissionTestRequest,
     identity: Identity = get_current_identity(
         required_permissions=["credentials:read", "owner:credentials:read"]
@@ -579,8 +664,17 @@ async def test_agent_permissions(
     responses=not_found(),
 )
 async def attach_agent_rule_set(
-    credential_id: str,
-    agent_id: str,
+    credential_id: Annotated[
+        str,
+        Path(description="ID of the credential.", openapi_examples=ex.example(ex.CREDENTIAL_ID)),
+    ],
+    agent_id: Annotated[
+        str,
+        Path(
+            description="ID of the agent bound to the credential.",
+            openapi_examples=ex.example(ex.AGENT_ID),
+        ),
+    ],
     body: RuleSetAttachRequest,
     identity: Identity = get_current_identity(required_permissions=["credentials:write"]),
     svc: CredentialService = Depends(get_credential_service),
@@ -589,7 +683,11 @@ async def attach_agent_rule_set(
 
     While attached, the set's ordered list is the binding's effective policy
     and its inline rules are dormant — `permissions:test` evaluates the set.
-    The set must exist (404 `rule_set_not_found`).
+    The set must exist (404 `rule_set_not_found`). The caller must be the
+    set's creator or an org admin, unless the set is curated (created by an
+    org admin), which any caller who may write the binding's rules can
+    attach; otherwise 403 `rule_set_attach_denied`. Re-attaching the set the
+    binding already points at is a no-op.
     """
     await svc.attach_binding_rule_set(credential_id, agent_id, body.rule_set_id, identity=identity)
     return Response(status_code=204)
@@ -603,8 +701,17 @@ async def attach_agent_rule_set(
     responses=not_found(),
 )
 async def detach_agent_rule_set(
-    credential_id: str,
-    agent_id: str,
+    credential_id: Annotated[
+        str,
+        Path(description="ID of the credential.", openapi_examples=ex.example(ex.CREDENTIAL_ID)),
+    ],
+    agent_id: Annotated[
+        str,
+        Path(
+            description="ID of the agent bound to the credential.",
+            openapi_examples=ex.example(ex.AGENT_ID),
+        ),
+    ],
     identity: Identity = get_current_identity(required_permissions=["credentials:write"]),
     svc: CredentialService = Depends(get_credential_service),
 ) -> Response:
@@ -638,6 +745,7 @@ def _to_rule_set_response(
             for r in rules
         ],
         binding_count=binding_count,
+        curated=rule_set.curated,
         created_by=rule_set.created_by,
         created_at=rule_set.created_at,
     )
@@ -653,8 +761,18 @@ async def list_rule_sets(
         required_permissions=["credentials:read", "owner:credentials:read"]
     ),
     svc: CredentialService = Depends(get_credential_service),
-    cursor: str | None = None,
-    limit: int = Query(default=50, ge=1, le=200),
+    cursor: str | None = Query(
+        default=None,
+        description="Opaque cursor from a previous page's next_cursor; omit for the first page.",
+        openapi_examples=ex.example(ex.CURSOR),
+    ),
+    limit: int = Query(
+        default=50,
+        ge=1,
+        le=200,
+        description="Maximum number of rule sets to return (1-200, default 50).",
+        openapi_examples=ex.example(25),
+    ),
 ) -> RuleSetListResponse:
     """List shared rule sets with per-set rule counts (cursor-paginated)."""
     data, has_more, next_cursor = await svc.list_rule_sets(
@@ -667,6 +785,7 @@ async def list_rule_sets(
                 name=rs.name,
                 description=rs.description,
                 rule_count=count,
+                curated=rs.curated,
                 created_by=rs.created_by,
                 created_at=rs.created_at,
             )
@@ -689,10 +808,17 @@ async def create_rule_set(
     identity: Identity = get_current_identity(required_permissions=["credentials:write"]),
     svc: CredentialService = Depends(get_credential_service),
 ) -> RuleSetResponse:
-    """Create a named, shareable ordered rule list (theme 5 rule grouping).
+    """Create a named, reusable list of permission rules.
 
-    N agent-credential bindings can point at one set, so `permissions:test`
-    and "revoke this operation everywhere" stay single-place edits.
+    Attach the set to any number of agent-credential bindings
+    (`PUT /credentials/{credential_id}/agents/{agent_id}/rule-set`); editing
+    its rules later updates every attached binding at once, so a policy
+    change such as "block this operation everywhere" is a single edit.
+    Supply a unique `name`, an optional `description`, and optional initial
+    ordered `rules`. A set created by an `org:admin` is *curated*: any
+    `credentials:write` holder may attach it, but only an `org:admin` may
+    edit it. Returns the set with its rules; 409 (`rule_set_name_conflict`)
+    if the name is taken.
     """
     rule_set, rules = await svc.create_rule_set(
         name=body.name,
@@ -710,7 +836,13 @@ async def create_rule_set(
     responses=not_found(),
 )
 async def get_rule_set(
-    rule_set_id: str,
+    rule_set_id: Annotated[
+        str,
+        Path(
+            description="ID of the permission rule set.",
+            openapi_examples=ex.example(ex.RULE_SET_ID),
+        ),
+    ],
     identity: Identity = get_current_identity(
         required_permissions=["credentials:read", "owner:credentials:read"]
     ),
@@ -724,16 +856,30 @@ async def get_rule_set(
 @router.patch(
     "/permission-rule-sets/{rule_set_id}",
     operation_id="updatePermissionRuleSet",
-    summary="Update permission rule set",
+    summary="Rename or re-describe a permission rule set",
     responses=not_found(),
 )
 async def update_rule_set(
-    rule_set_id: str,
+    rule_set_id: Annotated[
+        str,
+        Path(
+            description="ID of the permission rule set.",
+            openapi_examples=ex.example(ex.RULE_SET_ID),
+        ),
+    ],
     body: RuleSetUpdateRequest,
     identity: Identity = get_current_identity(required_permissions=["credentials:write"]),
     svc: CredentialService = Depends(get_credential_service),
 ) -> RuleSetResponse:
-    """Rename or re-describe a rule set (creator or org admin)."""
+    """Change a rule set's `name` and/or `description`.
+
+    The rules themselves are replaced separately, with
+    `PUT /permission-rule-sets/{rule_set_id}/rules`. A curated set is editable
+    only by an `org:admin`; any other set by its creator or an `org:admin`
+    (403 `rule_set_access_denied` otherwise). Returns the updated set with
+    its rules and the number of bindings referencing it; 409
+    (`rule_set_name_conflict`) if the new name is taken.
+    """
     await svc.update_rule_set(
         rule_set_id, identity=identity, name=body.name, description=body.description
     )
@@ -744,19 +890,29 @@ async def update_rule_set(
 @router.put(
     "/permission-rule-sets/{rule_set_id}/rules",
     operation_id="replacePermissionRuleSetRules",
-    summary="Replace rule set rules",
+    summary="Replace all rules in a permission rule set",
     responses=not_found(),
 )
 async def replace_rule_set_rules(
-    rule_set_id: str,
+    rule_set_id: Annotated[
+        str,
+        Path(
+            description="ID of the permission rule set.",
+            openapi_examples=ex.example(ex.RULE_SET_ID),
+        ),
+    ],
     body: Annotated[list[PermissionRuleSchema], Field(max_length=100)],
     identity: Identity = get_current_identity(required_permissions=["credentials:write"]),
     svc: CredentialService = Depends(get_credential_service),
 ) -> PermissionRuleListResponse:
-    """Replace the set's full ordered rule list (idempotent PUT).
+    """Replace a rule set's entire ordered rule list with the body.
 
-    Every binding pointing at the set picks the new list up at once — the
-    single-place edit rule grouping exists for.
+    This is a full replacement, not a merge: user rules missing from the body
+    are removed, and an empty list clears them. Platform-managed system rules
+    (`_system: true`) are kept. The request is idempotent.
+    Every binding attached to the set enforces the new rules immediately.
+    Same edit permission as updating the set (403 `rule_set_access_denied`).
+    Returns the stored rules in order.
     """
     rules_data = [r.model_dump(exclude_none=True) for r in body]
     rules = await svc.replace_rule_set_rules(rule_set_id, rules_data, identity=identity)
@@ -786,11 +942,23 @@ async def replace_rule_set_rules(
     responses=with_responses(not_found(), conflict()),
 )
 async def delete_rule_set(
-    rule_set_id: str,
+    rule_set_id: Annotated[
+        str,
+        Path(
+            description="ID of the permission rule set.",
+            openapi_examples=ex.example(ex.RULE_SET_ID),
+        ),
+    ],
     identity: Identity = get_current_identity(required_permissions=["credentials:write"]),
     svc: CredentialService = Depends(get_credential_service),
 ) -> Response:
-    """Delete a rule set nothing references (409 `rule_set_in_use` otherwise)."""
+    """Permanently delete a rule set that no binding uses.
+
+    Detach the set from every binding first: while any binding still
+    references it the delete fails with 409 (`rule_set_in_use`) and nothing
+    changes. Same edit permission as updating the set (403
+    `rule_set_access_denied`). Returns 204.
+    """
     await svc.delete_rule_set(rule_set_id, identity=identity)
     return Response(status_code=204)
 
@@ -801,7 +969,10 @@ async def delete_rule_set(
     responses=not_found(),
 )
 async def update_credential(
-    credential_id: str,
+    credential_id: Annotated[
+        str,
+        Path(description="ID of the credential.", openapi_examples=ex.example(ex.CREDENTIAL_ID)),
+    ],
     body: CredentialUpdateRequest,
     identity: Identity = get_current_identity(required_permissions=["credentials:write"]),
     svc: CredentialService = Depends(get_credential_service),
@@ -839,7 +1010,10 @@ async def update_credential(
     responses=not_found(),
 )
 async def delete_credential(
-    credential_id: str,
+    credential_id: Annotated[
+        str,
+        Path(description="ID of the credential.", openapi_examples=ex.example(ex.CREDENTIAL_ID)),
+    ],
     identity: Identity = get_current_identity(required_permissions=["credentials:write"]),
     svc: CredentialService = Depends(get_credential_service),
 ) -> Response:
@@ -855,7 +1029,10 @@ async def delete_credential(
     response_model=None,
 )
 async def connect_credential(
-    credential_id: str,
+    credential_id: Annotated[
+        str,
+        Path(description="ID of the credential.", openapi_examples=ex.example(ex.CREDENTIAL_ID)),
+    ],
     body: ConnectRequestBody,
     request: Request,
     identity: Identity = get_current_identity(required_permissions=["credentials:write"]),
@@ -875,12 +1052,9 @@ async def connect_credential(
         challenge = await svc.begin(
             credential_id,
             connect_req,
-            actor_id=identity.sub,
-            actor_type=identity.actor_type,
+            identity=identity,
             redirect_uri=redirect_uri,
         )
-    except CredentialNotFoundError:
-        return JSONResponse(status_code=404, content={"detail": "Credential not found"})
     except NotConnectableError as exc:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
     except ProviderError as exc:

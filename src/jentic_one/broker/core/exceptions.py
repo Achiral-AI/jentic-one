@@ -7,19 +7,23 @@ the transport coupling out of the domain/service layers (00-overview "Errors —
 domain in, problem+json out").
 
 Every error also carries the **agent-recovery contract**: an ``error_origin``
-(``broker`` | ``upstream``) and, where a deterministic recovery exists, a
+(``broker`` | ``upstream``: who generated the response — a ``BrokerError`` is
+always the broker's own response, so it keeps the ``broker`` default) and,
+where a deterministic recovery exists, a
 structured ``AgentDirective`` so the autonomous-agent caller can recover without
 reading docs (02-core-proxy "Agent-centric error recovery").
 """
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel
 
+from jentic_one.shared.access_guidance import ConnectTarget
 from jentic_one.shared.broker.execution import ErrorOrigin as ErrorOrigin
 from jentic_one.shared.broker.protocols import IdentityMismatch
+from jentic_one.shared.permissions.matching import validate_path
 
 AgentStrategy = Literal[
     "wait",
@@ -51,13 +55,19 @@ class BrokerError(Exception):
     Carries the problem+json ``detail``/``type`` plus optional extension members,
     the ``error_origin`` and an optional ``AgentDirective``. ``headers`` are extra
     response headers the central handler should attach (e.g. ``Retry-After``).
+
+    ``default_type`` is the problem ``type`` a subclass renders when the raise
+    site passes none, so a class with a stable wire identity (one a client keys
+    recovery on) never falls back to ``about:blank``.
     """
+
+    default_type: ClassVar[str] = "about:blank"
 
     def __init__(
         self,
         detail: str,
         *,
-        type: str = "about:blank",
+        type: str | None = None,
         extra: dict[str, Any] | None = None,
         origin: ErrorOrigin = ErrorOrigin.BROKER,
         directive: AgentDirective | None = None,
@@ -67,7 +77,7 @@ class BrokerError(Exception):
     ) -> None:
         super().__init__(detail)
         self.detail = detail
-        self.type = type
+        self.type = type or self.default_type
         self.extra = extra or {}
         self.origin = origin
         self.directive = directive
@@ -97,7 +107,12 @@ class MethodNotAllowedError(BrokerError):
 
 
 class TooManyCandidatesError(BrokerError):
-    """Discovery produced too many candidates to resolve safely (503)."""
+    """Discovery produced too many candidates to resolve safely (503).
+
+    Raised before dispatch, so the upstream never saw the call.
+    """
+
+    default_type = "too_many_candidates"
 
 
 class UpstreamUrlNotAllowedError(BrokerError):
@@ -183,7 +198,13 @@ class CredentialNeedsReconnectError(BrokerError):
 
 
 class CredentialRefreshTransientError(BrokerError):
-    """The IdP returned a transient error during token refresh (502)."""
+    """The IdP returned a transient error during token refresh (502).
+
+    ``broker`` origin: the refresh runs before dispatch, so the upstream API
+    never saw the call and the 502 is the broker's own response.
+    """
+
+    default_type = "refresh_transient_error"
 
 
 class InvalidCredentialNameError(BrokerError):
@@ -192,6 +213,19 @@ class InvalidCredentialNameError(BrokerError):
 
 class ActionDeniedError(BrokerError):
     """The request was denied by a permission rule on the caller's binding (403)."""
+
+
+class ApprovalPendingLimitError(BrokerError):
+    """The agent already holds the configured maximum of pending approvals (403)."""
+
+
+class ApprovalHoldUnavailableError(BrokerError):
+    """A require-approval rule matched but this deployment cannot hold the call (503).
+
+    A held call's payload is encrypted at rest with the credentials keyset;
+    without one configured there is nowhere safe to keep it, so the call is
+    refused rather than run or stored in plaintext.
+    """
 
 
 class CredentialIdentityMismatchError(BrokerError):
@@ -207,7 +241,15 @@ class CredentialIdentityMismatchError(BrokerError):
 
 
 class UpstreamTimeoutError(BrokerError):
-    """The upstream did not respond within the deadline (504)."""
+    """The upstream did not respond within the deadline (504).
+
+    ``broker`` origin: the broker gave up and generated this response; no
+    upstream answer exists. Typed ``upstream_timeout`` (read phase, the request
+    may have reached the upstream) or ``upstream_connect_failed`` (connect
+    phase, ``pre_send``: no request bytes were sent).
+    """
+
+    default_type = "upstream_timeout"
 
 
 class DeadlineExceededError(BrokerError):
@@ -217,19 +259,25 @@ class DeadlineExceededError(BrokerError):
     timeout): this is the **whole-call wall-clock budget** the ``DeadlineRunner``
     enforces *around* the transport (and, once it lands, the retry loop). Same
     ``504`` class, but the cause is "we ran out of time across the envelope", not
-    "one attempt stalled". ``upstream`` origin — the time was spent waiting on the
-    vendor — so the agent's directive points at the async-pivot / wait recovery.
+    "one attempt stalled". ``broker`` origin — the broker cut the call off and
+    generated this response — and the agent's directive points at the
+    async-pivot / wait recovery.
     """
+
+    default_type = "deadline_exceeded"
 
 
 class UpstreamResponseTooLargeError(BrokerError):
     """The upstream response body exceeded the broker's response-size cap (502).
 
     Enforced mid-stream so a hostile/large upstream can't OOM the instance — the
-    response-side counterpart to :class:`PayloadTooLargeError`. ``upstream`` origin
-    (the vendor sent too much), so the agent can ``switch_toolkit`` to an
-    alternative vendor.
+    response-side counterpart to :class:`PayloadTooLargeError`. ``broker`` origin
+    (the broker aborted the vendor's response and generated this one); the
+    vendor sent too much, so the agent can ``switch_toolkit`` to an alternative
+    vendor.
     """
+
+    default_type = "upstream_response_too_large"
 
 
 class RunnerSchemeUnsupportedError(BrokerError):
@@ -342,13 +390,71 @@ def credential_identity_mismatch_directive(*, mismatch: IdentityMismatch) -> Age
 # ---------------------------------------------------------------------------
 
 
+def suggested_permission_rules(*, method: str, path: str) -> list[dict[str, Any]] | None:
+    """The minimal permission rule allowing one denied request, in rule-schema shape.
+
+    One ``allow`` rule on the request's method and exact upstream path — the
+    narrowest grant that lets the denied call through. An approver widens it
+    (a path pattern, read-only ``GET``) at review. ``None`` when the path is
+    not a valid exact-mode rule path, so a directive never suggests a rule the
+    rule schema would refuse.
+    """
+    if not method or validate_path(path, "exact") is not None:
+        return None
+    return [{"effect": "allow", "methods": [method.upper()], "path": path, "match_mode": "exact"}]
+
+
+def connect_parameters(
+    connect: ConnectTarget | None, suggested_rules: list[dict[str, Any]] | None
+) -> dict[str, Any]:
+    """The provisioning fields a missing-credential directive adds to ``parameters``.
+
+    ``suggested_command`` is the CLI form and ``connect`` the structured form
+    an MCP client fills ``request_connection`` from — both only when something
+    connectable covers the API. ``suggested_rules`` is the minimal rule to ask
+    for with the credential, whoever provisions it.
+    """
+    params: dict[str, Any] = {}
+    if connect is not None:
+        params["suggested_command"] = connect.cli_command()
+        params["connect"] = connect.as_parameters()
+    if suggested_rules:
+        params["suggested_rules"] = suggested_rules
+    return params
+
+
+def api_connect_parameters(*, vendor: str, name: str, version: str) -> dict[str, Any]:
+    """The ``parameters`` a missing-credential directive adds for an API-target connect.
+
+    ``suggested_command`` is the CLI form (``jentic connect --api
+    <vendor/name/version>``) and ``connect.api`` the structured form an MCP
+    client passes as ``request_connection``'s ``api`` argument.
+    """
+    return {
+        "suggested_command": f"jentic connect --api {vendor}/{name}/{version}",
+        "connect": {"api": {"vendor": vendor, "name": name, "version": version}},
+    }
+
+
+def api_connect_hint(*, vendor: str, name: str, version: str) -> str:
+    """The prose naming both lanes' API-target connect call."""
+    return (
+        f'run `jentic connect --api {vendor}/{name}/{version} --reason "…"` (or call the '
+        f'request_connection tool with api {{"vendor": "{vendor}", "name": "{name}", '
+        f'"version": "{version}"}} and a reason)'
+    )
+
+
 def no_credential_binding_directive(
     *,
     vendor: str,
     name: str,
     version: str,
     api_served: bool,
-    connect_vendor: str | None = None,
+    connect: ConnectTarget | None = None,
+    suggested_rules: list[dict[str, Any]] | None = None,
+    provisioning_url: str | None = None,
+    connect_api: bool = False,
 ) -> AgentDirective:
     """Directive for a ``no_credential_binding`` 403 — recover the missing binding.
 
@@ -360,17 +466,33 @@ def no_credential_binding_directive(
       it. The operator grants the binding in the dashboard (or via
       ``POST /agents/{id}/credentials``) — binding stays human.
     - ``api_served=False`` — no credential is provisioned for this API yet.
-      The *provisioning* leg is agent-initiable when the API maps onto a
-      vendor-registry entry (``connect_vendor``): the agent runs ``jentic
-      connect <vendor>`` (or calls the ``request_connection`` MCP tool) —
-      an agent-initiated connect session binds the agent at confirm time —
-      and relays the approval_url to its operator; approval stays human.
-      Off the registry the whole ask stays with the operator.
+      The *provisioning* leg is agent-initiable when a vendor-registry entry
+      or a shared OAuth-app registration covers the API (``connect``): the
+      agent runs ``jentic connect <vendor>`` (or calls the
+      ``request_connection`` MCP tool) — an agent-initiated connect session
+      binds the agent at confirm time — and relays the approval_url to its
+      operator; approval stays human. Otherwise the whole ask stays with the
+      operator.
 
-    ``connect_vendor`` is the vendor-registry key resolved for this API
-    (``shared.access_guidance.connect_vendor_key``), or ``None`` when the API
-    is not in the registry; when set, the directive carries a runnable
-    ``parameters.suggested_command`` (``jentic connect <vendor>``).
+    ``connect`` is the target resolved for this API
+    (``broker.services.credentials.connect_target``), or ``None`` when nothing
+    connectable covers it; when set, the directive carries
+    ``parameters.suggested_command`` (``jentic connect <vendor>``),
+    and ``parameters.connect`` (``{vendor_key, registration_id?}``).
+    ``suggested_rules`` (the minimal rule allowing the denied request) rides
+    ``parameters.suggested_rules`` whenever given.
+
+    ``provisioning_url`` is the owner deep link to the agent's open connect
+    session for this API, when it has one: the agent already asked, so the
+    directive carries the link to relay and neither ``suggested_command`` nor
+    ``connect`` (a second connect would only duplicate the pending request).
+
+    ``connect_api`` says the deployment takes connect requests for any
+    registry API (``control.connect.manual_flows_enabled``). With no
+    ``connect`` target, the directive then names the API itself
+    (:func:`api_connect_parameters`) and the agent starts the connect; a human
+    enters the credential, so the agent relays the URL, ends its turn and
+    retries later. Without it the ask stays with the operator.
 
     Deliberately never enumerates other owners' credentials (that would leak
     instance inventory to an unbound agent).
@@ -379,9 +501,24 @@ def no_credential_binding_directive(
     parameters: dict[str, Any] = {
         "api": {"vendor": vendor, "name": name, "version": version},
         "api_served": api_served,
+        **connect_parameters(None if provisioning_url else connect, suggested_rules),
     }
-    if connect_vendor:
-        parameters["suggested_command"] = f"jentic connect {connect_vendor}"
+    if provisioning_url:
+        parameters["provisioning_url"] = provisioning_url
+        return AgentDirective(
+            strategy="prompt_human",
+            parameters=parameters,
+            human_readable_instruction=(
+                f"You have no credential binding for '{api}' yet, and your request to "
+                "connect a credential for it is still waiting for your operator. Do not "
+                f"start another: relay {provisioning_url} to them to approve it. Once they "
+                "confirm, retry this call."
+            ),
+        )
+    connect_command = connect.cli_command() if connect is not None else None
+    if connect is None and connect_api:
+        parameters.update(api_connect_parameters(vendor=vendor, name=name, version=version))
+    hint = api_connect_hint(vendor=vendor, name=name, version=version)
     if api_served:
         instruction = (
             f"You have no credential binding for '{api}', but a credential already serves "
@@ -389,19 +526,32 @@ def no_credential_binding_directive(
             "or via POST /agents/{agent_id}/credentials) — only a human can grant the "
             "binding. Once bound, retry this call."
         )
-        if connect_vendor:
+        if connect_command:
             instruction += (
                 f" Alternatively, start connecting a fresh credential yourself with "
-                f"`jentic connect {connect_vendor}` (or the request_connection tool) and "
+                f"`{connect_command}` (or the request_connection tool) and "
                 "relay its approval_url to your operator — approval is still theirs."
             )
-    elif connect_vendor:
+        elif connect_api:
+            instruction += (
+                f" Alternatively, start the request yourself: {hint}, and relay its "
+                "approval_url to your operator — they can bind you to the existing credential "
+                "from it. Approval is still theirs."
+            )
+    elif connect_command:
         instruction = (
             f"No credential is provisioned for '{api}' yet. Start connecting one yourself: "
-            f"run `jentic connect {connect_vendor}` (or call the request_connection tool) "
+            f"run `{connect_command}` (or call the request_connection tool) "
             "and relay the approval_url it returns to your operator — they approve the "
             "connection in the browser; only a human can approve. Once they confirm, retry "
             "this call."
+        )
+    elif connect_api:
+        instruction = (
+            f"No credential is provisioned for '{api}' yet. Start the request yourself: "
+            f"{hint}, and relay the approval_url it returns to your operator — a human "
+            "enters the credential in the browser, which can take a while, so end your turn "
+            "and retry this call later. Only a human can approve."
         )
     else:
         instruction = (
@@ -505,5 +655,22 @@ def direct_action_denied_directive() -> AgentDirective:
             "forbid this specific call — ask your operator to adjust the "
             "binding's permission rules. This is not something you can grant "
             "yourself."
+        ),
+    )
+
+
+def approval_pending_limit_directive(*, pending: int, limit: int) -> AgentDirective:
+    """Directive for the ``approval_pending_limit_reached`` 403.
+
+    The call matched a require-approval rule, but the agent already has
+    ``limit`` calls waiting on a reviewer. Only a human decision frees a slot.
+    """
+    return AgentDirective(
+        strategy="prompt_human",
+        parameters={"pending": pending, "limit": limit},
+        human_readable_instruction=(
+            "This call needs human approval, but you already have the maximum number of "
+            "calls waiting for review. Ask the user to review your pending approvals, then "
+            "send the call again once one is decided."
         ),
     )

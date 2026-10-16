@@ -87,7 +87,7 @@ config-schema: ## Regenerate the backend config JSON Schema (config/config-schem
 config-reference: ## Regenerate the configuration reference (docs/reference/config.md) from the AppConfig model
 	uv run python -m tools.config_reference
 	@echo "Regenerated docs/reference/config.md."
-endpoints: ## Regenerate the endpoint + scope reference (docs/reference/endpoints.{md,json}) from code
+endpoints: ## Regenerate the endpoint + permission reference (docs/reference/endpoints.{md,json}) from code
 	uv run python -m tools.endpoint_tree
 	@echo "Regenerated docs/reference/endpoints.md and docs/reference/endpoints.json."
 
@@ -103,12 +103,36 @@ skills: ## Mirror skills/<name>/SKILL.md into both content/ dirs (CLI embed + wh
 	uv run python -m tools.skills_sync
 	@echo "Mirrored the served skill set; run 'go build ./...' in cli/ to re-embed."
 
-score: ## Validate OpenAPI specs with the Jentic API Scorecard CLI (requires 80+)
-	# control.openapi.yaml is generated from code (make openapi) and carries the
-	# full metadata catalogue, so it must clear the 80+ scorecard floor.
-	npx --yes @jentic/api-scorecard-cli@1.0.0-alpha.29 score openapi/control/control.openapi.yaml --quiet
-	# broker.openapi.yaml is still hand-curated; re-enable once it is brought up to floor.
-	# npx --yes @jentic/api-scorecard-cli@1.0.0-alpha.29 score openapi/broker/broker.openapi.yaml --quiet
+SCORECARD_CLI := @jentic/api-scorecard-cli@1.12.0
+
+score: ## Score the control + broker OpenAPI specs with the Jentic API Scorecard (needs JENTIC_SCORE_API_KEY; SCORECARD_MIN_SCORE gates)
+	@# Opt-in: skips cleanly without a key so `make check` stays green offline.
+	@# The CLI reads JENTIC_API_KEY; the key is handed to it per-invocation only.
+	@# The registry override keeps a user-level `@jentic:` scope mapping (e.g. to
+	@# GitHub Packages) from shadowing the public npm package.
+	@if [ -z "$$JENTIC_SCORE_API_KEY" ]; then \
+		echo "JENTIC_SCORE_API_KEY is not set; skipping OpenAPI scorecard."; \
+		exit 0; \
+	fi; \
+	status=0; \
+	for spec in control broker; do \
+		file="openapi/$$spec/$$spec.openapi.yaml"; \
+		echo "==> scoring $$file"; \
+		if [ -z "$$SCORECARD_MIN_SCORE" ]; then \
+			JENTIC_API_KEY="$$JENTIC_SCORE_API_KEY" npx --yes --@jentic:registry=https://registry.npmjs.org \
+				$(SCORECARD_CLI) score "$$file" --quiet || status=1; \
+		else \
+			score=$$(JENTIC_API_KEY="$$JENTIC_SCORE_API_KEY" npx --yes --@jentic:registry=https://registry.npmjs.org \
+				$(SCORECARD_CLI) score "$$file" --quiet --format json --detail summary | jq -r '.summary.score'); \
+			case "$$score" in ''|null) echo "FAIL: could not read a score for $$spec"; status=1; continue;; esac; \
+			if awk -v s="$$score" -v m="$$SCORECARD_MIN_SCORE" 'BEGIN { exit !(s < m) }'; then \
+				echo "FAIL: $$spec scored $$score (< $$SCORECARD_MIN_SCORE)"; status=1; \
+			else \
+				echo "ok: $$spec scored $$score (>= $$SCORECARD_MIN_SCORE)"; \
+			fi; \
+		fi; \
+	done; \
+	exit $$status
 
 detect-secrets: ## Check for new secrets not in baseline
 	uv run detect-secrets scan --baseline .secrets.baseline --exclude-files '\.git/'
@@ -152,15 +176,20 @@ start-admin: ## Start admin surface standalone
 start-control: ## Start control surface standalone
 	JENTIC__APPS=control uv run python -m jentic_one
 
+# The standalone broker answers on :8100, but the admin API (jobs, approvals)
+# and the web UI live on the combined app at :8000. Point the broker's
+# absolute links (async-job and held-call `_links`, the approval `review_url`)
+# there; its own request origin would name the broker instead.
+# scripts/start-local.sh sets the same broker env for `start-local`.
+LOCAL_BROKER_ENV := JENTIC__APPS=broker JENTIC__SERVER__PORT=8100 \
+	JENTIC__BROKER__JOBS_API_BASE_URL=http://127.0.0.1:8000
+
 start-broker: ## Start broker surface standalone on :8100 (runs alongside start-app on :8000)
-	JENTIC__APPS=broker JENTIC__SERVER__PORT=8100 uv run python -m jentic_one
+	$(LOCAL_BROKER_ENV) uv run python -m jentic_one
 
 start-local: ## Start the combined app (:8000) and the broker (:8100) together for local testing
 	@echo "==> combined app → http://127.0.0.1:8000   broker → http://127.0.0.1:8100 (Ctrl-C stops both)"
-	@trap 'kill 0' INT TERM EXIT; \
-		$(MAKE) start-app & \
-		JENTIC__APPS=broker JENTIC__SERVER__PORT=8100 uv run python -m jentic_one & \
-		wait
+	@scripts/start-local.sh
 
 migrate-sqlite: ## Apply all migrations to the local SQLite databases (config/local-sqlite.yaml)
 	@mkdir -p .data

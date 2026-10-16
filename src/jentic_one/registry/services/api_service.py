@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -20,7 +21,11 @@ from jentic_one.registry.repos.catalog_update_check_repo import CatalogUpdateChe
 from jentic_one.registry.repos.control_credential_boundary_repo import (
     ControlCredentialBoundaryRepository,
 )
-from jentic_one.registry.services.errors import ApiNotFoundError, NoCurrentRevisionError
+from jentic_one.registry.services.errors import (
+    ApiDeleteBlockedError,
+    ApiNotFoundError,
+    NoCurrentRevisionError,
+)
 from jentic_one.registry.web.schemas.apis import (
     SecuritySchemeFlowResponse,
     SecuritySchemeListResponse,
@@ -34,11 +39,27 @@ from jentic_one.shared.audit import (
 )
 from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.context import Context
-from jentic_one.shared.events import emit_event_best_effort
+from jentic_one.shared.db.errors import DatabaseIntegrityError
+from jentic_one.shared.events import emit_event_best_effort, summary_label
 from jentic_one.shared.models.events import EventSeverity, EventType
 from jentic_one.shared.pagination import decode_cursor, encode_cursor
 
 logger = structlog.get_logger()
+
+# Postgres FK-violation message shape, e.g. ``update or delete on table "apis"
+# violates foreign key constraint "fk_x" on table "y"``. Only the two quoted
+# identifiers are extracted — never the SQL statement or bound parameters.
+_FK_VIOLATION_RE = re.compile(
+    r'violates foreign key constraint "(?P<constraint>[^"]+)"(?: on table "(?P<table>[^"]+)")?'
+)
+
+
+def _fk_violation_parts(exc: DatabaseIntegrityError) -> tuple[str | None, str | None]:
+    """Best-effort ``(constraint, referencing_table)`` from an FK-violation error."""
+    match = _FK_VIOLATION_RE.search(exc.detail or str(exc))
+    if match is None:
+        return None, None
+    return match.group("constraint"), match.group("table")
 
 
 class ApiPageItem(BaseModel):
@@ -108,6 +129,8 @@ class _ControlCleanup:
     """What the control-DB step of an API delete retired."""
 
     credential_ids: list[str] = field(default_factory=list)
+    #: ``{credential_id: name}`` for the event summaries of suspended bindings.
+    credential_names: dict[str, str] = field(default_factory=dict)
     deactivated: int = 0
 
 
@@ -240,18 +263,40 @@ class ApiService:
         restores each one deliberately with the binding ``:resume`` action
         (and re-activates the credential). Both cross-database steps are
         best-effort; the registry and control/admin databases cannot share
-        a transaction. Vendor-wide credentials (``NULL`` name/version) are
+        a transaction.         Vendor-wide credentials (``NULL`` name/version) are
         left alone because they also serve the vendor's other APIs.
+
+        A foreign key that still references the API (or a revision) and does
+        not cascade rolls the whole delete back; that surfaces as
+        :class:`ApiDeleteBlockedError` (409 ``api_delete_blocked``) rather than
+        the generic DB-integrity conflict, with the blocking constraint logged.
         """
-        async with self._ctx.registry_db.transaction() as session:
-            api = await ApiRepository.get_by_identifier(session, vendor, name, version)
-            if api is None:
-                raise ApiNotFoundError(vendor, name, version)
-            await ApiRepository.delete(session, api.id)
+        try:
+            async with self._ctx.registry_db.transaction() as session:
+                api = await ApiRepository.get_by_identifier(session, vendor, name, version)
+                if api is None:
+                    raise ApiNotFoundError(vendor, name, version)
+                await ApiRepository.delete(session, api.id)
+        except DatabaseIntegrityError as exc:
+            constraint, table = _fk_violation_parts(exc)
+            logger.warning(
+                "api_delete_blocked",
+                api_vendor=vendor,
+                api_name=name,
+                api_version=version,
+                constraint=constraint,
+                referencing_table=table,
+            )
+            raise ApiDeleteBlockedError(
+                vendor, name, version, constraint=constraint, table=table
+            ) from exc
 
         control = await self._retire_control_credentials(vendor, name, version)
         suspended = await self._suspend_agent_bindings(
-            control.credential_ids, api_id=str(api.id), identity=identity
+            control.credential_ids,
+            api_id=str(api.id),
+            identity=identity,
+            credential_names=control.credential_names,
         )
 
         await record_audit_best_effort(
@@ -302,7 +347,7 @@ class ApiService:
             return _ControlCleanup()
         try:
             async with self._ctx.control_db.transaction() as session:
-                credential_ids = await ControlCredentialBoundaryRepository.credential_ids_for_api(
+                credential_names = await ControlCredentialBoundaryRepository.credentials_for_api(
                     session, api_vendor=vendor, api_name=name, api_version=version
                 )
                 deactivated = (
@@ -310,7 +355,11 @@ class ApiService:
                         session, api_vendor=vendor, api_name=name, api_version=version
                     )
                 )
-                return _ControlCleanup(credential_ids=credential_ids, deactivated=deactivated)
+                return _ControlCleanup(
+                    credential_ids=list(credential_names),
+                    credential_names=credential_names,
+                    deactivated=deactivated,
+                )
         except Exception:
             logger.warning(
                 "control_credential_deactivation_failed",
@@ -322,7 +371,12 @@ class ApiService:
             return _ControlCleanup()
 
     async def _suspend_agent_bindings(
-        self, credential_ids: list[str], *, api_id: str, identity: Identity
+        self,
+        credential_ids: list[str],
+        *,
+        api_id: str,
+        identity: Identity,
+        credential_names: dict[str, str] | None = None,
     ) -> int:
         """Suspend agent bindings to the deleted API's credentials; return the count.
 
@@ -350,6 +404,7 @@ class ApiService:
                         session, credential_ids=credential_ids, reason=SUSPENDED_REASON_API_DELETED
                     )
                 )
+                names = credential_names or {}
                 for binding in suspended:
                     await record_audit(
                         session,
@@ -363,15 +418,25 @@ class ApiService:
                         after={"suspended": True, "api_id": api_id},
                         origin=identity.origin.value,
                     )
+                    credential = summary_label(
+                        names.get(binding.credential_id), binding.credential_id
+                    )
+                    agent = summary_label(binding.agent_name, binding.agent_id)
                     await emit_event_best_effort(
                         session,
                         type=EventType.CREDENTIAL_UNBOUND_FROM_AGENT,
                         severity=EventSeverity.INFO,
                         summary=(
-                            f"Credential {binding.credential_id} suspended for agent "
-                            f"{binding.agent_id} because its API was deleted"
+                            f"Credential {credential} suspended for agent {agent} "
+                            "because its API was deleted"
                         ),
-                        created_by=identity.sub,
+                        data={
+                            "agent_id": binding.agent_id,
+                            "credential_id": binding.credential_id,
+                            "api_id": api_id,
+                        },
+                        # Subject is the agent, so its owner sees the suspension.
+                        created_by=binding.agent_id,
                         actor_id=identity.sub,
                         actor_type=identity.actor_type.value,
                     )

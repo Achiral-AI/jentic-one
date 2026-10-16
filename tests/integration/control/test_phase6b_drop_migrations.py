@@ -26,7 +26,7 @@ from sqlalchemy import inspect, text
 from jentic_one.control.repos.toolkit_flattening_repo import legacy_state_digest
 from jentic_one.shared.config import AppConfig
 from jentic_one.shared.db.session import DatabaseSession
-from tests.integration.conftest import _alembic_config_for
+from tests.harness.postgres import alembic_config_for
 from tests.integration.service_account_schema import restore_pre_sa_drop_admin
 
 pytestmark = pytest.mark.integration
@@ -35,6 +35,9 @@ pytestmark = pytest.mark.integration
 #: already carries the ack evidence columns (``f2b3c4d5e6a7``).
 _CONTROL_PRE_DROP = "f2b3c4d5e6a7"  # pragma: allowlist secret
 _ADMIN_PRE_DROP = "c0e1f2a3b4c5"  # pragma: allowlist secret
+#: The admin drop itself. A superuser-run chain stops here and the app role
+#: takes it on to head, so later revisions' objects stay owned by that role.
+_ADMIN_DROP = "d1e2f3a4b5c6"  # pragma: allowlist secret
 
 _CONTROL_LEGACY_TABLES = (
     "toolkit_permission_rules",
@@ -45,11 +48,11 @@ _CONTROL_LEGACY_TABLES = (
 
 
 def _control_cfg(integration_config: AppConfig) -> AlembicConfig:
-    return _alembic_config_for("control", integration_config.databases.control)
+    return alembic_config_for("control", integration_config.databases.control)
 
 
 def _admin_cfg(integration_config: AppConfig) -> AlembicConfig:
-    return _alembic_config_for("admin", integration_config.databases.admin)
+    return alembic_config_for("admin", integration_config.databases.admin)
 
 
 async def _table_names(db: DatabaseSession) -> set[str]:
@@ -326,7 +329,7 @@ def _superuser_admin_cfg(integration_config: AppConfig) -> AlembicConfig:
     db = integration_config.databases.admin.model_copy(
         update={"user": "postgres", "password": SecretStr("postgres")}
     )
-    return _alembic_config_for("admin", db)
+    return alembic_config_for("admin", db)
 
 
 async def test_admin_drop_uses_the_control_ack_when_readable(
@@ -382,7 +385,7 @@ async def test_admin_drop_uses_the_control_ack_when_readable(
             control_digest="x",
             admin_digest=legacy_state_digest({"agent_toolkit_bindings": ["atb_6btest_1"]}),
         )
-        await asyncio.to_thread(command.upgrade, cfg, "head")
+        await asyncio.to_thread(command.upgrade, cfg, _ADMIN_DROP)
         assert "agent_toolkit_bindings" not in await _table_names(admin_db)
     finally:
         async with control_db.session() as session:
@@ -396,4 +399,5 @@ async def test_admin_drop_uses_the_control_ack_when_readable(
                 text("DELETE FROM agent_credential_bindings WHERE agent_id LIKE 'agnt_6btest%'")
             )
             await session.commit()
-        await asyncio.to_thread(command.upgrade, cfg, "head")
+        await asyncio.to_thread(command.upgrade, cfg, _ADMIN_DROP)
+        await asyncio.to_thread(command.upgrade, _admin_cfg(integration_config), "head")

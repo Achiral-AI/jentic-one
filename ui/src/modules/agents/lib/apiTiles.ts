@@ -8,8 +8,10 @@
 import { apiRefDisplayName } from '@/shared/lib';
 import { CredentialType, type ApiResponse, type Credential } from '@/shared/credentials/api';
 import { apiScopeCovers } from '@/shared/credentials/lib/apiIdentity';
-import { credentialAwaitsConsent } from '@/shared/credentials/lib/credentialIdentity';
+import { credentialAwaitsConsent, idTail } from '@/shared/credentials/lib/credentialIdentity';
+import type { BindingRulesState } from '@/modules/agents/api';
 import type { CredentialBindingEntity, ServedApiEntity } from '@/modules/agents/api/types';
+import { ruleSummaryOf, rulesBlock } from '@/modules/agents/lib/tileStatus';
 
 /** One tile on the grid: the API is the card, the credential is a line on it. */
 export interface ApiTileModel {
@@ -34,6 +36,9 @@ export interface ApiTileModel {
 	/** Null when the credential's org row is unreachable. */
 	credentialCreatedAt: string | null;
 	credentialUpdatedAt: string | null;
+	/** Who created the credential (`null` when it records no owner). Absent when
+	 * the credential's org row is unreachable — its owner is then unknown. */
+	credentialCreatedBy?: string | null;
 	boundAt: string;
 	/** Soft-suspended — the broker excludes the binding until resumed. */
 	suspended: boolean;
@@ -41,6 +46,8 @@ export interface ApiTileModel {
 	suspendedReason: string | null;
 	/** OAuth sign-in not completed. Drives the dashed treatment. */
 	awaitingConsent: boolean;
+	/** The registry has an upstream spec update this API hasn't adopted. */
+	updateAvailable: boolean;
 }
 
 /** Human labels for the credential auth types shown on a tile. */
@@ -69,6 +76,8 @@ function* tileIdentities(
 	served: ServedApiEntity;
 	api: ApiResponse | null;
 	key: string;
+	/** The API alone, as {@link tileApiKey} keys it: shared by its credentials. */
+	apiKey: string;
 }> {
 	const seen = new Set<string>();
 	for (const binding of bindings) {
@@ -76,16 +85,27 @@ function* tileIdentities(
 			const matches = apis.filter((api) => servedMatchesApi(served, api));
 			if (matches.length === 0) {
 				const key = `${binding.id}:${served.vendor}/${served.name ?? '*'}/${served.version ?? '*'}`;
+				// As its tile keys it: an unimported API's tile carries no version.
+				const apiKey = tileApiKey({
+					vendor: served.vendor,
+					apiName: served.name ?? null,
+					version: null,
+				});
 				if (seen.has(key)) continue;
 				seen.add(key);
-				yield { binding, served, api: null, key };
+				yield { binding, served, api: null, key, apiKey };
 				continue;
 			}
 			for (const api of matches) {
-				const key = `${binding.id}:${api.api.vendor}/${api.api.name}/${api.api.version}`;
+				const apiKey = tileApiKey({
+					vendor: api.api.vendor,
+					apiName: api.api.name,
+					version: api.api.version,
+				});
+				const key = `${binding.id}:${apiKey}`;
 				if (seen.has(key)) continue;
 				seen.add(key);
-				yield { binding, served, api, key };
+				yield { binding, served, api, key, apiKey };
 			}
 		}
 	}
@@ -166,6 +186,7 @@ export function composeApiTiles(
 			credentialName: binding.name || credential?.name || binding.credentialId,
 			credentialCreatedAt: credential?.created_at ?? null,
 			credentialUpdatedAt: credential?.updated_at ?? null,
+			...(credential && { credentialCreatedBy: credential.created_by ?? null }),
 			boundAt: binding.boundAt,
 			suspended: binding.suspended,
 			suspendedReason: binding.suspendedReason,
@@ -186,6 +207,7 @@ export function composeApiTiles(
 				apiName: served.name ?? null,
 				version: null,
 				operationCount: null,
+				updateAvailable: false,
 			});
 			continue;
 		}
@@ -206,23 +228,87 @@ export function composeApiTiles(
 			apiName: api.api.name,
 			version: api.api.version,
 			operationCount: api.operation_count,
+			updateAvailable: api.update_available ?? false,
 		});
 	}
 
 	return tiles.sort((a, b) => a.title.localeCompare(b.title));
 }
 
-/** How many APIs an agent reaches — the count on its tab in the strip. */
+/** One API the agent reaches through several bindings (one per account). */
+export interface MultiAccountApi {
+	title: string;
+	/** Distinct bindings serving it — always 2 or more. */
+	count: number;
+}
+
+/** The API identity a tile draws, without the binding — tiles sharing it are
+ * accounts of one API. */
+export function tileApiKey(tile: Pick<ApiTileModel, 'vendor' | 'apiName' | 'version'>): string {
+	return `${tile.vendor}/${tile.apiName ?? '*'}/${tile.version ?? '*'}`;
+}
+
+/** The APIs the grid draws more than one binding for, keyed by {@link tileApiKey},
+ * in grid order. With several accounts the broker needs the call to name one. */
+export function multiAccountApis(tiles: ApiTileModel[]): Map<string, MultiAccountApi> {
+	const bindingsByApi = new Map<string, { title: string; bindings: Set<string> }>();
+	for (const tile of tiles) {
+		const key = tileApiKey(tile);
+		const entry = bindingsByApi.get(key) ?? { title: tile.title, bindings: new Set() };
+		entry.bindings.add(tile.bindingId);
+		bindingsByApi.set(key, entry);
+	}
+	const multi = new Map<string, MultiAccountApi>();
+	for (const [key, { title, bindings }] of bindingsByApi) {
+		if (bindings.size > 1) multi.set(key, { title, count: bindings.size });
+	}
+	return multi;
+}
+
+/** The label each multi-account tile prints so its account is told apart, keyed
+ * by tile key: the credential's name, with its id tail when two accounts of one
+ * API share a name. Tiles of a single-account API are absent. */
+export function accountLabels(tiles: ApiTileModel[]): Map<string, string> {
+	const multi = multiAccountApis(tiles);
+	const labels = new Map<string, string>();
+	for (const tile of tiles) {
+		const apiKey = tileApiKey(tile);
+		if (!multi.has(apiKey)) continue;
+		const twin = tiles.some(
+			(t) =>
+				t.bindingId !== tile.bindingId &&
+				tileApiKey(t) === apiKey &&
+				t.credentialName === tile.credentialName,
+		);
+		labels.set(
+			tile.key,
+			twin ? `${tile.credentialName} · …${idTail(tile.credentialId)}` : tile.credentialName,
+		);
+	}
+	return labels;
+}
+
+/** How many APIs an agent reaches — the count on its tab in the strip. An API
+ * reached through several credentials counts once. */
 export function agentApiCount(
 	bindings: CredentialBindingEntity[] | undefined,
 	apis: ApiResponse[],
 ): number {
 	if (!bindings || bindings.length === 0) return 0;
-	return [...tileIdentities(bindings, apis)].length;
+	return new Set([...tileIdentities(bindings, apis)].map((t) => t.apiKey)).size;
 }
 
-/** Stat-summary math for the grid's side column. */
+/** How many APIs the grid's tiles cover — the number beside its heading. An API
+ * drawn once per credential counts once. */
+export function distinctApiCount(tiles: ApiTileModel[]): number {
+	return new Set(tiles.map(tileApiKey)).size;
+}
+
+/** Stat-summary math for the grid's side column. Counts are per API — one
+ * drawn once per credential counts once — except `needsSetup` and
+ * `blockedBindings`, which are per credential. */
 export interface ApiTileStats {
+	/** APIs with at least one credential past its sign-in. */
 	configured: number;
 	/** Sign-ins owed, per credential — one clears all of its tiles. */
 	needsSetup: number;
@@ -230,35 +316,85 @@ export interface ApiTileStats {
 	operations: number | null;
 	/** `operations` is a floor: some tiles withheld their count. Renders as `N+`. */
 	operationsAtLeast: boolean;
+	/** Some tile's rules are still being read, so the reachable figure may change. */
+	operationsChecking: boolean;
+	/** Bindings (credentials) whose rules let no call through (`Blocked`) — 0
+	 * when rules are unknown. Rules live on the binding, so a binding drawn on
+	 * several rows (a vendor-wide one) counts once: this sits beside the
+	 * credential count, never the API count. */
+	blockedBindings: number;
+	/** APIs every one of whose rows is Blocked — the only per-API blocked fact.
+	 * An API with one credential through (or paused, or awaiting sign-in) is
+	 * not fully blocked. */
+	fullyBlockedApis: number;
 }
 
-export function tileStats(tiles: ApiTileModel[]): ApiTileStats {
-	let configured = 0;
-	let operations = 0;
+export function tileStats(
+	tiles: ApiTileModel[],
+	/**
+	 * Where each tile's rules read stands (see `deriveTileStatus`). A Blocked
+	 * tile reaches nothing, so its operations stay out of "reachable"; a tile
+	 * whose rules are still loading or unreadable ("Checking access…" /
+	 * "Status unavailable") may be blocked, so its count is withheld rather
+	 * than claimed. Omitted → rules aren't considered.
+	 */
+	rulesFor?: (tile: ApiTileModel) => BindingRulesState | undefined,
+): ApiTileStats {
+	const configured = new Set<string>();
+	// Per API: the largest count its reachable tiles prove (its credentials reach
+	// the same operations), or null while none of them proves one.
+	const operationsByApi = new Map<string, number | null>();
+	const blockedBindings = new Set<string>();
+	// Per API: its rows, and how many of them are Blocked.
+	const rowsByApi = new Map<string, { rows: number; blocked: number }>();
+	let checking = false;
 	// Deduped: several tiles can share one sign-in.
 	const awaiting = new Set<string>();
-	let counted = false;
-	let withheld = false;
 	for (const tile of tiles) {
+		const apiKey = tileApiKey(tile);
+		const apiRows = rowsByApi.get(apiKey) ?? { rows: 0, blocked: 0 };
+		apiRows.rows += 1;
+		rowsByApi.set(apiKey, apiRows);
 		if (tile.awaitingConsent) {
 			awaiting.add(tile.credentialId);
 			continue;
 		}
-		configured += 1;
+		configured.add(apiKey);
 		// A pause is a deliberate exclusion, not a missing fact.
 		if (tile.suspended) continue;
-		if (tile.operationCount == null) {
+		const rules = rulesFor?.(tile);
+		if (rulesBlock(ruleSummaryOf(rules))) {
+			blockedBindings.add(tile.bindingId);
+			apiRows.blocked += 1;
+			continue;
+		}
+		const rulesUnknown = rulesFor != null && typeof rules !== 'object';
+		if (rulesUnknown && rules !== 'error') checking = true;
+		const count = rulesUnknown ? null : tile.operationCount;
+		const known = operationsByApi.get(apiKey) ?? null;
+		operationsByApi.set(apiKey, count == null ? known : Math.max(known ?? 0, count));
+	}
+	let operations = 0;
+	let counted = false;
+	let withheld = false;
+	for (const count of operationsByApi.values()) {
+		if (count == null) {
 			withheld = true;
 			continue;
 		}
-		operations += tile.operationCount;
+		operations += count;
 		counted = true;
 	}
 	return {
-		configured,
+		configured: configured.size,
 		needsSetup: awaiting.size,
 		operations: withheld && !counted ? null : operations,
 		operationsAtLeast: withheld && counted,
+		operationsChecking: checking,
+		blockedBindings: blockedBindings.size,
+		fullyBlockedApis: [...rowsByApi.values()].filter(
+			(a) => a.blocked > 0 && a.blocked === a.rows,
+		).length,
 	};
 }
 

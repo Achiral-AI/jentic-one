@@ -34,8 +34,9 @@ import hashlib
 import json
 from dataclasses import dataclass
 
-from sqlalchemy import Row, inspect, select, text
+from sqlalchemy import inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only, raiseload
 
 from jentic_one.control.core.schema.agent_permission_rules import AgentPermissionRule
 from jentic_one.control.core.schema.credentials import Credential
@@ -234,15 +235,21 @@ class FlatteningControlRepository:
         ]
 
     @staticmethod
-    async def list_credentials(session: AsyncSession) -> list[Row[tuple[str, str, str | None]]]:
-        # Columns only: loading the entity eager-loads its credential subtypes, whose
-        # later columns are missing from the pre-drop schema this job runs against.
+    async def list_credentials(session: AsyncSession) -> list[Credential]:
+        # Only the columns the flatten reads, and no relationship loads. The
+        # job runs against the pre-drop schema, before any later migration has
+        # added columns or related tables, so a full ORM load would fail there.
         result = await session.execute(
-            select(Credential.id, Credential.api_vendor, Credential.created_by).order_by(
-                Credential.id
+            select(Credential)
+            .options(
+                load_only(
+                    Credential.id, Credential.name, Credential.api_vendor, Credential.created_by
+                ),
+                raiseload("*"),
             )
+            .order_by(Credential.id)
         )
-        return list(result.all())
+        return list(result.scalars().all())
 
     @staticmethod
     async def list_inline_rules(
@@ -342,8 +349,6 @@ _LIST_CREDENTIAL_BINDING_PAIRS = text(
     "SELECT agent_id, credential_id, rule_set_id FROM agent_credential_bindings"
 )
 
-_COUNT_CREDENTIAL_BINDINGS = text("SELECT count(*) AS n FROM agent_credential_bindings")
-
 _LIST_AGENT_IDS = text("SELECT id FROM agents")
 
 _LIST_SERVICE_ACCOUNT_IDS = text("SELECT id FROM service_accounts")
@@ -421,11 +426,6 @@ class FlatteningAdminRepository:
             )
             for r in rows
         }
-
-    @staticmethod
-    async def count_direct_bindings(session: AsyncSession) -> int:
-        row = (await session.execute(_COUNT_CREDENTIAL_BINDINGS)).one()
-        return int(row.n)
 
     @staticmethod
     async def _service_accounts_present(session: AsyncSession) -> bool:

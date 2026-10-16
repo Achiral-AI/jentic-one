@@ -10,7 +10,7 @@
  * toast, and the sound on failures — so they live next to the notifications
  * they govern instead of in the activity feed's overflow menu.
  */
-import { useCallback, useId, useState } from 'react';
+import { useCallback, useId, useMemo, useState } from 'react';
 import { ArrowLeft, Bell, CheckCircle2, Inbox, Settings2 } from 'lucide-react';
 import { AppLink } from '@/shared/ui/AppLink';
 import { Button } from '@/shared/ui/Button';
@@ -20,6 +20,7 @@ import { ROUTES } from '@/shared/app/routes';
 import { useRailPreferences } from '@/shared/app/rail/railPreferences';
 import { AttentionList } from '@/shared/attention/AttentionList';
 import { useAttentionItems } from '@/shared/attention/useAttentionItems';
+import { useNotificationsSeen } from '@/shared/attention/useNotificationsSeen';
 import type { ToastScope } from '@/shared/lib/agentStream';
 import { cn } from '@/shared/lib/utils';
 
@@ -32,6 +33,10 @@ const TOAST_SCOPE_OPTIONS: Array<{ value: ToastScope; label: string; hint: strin
 
 export function NotificationsMenu() {
 	const { items, count, isLoading, failedSources } = useAttentionItems();
+	// The badge counts what this viewer hasn't read; the list keeps every item
+	// still waiting on them, read or not.
+	const itemKeys = useMemo(() => items.map((i) => i.key), [items]);
+	const { isUnread, unreadCount, markAllRead } = useNotificationsSeen(itemKeys);
 	const [open, setOpen] = useState(false);
 	const [view, setView] = useState<'list' | 'settings'>('list');
 	const close = useCallback(() => {
@@ -42,9 +47,11 @@ export function NotificationsMenu() {
 	const panelRef = useViewportClamp<HTMLDivElement>(open);
 	const titleId = useId();
 
-	const urgent = items.some((i) => i.urgency === 3);
-	const label =
-		count > 0 ? `Notifications (${count} need${count === 1 ? 's' : ''} you)` : 'Notifications';
+	const urgent = items.some((i) => i.urgency === 3 && isUnread(i.key));
+	// The badge's figure sits outside any parentheses in the name (axe drops
+	// parentheticals) so the visible text is part of it (WCAG 2.5.3).
+	const badge = unreadCount > 99 ? '99+' : String(unreadCount);
+	const label = unreadCount > 0 ? `Notifications, ${badge} unread` : 'Notifications';
 
 	return (
 		<div ref={containerRef} className="relative">
@@ -56,20 +63,20 @@ export function NotificationsMenu() {
 				aria-haspopup="dialog"
 				aria-expanded={open}
 				className={cn(
-					'text-muted-foreground hover:bg-muted hover:text-foreground relative flex h-7 w-7 shrink-0 items-center justify-center rounded-md transition-colors duration-150',
-					open && 'bg-muted text-foreground',
+					'text-muted-foreground hover:bg-tint-2 hover:text-foreground relative flex h-7 w-7 shrink-0 items-center justify-center rounded-md transition-colors duration-150',
+					open && 'bg-tint-2 text-foreground',
 				)}
 			>
 				<Bell className="h-4 w-4" aria-hidden="true" />
-				{count > 0 && (
+				{unreadCount > 0 && (
 					<span
 						className={cn(
 							'ring-background absolute -top-0.5 -right-1 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] leading-none font-semibold tabular-nums ring-2',
-							urgent ? 'bg-danger text-white' : 'bg-warning text-black',
+							urgent ? 'bg-danger text-background' : 'bg-warning text-background',
 						)}
 						aria-hidden="true"
 					>
-						{count > 99 ? '99+' : count}
+						{badge}
 					</span>
 				)}
 			</button>
@@ -79,17 +86,17 @@ export function NotificationsMenu() {
 					ref={panelRef}
 					role="dialog"
 					aria-labelledby={titleId}
-					className="border-border bg-background absolute top-full right-0 z-50 mt-2 flex max-h-[min(36rem,calc(100dvh-4.5rem))] w-[min(24rem,calc(100vw-1.5rem))] flex-col overflow-hidden rounded-xl border shadow-xl"
+					className="border-border/60 bg-popover absolute top-full right-0 z-50 mt-2 flex max-h-[min(36rem,calc(100dvh-4.5rem))] w-[min(24rem,calc(100vw-1.5rem))] flex-col overflow-hidden rounded-xl border shadow-xl"
 				>
 					{view === 'list' ? (
 						<>
-							<div className="border-border flex items-center justify-between gap-2 border-b px-3 py-2.5">
+							<div className="border-hairline flex items-center justify-between gap-2 border-b px-3 py-2.5">
 								<h2
 									id={titleId}
 									className="text-foreground flex items-center gap-2 text-sm font-semibold"
 								>
 									Notifications
-									{count > 0 && (
+									{unreadCount > 0 && (
 										<span
 											className={cn(
 												'rounded-full px-1.5 py-0.5 font-mono text-[11px] tabular-nums',
@@ -98,14 +105,23 @@ export function NotificationsMenu() {
 													: 'bg-warning/15 text-warning',
 											)}
 										>
-											{count}
+											{unreadCount}
 										</span>
 									)}
 								</h2>
+								{unreadCount > 0 && (
+									<Button
+										variant="ghost"
+										size="xs"
+										className="ml-auto"
+										onClick={markAllRead}
+									>
+										Mark all as read
+									</Button>
+								)}
 								<Button
 									variant="ghost"
-									size="sm"
-									className="h-7 w-7 p-0"
+									size="icon-xs"
 									aria-label="Notification settings"
 									title="Notification settings"
 									onClick={() => setView('settings')}
@@ -118,6 +134,22 @@ export function NotificationsMenu() {
 								{isLoading && count === 0 ? (
 									<div className="px-3 py-3">
 										<SkeletonRows rows={2} />
+									</div>
+								) : count === 0 && failedSources.length > 0 ? (
+									// "All caught up" would be a claim the failed
+									// sources can't back; the note below names them.
+									<div className="flex flex-col items-center gap-2 px-6 py-8 text-center">
+										<Inbox
+											className="text-muted-foreground h-6 w-6"
+											aria-hidden="true"
+										/>
+										<p className="text-foreground text-sm font-medium">
+											Nothing to show right now
+										</p>
+										<p className="text-muted-foreground text-xs">
+											Some notifications couldn't be checked, so there may be
+											items waiting.
+										</p>
 									</div>
 								) : count === 0 ? (
 									<div className="flex flex-col items-center gap-2 px-6 py-8 text-center">
@@ -138,15 +170,16 @@ export function NotificationsMenu() {
 										items={items}
 										variant="menu"
 										onNavigate={close}
+										isUnread={isUnread}
 									/>
 								)}
 								{failedSources.length > 0 && (
 									<p
 										role="status"
-										className="text-warning border-border flex items-center gap-2 border-t px-3 py-2 text-xs"
+										className="text-foreground-sub border-hairline flex items-center gap-2 border-t px-3 py-2 text-xs"
 									>
 										<Inbox
-											className="h-3.5 w-3.5 shrink-0"
+											className="text-warning h-3.5 w-3.5 shrink-0"
 											aria-hidden="true"
 										/>
 										Couldn't load {failedSources.join(', ')} — this list may be
@@ -155,7 +188,7 @@ export function NotificationsMenu() {
 								)}
 							</div>
 
-							<div className="border-border bg-muted/30 flex items-center justify-end border-t px-3 py-2 text-xs font-medium">
+							<div className="border-hairline flex items-center justify-end border-t px-3 py-2 text-xs font-medium">
 								<AppLink
 									href={ROUTES.monitor}
 									onClick={close}
@@ -181,11 +214,10 @@ function NotificationSettings({ titleId, onBack }: { titleId: string; onBack: ()
 
 	return (
 		<>
-			<div className="border-border flex items-center gap-1.5 border-b px-2 py-2.5">
+			<div className="border-hairline flex items-center gap-1.5 border-b px-2 py-2.5">
 				<Button
 					variant="ghost"
-					size="sm"
-					className="h-7 w-7 p-0"
+					size="icon-xs"
 					aria-label="Back to notifications"
 					onClick={onBack}
 				>
@@ -206,10 +238,10 @@ function NotificationSettings({ titleId, onBack }: { titleId: string; onBack: ()
 							<label
 								key={opt.value}
 								className={cn(
-									'flex cursor-pointer items-start gap-2.5 rounded-lg border px-2.5 py-2 transition-colors',
+									'flex cursor-pointer items-start gap-2.5 rounded-md px-2.5 py-2 transition-colors',
 									effectiveScope === opt.value
-										? 'border-primary/50 bg-primary/5'
-										: 'border-border hover:bg-muted/50',
+										? 'bg-surface-selected'
+										: 'hover:bg-tint-2',
 								)}
 							>
 								<input
@@ -232,7 +264,7 @@ function NotificationSettings({ titleId, onBack }: { titleId: string; onBack: ()
 						))}
 					</div>
 				</fieldset>
-				<label className="border-border flex cursor-pointer items-center justify-between gap-3 rounded-lg border px-2.5 py-2">
+				<label className="bg-surface-field flex cursor-pointer items-center justify-between gap-3 rounded-md px-2.5 py-2">
 					<span>
 						<span className="text-foreground block text-[13px] font-medium">
 							Sound on failures

@@ -20,7 +20,8 @@ import {
 } from '@/modules/monitor/components/LogDetailPane';
 import { formatTimestamp } from '@/modules/monitor/lib/format';
 import { originLabel } from '@/modules/monitor/lib/logVocabulary';
-import { hasTrace, monitorHref } from '@/modules/monitor/lib/links';
+import { monitorHref } from '@/modules/monitor/lib/links';
+import { hasTrace } from '@/shared/lib';
 import { auditChanges, auditSentence, auditTargetLabel } from '@/modules/monitor/lib/describeAudit';
 
 export function AuditDetail({
@@ -61,7 +62,7 @@ export function AuditDetail({
 			idLabel="audit id"
 		>
 			{entry.reason && (
-				<p className="border-border bg-muted/30 rounded-md border px-3 py-2 text-sm">
+				<p className="bg-field rounded-md px-3 py-2 text-sm">
 					<span className="text-muted-foreground mr-1.5 text-xs">Reason</span>
 					{entry.reason}
 				</p>
@@ -107,7 +108,7 @@ export function AuditDetail({
 
 			{changes.length > 0 && (
 				<DetailSection title={`Changes (${changes.length})`}>
-					<ul className="border-border divide-border/60 divide-y rounded-lg border text-sm">
+					<ul className="bg-field divide-hairline-row divide-y rounded-lg text-sm">
 						{changes.map((c) => (
 							<li key={c.field} className="px-3 py-2">
 								<p className="text-muted-foreground font-mono text-xs">{c.field}</p>

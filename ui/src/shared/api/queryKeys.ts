@@ -65,11 +65,9 @@ export const sharedQueryKeys = {
 	/**
 	 * The Monitor Events feed root (`GET /events` list slices; the Monitor
 	 * module's `monitorKeys.events(params)` derives from this). Owned by the
-	 * Monitor module, but the shared agent-stream provider's `acknowledge`
-	 * (rail rows, failure toasts) flips an event's `acknowledged` flag outside
-	 * React Query — without invalidating this root the Events tab's
-	 * `status=unacknowledged` list keeps showing a failure the operator already
-	 * acked from the rail until its staleTime lapses (#671 follow-through).
+	 * Monitor module, and shared here so cross-module surfaces (rail rows,
+	 * failure toasts) can invalidate the Events tab's list slices when a
+	 * decision (approve/deny/withdraw) supersedes an actionable event.
 	 */
 	monitorEventsRoot: ['monitor', 'events'] as const,
 	/**
@@ -91,4 +89,22 @@ export const sharedQueryKeys = {
 	 * an `oauth_grant.*` event arrives.
 	 */
 	oauthGrantsRoot: ['oauth-grants'] as const,
+	/**
+	 * The held-executions root (the Approvals list and detail slices,
+	 * `GET /executions/holds`). Owned by the Agents module (its
+	 * `approvalsKeys` derive from this), but a hold is decided, withdrawn or
+	 * expires out-of-band (another reviewer, the agent, the expiry sweep), so
+	 * the shared agent-stream provider invalidates this root when an
+	 * `execution.approval_*` event arrives.
+	 */
+	approvalsRoot: ['approvals'] as const,
+	/**
+	 * The Monitor job slices (`GET /jobs` lists and one job). Owned by the
+	 * Monitor module (`monitorKeys.jobs` / `monitorKeys.job` derive from
+	 * these), but a held job moves on when its hold settles, which the
+	 * agent-stream provider learns from an `execution.approval_*` event and
+	 * the Agents module from its own decision.
+	 */
+	monitorJobsRoot: ['monitor', 'jobs'] as const,
+	monitorJobRoot: ['monitor', 'job'] as const,
 };

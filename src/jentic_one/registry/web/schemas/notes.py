@@ -8,6 +8,13 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
+from jentic_one.shared.web import openapi_examples as ex
+
+_EX_NOTE_BODY = (
+    "Stripe returns 401 unless the secret key is sent as a Bearer token; "
+    "Basic auth with an empty password also works."
+)
+
 
 class NoteType(StrEnum):
     """Category of a note (matches the spec ``NoteType`` enum)."""
@@ -39,9 +46,9 @@ class NoteApiReference(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    vendor: str
-    name: str
-    version: str
+    vendor: str = Field(description="Vendor of the API.", examples=[ex.API_VENDOR])
+    name: str = Field(description="Name of the API within the vendor.", examples=[ex.API_NAME])
+    version: str = Field(description="Version of the API.", examples=[ex.API_VERSION])
 
 
 class NoteResource(BaseModel):
@@ -49,10 +56,24 @@ class NoteResource(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    api: NoteApiReference | None = None
-    operation_id: str | None = None
-    execution_id: str | None = None
-    credential_id: str | None = None
+    api: NoteApiReference | None = Field(
+        default=None, description="API to attach the note to; set exactly one resource field."
+    )
+    operation_id: str | None = Field(
+        default=None,
+        description="ID of the operation to attach the note to; set exactly one resource field.",
+        examples=[ex.REGISTRY_OPERATION_ID],
+    )
+    execution_id: str | None = Field(
+        default=None,
+        description="ID of the execution to attach the note to; set exactly one resource field.",
+        examples=[ex.EXECUTION_ID],
+    )
+    credential_id: str | None = Field(
+        default=None,
+        description="ID of the credential to attach the note to; set exactly one resource field.",
+        examples=[ex.CREDENTIAL_ID],
+    )
 
     @model_validator(mode="after")
     def _exactly_one(self) -> NoteResource:
@@ -73,11 +94,31 @@ class NoteCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     resource: NoteResource
-    type: NoteType | None = None
-    body: str = Field(max_length=4000)
-    confidence: NoteConfidence | None = None
-    source: NoteSource | None = None
-    related_execution_id: str | None = None
+    type: NoteType | None = Field(
+        default=None,
+        description="Category of the note; null if uncategorised.",
+        examples=[NoteType.auth_quirk],
+    )
+    body: str = Field(
+        max_length=4000,
+        description="Text of the note, up to 4000 characters.",
+        examples=[_EX_NOTE_BODY],
+    )
+    confidence: NoteConfidence | None = Field(
+        default=None,
+        description="Author's confidence in the note; null if not stated.",
+        examples=[NoteConfidence.observed],
+    )
+    source: NoteSource | None = Field(
+        default=None,
+        description="Origin of the note (`agent`, `human` or `platform`); null if not stated.",
+        examples=[NoteSource.agent],
+    )
+    related_execution_id: str | None = Field(
+        default=None,
+        description="ID of an execution the note relates to; null if none.",
+        examples=[ex.EXECUTION_ID],
+    )
 
 
 class NoteUpdateRequest(BaseModel):
@@ -85,11 +126,32 @@ class NoteUpdateRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    body: str | None = Field(default=None, max_length=4000)
-    type: NoteType | None = None
-    confidence: NoteConfidence | None = None
-    source: NoteSource | None = None
-    related_execution_id: str | None = None
+    body: str | None = Field(
+        default=None,
+        max_length=4000,
+        description="New text of the note, up to 4000 characters; may be omitted but not null.",
+        examples=[_EX_NOTE_BODY],
+    )
+    type: NoteType | None = Field(
+        default=None,
+        description="New category of the note; null clears it.",
+        examples=[NoteType.auth_quirk],
+    )
+    confidence: NoteConfidence | None = Field(
+        default=None,
+        description="New confidence in the note; null clears it.",
+        examples=[NoteConfidence.verified],
+    )
+    source: NoteSource | None = Field(
+        default=None,
+        description="New origin of the note; null clears it.",
+        examples=[NoteSource.agent],
+    )
+    related_execution_id: str | None = Field(
+        default=None,
+        description="ID of an execution the note relates to; null clears it.",
+        examples=[ex.EXECUTION_ID],
+    )
 
     @model_validator(mode="after")
     def _body_not_null(self) -> NoteUpdateRequest:

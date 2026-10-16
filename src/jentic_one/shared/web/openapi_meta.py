@@ -4,7 +4,7 @@ This module is the single source of truth for the document-level metadata that
 FastAPI cannot infer from type hints and docstrings: the ``info`` block (title,
 summary, the long marketing/architecture description, contact, license),
 ``servers``, the tag catalogue (with descriptions), the Redoc ``x-tagGroups``
-extension, and the global ``BearerAuth`` security scheme.
+extension, and the global ``BearerAuth`` / ``OAuth2`` security schemes.
 
 It was ported from the hand-curated ``openapi/control/control.openapi.yaml`` so
 the generated spec carries the same richness. Wire it into a FastAPI app via
@@ -24,7 +24,8 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.routing import APIRoute
 
 from jentic_one import __version__
-from jentic_one.shared.web.endpoint_scopes import build_operation_auth_map
+from jentic_one.shared.auth.permission_catalog import ALL_PERMISSIONS, OIDC_PASSTHROUGH_SCOPES
+from jentic_one.shared.web.endpoint_permissions import build_operation_auth_map
 from jentic_one.shared.web.openapi_responses import PROBLEM_JSON, STATUS_EXAMPLES
 
 _HTTP_METHODS = {"get", "put", "post", "delete", "patch", "options", "head", "trace"}
@@ -214,7 +215,7 @@ JWKS, then RFC 7523 JWT-bearer assertions exchanged at
   | `evt_` | Event | ULID-shaped. |
   | `op_` | Registered operation | |
   | `rev_` | API revision | ULID-shaped. |
-  | `usr_` | User | Org member. Resolves via `GET /users/{user_id}`. Used in `acknowledged_by`, `decided_by`, and similar audit references. |
+  | `usr_` | User | Org member. Resolves via `GET /users/{user_id}`. Used in `decided_by` and similar audit references. |
   | `inv_` | Invite token | One-time token issued at user creation. Plaintext value shown **once** at issue / re-issue; `:redeem-invite` consumes it. |
   | `areq_` | Access request (retired) | Retired (theme 7): the access-request flow is gone. Ids still appear in stored audit/event records. |
   | `note_` | Note | ULID-shaped. Free-form annotation attached to a registry resource — see the `Notes` tag. |
@@ -481,6 +482,21 @@ OPENAPI_TAGS: list[dict[str, str]] = [
         ),
     },
     {
+        "name": "Held Executions",
+        "description": (
+            "Executions held for human approval. When a call matches a permission rule with "
+            "`effect: require-approval`, the broker does not run it: it answers `202` with a "
+            "held execution (`held_…`) and a review link. A reviewer, the agent's owner or any "
+            "`org:admin`, calls `POST /executions/holds/{id}:decide` to approve or deny it.\n\n"
+            "An approved call runs once; `GET /executions/holds/{id}` reports where it stands and "
+            "`GET /executions/holds/{id}/result` returns the call's execution document, or the problem "
+            "explaining why it never ran (denied, expired or refused at run time). A held execution nobody "
+            "decides expires after the configured window. Agents may never decide; the agent "
+            "that filed one may withdraw it. Each caller sees only the held executions it may "
+            "review or filed."
+        ),
+    },
+    {
         "name": "Events",
         "description": (
             "Curated, severity-tagged event stream surfaced to dashboards and operators. Each "
@@ -489,12 +505,11 @@ OPENAPI_TAGS: list[dict[str, str]] = [
             "`execution.repeated_failure`). Events reference the underlying `ExecutionRecord` "
             "or `Job` via `_links` and share `trace_id` for correlation. Subscribe live via "
             "`GET /events/stream` (Server-Sent Events) or poll `GET /events` with a `since=` "
-            "filter. An event is visible only to the actor (`actor_id`) or creator "
-            "(`created_by`) it names, to the human owner of either when that is an agent, "
-            "and to `org:admin`; system events with no subject are visible only to "
-            "`org:admin`. To "
-            "any other caller an event is indistinguishable from a missing one (`404`), "
-            "including on acknowledgement."
+            "filter. An event is visible only to the actor it names (`actor_id`), to the "
+            "subject it is about (for example the owner of the credential or the agent "
+            "concerned), to the human owner of either when that is an agent, and to "
+            "`org:admin`; system events with no subject are visible only to `org:admin`. To "
+            "any other caller an event is indistinguishable from a missing one (`404`)."
         ),
     },
     {
@@ -560,7 +575,8 @@ OPENAPI_TAGS: list[dict[str, str]] = [
             "(full deployment-wide access, granted via direct DB action). It is not enumerated "
             "to non-holders by `GET /permissions`, and is rejected by `PUT "
             "/users/{user_id}/permissions` from any caller who doesn't already hold it.\n\n"
-            "The same vocabulary is used for `User.permissions` — coarse JWT-embedded scopes — "
+            "The same vocabulary is used for `User.permissions` — the coarse set embedded in "
+            "the JWT — "
             "so the catalogue below covers user assignment. The per-binding fine-grained "
             "`PermissionRule[]` (the inner PBAC tier) lives separately on the direct "
             "agent↔credential bindings under the `Credentials` tag."
@@ -580,7 +596,7 @@ OPENAPI_TAGS: list[dict[str, str]] = [
         "name": "Identity",
         "description": (
             "Identity introspection for the calling principal (human or agent) — `GET /me` "
-            "returns the resolved subject, scopes, and permissions behind the presented token."
+            "returns the resolved subject and its permissions behind the presented token."
         ),
     },
     {
@@ -662,6 +678,16 @@ OPENAPI_TAGS: list[dict[str, str]] = [
         ),
     },
     {
+        "name": "OAuth App Registrations",
+        "description": (
+            "Admin-managed OAuth application registrations that end users on the "
+            "instance can SSO through. Each row holds a client_id, endpoints, and "
+            "(for authorization-code flows) an encrypted client secret. Registrations "
+            "are per-vendor and per-flow-kind; users then start a connect session "
+            "against a registration to mint their own tokens."
+        ),
+    },
+    {
         "name": "MCP",
         "description": (
             "MCP (Model Context Protocol) transport reporting. The `jentic mcp` stdio "
@@ -707,12 +733,14 @@ X_TAG_GROUPS: list[dict[str, Any]] = [
             "Actors",
             "Permissions",
             "Executions",
+            "Held Executions",
             "Jobs",
             "Events",
             "Audit",
             "Monitoring",
             "Configuration",
             "OAuth Clients",
+            "OAuth App Registrations",
         ],
     },
     {
@@ -746,8 +774,8 @@ BEARER_SECURITY_SCHEME = {
             "(the JWT is the *assertion*, not the resulting access token).\n"
             "- **Users** — `grant_type=authorization_code` (interactive) or "
             "`grant_type=password`; refresh either with `grant_type=refresh_token`.\n\n"
-            "Per-endpoint scope and actor-type requirements are not modelled in this "
-            "document (OpenAPI cannot faithfully express the OR-of-scopes / "
+            "Per-endpoint permission and actor-type requirements are not modelled in "
+            "this document (OpenAPI cannot faithfully express the OR-of-permissions / "
             "`org:admin` bypass / service-layer enforcement); see "
             "`GET /reference/endpoints.json` for the authoritative authorization "
             "reference."
@@ -755,36 +783,122 @@ BEARER_SECURITY_SCHEME = {
     }
 }
 
+_OIDC_SCOPE_DESCRIPTIONS = {
+    "openid": "Issue an OpenID Connect ID token identifying the user.",
+    "email": "Include the user's email address in the ID token.",
+    "profile": "Include the user's display name in the ID token.",
+}
+
+#: The interactive OAuth 2.0 flow this deployment's own authorization server runs
+#: (the one ``/.well-known/oauth-authorization-server`` advertises). It yields the
+#: same opaque ``at_`` access token ``BearerAuth`` describes, so operations accept
+#: either requirement. It carries no per-operation scopes: what a token may do is
+#: decided by the actor's permissions (see the ``BearerAuth`` description), and a
+#: scope only narrows a grant to a subset of them.
+OAUTH2_SECURITY_SCHEME = {
+    "OAuth2": {
+        "type": "oauth2",
+        "description": (
+            "OAuth 2.0 authorization code flow with PKCE (`S256` only), run by this "
+            "deployment's authorization server. The resulting access token is the same "
+            "opaque bearer token `BearerAuth` describes, sent as "
+            "`Authorization: Bearer <token>`.\n\n"
+            "Scopes are permission names, plus the OpenID Connect identity scopes. A "
+            "request for scopes beyond the client's allowed scopes is rejected with "
+            "`invalid_scope`, and a token is never enforced beyond its client's allowed "
+            "scopes or the consent grant. Agents normally authenticate with the "
+            "JWT-bearer grant instead — see `BearerAuth`."
+        ),
+        "flows": {
+            "authorizationCode": {
+                "authorizationUrl": "/authorize",
+                "tokenUrl": "/oauth/token",
+                "refreshUrl": "/oauth/token",
+                "scopes": {
+                    **{
+                        scope: _OIDC_SCOPE_DESCRIPTIONS[scope]
+                        for scope in sorted(OIDC_PASSTHROUGH_SCOPES)
+                    },
+                    **{
+                        name: f"{perm.description}."
+                        if not perm.description.endswith(".")
+                        else perm.description
+                        for name, perm in sorted(ALL_PERMISSIONS.items())
+                    },
+                },
+            }
+        },
+    }
+}
+
+
+def authenticated_security() -> list[dict[str, list[str]]]:
+    """Security requirement for an authenticated operation: either scheme.
+
+    A fresh list per call, so the YAML export never emits anchors/aliases for a
+    shared object.
+    """
+    return [{"BearerAuth": []}, {"OAuth2": []}]
+
+
 # Operations that are intentionally unauthenticated and must NOT inherit the
 # global BearerAuth requirement.
+#
+# Every entry carries its own ``#`` justification comment on the line(s)
+# directly above it — what it returns and what binds or limits it in place of a
+# platform token. ``tests/arch/test_route_auth_gate.py`` enforces this, fails
+# on entries that match no real route, and fails on any route that neither
+# authenticates nor is declared here.
 PUBLIC_OPERATION_IDS: frozenset[str] = frozenset(
     {
-        # Health probes (root + per-surface) are dependency-free liveness checks.
+        # Root liveness probe of the combined app: dependency-free, returns only
+        # a status string and the running version.
         "getHealth",
         # Backend-identity probe: unauthenticated, self-describing, no secrets.
         "getInstance",
+        # Admin-surface health probe (``/admin/health`` combined, ``/health``
+        # standalone): liveness plus the setup_required first-run flag the SPA
+        # and CLI read before any user exists. No tenant data.
         "health",
+        # Control-surface liveness probe: dependency-free, returns only the
+        # surface name and status.
         "controlHealth",
-        "adminHealth",
+        # Registry-surface liveness probe: dependency-free, returns only the
+        # surface name and status.
         "registryHealth",
+        # Auth-surface liveness probe: dependency-free, returns only the
+        # surface name and status.
         "authHealth",
-        # Unauthenticated auth/onboarding flows.
+        # Password login: the caller has no token yet; the credential is the
+        # request body, verified by AuthService.authenticate.
         "login",
+        # Invite redemption: the caller has no token yet; bound by the
+        # single-use invite token in the request body.
         "redeemInvite",
         # First-run setup: create the first admin. Self-closes (410) once any
         # user exists, so it is safe to leave unauthenticated.
         "createAdmin",
-        # Token + authorize + dynamic-registration endpoints: the caller has no
-        # platform token yet (you call these to *get* one / to bootstrap a client).
+        # OAuth token endpoint: the caller has no platform token yet (it calls
+        # this to *get* one); authenticated by the grant itself (code + PKCE,
+        # refresh token, client assertion). Rate limited.
         "tokenEndpoint",
+        # OAuth /authorize entry point: a browser starting the flow has no
+        # platform token yet; bound by the registered client and its redirect
+        # URI, and carries the flow forward in signed state. Rate limited.
         "authorizeEndpoint",
+        # Agent dynamic registration (RFC 7591): the agent has no platform
+        # token yet; it receives a pending registration that an admin must
+        # approve before any token is issued.
         "registerEndpoint",
         # Anonymous OAuth-client DCR front door: flagship MCP
         # clients register anonymously; the boundary is admin approval +
         # consent, not registration. Rate limited and config-gated instead.
         "registerOauthClientEndpoint",
-        # OAuth redirect callbacks (bound by a signed state param, not a session).
+        # Credential-connect OAuth redirect callback: the upstream provider
+        # redirects the browser here; bound by a signed state param, not a session.
         "oauthCallback",
+        # IdP login redirect callback on the /authorize flow: bound by the
+        # signed authorize state param, not a session. Rate limited.
         "authorizeOauthCallback",
         # Approval-pending status poll: anonymous by design (the polling
         # browser has no platform token yet), bound by the signed
@@ -792,8 +906,12 @@ PUBLIC_OPERATION_IDS: frozenset[str] = frozenset(
         # bare client_id. Returns only the pending/approved/denied tri-state;
         # rate limited in its own bucket instead.
         "approvalStatusEndpoint",
-        # OAuth consent screen (presented after IdP login, before issuing the code).
+        # OAuth consent screen (presented after IdP login, before issuing the
+        # code): bound by the consent handle from the signed flow state.
         "consentPage",
+        # OAuth consent form submission: same browser-mid-flow caller as the
+        # consent page; bound by the consent handle and rate limited. Mints the
+        # auth code only on approval.
         "consentSubmit",
         # Inline first-agent creation on the zero-agents consent page (P4):
         # same browser-mid-flow caller as the consent submit (no platform
@@ -811,17 +929,26 @@ PUBLIC_OPERATION_IDS: frozenset[str] = frozenset(
         # browser mid-authorization with no token yet. Config-gated
         # (auth.local_login.enabled → 404) and rate limited instead.
         "loginPage",
+        # Local-account login form submission: the credential is the request
+        # body; bound by the signed authorize state and a single-use CSRF
+        # nonce. Config-gated (404) and rate limited like the login page.
         "loginSubmit",
         # Browser-facing OAuth error page (no auth; just renders an error code).
         "errorPage",
-        # Unauthenticated discovery metadata.
+        # JWKS: the public signing keys clients need to verify tokens; public
+        # key material only, unauthenticated by spec.
         "jwks",
+        # RFC 8414 authorization-server metadata: endpoint URLs and supported
+        # algorithms only, unauthenticated by spec.
         "oauthAuthorizationServer",
-        # /mcp-scoped discovery documents: RFC 8414 for the
-        # path-scoped issuer, RFC 9728 protected-resource metadata, and its
-        # root-path alias. Unauthenticated by spec; config-gated (404) instead.
+        # /mcp-scoped RFC 8414 discovery document for the path-scoped issuer.
+        # Unauthenticated by spec; config-gated (404) instead.
         "mcpOauthAuthorizationServer",
+        # RFC 9728 protected-resource metadata for /mcp. Unauthenticated by
+        # spec; config-gated (404) instead.
         "mcpOauthProtectedResource",
+        # Root-path alias of the RFC 9728 /mcp protected-resource document.
+        # Unauthenticated by spec; config-gated (404) instead.
         "mcpOauthProtectedResourceRootAlias",
         # Public IdP-login capability hint (enabled flag + provider name only;
         # no secrets). The SPA reads this pre-login to render the SSO button.
@@ -836,7 +963,7 @@ PUBLIC_OPERATION_IDS: frozenset[str] = frozenset(
 #: credentials with ``401``, so the documented error responses are kept intact.
 #: Their ``security`` is dropped to ``[]`` (no platform bearer requirement); the
 #: real credential is described in the endpoint reference's ``auth_note`` (see
-#: ``NON_IDENTITY_AUTH`` in ``endpoint_scopes.py``).
+#: ``NON_IDENTITY_AUTH`` in ``endpoint_permissions.py``).
 NON_BEARER_AUTH_OPERATION_IDS: frozenset[str] = frozenset(
     {
         # RFC 7592 registration-status poll: authenticated by the
@@ -901,6 +1028,7 @@ _TAG_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^/lookup"), "Lookup"),
     (re.compile(r"^/notes"), "Notes"),
     (re.compile(r"^/monitoring"), "Monitoring"),
+    (re.compile(r"^/executions/holds"), "Held Executions"),
     (re.compile(r"^/executions"), "Executions"),
     (re.compile(r"^/jobs"), "Jobs"),
     (re.compile(r"^/events"), "Events"),
@@ -916,6 +1044,8 @@ _TAG_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^/admin/oauth-grants"), "OAuth"),
     # Anonymous DCR front door — before the broader ^/oauth rule below.
     (re.compile(r"^/oauth-clients"), "OAuth Clients"),
+    # Admin-managed shared OAuth application registrations — before ^/oauth.
+    (re.compile(r"^/oauth-app-registrations"), "OAuth App Registrations"),
     # Platform-actor surfaces (superset, not in the original reference).
     (re.compile(r"^/agents"), "Agents"),
     (re.compile(r"^/oauth"), "OAuth"),
@@ -984,30 +1114,76 @@ def fastapi_metadata_kwargs(public_base_url: str = "") -> dict[str, Any]:
     }
 
 
-def _normalise_error_responses(responses: dict[str, Any]) -> None:
-    """Render error responses as ``application/problem+json`` with examples.
+_PROBLEM_DETAIL_REF = "#/components/schemas/ProblemDetail"
 
-    FastAPI emits error bodies (``model=ProblemDetail``) under
-    ``application/json``. This rewrites each 4xx/5xx response to the RFC 9457
-    media type and attaches the canonical per-status example, matching the
-    platform error contract.
+
+def _is_problem_detail_media(media: Any) -> bool:
+    return (
+        isinstance(media, dict) and (media.get("schema") or {}).get("$ref") == _PROBLEM_DETAIL_REF
+    )
+
+
+def _normalise_error_responses(responses: dict[str, Any]) -> None:
+    """Render Problem Details error responses as ``application/problem+json``.
+
+    FastAPI files an error ``model=ProblemDetail`` under the route's response
+    media type: ``application/json`` by default, but ``text/html`` for an
+    HTML-page route (``response_class=HTMLResponse``). This moves whichever
+    entry carries the ``ProblemDetail`` schema to the RFC 9457 media type and
+    attaches the canonical per-status example, matching the platform error
+    contract. Entries in another dialect (e.g. the RFC 6749 §5.2 OAuth error
+    body, or the framework's plain route-not-found body) keep their
+    ``application/json`` media type.
     """
     for code, response in responses.items():
-        if not isinstance(response, dict) or code not in STATUS_EXAMPLES:
+        if not isinstance(response, dict) or not code.startswith(("4", "5")):
             continue
         content = response.get("content")
         if not isinstance(content, dict):
             continue
-        media = content.pop("application/json", None)
-        if media is None:
-            media = content.get(PROBLEM_JSON, {})
-        if not isinstance(media, dict):
-            media = {}
+        # An error ``model=`` on an HTML-page route lands under ``text/html``;
+        # error bodies are always JSON, so fold it into ``application/json``.
+        html = content.get("text/html")
+        if isinstance(html, dict) and html.get("schema"):
+            content.pop("text/html")
+            json_media = content.setdefault("application/json", {})
+            json_media.setdefault("schema", html["schema"])
+        if code not in STATUS_EXAMPLES:
+            continue
+        problem_media_types = [mt for mt, m in content.items() if _is_problem_detail_media(m)]
+        if not problem_media_types:
+            continue
+        media = content[problem_media_types[0]]
+        for mt in problem_media_types:
+            content.pop(mt, None)
+        # A schema-less problem+json placeholder (an earlier pass, or a route
+        # that pre-declared the media type) is superseded by the real entry.
+        content.pop(PROBLEM_JSON, None)
         media["example"] = STATUS_EXAMPLES[code]
         content[PROBLEM_JSON] = media
 
 
-def _stamp_scope_metadata(
+def _add_default_problem_response(responses: dict[str, Any]) -> None:
+    """Document the RFC 9457 catch-all as the operation's ``default`` response.
+
+    Any status the operation does not list (an unmapped 5xx, a proxy-injected
+    error) still arrives as Problem Details: ``unhandled_exception_handler``
+    guarantees it for an unclaimed exception, so every operation — the bare
+    public probes included — gets the same ``default``.
+    """
+    if "default" not in responses:
+        responses["default"] = {
+            "description": "Unexpected error, as RFC 9457 Problem Details.",
+            "content": {
+                PROBLEM_JSON: {
+                    "schema": {"$ref": "#/components/schemas/ProblemDetail"},
+                    "example": STATUS_EXAMPLES["500"],
+                }
+            },
+        }
+
+
+def _stamp_permission_metadata(
     method: str,
     path: str,
     operation: dict[str, Any],
@@ -1015,12 +1191,14 @@ def _stamp_scope_metadata(
 ) -> None:
     """Stamp the operation's ``security`` from its recovered identity dependency.
 
-    The OpenAPI document models only the real authentication mechanism —
-    ``BearerAuth`` (an opaque bearer token, not a JWT). The per-operation scope/actor-type join
-    is *not* expressed here: OpenAPI's ``security`` model cannot faithfully carry
-    our OR-of-scopes semantics, the ``org:admin`` superuser bypass, the
-    typical-caller hint, or the fact that many scopes are enforced in the service
-    layer rather than at the gateway. Encoding it as a fabricated OAuth2 flow
+    The OpenAPI document models only the real authentication mechanism — an
+    opaque bearer token (not a JWT), described as ``BearerAuth`` and, for the
+    interactive authorization-code flow that issues it, ``OAuth2``. The per-operation
+    permission/actor-type join is *not* expressed here: OpenAPI's ``security`` model
+    cannot faithfully carry our OR-of-permissions semantics, the ``org:admin``
+    superuser bypass, the typical-caller hint, or the fact that many permissions are
+    enforced in the service layer rather than at the gateway. Encoding it as a
+    fabricated OAuth2 flow
     would misrepresent enforcement, so that richer authorization reference lives
     in the endpoint reference (:mod:`jentic_one.shared.web.endpoint_reference`,
     served at ``GET /reference/endpoints.json``), which the CLI and docs SPA
@@ -1030,7 +1208,8 @@ def _stamp_scope_metadata(
     never fall back to the global document-level requirement to decide whether an
     operation authenticates: an operation with no recovered identity dependency is
     stamped ``security: []`` (public); an authenticated one is stamped
-    ``[{"BearerAuth": []}]``. This keeps the public/authenticated boundary derived
+    ``[{"BearerAuth": []}, {"OAuth2": []}]`` (either scheme, no per-operation
+    scopes). This keeps the public/authenticated boundary derived
     from the actual route dependency rather than inferred.
     """
     info = operation_auth.get((method.upper(), path))
@@ -1042,7 +1221,7 @@ def _stamp_scope_metadata(
         for code in ("401", "403"):
             responses.pop(code, None)
         return
-    operation["security"] = [{"BearerAuth": []}]
+    operation["security"] = authenticated_security()
 
 
 def install_openapi_metadata(app: FastAPI) -> None:
@@ -1075,8 +1254,9 @@ def install_openapi_metadata(app: FastAPI) -> None:
         components = schema.setdefault("components", {})
         security_schemes = components.setdefault("securitySchemes", {})
         security_schemes.update(BEARER_SECURITY_SCHEME)
+        security_schemes.update(OAUTH2_SECURITY_SCHEME)
 
-        schema["security"] = [{"BearerAuth": []}]
+        schema["security"] = authenticated_security()
         schema["x-tagGroups"] = X_TAG_GROUPS
 
         operation_auth = build_operation_auth_map(app)
@@ -1099,20 +1279,312 @@ def install_openapi_metadata(app: FastAPI) -> None:
                     # Authenticates by a non-bearer credential (e.g. an RFC 7592
                     # Registration-Access-Token): drop the platform BearerAuth
                     # requirement but keep the 401 it genuinely returns on a bad
-                    # credential. It never reaches the scope/authz layer, so the
+                    # credential. It never reaches the permission/authz layer, so the
                     # 403 (which only the permission gate raises) is dropped.
                     operation["security"] = []
                     operation.get("responses", {}).pop("403", None)
                 else:
-                    _stamp_scope_metadata(method, path, operation, operation_auth)
+                    _stamp_permission_metadata(method, path, operation, operation_auth)
                 if op_id in ROUTER_RESHAPED_422_OPERATION_IDS:
                     # Validation failures are reshaped to the governing spec's
                     # dialect at the router; the framework 422 can never be
                     # returned.
                     operation.get("responses", {}).pop("422", None)
                 _normalise_error_responses(operation.get("responses", {}))
+                _add_default_problem_response(operation.get("responses", {}))
+                _summarise_parameter_examples(operation)
+                _describe_request_body(operation, components.get("schemas", {}))
+            _summarise_path_item(path_item)
+            _describe_path_item(path_item)
+
+        _compose_component_examples(components.get("schemas", {}))
+        _propagate_examples(schema.get("paths", {}), components.get("schemas", {}))
+        _add_oneof_discriminators(schema, components.get("schemas", {}))
 
         app.openapi_schema = schema
         return schema
 
     app.openapi = custom_openapi  # type: ignore[method-assign]
+
+
+def _summarise_parameter_examples(operation: dict[str, Any]) -> None:
+    """Give every parameter example a ``summary``.
+
+    ``openapi_examples.example()`` labels the canonical values itself; any other
+    value (a page size, a status filter) is labelled from its parameter here,
+    because only the spec knows which parameter an example is attached to.
+    """
+    for param in operation.get("parameters") or []:
+        for entry in (param.get("examples") or {}).values():
+            if isinstance(entry, dict) and not entry.get("summary"):
+                entry["summary"] = f"Example {param['in']} value for `{param['name']}`"
+
+
+def _summarise_path_item(path_item: dict[str, Any]) -> None:
+    """Set the path item's ``summary`` from its operations' summaries.
+
+    OpenAPI's path-level ``summary`` applies to every operation on the path;
+    FastAPI never emits one. Joining the operation summaries in spec order
+    (``"List agents; Register agent"``) states exactly what the path offers.
+    """
+    if path_item.get("summary"):
+        return
+    summaries = [
+        op["summary"]
+        for method, op in path_item.items()
+        if method.lower() in _HTTP_METHODS and isinstance(op, dict) and op.get("summary")
+    ]
+    if summaries:
+        path_item["summary"] = "; ".join(summaries)
+
+
+def _describe_path_item(path_item: dict[str, Any]) -> None:
+    """Set the path item's ``description`` to a method-by-method index.
+
+    The joined ``summary`` says what the path offers; the description adds which
+    HTTP method does what (``"`GET`: List agents. `POST`: Register agent."``),
+    so a reader of the path alone can pick the right operation.
+    """
+    if path_item.get("description"):
+        return
+    entries = [
+        f"`{method.upper()}`: {op['summary'].rstrip('.')}."
+        for method, op in path_item.items()
+        if method.lower() in _HTTP_METHODS and isinstance(op, dict) and op.get("summary")
+    ]
+    if entries:
+        path_item["description"] = " ".join(entries)
+
+
+def _describe_request_body(operation: dict[str, Any], schemas: dict[str, Any]) -> None:
+    """Give the operation's ``requestBody`` a ``description``.
+
+    FastAPI never emits one. Prefer the body model's own description (its
+    docstring, already public on the component); otherwise fall back to naming
+    the operation the payload is for.
+    """
+    body = operation.get("requestBody")
+    if not isinstance(body, dict) or body.get("description"):
+        return
+    for media in (body.get("content") or {}).values():
+        schema = media.get("schema") or {}
+        ref = schema.get("$ref", "")
+        target = schemas.get(ref.rsplit("/", 1)[-1], {}) if ref else schema
+        if target.get("description"):
+            body["description"] = target["description"]
+            return
+    op_id = operation.get("operationId")
+    if op_id:
+        body["description"] = f"Request payload for the `{op_id}` operation."
+
+
+_MISSING = object()
+
+
+def _example_for(schema: Any, schemas: dict[str, Any], stack: tuple[str, ...]) -> Any:
+    """One example for ``schema``, or ``_MISSING`` if it cannot be built from leaves.
+
+    Uses the schema's own ``examples``/``example``, else follows a ``$ref`` to the
+    component (composing it if needed), else the first ``anyOf``/``oneOf`` branch
+    that yields one, else builds an array from ``items`` or an object from its
+    properties. ``stack`` stops recursion through self-referencing models.
+    """
+    if not isinstance(schema, dict):
+        return _MISSING
+    if schema.get("examples"):
+        return schema["examples"][0]
+    if "example" in schema:
+        return schema["example"]
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        name = ref.rsplit("/", 1)[-1]
+        if name in stack or name not in schemas:
+            return _MISSING
+        return _component_example(name, schemas, stack)
+    for key in ("anyOf", "oneOf"):
+        for branch in schema.get(key) or []:
+            if isinstance(branch, dict) and branch.get("type") == "null":
+                continue
+            value = _example_for(branch, schemas, stack)
+            if value is not _MISSING:
+                return value
+    if schema.get("type") == "array":
+        item = _example_for(schema.get("items"), schemas, stack)
+        return _MISSING if item is _MISSING else [item]
+    if "properties" in schema:
+        return _object_example(schema, schemas, stack)
+    return _MISSING
+
+
+def _object_example(schema: dict[str, Any], schemas: dict[str, Any], stack: tuple[str, ...]) -> Any:
+    """An object example from its properties; ``_MISSING`` if a required one has none."""
+    required = set(schema.get("required") or [])
+    value: dict[str, Any] = {}
+    for prop, prop_schema in (schema.get("properties") or {}).items():
+        example = _example_for(prop_schema, schemas, stack)
+        if example is _MISSING:
+            if prop in required:
+                return _MISSING
+            continue
+        value[prop] = example
+    return value
+
+
+def _component_example(name: str, schemas: dict[str, Any], stack: tuple[str, ...]) -> Any:
+    component = schemas[name]
+    if component.get("examples"):
+        return component["examples"][0]
+    if "example" in component:
+        return component["example"]
+    if "properties" not in component:
+        return _example_for(component, schemas, (*stack, name))
+    return _object_example(component, schemas, (*stack, name))
+
+
+def _compose_component_examples(schemas: dict[str, Any]) -> None:
+    """Give object components and their nested-model properties a composed example.
+
+    Field-level ``examples=`` sit on leaf properties; a property typed as another
+    model (``$ref``, ``list[Model]``, ``Model | None``) and the component as a
+    whole have none. Composing them from the leaves keeps one source of truth —
+    a composed value is valid exactly when its leaves are, which the arch tests
+    check — while giving readers (and agents) a complete, realistic object.
+    Components that already declare ``examples`` are left as written.
+    """
+    for name, component in schemas.items():
+        if not isinstance(component, dict) or "properties" not in component:
+            continue
+        for prop_schema in component["properties"].values():
+            if not isinstance(prop_schema, dict) or "examples" in prop_schema:
+                continue
+            if "example" in prop_schema:
+                continue
+            value = _example_for(prop_schema, schemas, (name,))
+            if value is not _MISSING:
+                prop_schema["examples"] = [value]
+        if "examples" not in component and "example" not in component:
+            value = _object_example(component, schemas, (name,))
+            if value is not _MISSING and value:
+                component["examples"] = [value]
+
+
+def _variant_tag(ref: str, schemas: dict[str, Any], prop: str) -> str | None:
+    """The single constant value ``prop`` takes in the ``$ref``'d variant, if any."""
+    variant = schemas.get(ref.rsplit("/", 1)[-1]) or {}
+    spec = (variant.get("properties") or {}).get(prop) or {}
+    if "const" in spec:
+        return str(spec["const"])
+    enum = spec.get("enum")
+    return str(enum[0]) if isinstance(enum, list) and len(enum) == 1 else None
+
+
+def _add_oneof_discriminators(node: Any, schemas: dict[str, Any]) -> None:
+    """Declare the discriminator Pydantic omits for a callable-discriminated union.
+
+    A union discriminated by a callable (``Discriminator(fn)``) — used where one
+    variant may omit the tag and is selected by default — renders as a bare
+    ``oneOf`` of ``$ref`` schemas. When every variant pins the same property to a
+    distinct constant, that property *is* the discriminator; declare it (with
+    the explicit mapping) so clients can deserialise without trial-matching.
+    """
+    if isinstance(node, list):
+        for item in node:
+            _add_oneof_discriminators(item, schemas)
+        return
+    if not isinstance(node, dict):
+        return
+    for value in node.values():
+        _add_oneof_discriminators(value, schemas)
+    variants = node.get("oneOf")
+    if "discriminator" in node or not isinstance(variants, list) or len(variants) < 2:
+        return
+    refs = [v["$ref"] for v in variants if isinstance(v, dict) and isinstance(v.get("$ref"), str)]
+    if len(refs) != len(variants):
+        return
+    first = schemas.get(refs[0].rsplit("/", 1)[-1]) or {}
+    for prop in first.get("properties") or {}:
+        tags = [_variant_tag(r, schemas, prop) for r in refs]
+        if all(tags) and len(set(tags)) == len(tags):
+            node["discriminator"] = {
+                "propertyName": prop,
+                "mapping": dict(zip(tags, refs, strict=True)),
+            }
+            return
+
+
+_JSON_TYPES: dict[str, tuple[type, ...]] = {
+    "string": (str,),
+    "integer": (int,),
+    "number": (int, float),
+    "boolean": (bool,),
+    "array": (list,),
+    "object": (dict,),
+}
+
+
+def _matches_type(value: Any, branch: dict[str, Any]) -> bool:
+    """Whether ``value`` has the JSON type ``branch`` declares (bool is not a number)."""
+    kinds = _JSON_TYPES.get(branch.get("type", ""))
+    if kinds is None or (isinstance(value, bool) and bool not in kinds):
+        return False
+    return isinstance(value, kinds)
+
+
+def _seed_schema_example(target: dict[str, Any], value: Any) -> None:
+    """Put ``value`` on a parameter schema and on each typed branch it satisfies."""
+    target.setdefault("examples", [value])
+    for key in ("anyOf", "oneOf"):
+        for branch in target.get(key) or []:
+            if isinstance(branch, dict) and _matches_type(value, branch):
+                _seed_schema_example(branch, value)
+    items = target.get("items")
+    if isinstance(items, dict) and isinstance(value, list) and value:
+        _seed_schema_example(items, value[0])
+
+
+def _first_example(holder: dict[str, Any]) -> Any:
+    """The first example value declared on a parameter or schema, else ``_MISSING``."""
+    if "example" in holder:
+        return holder["example"]
+    examples = holder.get("examples")
+    if isinstance(examples, dict) and examples:
+        first = next(iter(examples.values()))
+        return first.get("value", _MISSING) if isinstance(first, dict) else _MISSING
+    if isinstance(examples, list) and examples:
+        return examples[0]
+    return _MISSING
+
+
+def _propagate_examples(paths: dict[str, Any], schemas: dict[str, Any]) -> None:
+    """Surface existing examples where clients look for them.
+
+    A parameter's example lives on the parameter (a named map for the docs UI);
+    JSON-Schema-driven tooling reads ``schema.examples`` instead, so mirror it
+    there. A JSON request/response that references a component with an example
+    gets that example on the media type, so it renders without resolution.
+    Nothing is invented: every value is one the spec already declares.
+    """
+    for path_item in paths.values():
+        for operation in path_item.values():
+            if not isinstance(operation, dict):
+                continue
+            for param in operation.get("parameters") or []:
+                value = _first_example(param)
+                if value is not _MISSING and isinstance(param.get("schema"), dict):
+                    _seed_schema_example(param["schema"], value)
+            bodies = [operation.get("requestBody") or {}]
+            bodies += list((operation.get("responses") or {}).values())
+            for body in bodies:
+                for media_type, media in (body.get("content") or {}).items():
+                    if "json" not in media_type or "example" in media or "examples" in media:
+                        continue
+                    media_schema = media.get("schema") or {}
+                    ref = media_schema.get("$ref")
+                    source = (
+                        schemas.get(ref.rsplit("/", 1)[-1], {})
+                        if isinstance(ref, str)
+                        else media_schema
+                    )
+                    value = _first_example(source)
+                    if value is not _MISSING:
+                        media["example"] = value

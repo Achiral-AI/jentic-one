@@ -25,22 +25,13 @@
  * Building links: prefer `monitorHref(...)` so callers don't hand-assemble
  * query strings (and so cross-references always carry their id).
  *
- * Cross-module callers (the agents console) can't import this module;
+ * Cross-module callers (the Agents page) can't import this module;
  * they build the API-calls subset via `ROUTE_PATHS.monitorExecutions`
  * in `shared/app/routes.ts` — keep the param names above in lockstep with it.
  */
 import type { ActivitySource, MonitorView } from '@/modules/monitor/api';
 import { ROUTES } from '@/shared/app';
-
-/**
- * The backend stores `trace_id="unknown"` for executions/jobs that ran without
- * a `traceparent`/`x-request-id` header (see the broker's executor). Such a
- * value can't open a trace sheet or filter the audit log, so we treat it — and
- * empty/nullish ids — as "no usable trace" everywhere a cross-link is offered.
- */
-export function hasTrace(traceId: string | null | undefined): traceId is string {
-	return traceId != null && traceId !== '' && traceId !== 'unknown';
-}
+import { hasTrace } from '@/shared/lib';
 
 export interface MonitorLinkParams {
 	view?: MonitorView;

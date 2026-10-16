@@ -2,7 +2,6 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-import type { EventAcknowledgeRequest } from '../models/EventAcknowledgeRequest';
 import type { EventListResponse } from '../models/EventListResponse';
 import type { EventResponse } from '../models/EventResponse';
 import type { EventSeverity } from '../models/EventSeverity';
@@ -20,7 +19,6 @@ export class EventsService {
         eventType,
         severity,
         requiresAction,
-        acknowledged,
         from,
         to,
         traceId,
@@ -29,16 +27,45 @@ export class EventsService {
         cursor,
         limit = 25,
     }: {
+        /**
+         * Only return events of one of these types; repeat the parameter for several.
+         */
         eventType?: (Array<string> | null),
+        /**
+         * Only return events with one of these severities; repeat the parameter for several.
+         */
         severity?: (Array<EventSeverity> | null),
+        /**
+         * Only return events whose `requires_action` flag matches.
+         */
         requiresAction?: (boolean | null),
-        acknowledged?: (boolean | null),
+        /**
+         * Only return events created at or after this time (RFC 3339).
+         */
         from?: (string | null),
+        /**
+         * Only return events created before this time (RFC 3339).
+         */
         to?: (string | null),
+        /**
+         * Only return events with this trace ID.
+         */
         traceId?: (string | null),
+        /**
+         * Only return events caused by this actor.
+         */
         actorId?: (string | null),
+        /**
+         * Only return events caused by this kind of actor, e.g. `user` or `agent`.
+         */
         actorType?: (string | null),
+        /**
+         * Opaque cursor from a previous page's `next_cursor`; omit for the first page.
+         */
         cursor?: (string | null),
+        /**
+         * Maximum number of events to return (1-100, default 25).
+         */
         limit?: number,
     }): CancelablePromise<EventListResponse> {
         return __request(OpenAPI, {
@@ -48,7 +75,6 @@ export class EventsService {
                 'event_type': eventType,
                 'severity': severity,
                 'requires_action': requiresAction,
-                'acknowledged': acknowledged,
                 'from': from,
                 'to': to,
                 'trace_id': traceId,
@@ -83,13 +109,37 @@ export class EventsService {
         actorType,
         lastEventId,
     }: {
+        /**
+         * Stream events created after this time (RFC 3339); defaults to now, and a future time is treated as now.
+         */
         since?: (string | null),
+        /**
+         * Only return events of one of these types; repeat the parameter for several.
+         */
         eventType?: (Array<string> | null),
+        /**
+         * Only return events with one of these severities; repeat the parameter for several.
+         */
         severity?: (Array<EventSeverity> | null),
+        /**
+         * Only return events whose `requires_action` flag matches.
+         */
         requiresAction?: (boolean | null),
+        /**
+         * Only return events with this trace ID.
+         */
         traceId?: (string | null),
+        /**
+         * Only return events caused by this actor.
+         */
         actorId?: (string | null),
+        /**
+         * Only return events caused by this kind of actor, e.g. `user` or `agent`.
+         */
         actorType?: (string | null),
+        /**
+         * ID of the last event received (`evt_` plus 24 hex characters), to resume a stream after it; ignored if the event is not visible to the caller.
+         */
         lastEventId?: (string | null),
     }): CancelablePromise<any> {
         return __request(OpenAPI, {
@@ -126,6 +176,9 @@ export class EventsService {
     public static getEvent({
         eventId,
     }: {
+        /**
+         * ID of the event.
+         */
         eventId: string,
     }): CancelablePromise<EventResponse> {
         return __request(OpenAPI, {
@@ -134,37 +187,6 @@ export class EventsService {
             path: {
                 'event_id': eventId,
             },
-            errors: {
-                400: `Bad Request`,
-                401: `Unauthorized`,
-                403: `Forbidden`,
-                422: `Unprocessable Entity`,
-                500: `Internal Server Error`,
-                503: `Service Unavailable`,
-            },
-        });
-    }
-    /**
-     * Acknowledge Event
-     * Acknowledge an event.
-     * @returns EventResponse Successful Response
-     * @throws ApiError
-     */
-    public static acknowledgeEvent({
-        eventId,
-        requestBody,
-    }: {
-        eventId: string,
-        requestBody: EventAcknowledgeRequest,
-    }): CancelablePromise<EventResponse> {
-        return __request(OpenAPI, {
-            method: 'PATCH',
-            url: '/events/{event_id}',
-            path: {
-                'event_id': eventId,
-            },
-            body: requestBody,
-            mediaType: 'application/json',
             errors: {
                 400: `Bad Request`,
                 401: `Unauthorized`,

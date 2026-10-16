@@ -7,8 +7,8 @@ before any credential is resolved:
 
 1. the enqueuing actor must still be active (the sync path's token-resolution
    check, answered from the actor row since the worker holds no token);
-2. an agent must still hold the execute scope (the sync path's
-   ``require_execute_scope``, answered from the live grant rows an agent's
+2. an agent must still hold the execute permission (the sync path's
+   ``require_execute_permission``, answered from the live grant rows an agent's
    credentials resolve their scopes from);
 3. the actor's bindings for the API are re-derived, so a removed or
    suspended binding (or a disabled credential) no longer resolves;
@@ -30,15 +30,18 @@ from jentic_one.broker.core.problem import broker_error_problem
 from jentic_one.broker.repos.actor_status import ActorStatusResolver
 from jentic_one.broker.services.execution.authorization import authorize_execution
 from jentic_one.shared.auth.identity import Identity
+from jentic_one.shared.auth.permission_catalog import BROKER_EXECUTE_PERMISSION
 from jentic_one.shared.broker.protocols import (
     AgentRuleEvaluatorProtocol,
     CredentialDeriverProtocol,
+    RuleVerdict,
 )
 from jentic_one.shared.context import Context
+from jentic_one.shared.jobs.hold import approval_required_problem, get_approved_by_job_id
 from jentic_one.shared.jobs.protocols import QueuedExecutionRequest, QueuedExecutionVerdict
 from jentic_one.shared.models import ActorType
+from jentic_one.shared.permissions.evaluation import rule_request_path
 from jentic_one.shared.schemas import APIReference
-from jentic_one.shared.scopes import BROKER_EXECUTE_SCOPE
 
 logger = structlog.get_logger(__name__)
 
@@ -58,12 +61,12 @@ def _inactive_actor_problem(instance: str) -> dict[str, object]:
 
 
 def _insufficient_scope_problem(instance: str) -> dict[str, object]:
-    """Mirrors the sync edge's 403 from ``require_execute_scope``."""
+    """Mirrors the sync edge's 403 from ``require_execute_permission``."""
     return {
         "type": "insufficient_scope",
         "title": "Forbidden",
         "status": 403,
-        "detail": f"Insufficient scope: '{BROKER_EXECUTE_SCOPE}' required",
+        "detail": f"Insufficient scope: '{BROKER_EXECUTE_PERMISSION}' required",
         "instance": instance,
     }
 
@@ -93,6 +96,7 @@ class QueuedExecutionAuthorizer:
         self._actor_status = actor_status
         self._credential_deriver = credential_deriver
         self._agent_rule_evaluator = agent_rule_evaluator
+        self._admin_db = ctx.admin_db
 
     async def authorize(self, request: QueuedExecutionRequest) -> QueuedExecutionVerdict:
         """Allow (with the current injection boundary) or deny (with a problem body)."""
@@ -109,8 +113,10 @@ class QueuedExecutionAuthorizer:
             )
             return QueuedExecutionVerdict(allowed=False, problem=_inactive_actor_problem(instance))
 
-        if not await self._actor_status.holds_scope(
-            actor_id=request.actor_id, actor_type=request.actor_type, scope=BROKER_EXECUTE_SCOPE
+        if not await self._actor_status.holds_permission(
+            actor_id=request.actor_id,
+            actor_type=request.actor_type,
+            permission=BROKER_EXECUTE_PERMISSION,
         ):
             logger.info(
                 "queued_execution_denied",
@@ -155,7 +161,12 @@ class QueuedExecutionAuthorizer:
                 ),
                 operation_id=request.operation_id,
                 method=request.method,
-                path=urlparse(request.upstream_url).path,
+                path=rule_request_path(
+                    request.relative_path,
+                    request.upstream_url,
+                    operation_id=request.operation_id,
+                ),
+                upstream_url=request.upstream_url,
                 instance=instance,
                 credential_deriver=self._credential_deriver,
                 agent_rule_evaluator=self._agent_rule_evaluator,
@@ -171,6 +182,38 @@ class QueuedExecutionAuthorizer:
                 actor_type=request.actor_type,
             )
             return QueuedExecutionVerdict(allowed=False, problem=broker_error_problem(exc))
+
+        if authorization.verdict == RuleVerdict.REQUIRE_APPROVAL:
+            # A require-approval verdict at run time passes only for the job a
+            # reviewer approved; the worker never files a second hold.
+            approved = False
+            if request.job_id:
+                async with self._admin_db.session() as session:
+                    row = await get_approved_by_job_id(session, request.job_id)
+                    approved = row is not None
+            if not approved:
+                logger.info(
+                    "queued_execution_denied",
+                    reason="require_approval_no_approved_row",
+                    job_id=request.job_id,
+                    actor_id=request.actor_id,
+                    actor_type=request.actor_type,
+                )
+                return QueuedExecutionVerdict(
+                    allowed=False, problem=approval_required_problem(instance)
+                )
+            logger.info(
+                "queued_execution_approved_by_row",
+                job_id=request.job_id,
+                actor_id=request.actor_id,
+                actor_type=request.actor_type,
+            )
+            cred = authorization.selected_credential.credential_id
+            return QueuedExecutionVerdict(
+                allowed=True,
+                allowed_credential_ids=tuple(authorization.allowed_credential_ids),
+                credential_id=cred,
+            )
 
         return QueuedExecutionVerdict(
             allowed=True,

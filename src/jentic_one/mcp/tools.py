@@ -12,13 +12,13 @@ jobs, auth identity, connect sessions); the execute family proxies to the
 broker server-side
 (the broker stays MCP-free).
 
-Scope enforcement mirrors the REST routes fronted: the same
+Permission enforcement mirrors the REST routes fronted: the same
 ``required_permissions`` the routers declare, checked against the resolved
 identity through the same ``compute_effective`` expansion + ``org:admin``
-bypass ``get_current_identity`` applies. A scope failure maps exactly like the
-Go client's wire 403 (``mcpCoded``): NOT_AUTHENTICATED with the get_started
+bypass ``get_current_identity`` applies. A permission failure maps exactly like
+the Go client's wire 403 (``mcpCoded``): NOT_AUTHENTICATED with the get_started
 pointer — except ``search_catalog`` and ``import_api``, whose 403s are
-missing-scope facts routed to the operator (BROKER_DENIED with an
+missing-permission facts routed to the operator (BROKER_DENIED with an
 ask-your-operator step, the Go special case).
 """
 
@@ -29,31 +29,58 @@ import json
 import time
 import uuid as uuid_mod
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import mcp.types as mcp_types
 import structlog
 from jentic.problem_details import Forbidden, Unauthorized
 from mcp.shared.exceptions import MCPError
+from pydantic import ValidationError
 
-from jentic_one.admin.services.errors import JobNotFoundError
+from jentic_one.admin.services.errors import (
+    HeldExecutionNotFoundError,
+    HeldExecutionResultNotReadyError,
+    JobNotCompletedError,
+    JobNotFoundError,
+)
+from jentic_one.admin.services.held_execution_service import HeldExecutionService
 from jentic_one.admin.services.job_result_service import JobResultService
 from jentic_one.admin.services.job_service import JobService
-from jentic_one.admin.services.schemas.jobs import JobView
+from jentic_one.admin.services.schemas.jobs import JobResultView, JobView
 from jentic_one.admin.services.user_service import UserService
 from jentic_one.auth.services.agent_service import AgentService
 from jentic_one.auth.web.routers.identity import _resolve_agent, _resolve_user
 from jentic_one.control.services.integrations.connect_session_service import (
+    ApiTarget,
     ConnectSessionService,
 )
-from jentic_one.control.services.integrations.errors import NoOpForFlowError
+from jentic_one.control.services.integrations.errors import (
+    AuthTypeNotDeclaredError,
+    AuthTypeRequiredError,
+    InvalidOAuthAppRegistrationError,
+    ManualFlowsDisabledError,
+    NoDeclaredSchemeError,
+    NoOpForFlowError,
+    RecentlyRejectedError,
+    ReservedAuthFieldError,
+    SecuritySchemesLookupUnavailableError,
+    TooManyOpenSessionsError,
+    UnknownApiError,
+    UnpinnedServerHostError,
+)
 from jentic_one.control.services.vendors.service import (
+    AmbiguousVendorError,
     UnknownVendorError,
     UnsupportedFlowError,
     VendorNotConfiguredError,
+    VendorRegistryService,
 )
 from jentic_one.control.web.routers.integrations import _CONNECT_BURST, _CONNECT_RPM
+from jentic_one.control.web.schemas.permission_rules import PermissionRuleSchema
+from jentic_one.mcp import approvals
 from jentic_one.mcp import execute as ex
 from jentic_one.mcp.envelopes import (
     CODE_BROKER_DENIED,
@@ -88,7 +115,16 @@ from jentic_one.registry.services.search_service import SearchService
 from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.auth.permission_catalog import compute_effective
 from jentic_one.shared.auth.permissions import has_effective_permission
+from jentic_one.shared.catalog.protocols import (
+    CatalogAutoImportProtocol,
+    SecuritySchemesLookupProtocol,
+)
 from jentic_one.shared.context import Context
+from jentic_one.shared.jobs.hold import (
+    HELD_AGENT_DIRECTIVE,
+    STILL_HELD_AGENT_DIRECTIVE,
+    review_page_path,
+)
 from jentic_one.shared.models import ActorType
 from jentic_one.shared.pagination import InvalidCursorError, InvalidSearchCursorError
 from jentic_one.shared.redaction import redact_value
@@ -113,9 +149,30 @@ class CallEnv:
     base_url: str
     #: sanitized ``X-Jentic-Session-Id`` when the inbound request carried one.
     session_id: str | None
+    #: this request's declared ``_meta`` client capabilities (per request —
+    #: there is no session to remember them).
+    client_capabilities: dict[str, Any] = field(default_factory=dict)
+    #: this request's ``_meta`` clientInfo, for logging only.
+    client_name: str | None = None
+    client_version: str | None = None
+    #: the ``requestState`` a multi-round-trip retry echoes back, if any.
+    request_state: str | None = None
+    #: the protocol version this request was served under (``None`` when unknown).
+    protocol_version: str | None = None
+    #: the process-level catalog auto-importer the HTTP connect route threads
+    #: into ``ConnectSessionService`` (``app.state.catalog_auto_importer``);
+    #: ``None`` when this process does not serve the registry.
+    catalog_auto_importer: CatalogAutoImportProtocol | None = None
+    #: the process-level registry lookup the HTTP connect route threads into
+    #: ``ConnectSessionService`` (``app.state.security_schemes_lookup``) for
+    #: sessions that target a registry API; ``None`` when this process cannot
+    #: read the registry.
+    security_schemes_lookup: SecuritySchemesLookupProtocol | None = None
 
 
-Handler = Callable[[CallEnv, dict[str, Any]], Awaitable[mcp_types.CallToolResult]]
+ToolCallResult = mcp_types.CallToolResult | mcp_types.InputRequiredResult
+
+Handler = Callable[[CallEnv, dict[str, Any]], Awaitable[ToolCallResult]]
 
 
 def invalid_params(message: str) -> MCPError:
@@ -206,10 +263,10 @@ def _coerce(spec: ParamSpec, value: Any) -> Any:
     return value
 
 
-# ── scope enforcement (same scopes as the REST routes fronted) ──────────────
+# ── permission enforcement (same permissions as the REST routes fronted) ────
 
 
-def require_scopes(identity: Identity, required: list[str]) -> None:
+def require_permissions(identity: Identity, required: list[str]) -> None:
     """The ``get_current_identity(required_permissions=…)`` check, mount-side.
 
     Same expansion (``compute_effective``) and the same ``org:admin`` bypass;
@@ -226,11 +283,11 @@ def require_scopes(identity: Identity, required: list[str]) -> None:
         "the identity may have been revoked or disabled",
         # Lane-aware prose (#1327 deferred work): the stdio taxonomy points
         # this code at get_started, which this mount does not serve. whoami
-        # DOES resolve here (the credential authenticated; it lacks scopes),
+        # DOES resolve here (the credential authenticated; it lacks permissions),
         # so it is the honest next step on this lane.
-        actionable="call whoami to see this connection's identity and granted scopes, "
-        "and relay the missing scopes to your operator — scopes are granted by a "
-        "human in the Jentic One dashboard",
+        actionable="call whoami to see this connection's identity and granted "
+        "permissions, and relay the missing ones to your operator — permissions are "
+        "granted by a human in the Jentic One dashboard",
     )
 
 
@@ -348,7 +405,7 @@ async def handle_search_apis(env: CallEnv, arguments: dict[str, Any]) -> mcp_typ
     limit = args.get("limit", 0)
     if limit and not 1 <= limit <= 100:
         raise invalid_params(f"limit must be between 1 and 100, got {limit}")
-    require_scopes(env.identity, ["apis:read"])
+    require_permissions(env.identity, ["apis:read"])
     _require_db(env.ctx, "registry", "search")
 
     try:
@@ -422,7 +479,7 @@ async def handle_inspect_operation(
             'a METHOD:url pair like "GET:https://api.example.com/v1/things" '
             "(a search_apis hit's target)"
         )
-    require_scopes(env.identity, ["apis:read"])
+    require_permissions(env.identity, ["apis:read"])
     payload = await _inspect_document(env, target, args.get("revision", ""))
     payload["schema_version"] = SCHEMA_VERSION
     return tool_result(env.ctx, payload)
@@ -492,17 +549,17 @@ async def handle_search_catalog(
     if limit and not 1 <= limit <= 200:
         raise invalid_params(f"limit must be between 1 and 200, got {limit}")
     try:
-        require_scopes(env.identity, ["capabilities:read"])
+        require_permissions(env.identity, ["capabilities:read"])
     except ToolError as exc:
         # The Go special case: a 403 on THIS route is the missing
-        # capabilities:read scope — an access gap the operator closes with a
+        # capabilities:read permission — an access gap the operator closes with a
         # dashboard grant, not a revoked identity. The wire
         # error rides as the message tail, like Go's ``: %v`` (mcp_catalog.go).
         raise ToolError(
             CODE_BROKER_DENIED,
-            f"reading the catalog requires the capabilities:read scope: {exc}",
+            f"reading the catalog requires the capabilities:read permission: {exc}",
             actionable="Ask your human operator to grant this agent the "
-            "capabilities:read scope in the dashboard, then retry "
+            "capabilities:read permission in the dashboard, then retry "
             "search_catalog once they confirm.",
         ) from None
     _require_db(env.ctx, "registry", "the catalog")
@@ -610,6 +667,11 @@ _JOB_COMPLETED = "completed"
 #: the job kind the catalog import loop rides (``JobKind.IMPORT``).
 _JOB_KIND_IMPORT = "import"
 
+#: execution jobs that end ``failed`` may carry their problem body as the
+#: result (a denied or expired held execution).
+_JOB_KIND_EXECUTION = "execution"
+_JOB_FAILED = "failed"
+
 
 def validate_api_id(api_id: str) -> None:
     """Syntactic guard on the catalog entry id (Go: ``validateAPIID``).
@@ -713,9 +775,9 @@ async def _promote_revisions(env: CallEnv, revisions: list[Any]) -> dict[str, st
     Catalog imports normally land ``IMPORTED`` (already live/searchable), so
     this loop is usually a runtime no-op — non-draft revisions map to their
     state verbatim, exactly like Go. For a genuine draft:
-    ``RevisionService.promote`` enforces NO scopes in-process (the
+    ``RevisionService.promote`` enforces NO permissions in-process (the
     ``apis:write`` gate lives only on the REST route), so the handler
-    soft-checks the scope itself — an unguarded call would let a default agent
+    soft-checks the permission itself — an unguarded call would let a default agent
     actually promote, a capability escalation over REST. The check is
     ``has_effective_permission`` (implication-map expansion), never a literal
     membership test: grants arrive unexpanded and ``org:admin`` implies
@@ -747,7 +809,7 @@ async def _promote_revisions(env: CallEnv, revisions: list[Any]) -> dict[str, st
             promoted[revision_id] = state
             continue
         if not can_write:
-            promoted[revision_id] = "promote failed: missing apis:write scope"
+            promoted[revision_id] = "promote failed: missing apis:write permission"
             continue
         api = rev.get("api") or {}
         try:
@@ -777,16 +839,16 @@ async def handle_import_api(env: CallEnv, arguments: dict[str, Any]) -> mcp_type
         )
     validate_api_id(api_id)
     try:
-        require_scopes(env.identity, ["catalog:import"])
+        require_permissions(env.identity, ["catalog:import"])
     except ToolError as exc:
         # The Go special case (importAPIError's 403 arm): a 403 on THIS route
-        # is the missing catalog:import scope — an access gap the operator
+        # is the missing catalog:import permission — an access gap the operator
         # closes with a dashboard grant, not a revoked identity.
         raise ToolError(
             CODE_BROKER_DENIED,
-            f"importing a cataloged API requires the catalog:import scope: {exc}",
+            f"importing a cataloged API requires the catalog:import permission: {exc}",
             actionable="Ask your human operator to grant this agent the "
-            "catalog:import scope in the dashboard, then retry import_api "
+            "catalog:import permission in the dashboard, then retry import_api "
             "once they confirm.",
         ) from None
     _require_db(env.ctx, "registry", "the catalog")
@@ -805,15 +867,15 @@ async def handle_import_api(env: CallEnv, arguments: dict[str, Any]) -> mcp_type
             job_id = await _file_import(env, api_id)
 
             try:
-                require_scopes(env.identity, ["jobs:read"])
+                require_permissions(env.identity, ["jobs:read"])
             except ToolError:
                 # In-process tracking rides the same jobs:read gate the Go
-                # client's poll leg does (GET /jobs/{id}). Absent the scope,
+                # client's poll leg does (GET /jobs/{id}). Absent the permission,
                 # degrade to the filed-{job_id, status} envelope — NOT an
                 # error: the filing succeeded, only the courtesy tracking is
                 # off the table (REST parity: the poll would have been
-                # refused, the import would not). Both scopes ride
-                # DEFAULT_AGENT_SCOPES, so defaults are unaffected.
+                # refused, the import would not). Both permissions ride
+                # DEFAULT_AGENT_PERMISSIONS, so defaults are unaffected.
                 return tool_result(
                     env.ctx,
                     {"schema_version": SCHEMA_VERSION, "job_id": job_id, "status": "queued"},
@@ -877,7 +939,7 @@ async def _file_import(env: CallEnv, api_id: str) -> str:
             CODE_BROKER_DENIED,
             str(exc),
             actionable="Relay this to your human operator: superseding a confirmed "
-            "overlay is an operator decision (overlays:confirm), not a scope an agent "
+            "overlay is an operator decision (overlays:confirm), not a permission an agent "
             "should request for itself.",
         ) from None
     except CatalogUnavailableError as exc:
@@ -962,17 +1024,17 @@ _EXECUTE_PARAMS = [
 ]
 
 
-async def handle_execute(env: CallEnv, arguments: dict[str, Any]) -> mcp_types.CallToolResult:
+async def handle_execute(env: CallEnv, arguments: dict[str, Any]) -> ToolCallResult:
     return await _execute_tool(env, arguments, read_only_variant=False)
 
 
-async def handle_execute_read(env: CallEnv, arguments: dict[str, Any]) -> mcp_types.CallToolResult:
+async def handle_execute_read(env: CallEnv, arguments: dict[str, Any]) -> ToolCallResult:
     return await _execute_tool(env, arguments, read_only_variant=True)
 
 
 async def _execute_tool(
     env: CallEnv, arguments: dict[str, Any], *, read_only_variant: bool
-) -> mcp_types.CallToolResult:
+) -> ToolCallResult:
     """The shared execute/execute_read handler (Go: ``executeTool``).
 
     Resolve → build → send → classify, with the broker leg proxied
@@ -983,6 +1045,10 @@ async def _execute_tool(
     and never re-sends.
     """
     tool_name = "execute_read" if read_only_variant else "execute"
+    if env.request_state is not None:
+        # A multi-round-trip retry of a held call: never re-send it — read the
+        # job the sealed state names.
+        return await _resume_held(env, env.request_state)
     args = normalize_tool_args(arguments, _EXECUTE_PARAMS)
     target = args.get("operation_id", "")
     if not target:
@@ -1048,6 +1114,9 @@ async def _execute_tool(
         body_bytes = json.dumps(body_value, ensure_ascii=False).encode("utf-8")
 
     idempotency_key = args.get("idempotency_key", "")
+    # Both failure paths judge retry safety on the key that actually rides the
+    # wire, so a key passed via ``headers`` counts the same as idempotency_key.
+    retry_safe = ex.retry_safe(method, ex.effective_idempotency_key(headers, idempotency_key))
     try:
         status, response_headers, raw, execution_id = await ex.send_to_broker(
             method=method,
@@ -1059,7 +1128,6 @@ async def _execute_tool(
             idempotency_key=idempotency_key or None,
         )
     except Exception as exc:
-        retry_safe = bool(idempotency_key) or method in ("GET", "HEAD")
         # ``from None``: the raw transport message stays out of any rendered
         # traceback (``transport_error`` logs a redacted copy).
         raise ex.transport_error(exc, retry_safe=retry_safe) from None
@@ -1068,8 +1136,71 @@ async def _execute_tool(
         raise redirect
     if (denial := ex.classify_denial(status, response_headers, raw)) is not None:
         raise denial
-    return tool_result(
-        env.ctx, ex.execute_result_payload(status, response_headers, raw, execution_id)
+    if (resolve_failure := ex.classify_broker_error(status, response_headers, raw)) is not None:
+        raise resolve_failure
+    if (
+        broker_failure := ex.classify_broker_transport_error(
+            status, response_headers, raw, retry_safe=retry_safe
+        )
+    ) is not None:
+        raise broker_failure
+    payload = ex.execute_result_payload(status, response_headers, raw, execution_id)
+    held = ex.held_envelope(status, payload.get("body"))
+    if held is not None:
+        return await _answer_held(env, held, payload, method, urlsplit(upstream).path or "/")
+    return tool_result(env.ctx, payload)
+
+
+async def _answer_held(
+    env: CallEnv, envelope: dict[str, Any], payload: dict[str, Any], method: str, path: str
+) -> ToolCallResult:
+    """Shape a held (202) call for this client: URL elicitation, else the held result at once."""
+    door = approvals.front_door(env.client_capabilities, env.protocol_version)
+    _log_front_door(env, door, envelope)
+    if door == approvals.FRONT_DOOR_URL_ELICITATION:
+        state = approvals.seal_request_state(
+            env.ctx.encryption, envelope=envelope, agent_id=env.identity.sub
+        )
+        return approvals.url_elicitation_result(
+            review_url=envelope["review_url"],
+            message=approvals.review_message(method, path),
+            request_state=state,
+        )
+    return tool_result(env.ctx, payload)
+
+
+async def _resume_held(env: CallEnv, token: str) -> ToolCallResult:
+    """A URL-elicitation retry: the call's result if finished, else short wait then held result.
+
+    The elicitation response the client sends back is consent to open the
+    review page only — it never decides the approval.
+    """
+    state = approvals.open_request_state(env.ctx.encryption, token, agent_id=env.identity.sub)
+    if state is None:
+        raise invalid_params("Invalid or expired requestState")
+    _log_front_door(env, "url_elicitation_retry", {"held_execution_id": state["held_execution_id"]})
+    terminal = await approvals.short_wait(_held_poller(env), state["held_execution_id"])
+    if terminal is not None:
+        return tool_result(env.ctx, terminal)
+    envelope = approvals.envelope_from_state(state, HELD_AGENT_DIRECTIVE)
+    return tool_result(env.ctx, approvals.held_result_payload(envelope))
+
+
+def _poller(env: CallEnv) -> Callable[[str], Awaitable[dict[str, Any]]]:
+    async def poll(job_id: str) -> dict[str, Any]:
+        return await job_poll_payload(env, job_id)
+
+    return poll
+
+
+def _log_front_door(env: CallEnv, door: str, envelope: dict[str, Any]) -> None:
+    logger.info(
+        "mcp_held_execution_front_door",
+        front_door=door,
+        held_execution_id=envelope.get("held_execution_id"),
+        client_name=env.client_name,
+        client_version=env.client_version,
+        actor_id=env.identity.sub,
     )
 
 
@@ -1090,21 +1221,134 @@ def _header_kvs(obj: dict[str, Any] | None) -> list[tuple[str, str]]:
 
 # ── get_execution_result ──────────────────────────────────────────────────────
 
-_GET_EXECUTION_RESULT_PARAMS = [ParamSpec("job_id", "string", ("id", "job"))]
+_GET_EXECUTION_RESULT_PARAMS = [
+    ParamSpec("held_execution_id", "string", ("held_execution",)),
+    ParamSpec("job_id", "string", ("id", "job")),
+    ParamSpec("timeout", "int"),
+]
+
+#: get_execution_result's ``timeout`` in seconds when the caller sets none, and
+#: its cap (Go: ``defaultPollTimeoutSeconds`` / ``maxPollTimeoutSeconds``).
+DEFAULT_POLL_TIMEOUT_SECONDS = 30
+MAX_POLL_TIMEOUT_SECONDS = 30
 
 
 async def handle_get_execution_result(
     env: CallEnv, arguments: dict[str, Any]
 ) -> mcp_types.CallToolResult:
-    """GET /jobs/{id} (+ /result) in-process (Go: ``handleGetExecutionResult``)."""
+    """Poll a held execution, or an async execution's job (Go: ``handleGetExecutionResult``).
+
+    ``held_execution_id`` (from a held 202) reads through the held execution
+    itself; ``job_id`` (from an async 202) reads the job. It re-polls until the
+    call has finished or ``timeout`` seconds lapse — 30 when absent, and at most
+    30; ``0`` polls once and answers at once.
+    """
     args = normalize_tool_args(arguments, _GET_EXECUTION_RESULT_PARAMS)
+    held_execution_id = args.get("held_execution_id", "")
     job_id = args.get("job_id", "")
-    if not job_id:
+    if bool(held_execution_id) == bool(job_id):
         raise invalid_params(
-            'get_execution_result requires "job_id" (aliases: "id", "job"): the job id '
-            "from a held (202) execute response"
+            'get_execution_result requires exactly one of "held_execution_id" (from a held '
+            '202 execute response) or "job_id" (aliases: "id", "job"; from an async one)'
         )
-    require_scopes(env.identity, ["jobs:read"])
+    timeout = min(
+        max(int(args.get("timeout", DEFAULT_POLL_TIMEOUT_SECONDS)), 0), MAX_POLL_TIMEOUT_SECONDS
+    )
+    if held_execution_id:
+        poll = _held_poller(env)
+        target = held_execution_id
+    else:
+        poll = _poller(env)
+        target = job_id
+    return tool_result(env.ctx, await _poll_until_finished(poll, target, float(timeout)))
+
+
+async def _poll_until_finished(
+    poll: Callable[[str], Awaitable[dict[str, Any]]], target: str, wait: float
+) -> dict[str, Any]:
+    """Poll ``target``, re-polling until finished or ``wait`` seconds lapse; zero polls once."""
+    deadline = time.monotonic() + wait
+    while True:
+        payload = await poll(target)
+        if payload.get("status") in approvals.TERMINAL_JOB_STATUSES:
+            return payload
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return payload
+        await asyncio.sleep(min(approvals.SHORT_WAIT_POLL_SECONDS, remaining))
+
+
+async def held_execution_poll_payload(env: CallEnv, held_execution_id: str) -> dict[str, Any]:
+    """The poll payload for one held execution.
+
+    ``{held_execution_id, state, status, review_url, expires_at,
+    execution_id?, result?, agent_directive?}`` — ``state`` is the decision,
+    ``status`` where the call stands, and the result rides once the call has
+    finished: the upstream response, or the problem explaining why it never
+    ran. Every poll names the held execution and its review page; until the
+    call has finished it also carries the directive to show that page again.
+    Needs no ``jobs:*`` permission: visibility is the held execution's own (the
+    filing agent, its owner, or ``org:admin``).
+    """
+    _require_db(env.ctx, "admin", "held execution polling")
+    svc = HeldExecutionService(env.ctx)
+    try:
+        view = await svc.get(held_execution_id, identity=env.identity)
+    except HeldExecutionNotFoundError:
+        raise ToolError(
+            CODE_RESOLVE_FAILED,
+            f"held execution {held_execution_id!r} not found",
+            actionable="Re-check the id — it is the held_execution_id of the held (202) "
+            "execute response — and call get_execution_result again with the exact value.",
+            next_tool="get_execution_result",
+        ) from None
+    payload: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "held_execution_id": view.id,
+        "state": view.state,
+        "status": view.execution_status,
+        "review_url": env.base_url.rstrip("/") + review_page_path(view.id),
+        "expires_at": _rfc3339(view.expires_at),
+    }
+    if view.execution_id:
+        payload["execution_id"] = view.execution_id
+    if view.execution_status not in approvals.TERMINAL_JOB_STATUSES:
+        payload["agent_directive"] = STILL_HELD_AGENT_DIRECTIVE
+        return payload
+    if view.execution_status in (_JOB_COMPLETED, _JOB_FAILED):
+        try:
+            result = await svc.get_result(held_execution_id, identity=env.identity)
+        except HeldExecutionResultNotReadyError:
+            return payload
+        except Exception as exc:
+            payload["result_error"] = (
+                f"the call finished but its result could not be fetched: {exc}"
+            )
+            return payload
+        _attach_result_view(result, payload)
+    return payload
+
+
+def _rfc3339(when: datetime) -> str:
+    """UTC RFC 3339 with ``Z`` and no trailing fraction zeros (Go: ``time.RFC3339Nano``)."""
+    text = when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f").rstrip("0").rstrip(".")
+    return f"{text}Z"
+
+
+def _held_poller(env: CallEnv) -> Callable[[str], Awaitable[dict[str, Any]]]:
+    async def poll(held_execution_id: str) -> dict[str, Any]:
+        return await held_execution_poll_payload(env, held_execution_id)
+
+    return poll
+
+
+async def job_poll_payload(env: CallEnv, job_id: str) -> dict[str, Any]:
+    """The poll payload for one job (Go: ``handleGetExecutionResult`` body).
+
+    ``{job_id, kind, status, error?, execution_id?, result?}`` — the result
+    rides once the job is ``completed``.
+    """
+    require_permissions(env.identity, ["jobs:read"])
     _require_db(env.ctx, "admin", "job polling")
 
     try:
@@ -1113,7 +1357,7 @@ async def handle_get_execution_result(
         raise ToolError(
             CODE_RESOLVE_FAILED,
             f"job {job_id!r} not found",
-            actionable="Re-check the job id — it is carried by the held (202) execute "
+            actionable="Re-check the job id — it is carried by the async (202) execute "
             "response — and call get_execution_result again with the exact value.",
             next_tool="get_execution_result",
         ) from None
@@ -1134,7 +1378,7 @@ async def handle_get_execution_result(
         # job that failed once with the duplicate message and succeeded on a
         # later attempt carries the stale fragment — its completed result is
         # always more honest than its residual error.
-        return tool_result(env.ctx, _already_imported_payload(job.id))
+        return _already_imported_payload(job.id)
 
     payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -1148,7 +1392,7 @@ async def handle_get_execution_result(
         payload["execution_id"] = job.execution_id
     if job.status == _JOB_COMPLETED:
         await _attach_job_result(env, job_id, payload)
-    return tool_result(env.ctx, payload)
+    return payload
 
 
 async def _attach_job_result(env: CallEnv, job_id: str, payload: dict[str, Any]) -> None:
@@ -1159,9 +1403,17 @@ async def _attach_job_result(env: CallEnv, job_id: str, payload: dict[str, Any])
     """
     try:
         view = await JobResultService(env.ctx).get(job_id, identity=env.identity)
+    except JobNotCompletedError:
+        # A failed job without a recorded problem body has no result to attach.
+        return
     except Exception as exc:
         payload["result_error"] = f"the job completed but its result could not be fetched: {exc}"
         return
+    _attach_result_view(view, payload)
+
+
+def _attach_result_view(view: JobResultView, payload: dict[str, Any]) -> None:
+    """Attach a result document, size-capped: the upstream body, or JSON for other kinds."""
     raw: bytes
     if view.kind == "execution" and view.content_type and view.raw_body is not None:
         raw = view.raw_body
@@ -1183,8 +1435,12 @@ async def _attach_job_result(env: CallEnv, job_id: str, payload: dict[str, Any])
 
 _REQUEST_CONNECTION_PARAMS = [
     ParamSpec("vendor", "string"),
+    ParamSpec("api", "json"),
+    ParamSpec("auth_type", "string"),
     ParamSpec("requested_scopes", "string_list", ("scopes",)),
     ParamSpec("reason", "string"),
+    ParamSpec("oauth_app_registration_id", "string", ("registration_id",)),
+    ParamSpec("requested_permission_rules", "json", ("permission_rules",)),
 ]
 
 #: The operator-relay guidance stamped on every successful result (Go:
@@ -1198,6 +1454,24 @@ _REQUEST_CONNECTION_INSTRUCTION = (
     "that was blocked."
 )
 
+#: Replaces :data:`_REQUEST_CONNECTION_INSTRUCTION` for a session a human
+#: finishes by entering a credential (or picking an OAuth app) — Go:
+#: ``requestConnectionHumanEntryInstruction``, same text. It can take hours and
+#: this surface has no status tool, so the agent ends its turn and retries
+#: ``execute`` later.
+_REQUEST_CONNECTION_HUMAN_ENTRY_INSTRUCTION = (
+    "Relay the approval_url to your human user and end your turn: a human enters the "
+    "credential (or picks the OAuth app) in the browser, which can take hours, so do not "
+    "wait or poll. Later, check your bindings with whoami and retry the call that was "
+    "blocked. Asking again for the same API returns this same request."
+)
+
+#: ``resolved_flow`` of an OAuth API with no OAuth app to connect through yet.
+_FLOW_AWAITING_APP = "awaiting_app"
+
+#: the route's ``auth_type`` bound (``max_length=255``) — Go: ``connectAuthTypeMax``.
+_REQUEST_CONNECTION_AUTH_TYPE_MAX = 255
+
 #: the route's ``reason`` bound (``IntegrationsConnectRequest.reason`` —
 #: ``max_length=1024``), enforced here because the in-process call skips the
 #: route's pydantic validation.
@@ -1206,6 +1480,226 @@ _REQUEST_CONNECTION_REASON_MAX = 1024
 #: Upper bound on ``requested_scopes`` — the Go mount's ``connectScopesMax``
 #: twin, so neither mount forwards an unbounded list to the vendor authorize URL.
 _REQUEST_CONNECTION_SCOPES_MAX = 100
+
+#: The route's ``oauth_app_registration_id`` bound (``max_length=30``) — the
+#: Go mount's ``connectRegistrationMax`` twin.
+_REQUEST_CONNECTION_REGISTRATION_MAX = 30
+
+#: The route's ``requested_permission_rules`` bound (``max_length=100``) — the
+#: Go mount's ``connectRulesMax`` twin.
+_REQUEST_CONNECTION_RULES_MAX = 100
+
+#: The MCP lanes' retry form in the ambiguous-vendor advice (Go:
+#: ``requestConnectionRegistrationRetry``).
+_REQUEST_CONNECTION_REGISTRATION_RETRY = (
+    "call request_connection again with oauth_app_registration_id set to the "
+    "registration_id they pick"
+)
+
+
+def _ambiguous_vendor_actionable(vendor: str, *, listed: bool) -> str:
+    """The ask-your-user advice (Go: ``ambiguousVendorActionable``, same text).
+
+    Choosing which shared OAuth app mints the credential is the user's policy
+    decision, so the agent asks and retries with the id — it never picks.
+    """
+    which = "ask your human user which app to use and for its registration_id"
+    if listed:
+        which = (
+            "show your human user the apps in details.candidates (name and "
+            "registration_id) and ask which one to use"
+        )
+    return (
+        f'Several shared OAuth apps serve vendor "{vendor}", and choosing one is your '
+        f"user's decision, not yours: {which}, then {_REQUEST_CONNECTION_REGISTRATION_RETRY}."
+    )
+
+
+async def _ambiguous_vendor_candidates(
+    env: CallEnv, registration_ids: list[str]
+) -> list[dict[str, str]]:
+    """The shared apps an ambiguous connect matched, as ``GET /vendors`` rows.
+
+    Same projection and gate as the Go mount's ``GET /vendors`` read
+    (``capabilities:read``), narrowed to the registrations the resolver
+    counted. Best effort: a failure yields ``[]`` and the advice still routes
+    the choice to the user.
+    """
+    try:
+        require_permissions(env.identity, ["capabilities:read"])
+    except ToolError:
+        return []
+    wanted = set(registration_ids)
+    try:
+        entries = await VendorRegistryService(env.ctx).list_entries()
+    except Exception:
+        logger.warning("mcp_request_connection_candidates_failed", exc_info=True)
+        return []
+    return [
+        {
+            "registration_id": e.registration_id,
+            "name": e.name,
+            "display_name": e.display_name,
+        }
+        for e in entries
+        if e.registration_id is not None and e.registration_id in wanted
+    ]
+
+
+def _requested_permission_rules(raw: Any) -> list[dict[str, object]] | None:
+    """Validate the rule ask with the route's schema (``PermissionRuleSchema``).
+
+    The in-process call skips the route's pydantic validation, so the same
+    model runs here; a malformed ask is an invalid-params error. Returns the
+    route's wire shape (``model_dump(exclude_none=True)``), or ``None`` when
+    no rules were passed.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise invalid_params(
+            "requested_permission_rules must be a list of rule objects "
+            "({effect, methods, path, match_mode, operations})"
+        )
+    if len(raw) > _REQUEST_CONNECTION_RULES_MAX:
+        raise invalid_params(
+            f"requested_permission_rules must list at most {_REQUEST_CONNECTION_RULES_MAX} "
+            f"rules, got {len(raw)}"
+        )
+    rules: list[dict[str, object]] = []
+    for idx, item in enumerate(raw):
+        try:
+            rule = PermissionRuleSchema.model_validate(item)
+        except ValidationError as exc:
+            reasons = "; ".join(str(e.get("msg", "")) for e in exc.errors())
+            raise invalid_params(f"requested_permission_rules[{idx}]: {reasons}") from None
+        rules.append(rule.model_dump(exclude_none=True))
+    return rules or None
+
+
+def _is_human_entry_flow(flow: str) -> bool:
+    """A session a human finishes by entering a credential (Go: ``isHumanEntryFlow``)."""
+    return flow == _FLOW_AWAITING_APP or flow.startswith("manual_")
+
+
+def _connect_api_target(raw: Any) -> ApiTarget:
+    """The ``api`` argument: a ``{vendor, name, version}`` object or a slug string."""
+    if isinstance(raw, str):
+        parts = raw.strip().split("/")
+        if len(parts) == 3 and all(parts):
+            return ApiTarget(vendor=parts[0], name=parts[1], version=parts[2])
+    elif isinstance(raw, dict):
+        fields = [raw.get(k) for k in ("vendor", "name", "version")]
+        if all(isinstance(v, str) and v for v in fields):
+            vendor, name, version = (str(v) for v in fields)
+            return ApiTarget(vendor=vendor, name=name, version=version)
+    raise invalid_params(
+        'api must be {"vendor", "name", "version"} or a "vendor/name/version" string'
+    )
+
+
+def _api_target_tool_error(exc: Exception, target: str) -> ToolError | None:
+    """The API-target and session-cap service errors as coded tool errors.
+
+    Same codes, prose and ``next_tool`` as the Go mount's ``apiTargetCoded``
+    (MCP vocabulary); ``None`` for any other error.
+    """
+    if isinstance(exc, ManualFlowsDisabledError):
+        return ToolError(
+            CODE_BROKER_DENIED,
+            f"this deployment does not take connect requests for registry APIs ({target}): {exc}",
+            actionable="Report the gap to your human user once: ask them to connect a "
+            f"credential for {target} in the dashboard and bind this agent — name the auth "
+            "type the API's spec declares, the permission rules you need, and why. Then end "
+            "your turn and retry later.",
+            extra={"retryable": False},
+        )
+    if isinstance(exc, UnknownApiError):
+        return ToolError(
+            CODE_RESOLVE_FAILED,
+            f"no live API {target} in this deployment's registry: {exc}",
+            actionable="Check the identity against the api.vendor/name/version that "
+            "inspect_operation reports; if the API is not imported yet, find it with "
+            "search_catalog and import it with import_api, then call request_connection again.",
+            next_tool="search_catalog",
+            extra={"retryable": False},
+        )
+    if isinstance(exc, AuthTypeRequiredError | AuthTypeNotDeclaredError):
+        lead = (
+            "The API's spec declares several auth schemes"
+            if isinstance(exc, AuthTypeRequiredError)
+            else "That auth type is not one the API's spec declares"
+        )
+        retry = "call request_connection again with auth_type set to one of them"
+        if exc.options:
+            actionable = (
+                f"{lead} ({', '.join(exc.options)}): pick the one the task needs and {retry}."
+            )
+        else:
+            actionable = f"{lead}: read them from the API's spec and {retry}."
+        return ToolError(
+            CODE_RESOLVE_FAILED,
+            f"cannot start a connect session for {target}: {exc}",
+            actionable=actionable,
+            details={"options": list(exc.options)} if exc.options else None,
+            next_tool="request_connection",
+            extra={"retryable": False},
+        )
+    if isinstance(exc, NoDeclaredSchemeError):
+        return ToolError(
+            CODE_BROKER_DENIED,
+            f"API {target} declares no auth scheme a connect session can collect: {exc}",
+            actionable="You cannot start this connection. Tell your human user: an operator "
+            f"can create the credential for {target} directly in the dashboard (or the API's "
+            "spec must declare its auth). Do not retry the connect.",
+            extra={"retryable": False},
+        )
+    if isinstance(exc, UnpinnedServerHostError):
+        return ToolError(
+            CODE_BROKER_DENIED,
+            f"API {target} takes its server host from an unrestricted variable: {exc}",
+            actionable="A credential for it cannot be pinned to known hosts, so you cannot "
+            "start this connection. Tell your human user: an operator can create the "
+            "credential directly in the dashboard (or the API's spec must limit its server "
+            "variables to an enum). Do not retry the connect.",
+            details={"variables": list(exc.variables)} if exc.variables else None,
+            extra={"retryable": False},
+        )
+    if isinstance(exc, ReservedAuthFieldError):
+        return ToolError(
+            CODE_BROKER_DENIED,
+            f"API {target} injects its key into a header the platform reserves: {exc}",
+            actionable="You cannot start this connection. Tell your human user: an operator "
+            "can create the credential directly in the dashboard. Do not retry the connect.",
+            extra={"retryable": False},
+        )
+    if isinstance(exc, SecuritySchemesLookupUnavailableError):
+        return ToolError(
+            CODE_BROKER_DENIED,
+            f"this instance cannot read the registry to connect {target}: {exc}",
+            actionable="Report it to your human user: the connect service cannot reach the "
+            "registry on this deployment. They can connect the credential in the dashboard "
+            "instead.",
+            extra={"retryable": False},
+        )
+    if isinstance(exc, TooManyOpenSessionsError):
+        return ToolError(
+            CODE_BROKER_DENIED,
+            f"too many open connect requests are already waiting for a human: {exc}",
+            actionable="Do not open more. Relay the approval URLs you already have to your "
+            "human user, end your turn, and retry the blocked calls once they act.",
+            extra={"retryable": False},
+        )
+    if isinstance(exc, RecentlyRejectedError):
+        return ToolError(
+            CODE_BROKER_DENIED,
+            f"a human recently rejected this agent's request to connect {target}: {exc}",
+            actionable="Do not ask again. Tell your human user the request was rejected and "
+            "what you needed it for; continue without this API unless they say otherwise.",
+            extra={"retryable": False},
+        )
+    return None
+
 
 #: Per-actor rate-limit twin of the route's: the mount calls the
 #: connect-session service in-process, bypassing the route's app-state
@@ -1227,21 +1721,43 @@ async def handle_request_connection(
     """POST /integrations:connect in-process (Go: ``handleRequestConnection``).
 
     Create-only (theme-7 Phase 1b): starts a connect session for a registry
-    vendor and returns ``{session_id, approval_url, resolved_flow}`` plus the
-    operator-relay instruction. ``poll_token`` is not surfaced as a separate
-    field — this surface serves no poll leg (the recovery loop is relay
-    approval_url → operator approves → confirm via whoami → retry); it still
-    rides the approval_url's query string, which the approving human needs. ``agent_id``
+    vendor (``vendor``) or a registry API (``api``, with an optional
+    ``auth_type``) and returns ``{session_id, approval_url, resolved_flow}``
+    plus the operator-relay instruction — for a session a human finishes by
+    entering a credential, the end-your-turn instruction and ``next_tool:
+    execute``. ``poll_token`` is not surfaced — this surface
+    serves no poll leg (the recovery loop is relay approval_url → operator
+    approves → confirm via whoami → retry), and the approval_url carries only
+    the session id: the agent's owner or ``org:admin`` approves without the
+    token. ``agent_id``
     is never taken from arguments: the caller *is* the agent (the route
-    refuses a supplied agent_id with 403 for the same reason).
+    refuses a supplied agent_id with 403 for the same reason). Like the route,
+    it forwards ``oauth_app_registration_id``, the validated
+    ``requested_permission_rules`` and the process's catalog auto-importer and
+    security-schemes lookup.
     """
     args = normalize_tool_args(arguments, _REQUEST_CONNECTION_PARAMS)
     vendor = args.get("vendor", "")
-    if not vendor:
+    api_target = _connect_api_target(args["api"]) if "api" in args else None
+    if bool(vendor) == (api_target is not None):
         raise invalid_params(
-            'request_connection requires "vendor": the vendor registry key, '
-            'e.g. {"vendor": "github"}'
+            'request_connection requires exactly one of "vendor" (the vendor registry key, '
+            'e.g. {"vendor": "github"}) or "api" (e.g. {"api": {"vendor": "stripe-com", '
+            '"name": "stripe-com-api", "version": "2024-06-20"}})'
         )
+    auth_type = args.get("auth_type") or None
+    if auth_type is not None and api_target is None:
+        raise invalid_params('auth_type applies to an "api" target only')
+    if auth_type is not None and len(auth_type) > _REQUEST_CONNECTION_AUTH_TYPE_MAX:
+        raise invalid_params(
+            f"auth_type must be at most {_REQUEST_CONNECTION_AUTH_TYPE_MAX} characters, "
+            f"got {len(auth_type)}"
+        )
+    target = (
+        f"{api_target.vendor}/{api_target.name}/{api_target.version}"
+        if api_target is not None
+        else vendor
+    )
     reason = args.get("reason", "")
     if len(reason) > _REQUEST_CONNECTION_REASON_MAX:
         raise invalid_params(
@@ -1253,19 +1769,26 @@ async def handle_request_connection(
             f"requested_scopes must list at most {_REQUEST_CONNECTION_SCOPES_MAX} scopes, "
             f"got {len(requested_scopes)}"
         )
+    registration_id = args.get("oauth_app_registration_id") or None
+    if registration_id is not None and len(registration_id) > _REQUEST_CONNECTION_REGISTRATION_MAX:
+        raise invalid_params(
+            "oauth_app_registration_id must be at most "
+            f"{_REQUEST_CONNECTION_REGISTRATION_MAX} characters, got {len(registration_id)}"
+        )
+    requested_rules = _requested_permission_rules(args.get("requested_permission_rules"))
     try:
         # The route's any-of gate (credentials:connect | credentials:write);
         # agents hold credentials:connect by default.
-        require_scopes(env.identity, ["credentials:connect", "credentials:write"])
+        require_permissions(env.identity, ["credentials:connect", "credentials:write"])
     except ToolError as exc:
         # The Go special case (requestConnectionError's 403 arm): a 403 on
-        # THIS route is the missing credentials:connect scope — an access gap
+        # THIS route is the missing credentials:connect permission — an access gap
         # the operator closes with a dashboard grant, not a revoked identity.
         raise ToolError(
             CODE_BROKER_DENIED,
-            f"starting a connect session requires the credentials:connect scope: {exc}",
+            f"starting a connect session requires the credentials:connect permission: {exc}",
             actionable="Ask your human operator to grant this agent the "
-            "credentials:connect scope in the dashboard, then retry "
+            "credentials:connect permission in the dashboard, then retry "
             "request_connection once they confirm.",
         ) from None
 
@@ -1283,23 +1806,68 @@ async def handle_request_connection(
     # unbound credential (the tool surface carries no agent_id).
     agent_id = env.identity.sub if env.identity.actor_type == ActorType.AGENT else None
     try:
-        created = await ConnectSessionService(env.ctx).create_session(
+        created = await ConnectSessionService(
+            env.ctx,
+            catalog_auto_importer=env.catalog_auto_importer,
+            security_schemes_lookup=env.security_schemes_lookup,
+        ).create_session(
             vendor_key=vendor,
+            api_target=api_target,
+            auth_type=auth_type,
             agent_id=agent_id,
-            initiator_actor_id=env.identity.sub,
+            identity=env.identity,
             requested_scopes=requested_scopes,
+            requested_permission_rules=requested_rules,
             preferred_flow=None,
             reason=reason or None,
+            oauth_app_registration_id=registration_id,
         )
+    except (
+        ManualFlowsDisabledError,
+        UnknownApiError,
+        AuthTypeRequiredError,
+        AuthTypeNotDeclaredError,
+        NoDeclaredSchemeError,
+        UnpinnedServerHostError,
+        ReservedAuthFieldError,
+        SecuritySchemesLookupUnavailableError,
+        TooManyOpenSessionsError,
+        RecentlyRejectedError,
+    ) as exc:
+        mapped = _api_target_tool_error(exc, target)
+        assert mapped is not None
+        raise mapped from None
     except UnknownVendorError as exc:
         raise ToolError(
             CODE_RESOLVE_FAILED,
             f"cannot start a connect session for vendor {vendor!r}: {exc}",
             actionable='Pass a vendor registry key this deployment supports (e.g. "github"). '
-            "If the vendor is not in the registry, this tool cannot connect it: find the "
-            "API with search_catalog and ask your human operator to connect a credential "
-            "for it in the dashboard instead.",
+            "For an API outside the registry, call request_connection with api set to its "
+            "vendor/name/version instead (find it with search_catalog first); if this "
+            "deployment does not take API connect requests, ask your human operator to "
+            "connect a credential for it in the dashboard.",
             next_tool="search_catalog",
+        ) from None
+    except AmbiguousVendorError as exc:
+        # Several admin-registered OAuth apps serve this vendor and the call
+        # carried no pin: list them so the agent can ask its user, then retry
+        # with the picked id (Go mount: the 400 ambiguous_vendor arm).
+        candidates = await _ambiguous_vendor_candidates(env, exc.registration_ids)
+        raise ToolError(
+            CODE_RESOLVE_FAILED,
+            f"cannot start a connect session for {target!r}: {exc}",
+            actionable=_ambiguous_vendor_actionable(vendor or exc.vendor, listed=bool(candidates)),
+            details={"candidates": candidates} if candidates else None,
+            next_tool="request_connection",
+        ) from None
+    except InvalidOAuthAppRegistrationError as exc:
+        raise ToolError(
+            CODE_RESOLVE_FAILED,
+            f"cannot start a connect session for {target!r}: {exc}",
+            actionable="The registration_id does not name an active shared OAuth app for "
+            f'"{vendor or target}". Check the id with your human user, or call request_connection '
+            "again without oauth_app_registration_id to see the shared apps that serve it.",
+            next_tool="request_connection",
         ) from None
     except (UnsupportedFlowError, NoOpForFlowError) as exc:
         # Aligned with the Go mount's 400/404 arm (review L1): the route
@@ -1308,7 +1876,7 @@ async def handle_request_connection(
         # connected here, so rediscover or route to the operator.
         raise ToolError(
             CODE_RESOLVE_FAILED,
-            f"cannot start a connect session for vendor {vendor!r}: {exc}",
+            f"cannot start a connect session for {target!r}: {exc}",
             actionable="This vendor's connect flow is not usable on this deployment, so "
             "this tool cannot connect it: find the API with search_catalog and ask your "
             "human operator to connect a credential for it in the dashboard instead.",
@@ -1325,20 +1893,21 @@ async def handle_request_connection(
 
     logger.info(
         "mcp_request_connection",
-        vendor=vendor,
+        target=target,
         session_id=created.session_id,
         flow=created.resolved_flow,
     )
-    return tool_result(
-        env.ctx,
-        {
-            "schema_version": SCHEMA_VERSION,
-            "session_id": created.session_id,
-            "approval_url": created.approval_url,
-            "resolved_flow": created.resolved_flow,
-            "instruction": _REQUEST_CONNECTION_INSTRUCTION,
-        },
-    )
+    payload: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "session_id": created.session_id,
+        "approval_url": created.approval_url,
+        "resolved_flow": created.resolved_flow,
+        "instruction": _REQUEST_CONNECTION_INSTRUCTION,
+    }
+    if _is_human_entry_flow(created.resolved_flow):
+        payload["instruction"] = _REQUEST_CONNECTION_HUMAN_ENTRY_INSTRUCTION
+        payload["next_tool"] = "execute"
+    return tool_result(env.ctx, payload)
 
 
 # ── dispatch ──────────────────────────────────────────────────────────────────
@@ -1361,6 +1930,21 @@ HANDLERS: dict[str, Handler] = {
 async def dispatch_tool_call(
     env: CallEnv, name: str, arguments: dict[str, Any] | None
 ) -> mcp_types.CallToolResult:
+    """Route one tools/call whose caller declared no input-required support.
+
+    Only a held execute for a client declaring ``elicitation.url`` answers
+    with an input-required result, and ``env`` carries the capabilities, so a
+    caller passing none always gets a plain tool result.
+    """
+    result = await dispatch_mcp_tool_call(env, name, arguments)
+    if not isinstance(result, mcp_types.CallToolResult):
+        raise MCPError(mcp_types.INTERNAL_ERROR, "tool answered with input required")
+    return result
+
+
+async def dispatch_mcp_tool_call(
+    env: CallEnv, name: str, arguments: dict[str, Any] | None
+) -> ToolCallResult:
     """Route one authenticated tools/call to its handler.
 
     ``ToolError`` renders as the coded ``isError`` result (diagnosable

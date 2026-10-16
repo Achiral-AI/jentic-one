@@ -17,6 +17,8 @@ from jentic_one.broker.core.exceptions import (
     ActionDeniedError,
     AgentDirective,
     AmbiguousMatchError,
+    ApprovalHoldUnavailableError,
+    ApprovalPendingLimitError,
     BrokerError,
     CircuitOpenError,
     CredentialIdentityMismatchError,
@@ -48,6 +50,8 @@ from jentic_one.broker.core.exceptions import (
 # Domain exception → HTTP status error map.
 STATUS_BY_ERROR: dict[type[BrokerError], int] = {
     ActionDeniedError: 403,
+    ApprovalPendingLimitError: 403,
+    ApprovalHoldUnavailableError: 503,
     CredentialIdentityMismatchError: 403,
     OperationNotFoundError: 404,
     AmbiguousMatchError: 409,
@@ -91,11 +95,17 @@ def problem_body(
     directive: AgentDirective | None = None,
     instance: str | None = None,
 ) -> dict[str, Any]:
-    """Build an RFC 9457 problem body carrying the agent-recovery contract."""
+    """Build an RFC 9457 problem body carrying the agent-recovery contract.
+
+    ``detail`` is the occurrence-specific message (required by the published
+    problem-details schema). ``title`` carries the same text for backward
+    compatibility with callers that read the message from ``title``.
+    """
     body: dict[str, Any] = {
         "type": type,
         "title": detail,
         "status": status,
+        "detail": detail,
         "error_origin": origin.value,
         **(extra or {}),
     }

@@ -50,6 +50,74 @@ export interface ReviewSession {
 		name: string | null;
 		version: string | null;
 	};
+	/** ``vendor`` for a vendor-registry key, ``api`` for a registry API identity. */
+	target_kind?: 'vendor' | 'api';
+	/** OAuth scopes the session asks for — compared with an existing credential's grant. */
+	requested_scopes?: string[];
+	/** Where an API target's live revision came from; null for vendor targets. */
+	provenance?: ReviewProvenance | null;
+	/** The agent the session binds and its owner (server data). */
+	agent?: ReviewAgent | null;
+	/** The declared scheme an API target collects; null for vendor targets. */
+	scheme?: ReviewScheme | null;
+	/** The hosts the credential may be sent to, pinned at ``:connect``. */
+	pinned_hosts?: string[] | null;
+	/**
+	 * Fingerprint of what the approver decides on. Echoed on ``:confirm`` with
+	 * ``expected_agent_id``; a mismatch is 409 ``review_stale``.
+	 */
+	digest: string;
+	/** Whether this viewer may confirm the session as it stands. */
+	can_confirm: boolean;
+	/** Credentials the viewer already holds for the target. */
+	existing_credentials?: ExistingCredential[];
+}
+
+/** Session states a review can show; the terminal ones never reach the review read. */
+export type ReviewSessionState = 'created' | 'awaiting_app' | 'polling' | 'connected';
+
+export interface ReviewProvenance {
+	/** ``catalog`` for a public-catalog import; anything else is a submitted spec. */
+	origin: string | null;
+	catalog_api_id: string | null;
+	/** Actor id of whoever submitted the spec, when known. */
+	submitted_by: string | null;
+	source_url: string | null;
+	revision_id: string;
+}
+
+export interface ReviewAgent {
+	agent_id: string;
+	name: string | null;
+	owner_id: string | null;
+	status: string;
+}
+
+export interface ReviewScheme {
+	type: 'api_key' | 'bearer' | 'basic' | 'oauth2';
+	/** ``header`` / ``query`` / ``cookie`` for an API key. */
+	location: string | null;
+	field_name: string | null;
+	/** An OAuth scheme's authorize URL — set only when the API's spec is from the public catalog. */
+	authorization_url?: string | null;
+	/** An OAuth scheme's token URL — set only when the API's spec is from the public catalog. */
+	token_url?: string | null;
+}
+
+/**
+ * A credential the viewer already holds for the session's target.
+ * ``granted_scopes`` / ``missing_scopes`` are set for OAuth credentials only.
+ * ``can_reauthorize`` is false whenever another agent is bound to it.
+ */
+export interface ExistingCredential {
+	credential_id: string;
+	name: string;
+	type: string;
+	granted_scopes: string[] | null;
+	missing_scopes: string[] | null;
+	other_bound_agent_ids: string[];
+	can_bind: boolean;
+	can_reauthorize: boolean;
 }
 
 /**
@@ -61,12 +129,12 @@ export interface ReviewSession {
  * four match conditions being ``null`` means "match anything for this
  * field"; ``match_mode`` picks how ``path`` is interpreted.
  *
- * Backend model-validator forbids a condition-less ``allow`` — a rule
- * with ``effect=allow`` MUST constrain at least one of methods, path, or
- * operations.
+ * Backend model-validator forbids a condition-less ``allow`` or
+ * ``require-approval`` — such a rule MUST constrain at least one of
+ * methods, path, or operations.
  */
 export interface PermissionRule {
-	effect: 'allow' | 'deny';
+	effect: 'allow' | 'deny' | 'require-approval';
 	methods?: string[] | null;
 	path?: string | null;
 	match_mode?: 'regex' | 'prefix' | 'exact';
@@ -74,7 +142,9 @@ export interface PermissionRule {
 	comment?: string | null;
 }
 
+/** The OAuth confirm — the default variant (a body without ``kind``). */
 export interface ConfirmRequest {
+	kind?: 'oauth';
 	confirmed_scopes: string[];
 	permission_rules: PermissionRule[];
 	// Set when the caller wants the credential bound to an agent that
@@ -84,7 +154,60 @@ export interface ConfirmRequest {
 	// agent_id — so this is only meaningful for user-initiated
 	// unbound sessions.
 	agent_id?: string | null;
+	/** The review the approver saw; checked when given, required for an API target. */
+	expected_agent_id?: string | null;
+	digest?: string | null;
 }
+
+/** Fields every non-OAuth confirm carries: the rules and the review it answers. */
+interface ReviewedConfirm {
+	permission_rules: PermissionRule[];
+	agent_id?: string | null;
+	expected_agent_id: string | null;
+	digest: string;
+}
+
+export interface ApiKeyConfirmRequest extends ReviewedConfirm {
+	kind: 'api_key';
+	key: string;
+}
+
+export interface BearerConfirmRequest extends ReviewedConfirm {
+	kind: 'bearer';
+	token: string;
+}
+
+export interface BasicConfirmRequest extends ReviewedConfirm {
+	kind: 'basic';
+	username: string;
+	password: string;
+}
+
+/** Resolve an ``awaiting_app`` session with the approver's own OAuth client. */
+export interface OwnOAuthClientConfirmRequest extends ReviewedConfirm {
+	kind: 'own_oauth_client';
+	client_id: string;
+	client_secret: string;
+	/** Default to the API's declared authorization-code endpoints when omitted. */
+	authorize_url?: string | null;
+	token_url?: string | null;
+	confirmed_scopes: string[];
+}
+
+/** Bind a credential the approver already holds (optionally re-consenting it). */
+export interface ExistingCredentialConfirmRequest extends ReviewedConfirm {
+	kind: 'existing_credential' | 'reauthorize';
+	credential_id: string;
+}
+
+/** Every ``:confirm`` body; ``kind`` picks the variant server-side. */
+export type ConfirmSessionBody =
+	| ConfirmRequest
+	| ApiKeyConfirmRequest
+	| BearerConfirmRequest
+	| BasicConfirmRequest
+	| OwnOAuthClientConfirmRequest
+	| ExistingCredentialConfirmRequest;
 
 /**
  * Discriminated on ``kind`` — the UI branches on the tag, not on which
@@ -97,6 +220,28 @@ export interface ConfirmRequest {
  *   ``/credentials/oauth/callback`` and the SPA observes it via ``/status``.
  */
 export type ConfirmResponse = DeviceAuthorizationConfirmResponse | AuthCodeConfirmResponse;
+
+/**
+ * Every ``:confirm`` result. Beyond the vendor challenges above:
+ *
+ * * ``connected`` — the confirm finished the session (a typed secret or an
+ *   existing credential); ``credential_id`` is bound to the agent.
+ * * ``reauthorize`` — the agent is bound to ``credential_id``; ``authorize_url``
+ *   asks the vendor for the wider scopes on that credential.
+ */
+export type ConfirmSessionResponse =
+	ConfirmResponse | ConnectedConfirmResponse | ReauthorizeConfirmResponse;
+
+export interface ConnectedConfirmResponse {
+	kind: 'connected';
+	credential_id: string;
+}
+
+export interface ReauthorizeConfirmResponse {
+	kind: 'reauthorize';
+	credential_id: string;
+	authorize_url: string;
+}
 
 export interface DeviceAuthorizationConfirmResponse {
 	kind: 'device_authorization';
@@ -123,6 +268,19 @@ export interface StatusResponse {
 
 export interface ConnectRequest {
 	vendor: string;
+	/**
+	 * Optional user-facing label for the resulting credential. Defaults to
+	 * the vendor's display name when omitted. Lets a user distinguish
+	 * multiple credentials minted from the same vendor.
+	 */
+	name?: string | null;
+	/**
+	 * Optional pin to a specific admin-registered OAuth app. Without it the
+	 * server uses the platform config entry, else the vendor's single active
+	 * registration — several matching registrations is a 400
+	 * `ambiguous_vendor`, so picker cards for registrations always pin.
+	 */
+	oauth_app_registration_id?: string | null;
 	agent_id?: string | null;
 	requested_scopes?: string[];
 	preferred_flow?: string | null;
@@ -140,10 +298,38 @@ export interface ConnectResponse {
 // ---------------------------------------------------------------------------
 
 export interface VendorSummary {
+	/**
+	 * Stable per-row UI key. For admin-registered rows this is the
+	 * ``oar_...`` registration id; for platform-shipped config entries it is
+	 * the vendor slug. Two admin registrations for the same vendor share
+	 * ``key`` but differ on ``entry_id`` — key the picker off this so cards
+	 * do not collapse.
+	 */
+	entry_id: string;
+	/** Present when the row came from an ``oauth_app_registrations`` row. */
+	registration_id?: string | null;
+	/** Vendor slug shared by every registration for the same vendor. */
 	key: string;
+	/**
+	 * Config-side fully-qualified vendor id when available; falls back to
+	 * ``key`` for DB-only vendors.
+	 */
 	vendor: string;
+	/** Vendor's family display name (e.g. "Gmail"). */
 	display_name: string;
+	/**
+	 * Per-row human label. For DB rows this is the admin-picked registration
+	 * name; for config rows this equals ``display_name``.
+	 */
+	name: string;
+	/** ``db`` = admin registration, ``config`` = platform-shipped entry. */
+	source: 'db' | 'config';
 	flow_kinds: string[];
+	/**
+	 * For ``db`` rows, the catalog API the shared app signs in to
+	 * (``<domain>/<sub>``); ``null`` for config rows.
+	 */
+	catalog_api_id?: string | null;
 }
 
 export interface VendorListResponse {

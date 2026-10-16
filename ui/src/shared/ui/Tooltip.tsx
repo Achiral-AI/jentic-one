@@ -7,20 +7,21 @@ import {
 	useLayoutEffect,
 	useRef,
 	useState,
+	type FocusEvent,
 	type ReactElement,
 	type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
 import { cn } from '@/shared/lib/utils';
 
-type TooltipPlacement = 'top' | 'bottom';
+type TooltipPlacement = 'top' | 'bottom' | 'right';
 
 interface TooltipProps {
 	/** Tooltip content shown on hover/focus. Rendered into a body portal. */
 	content: ReactNode;
 	/** The trigger content the tooltip describes. */
 	children: ReactNode;
-	/** Where the tooltip sits relative to the trigger. Default `top`. */
+	/** Where the tooltip sits relative to the trigger (`right` = beside it). Default `top`. */
 	placement?: TooltipPlacement;
 	/**
 	 * Hover open delay in ms (default 400). Keyboard focus always opens
@@ -54,11 +55,15 @@ interface TooltipProps {
  * the rail's scroll container), and carries `role="tooltip"` +
  * `aria-describedby` for assistive tech.
  */
+/** How long a hover rests before a tooltip opens, unless the caller sets
+ * `delayMs` (focus opens it at once). */
+export const TOOLTIP_DELAY_MS = 400;
+
 export function Tooltip({
 	content,
 	children,
 	placement = 'top',
-	delayMs = 400,
+	delayMs = TOOLTIP_DELAY_MS,
 	className,
 	bubbleClassName,
 	interactiveChild = false,
@@ -82,8 +87,14 @@ export function Tooltip({
 		const el = triggerRef.current;
 		if (!el) return;
 		const rect = el.getBoundingClientRect();
-		const top = placement === 'top' ? rect.top - 8 : rect.bottom + 8;
-		const left = rect.left + rect.width / 2;
+		// `right`: beside the trigger, vertically centred (narrow vertical rails).
+		const top =
+			placement === 'top'
+				? rect.top - 8
+				: placement === 'right'
+					? rect.top + rect.height / 2
+					: rect.bottom + 8;
+		const left = placement === 'right' ? rect.right + 8 : rect.left + rect.width / 2;
 		// Skip the state write (and its re-render) when the measured position
 		// hasn't moved — a nested scroll that doesn't shift the trigger shouldn't
 		// churn React.
@@ -111,6 +122,18 @@ export function Tooltip({
 		clearTimer();
 		setShow(false);
 	}, [clearTimer]);
+
+	/** Focus open — KEYBOARD focus only. A sheet or dialog opened by a click
+	 *  moves focus onto its first control (and back onto the opener when it
+	 *  closes); that programmatic focus is not `:focus-visible`, and a tooltip
+	 *  it opened would sit over the sheet unasked. */
+	const revealOnFocus = useCallback(
+		(event: FocusEvent<HTMLElement>) => {
+			if (event.target instanceof Element && !event.target.matches(':focus-visible')) return;
+			reveal();
+		},
+		[reveal],
+	);
 
 	// Never leak a pending open timer if the trigger unmounts mid-delay.
 	useEffect(() => clearTimer, [clearTimer]);
@@ -194,7 +217,7 @@ export function Tooltip({
 			aria-describedby={interactiveChild ? undefined : tooltipId}
 			onMouseEnter={openDelayed}
 			onMouseLeave={close}
-			onFocus={reveal}
+			onFocus={revealOnFocus}
 			onBlur={close}
 		>
 			{describedChildren}
@@ -212,8 +235,10 @@ export function Tooltip({
 							// `whitespace-normal` (not nowrap): long content must wrap
 							// inside the max-width, not overflow the bubble. Consumers
 							// with short one-liners are unaffected.
-							'border-border/40 bg-card/70 text-card-foreground pointer-events-none fixed z-[9999] max-w-[320px] -translate-x-1/2 rounded-lg border px-3 py-2 text-xs whitespace-normal shadow-xl backdrop-blur-md',
+							'border-border/40 bg-card/70 text-card-foreground pointer-events-none fixed z-[9999] max-w-[320px] rounded-lg border px-3 py-2 text-xs whitespace-normal shadow-xl backdrop-blur-md',
+							placement !== 'right' && '-translate-x-1/2',
 							placement === 'top' && '-translate-y-full',
+							placement === 'right' && '-translate-y-1/2',
 							bubbleClassName,
 						)}
 						style={{ top: pos.top, left: pos.left }}

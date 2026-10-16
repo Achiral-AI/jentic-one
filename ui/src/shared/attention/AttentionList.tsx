@@ -5,26 +5,34 @@
  *
  * Items are grouped by what they ask of you:
  *
- *   Alerts     — failures and warnings that need a look (acknowledge / view)
- *   Approvals  — agents and OAuth clients waiting to be let in (approve / review)
+ *   Alerts     — recent failures and warnings that need a look (view)
+ *   Approvals  — agents and OAuth clients waiting to be let in, and agents
+ *                waiting on an account connection or a held call (approve / review)
  *   Setup      — credential sign-ins nobody finished
  *
- * The cheap, reversible verbs (approve an agent, acknowledge an alert) run
- * inline; anything that needs context links to where it is resolved.
+ * The cheap, reversible verb (approve an agent) runs inline; anything that
+ * needs context links to where it is resolved. Every verb is permission-gated so
+ * a row never offers a call the server refuses: Approve needs `agents:write`
+ * (the row still links to the agent for anyone else), and "Finish setup" needs
+ * `credentials:write`.
  */
 import { type ComponentType } from 'react';
-import { AlertTriangle, Bot, KeyRound, ShieldQuestion } from 'lucide-react';
+import { AlertTriangle, Bot, CheckSquare, KeyRound, PlugZap, ShieldQuestion } from 'lucide-react';
 import { AppLink } from '@/shared/ui/AppLink';
+import { UserText } from '@/shared/ui/UserText';
 import { Button } from '@/shared/ui/Button';
 import { toast } from '@/shared/ui';
 import { ROUTE_PATHS } from '@/shared/app/routes';
-import { useAcknowledgeAttention, useApproveAgent } from '@/shared/attention/actions';
+import { useApproveAgent } from '@/shared/attention/actions';
+import { AGENTS_WRITE, CREDENTIALS_WRITE, useCanAccess } from '@/shared/auth/useCanAccess';
 import type { AttentionItem, AttentionKind } from '@/shared/attention/useAttentionItems';
 import { cn, timeAgo } from '@/shared/lib/utils';
 
 const KIND_ICON: Record<AttentionKind, ComponentType<{ className?: string }>> = {
 	agent: Bot,
 	oauth_client: ShieldQuestion,
+	connect_request: PlugZap,
+	held_execution: CheckSquare,
 	credential: KeyRound,
 	event: AlertTriangle,
 };
@@ -35,6 +43,8 @@ const GROUP_OF: Record<AttentionKind, Group> = {
 	event: 'alerts',
 	agent: 'approvals',
 	oauth_client: 'approvals',
+	connect_request: 'approvals',
+	held_execution: 'approvals',
 	credential: 'setup',
 };
 
@@ -52,6 +62,8 @@ export type AttentionListProps = {
 	variant?: 'page' | 'menu';
 	/** Fired after any link in a row is followed (the menu closes itself). */
 	onNavigate?: () => void;
+	/** Marks the rows this viewer hasn't read yet (the menu's own read state). */
+	isUnread?: (itemKey: string) => boolean;
 };
 
 /** Group a pre-sorted list by what it asks of you, preserving order within a group. */
@@ -69,28 +81,34 @@ function groupItems(items: AttentionItem[]): Array<{ label: string; items: Atten
 	}));
 }
 
-export function AttentionList({ items, variant = 'page', onNavigate }: AttentionListProps) {
+export function AttentionList({
+	items,
+	variant = 'page',
+	onNavigate,
+	isUnread,
+}: AttentionListProps) {
 	const groups = groupItems(items);
 	return (
-		<div className="divide-border divide-y">
+		<div className="divide-hairline divide-y">
 			{groups.map((group) => (
 				<section key={group.label} aria-label={group.label}>
 					<h3
 						className={cn(
-							'text-muted-foreground bg-muted/40 text-[11px] font-semibold tracking-wide uppercase',
-							variant === 'menu' ? 'px-3 py-1.5' : 'px-5 py-1.5',
+							'text-foreground-faint text-[10.5px] font-bold tracking-[0.08em] uppercase',
+							variant === 'menu' ? 'px-3 pt-2.5 pb-1' : 'px-5 pt-3 pb-1',
 						)}
 					>
 						{group.label}
 						<span className="ml-1.5 font-mono tabular-nums">{group.items.length}</span>
 					</h3>
-					<ul className="divide-border divide-y" aria-label={group.label}>
+					<ul className="divide-hairline-row divide-y" aria-label={group.label}>
 						{group.items.map((item) => (
 							<AttentionRow
 								key={item.key}
 								item={item}
 								variant={variant}
 								onNavigate={onNavigate}
+								unread={isUnread?.(item.key) ?? false}
 							/>
 						))}
 					</ul>
@@ -104,10 +122,12 @@ function AttentionRow({
 	item,
 	variant,
 	onNavigate,
+	unread,
 }: {
 	item: AttentionItem;
 	variant: 'page' | 'menu';
 	onNavigate?: () => void;
+	unread: boolean;
 }) {
 	const Icon = KIND_ICON[item.kind];
 	const urgent = item.urgency === 3;
@@ -116,13 +136,13 @@ function AttentionRow({
 	const tile = (
 		<span
 			className={cn(
-				'flex shrink-0 items-center justify-center rounded-lg ring-1',
+				'flex shrink-0 items-center justify-center rounded-md',
 				menu ? 'h-7 w-7' : 'h-8 w-8',
 				urgent
-					? 'bg-danger/10 text-danger ring-danger/25'
+					? 'bg-danger/10 text-danger'
 					: item.urgency === 2
-						? 'bg-warning/10 text-warning ring-warning/25'
-						: 'bg-muted text-muted-foreground ring-border',
+						? 'bg-warning/10 text-warning'
+						: 'bg-surface-field text-foreground-sub',
 			)}
 		>
 			<Icon className={menu ? 'h-3.5 w-3.5' : 'h-4 w-4'} aria-hidden="true" />
@@ -131,15 +151,27 @@ function AttentionRow({
 
 	if (menu) {
 		return (
-			<li className="flex gap-2.5 px-3 py-2.5">
+			<li className="flex gap-2.5 px-3 py-2.5" data-unread={unread || undefined}>
 				{tile}
 				<div className="min-w-0 flex-1">
-					<p className="text-foreground line-clamp-2 text-[13px] leading-snug font-medium">
-						{item.title}
+					<p className="text-foreground-name line-clamp-2 text-[13px] leading-snug font-semibold">
+						{unread && (
+							<span
+								className="bg-primary mr-1.5 inline-block h-1.5 w-1.5 rounded-full align-middle"
+								aria-hidden="true"
+							/>
+						)}
+						{unread && <span className="sr-only">Unread: </span>}
+						<UserText>{item.title}</UserText>
 					</p>
 					<p className="text-muted-foreground mt-0.5 truncate text-xs">
 						<span title={item.since}>{timeAgo(item.since)}</span>
-						{item.detail && <> · {item.detail}</>}
+						{item.detail && (
+							<>
+								{' · '}
+								<UserText>{item.detail}</UserText>
+							</>
+						)}
 					</p>
 					<div className="mt-2 flex items-center gap-1.5">
 						<RowActions item={item} onNavigate={onNavigate} />
@@ -153,9 +185,13 @@ function AttentionRow({
 		<li className="flex flex-wrap items-center gap-3 px-5 py-3 sm:flex-nowrap">
 			{tile}
 			<div className="min-w-0 flex-1 basis-40">
-				<p className="text-foreground truncate text-sm font-medium">{item.title}</p>
+				<p className="text-foreground-name truncate text-sm font-semibold">
+					<UserText>{item.title}</UserText>
+				</p>
 				{item.detail && (
-					<p className="text-muted-foreground truncate text-xs">{item.detail}</p>
+					<p className="text-muted-foreground truncate text-xs">
+						<UserText>{item.detail}</UserText>
+					</p>
 				)}
 			</div>
 			<span
@@ -183,25 +219,32 @@ function RowActions({ item, onNavigate }: { item: AttentionItem; onNavigate?: ()
 				/>
 			) : null;
 		case 'event':
-			return item.event ? (
-				<EventActions
-					eventId={item.event.event_id}
-					href={item.href}
-					onNavigate={onNavigate}
-				/>
-			) : null;
+			return <ReviewLink href={item.href} label="View" onNavigate={onNavigate} />;
 		case 'oauth_client':
+		case 'connect_request':
+		case 'held_execution':
 			return <ReviewLink href={item.href} label="Review" onNavigate={onNavigate} />;
 		case 'credential':
 			// The inventory is a sheet on the Agents page; there is no per-credential route.
-			return (
-				<ReviewLink
-					href={ROUTE_PATHS.credentialInventory()}
-					label="Finish setup"
-					onNavigate={onNavigate}
-				/>
-			);
+			// Finishing an OAuth sign-in writes the credential's tokens, so without
+			// `credentials:write` the verb is not offered — the row stays in the
+			// list as the standing fact it is, for whoever can act on it.
+			return <FinishCredentialSetupLink onNavigate={onNavigate} />;
 	}
+}
+
+/** "Finish setup" for an unfinished OAuth sign-in, shown only to a caller who
+ * may actually complete it. */
+function FinishCredentialSetupLink({ onNavigate }: { onNavigate?: () => void }) {
+	const canWriteCredentials = useCanAccess(CREDENTIALS_WRITE);
+	if (!canWriteCredentials) return null;
+	return (
+		<ReviewLink
+			href={ROUTE_PATHS.credentialInventory()}
+			label="Finish setup"
+			onNavigate={onNavigate}
+		/>
+	);
 }
 
 function ReviewLink({
@@ -215,7 +258,7 @@ function ReviewLink({
 }) {
 	if (!href) return null;
 	return (
-		<AppLink href={href} variant="secondary" size="sm" onClick={onNavigate}>
+		<AppLink href={href} variant="tonal" size="xs" onClick={onNavigate}>
 			{label}
 		</AppLink>
 	);
@@ -231,64 +274,35 @@ function AgentActions({
 	onNavigate?: () => void;
 }) {
 	const approve = useApproveAgent();
+	const canApprove = useCanAccess(AGENTS_WRITE);
 	return (
 		<>
-			<Button
-				size="sm"
-				loading={approve.isPending}
-				onClick={() =>
-					approve.mutate(agentId, {
-						onSuccess: () => toast({ title: `${name} approved`, variant: 'success' }),
-						onError: (error) =>
-							toast({
-								title: `Couldn't approve ${name}`,
-								description: error.message,
-								variant: 'error',
-							}),
-					})
-				}
-			>
-				Approve
-			</Button>
+			{canApprove && (
+				<Button
+					variant="primary"
+					size="xs"
+					loading={approve.isPending}
+					onClick={() =>
+						approve.mutate(agentId, {
+							onSuccess: () =>
+								toast({ title: `${name} approved`, variant: 'success' }),
+							onError: (error) =>
+								toast({
+									title: `Couldn't approve ${name}`,
+									description: error.message,
+									variant: 'error',
+								}),
+						})
+					}
+				>
+					Approve
+				</Button>
+			)}
 			<ReviewLink
 				href={ROUTE_PATHS.agentTab(agentId)}
 				label="Review"
 				onNavigate={onNavigate}
 			/>
-		</>
-	);
-}
-
-function EventActions({
-	eventId,
-	href,
-	onNavigate,
-}: {
-	eventId: string;
-	href: string | null;
-	onNavigate?: () => void;
-}) {
-	const acknowledge = useAcknowledgeAttention();
-	return (
-		<>
-			<Button
-				variant="secondary"
-				size="sm"
-				loading={acknowledge.isPending}
-				onClick={() =>
-					acknowledge.mutate(eventId, {
-						onError: (error) =>
-							toast({
-								title: "Couldn't acknowledge the alert",
-								description: error.message,
-								variant: 'error',
-							}),
-					})
-				}
-			>
-				Acknowledge
-			</Button>
-			<ReviewLink href={href} label="View" onNavigate={onNavigate} />
 		</>
 	);
 }

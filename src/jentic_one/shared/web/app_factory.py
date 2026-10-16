@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib
+import re
 from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any
@@ -12,10 +13,11 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import RedirectResponse
 from jentic.problem_details import ProblemDetailException, problem_detail_exception_handler
 from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
 from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+from starlette.routing import Route
 
 from jentic_one import __version__
 from jentic_one.registry.services.import_service import ImportHandler
@@ -40,7 +42,11 @@ from jentic_one.shared.tracing import instrument_inbound_app
 from jentic_one.shared.web.agent_discovery import get_agent_discovery_router
 from jentic_one.shared.web.auth import API_KEY_HEADER
 from jentic_one.shared.web.container import AppContainer
-from jentic_one.shared.web.errors import request_validation_error_handler
+from jentic_one.shared.web.errors import (
+    request_validation_error_handler,
+    unhandled_exception_handler,
+)
+from jentic_one.shared.web.health import RootHealthResponse
 from jentic_one.shared.web.instance_identity import get_instance_router
 from jentic_one.shared.web.openapi_meta import (
     fastapi_metadata_kwargs,
@@ -92,23 +98,62 @@ SURFACE_MODULES = {
 _db_instrumented = False
 
 
-def attach_http_observability(app: FastAPI) -> None:
+def mount_metrics_endpoint(app: FastAPI) -> None:
+    """Mount the Prometheus ASGI app at "/metrics" when the exporter is enabled.
+
+    Starlette matches routes in registration order, so call this *before*
+    including any router with a catch-all path (the broker's
+    ``/{upstream_url:path}``) — otherwise the catch-all shadows the scrape
+    endpoint.
+
+    The exposition is served at "/metrics/"; the bare "/metrics" path answers a
+    307 to it. Starlette's own trailing-slash redirect only fires when *no*
+    route matches, and the broker's catch-all matches everything, so the bare
+    path gets an explicit redirect route registered alongside the mount. The
+    `local-prom-app.yaml` overlay sets `prometheus.io/path` to "/metrics/" with
+    the trailing slash — keep them in sync.
+    """
+    metrics_app = make_metrics_asgi_app()
+    if metrics_app is not None:
+        app.add_route("/metrics", _redirect_to_metrics_slash, include_in_schema=False)
+        app.mount("/metrics", metrics_app)
+
+
+async def _redirect_to_metrics_slash(request: Request) -> Response:
+    """307 the bare "/metrics" path to the "/metrics/" exposition mount."""
+    return RedirectResponse(request.url.replace(path="/metrics/"), status_code=307)
+
+
+_ROOT_CATCH_ALL_RE = re.compile(r"/\{[^{}/:]+:path\}")
+
+
+def _has_root_catch_all(router: APIRouter) -> bool:
+    """Whether ``router`` carries a root-level ``/{name:path}`` route.
+
+    Such a route (the broker's forward proxy) matches every path, so Starlette
+    — which matches in registration order — never reaches anything included
+    after it.
+    """
+    return any(
+        isinstance(route, Route) and _ROOT_CATCH_ALL_RE.fullmatch(route.path) is not None
+        for route in router.routes
+    )
+
+
+def attach_http_observability(app: FastAPI, *, mount_metrics: bool = True) -> None:
     """Wire FastAPI auto-instrumentation and (when enabled) mount /metrics.
 
     Safe to call once per FastAPI instance. DB instrumentation is *not* done
     here because it must happen after `Context.startup()` has created the
     SQLAlchemy engines — see `instrument_databases`.
 
-    The Prometheus ASGI app is mounted at "/metrics", which causes Starlette
-    to redirect the bare "/metrics" path to "/metrics/" with a 307. The
-    `local-prom-app.yaml` overlay therefore sets `prometheus.io/path` to
-    "/metrics/" with the trailing slash — keep them in sync.
+    ``mount_metrics=False`` skips the /metrics mount for callers that already
+    mounted it ahead of their routers via `mount_metrics_endpoint`.
     """
     instrument_inbound_app(app)
 
-    metrics_app = make_metrics_asgi_app()
-    if metrics_app is not None:
-        app.mount("/metrics", metrics_app)
+    if mount_metrics:
+        mount_metrics_endpoint(app)
 
 
 def instrument_databases(ctx: Context) -> None:
@@ -190,13 +235,21 @@ def _start_worker(
                 execution_authorizer=execution_authorizer,
                 egress=ctx.config.broker.egress,
                 security_config=ctx.config.security,
+                # Same predicate the broker's hold path files under, so a held
+                # payload the broker encrypted is one this worker can decrypt.
+                encryption=ctx.encryption if ctx.has_encryption_keyset else None,
             ),
         )
 
     if not handler_registry.kinds:
         return None
 
-    worker = WorkerLoop(ctx.admin_db, handler_registry, worker_config=ctx.config.worker)
+    worker = WorkerLoop(
+        ctx.admin_db,
+        handler_registry,
+        worker_config=ctx.config.worker,
+        approved_result_retention_seconds=ctx.config.held_executions.result_retention_seconds,
+    )
     task = asyncio.create_task(worker.run())
     _logger.info("worker_loop_task_started")
     return worker, task
@@ -565,7 +618,19 @@ def create_surface_app(
     # the broker's /{upstream_url:path} catch-all nor an injected extra router
     # can shadow the discovery paths (the /skills/* routes and llms.txt).
     app.include_router(get_agent_discovery_router())
+    # Prometheus scrape endpoint (when enabled), mounted ahead of the surface
+    # routers for the same reason: the broker catch-all must not shadow it.
+    mount_metrics_endpoint(app)
+    # A surface router carrying a root /{name:path} catch-all (the broker's
+    # forward proxy) is held back and included last — after the container
+    # extension seam — so it shadows neither an injected extra router nor an
+    # installer-added route. Every other surface router still precedes the
+    # extensions, so an extension never shadows a built-in route.
+    catch_all_routers: list[tuple[APIRouter, Sequence[str]]] = []
     for router, _prefix, tags in routers:
+        if _has_root_catch_all(router):
+            catch_all_routers.append((router, tags))
+            continue
         app.include_router(router, tags=list(tags), responses=COMMON_ERROR_RESPONSES)
     # Public, schema-visible backend-identity endpoint so a client (MCP server,
     # CLI, agent) can tell which backend it is bound to — cloud vs. local. Off
@@ -588,10 +653,15 @@ def create_surface_app(
         )
     for installer in container.extra_installers:
         installer(app, ctx)
+    for catch_all_router, catch_all_tags in catch_all_routers:
+        app.include_router(
+            catch_all_router, tags=list(catch_all_tags), responses=COMMON_ERROR_RESPONSES
+        )
     app.add_middleware(RequestIDMiddleware)
     app.add_exception_handler(ProblemDetailException, spa_aware_problem_detail_handler)  # type: ignore[arg-type]
     app.add_exception_handler(RequestValidationError, request_validation_error_handler)  # type: ignore[arg-type]
-    attach_http_observability(app)
+    app.add_exception_handler(Exception, unhandled_exception_handler)
+    attach_http_observability(app, mount_metrics=False)
     install_openapi_metadata(app)
     return app
 
@@ -663,20 +733,24 @@ def create_combined_app(
         )
     root.add_exception_handler(ProblemDetailException, spa_aware_problem_detail_handler)  # type: ignore[arg-type]
     root.add_exception_handler(RequestValidationError, request_validation_error_handler)  # type: ignore[arg-type]
+    root.add_exception_handler(Exception, unhandled_exception_handler)
 
     @root.get(
         "/health",
         operation_id="getHealth",
         summary="Health",
         tags=["System"],
+        # Keep the wire body exactly ``{"status", "version"}`` — the
+        # lockout-only ``reason`` member is never emitted as null.
+        response_model_exclude_none=True,
     )
-    async def health() -> JSONResponse:
+    async def health() -> RootHealthResponse:
         """Liveness probe for the combined control-plane app.
 
         Unauthenticated and dependency-free so orchestrators and load balancers
         have a stable target. Returns ``{"status": "ok"}`` when the process is up.
         """
-        return JSONResponse({"status": "ok", "version": __version__})
+        return RootHealthResponse(status="ok", version=__version__)
 
     # Public, schema-hidden agent-discovery documents: the skill set
     # (GET /skills/{name}.md, the GET /SKILL.md alias, GET /skills/index.json)

@@ -44,7 +44,7 @@ context).
 
 ## Step 2 — access
 
-See your own identity, status, scopes, and credential bindings (with the
+See your own identity, status, permissions, and credential bindings (with the
 APIs each one serves):
 
 ```
@@ -54,32 +54,42 @@ jentic whoami
 (`jentic api GET /me` returns the same view; `whoami` is the nicer form.)
 
 Decide access from that view first (see `SKILL.md` step 2 for the
-doctrine). When the missing credential is for a vendor in the deployment's
-connect registry, **start the connection yourself**:
+doctrine). When a credential is missing, **start the connection yourself**
+— by vendor key for a registry vendor, by API identity for anything else:
 
 ```
 jentic connect github --reason "read open PRs to summarise them"
+jentic connect --api stripe-com/stripe-com-api/2024-06-20 --reason "list this month's charges" \
+  --rules '[{"effect":"allow","methods":["GET"],"path":"/v1/charges","match_mode":"exact"}]'
 ```
 
 It prints the `approval_url` (and the resolved flow) — relay the URL to
-your human operator, who opens it in their browser and approves the
-connection and its scopes; you never open or approve it. `--scopes` names
-vendor scopes to request (write scopes are flagged for the approver);
-`--wait` polls until the session connects or ends (rejected, expired, or cancelled;
-exit 3 if the timeout lapses while still pending). Once they confirm,
-re-check `jentic whoami` — an agent-initiated connect binds you at
-approval — and retry the `execute` that was blocked.
+your human operator, who approves in their browser (and enters the key, for
+an `--api` connect); you never open or approve it. `--auth-type` picks a
+scheme when the spec declares several (the error lists them); `--rules`
+proposes the binding's rules (a denial's `suggested_rules` fit as-is);
+`--scopes` names vendor scopes. For a `manual_*` or `awaiting_app` flow,
+relay the URL, **end your turn**, and retry later — `--wait` returns at
+once for those unless you pass `--timeout`. Otherwise `--wait` polls until
+the session connects or ends (exit 3 if the timeout lapses). Once they
+confirm, re-check `jentic whoami` and retry the `execute` that was blocked.
+A rejected request means stop: tell your user, don't ask again.
 
-For APIs outside the registry, **report the gap to your operator in
-one complete summary** — the API (vendor/name), the auth type the spec
-declares, the operations you intend to call, your proposed permission
-rules, and why. Approval is always a human action, and so are binding an
-existing credential and scope grants: the operator acts in the Jentic One
+If several shared OAuth apps serve the vendor, `jentic connect` fails and
+lists them in `details.candidates` (name and `registration_id`). Choosing
+the app is your user's decision, not yours: show them the list, ask which
+one to use, then re-run `jentic connect <vendor> --registration <registration_id>`.
+
+Where `--api` isn't available (the error says so), **report the gap to
+your operator in one complete summary** — the API (vendor/name), the auth
+type the spec declares, the operations you intend to call, your proposed
+permission rules, and why. Approval is always a human action, and so are binding an
+existing credential and permission grants: the operator acts in the Jentic One
 dashboard. Bindings take effect live — once your operator confirms, just
-retry the `execute` that was blocked. Newly granted **scopes** bake into
-your token at mint time, so after a scope grant run `jentic logout` (it
+retry the `execute` that was blocked. Newly granted **permissions** bake into
+your token at mint time, so after a permission grant run `jentic logout` (it
 clears only the cached token, not your identity) before retrying — the next
-call mints a fresh token that carries the scope.
+call mints a fresh token that carries the permission.
 
 ### The reactive path: denial directives
 
@@ -92,10 +102,16 @@ which recoveries an operator must perform) are shared by both lanes and
 live in `references/recovery.md`; what follows is this lane's mechanics per
 code:
 
-- **`no_credential_binding` (403)** — with `api_served: false` no credential
-  is provisioned for the API at all: if the directive carries a
-  `suggested_command` (`jentic connect <vendor>`), run it and relay the
-  printed `approval_url` to your operator; otherwise ask them to connect or
+- **`no_credential_binding` (403)** — if the directive carries a
+  `provisioning_url`, a connect request you opened for this API is still
+  waiting: relay that link to your operator instead of connecting again,
+  then retry once they approve. Otherwise, with `api_served: false` no
+  credential is provisioned for the API at all: if the directive carries a
+  `suggested_command` (`jentic connect <vendor>` — with `--registration
+  <id>` when one shared app covers the API — or `jentic connect --api
+  …`), run it with a `--reason` (and the directive's `suggested_rules` as
+  `--rules`) and relay the printed `approval_url` to
+  your operator; otherwise ask them to connect or
   provision a credential in the dashboard and bind you to it, proposing the
   auth type and permission rules you read from the API spec (see `SKILL.md`
   step 2).
@@ -103,10 +119,12 @@ code:
   aren't bound: ask your operator to bind you to it (dashboard, or
   `POST /agents/{agent_id}/credentials`). Then retry.
 - **`credential_not_provisioned` (424)** — if the directive carries a
-  `suggested_command` (`jentic connect <key>`), the vendor is in the
-  connect registry: run it and relay the printed `approval_url` to your
-  operator; otherwise relay the directive's `provisioning_url` (when
-  present) — or report the gap — so they can connect the account. Then
+  `provisioning_url`, your earlier connect request is still waiting: relay
+  that link to your operator instead of connecting again. Otherwise, if it
+  carries a `suggested_command` (`jentic connect <key>`, pinned with
+  `--registration <id>` when one shared app covers the API, or `jentic
+  connect --api …`), run it and relay the printed `approval_url` to your
+  operator; otherwise report the gap so they can connect the account. Then
   retry.
 - **`credential_undecryptable` (424)** — ask your operator to remove and
   re-add the credential, then retry; this is not agent-recoverable.
@@ -143,10 +161,10 @@ MCP mount reports the same duplicate as an `already_imported` success — a
 surface difference, not a state difference.)
 
 If `import` unexpectedly fails with `403 … requires one of: catalog:import`
-— e.g. you were approved before `catalog:import` became a default scope and
-weren't re-granted — ask your operator to grant the `catalog:import` scope
+— e.g. you were approved before `catalog:import` became a default permission and
+weren't re-granted — ask your operator to grant the `catalog:import` permission
 to this agent in the dashboard. Once they confirm, run `jentic logout` so
-the next call mints a fresh token carrying the scope, then retry:
+the next call mints a fresh token carrying the permission, then retry:
 
 ```
 jentic catalog import googleapis.com/sheets
@@ -214,6 +232,21 @@ jentic execute GET:https://api.example.com/v1/things --query limit=10
 jentic execute GET:https://sheets.googleapis.com/v4/spreadsheets/{id}/values/{range} --path id=ABC --path range=A1:Z10
 ```
 
+**A call held for human approval exits 3** (`TIMEOUT_PENDING`). stdout
+carries the held envelope (`body.held_execution_id`, `body.review_url`); stderr
+repeats the review link. Show the user the `review_url`, end your turn, and
+once they reply collect the outcome with
+`jentic executions poll <held_execution_id>` — never re-send the call.
+`executions poll` (and `execute --wait`) prints the result exactly like a call
+that ran at once (exit 0), or the denial/expiry (exit 2). If the call is still
+held when `--timeout` lapses (default 30s, up to 5m), it exits 3 again and
+prints the review link and id: show the user the link again and end your turn.
+
+```
+jentic execute POST:https://api.example.com/v1/orders -d '{"n":1}'   # exit 3: held, prints review_url
+jentic executions poll <held_execution_id> --timeout 2m               # after the user decides
+```
+
 **Diagnose an `execute` failure by its symptom, not the exit code alone.** A
 broker **denial** prints an `agent_directive` on stderr (exit **2**). An
 error naming DNS, TLS, timeout, or connection refused is a **transport
@@ -262,6 +295,17 @@ jentic execute <METHOD:url> --broker-scheme http --broker-host 127.0.0.1:8100
   appears to be stopped, which is why I can't reach {API}. Restart it with
   `jenticctl start` (then `jenticctl status` to confirm), and I'll retry."*
   After the restart, retry the original call and continue the task.
+
+- **Broker-side failure (`TRANSPORT_ERROR`, exit 1, `details.origin:
+  broker`).** A 5xx or 429 the broker generated itself (circuit open, runner
+  degraded, at capacity, rate limited, token refresh failed, upstream timed
+  out, deadline exceeded, response too large) is not an upstream answer.
+  Branch on `details.retryable`: when `true`, wait `details.retry_after_s`
+  seconds (or briefly, when absent) and re-run the same call; when `false`,
+  do not re-run it as-is — it may have reached the upstream, or (for
+  `runner_scheme_unsupported`) it can never succeed. A 5xx the broker
+  mirrored from the vendor (`Jentic-Error-Origin: upstream`) stays exit 0
+  — that is the API's own answer.
 
 ## Correlation, retries, and dry runs
 

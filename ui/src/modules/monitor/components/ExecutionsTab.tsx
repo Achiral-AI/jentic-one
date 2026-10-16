@@ -14,7 +14,7 @@ import { useMemo } from 'react';
 import { useSearchParams } from 'react-router';
 import { Activity, ChevronRight, X } from 'lucide-react';
 import { ActorLabel, Button, EmptyState, ErrorAlert, SkeletonRows, VendorIcon } from '@/shared/ui';
-import { formatOperation } from '@/shared/lib';
+import { formatOperation, hasTrace } from '@/shared/lib';
 import { cn } from '@/shared/lib/utils';
 import { toExecutionStatus, useExecutions, type ExecutionResponse } from '@/modules/monitor/api';
 import { CursorPager } from '@/modules/monitor/components/CursorPager';
@@ -24,7 +24,6 @@ import { RecordDetail } from '@/modules/monitor/components/RecordDetail';
 import { useMonitorFilters } from '@/modules/monitor/lib/useMonitorFilters';
 import { useCursorStack } from '@/modules/monitor/lib/useCursorStack';
 import { detailKey, useLogDetail, type LogDetail } from '@/modules/monitor/lib/useLogDetail';
-import { hasTrace } from '@/modules/monitor/lib/links';
 import { formatDuration } from '@/modules/monitor/lib/format';
 import { EXECUTION_LABEL, EXECUTION_TONE } from '@/modules/monitor/lib/logVocabulary';
 import {
@@ -225,11 +224,10 @@ export function ExecutionsTab() {
 												}
 												action={
 													<ChevronRight
-														className="text-muted-foreground/60 h-4 w-4"
+														className="text-foreground-faint h-4 w-4"
 														aria-hidden="true"
 													/>
 												}
-												label={`View trace for ${op}`}
 												active={openKey === detailKey(d)}
 												onOpen={() => open(d)}
 											/>

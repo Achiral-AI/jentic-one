@@ -15,6 +15,7 @@ import {
 	within,
 	userEvent,
 	checkA11y,
+	sheetSettled,
 } from '@/__tests__/test-utils';
 import { worker } from '@/mocks/browser';
 import { setToken } from '@/shared/api';
@@ -26,6 +27,7 @@ import {
 	resetCredentialsStore,
 } from '@/shared/credentials/mocks/handlers';
 import { CredentialType } from '@/shared/credentials/api';
+import { AuthProvider } from '@/shared/auth';
 import AgentsPage from '@/modules/agents/pages/AgentsPage';
 
 /** Surfaces the router's search string so specs can assert `?credentials` is spent. */
@@ -46,23 +48,15 @@ function renderPage(route = '/') {
 }
 
 /**
- * Wait until the sheet and its cards have finished entering, so axe measures
- * contrast against the settled surface. Two animations are still in flight once
- * the cards' text is in the DOM: the backdrop's 300ms opacity fade (CSS) and
- * the grid's staggered card fade-in from opacity 0 (framer-motion). axe blends
- * a translucent ancestor into the colours it measures, so auditing a
- * half-faded card reads its text as low-contrast.
+ * Wait until the sheet and its cards have finished entering: the grid's cards
+ * stagger in from opacity 0 (framer-motion) on top of the backdrop fade.
  */
-async function sheetSettled(): Promise<void> {
-	await waitFor(() => {
-		expect(getComputedStyle(screen.getByTestId('sheet-backdrop')).opacity).toBe('1');
-		const grid = within(screen.getByTestId('sheet-primitive')).getByTestId('credentials-grid');
-		// No cards would make the loop below pass vacuously.
-		expect(grid.children.length).toBeGreaterThan(0);
-		for (const item of Array.from(grid.children)) {
-			expect(getComputedStyle(item).opacity).toBe('1');
-		}
-	});
+function inventorySettled(): Promise<void> {
+	return sheetSettled(() =>
+		Array.from(
+			within(screen.getByTestId('sheet-primitive')).getByTestId('credentials-grid').children,
+		),
+	);
 }
 
 /** The page-header trigger — the only Credentials control on the surface. */
@@ -120,7 +114,7 @@ describe('CredentialInventorySheet — page-level org-wide inventory', () => {
 		expect(sheet.getByText('GitHub PAT')).toBeInTheDocument();
 		expect(sheet.getByRole('button', { name: /Add credential/ })).toBeEnabled();
 
-		await sheetSettled();
+		await inventorySettled();
 		await checkA11y(document.body, { modal: true });
 	});
 
@@ -134,9 +128,7 @@ describe('CredentialInventorySheet — page-level org-wide inventory', () => {
 		renderPage();
 
 		// No agents, no dock — but the org-wide inventory still opens.
-		expect(
-			await screen.findByRole('heading', { name: 'Set up your workspace' }),
-		).toBeInTheDocument();
+		expect(await screen.findByTestId('agents-empty-landing')).toBeInTheDocument();
 		expect(screen.queryByTestId('agent-dock')).not.toBeInTheDocument();
 
 		await user.click(headerTrigger());
@@ -511,10 +503,10 @@ describe('CredentialInventorySheet — page-level org-wide inventory', () => {
 			expect(slack).toHaveTextContent(/Any of these can be bound to an agent/);
 			// Two rows share a name, so the id tail is what sets them apart.
 			expect(slack).toHaveTextContent('Some share a name; rename one to tell them apart.');
-			expect(slack).toHaveTextContent('…lack_1');
-			expect(slack).toHaveTextContent('…lack_3');
+			expect(slack).toHaveTextContent('…ck_1');
+			expect(slack).toHaveTextContent('…ck_3');
 			// A name no other row shares needs no tail.
-			expect(slack).not.toHaveTextContent('…lack_2');
+			expect(slack).not.toHaveTextContent('…ck_2');
 			// The rows pin different revisions; each row says which.
 			const versions = within(slack)
 				.getAllByTestId('credential-row-api')
@@ -547,7 +539,7 @@ describe('CredentialInventorySheet — page-level org-wide inventory', () => {
 
 		it('passes an accessibility audit with a grouped API on screen', async () => {
 			await openInventory();
-			await sheetSettled();
+			await inventorySettled();
 			await checkA11y(document.body, { modal: true });
 		});
 	});
@@ -564,5 +556,284 @@ describe('CredentialInventorySheet — page-level org-wide inventory', () => {
 				name: 'Credentials',
 			}),
 		).toBeInTheDocument();
+	});
+});
+
+describe('CredentialInventorySheet — credentials shared with the viewer', () => {
+	const VIEWER = 'usr_viewer_1';
+
+	beforeEach(async () => {
+		await page.viewport(1280, 900);
+		setToken('test-token');
+		resetAgentsStore();
+		resetApisStore([]);
+		resetCredentialsStore([
+			makeMockCredential({
+				credential_id: 'cred_slack_1',
+				name: 'Slack bot token',
+				type: CredentialType.API_KEY,
+				api: { vendor: 'slack.com', name: 'default', version: '1.0.0' },
+				created_by: 'usr_someone_else',
+			}),
+			makeMockCredential({
+				credential_id: 'cred_github_1',
+				name: 'GitHub PAT',
+				type: CredentialType.BEARER_TOKEN,
+				api: { vendor: 'github.com', name: 'default', version: '1.0.0' },
+				created_by: VIEWER,
+			}),
+		]);
+		worker.use(
+			http.get('/users/me', () =>
+				HttpResponse.json({
+					id: VIEWER,
+					email: 'viewer@local',
+					first_name: 'View',
+					last_name: 'Er',
+					active: true,
+					// A member: manages agents and credentials, but is not an org admin.
+					permissions: ['agents:read', 'agents:write', 'credentials:write'],
+					must_change_password: false,
+					created_at: '2026-01-01T00:00:00Z',
+					updated_at: null,
+				}),
+			),
+		);
+	});
+
+	it('a sharee sees the badge and no edit or delete on the shared card only', async () => {
+		const user = userEvent.setup();
+		renderWithProviders(
+			<AuthProvider>
+				<AgentsPage />
+				<Toaster />
+			</AuthProvider>,
+			{ route: '/?agent=agnt_active_1' },
+		);
+		await screen.findByTestId('agent-dock');
+		await user.click(headerTrigger());
+		const sheet = within(await screen.findByRole('dialog'));
+		await sheet.findByText('Slack bot token');
+
+		const cardFor = (name: string): HTMLElement => {
+			const card = sheet
+				.getAllByTestId('credential-card')
+				.find((c) => within(c).queryByText(name));
+			if (!card) throw new Error(`no card for ${name}`);
+			return card;
+		};
+
+		const shared = within(cardFor('Slack bot token'));
+		expect(shared.getByText('Shared with you')).toBeInTheDocument();
+		expect(
+			shared.queryByRole('button', { name: 'Edit credential Slack bot token' }),
+		).not.toBeInTheDocument();
+		expect(
+			shared.queryByRole('button', { name: 'Delete credential Slack bot token' }),
+		).not.toBeInTheDocument();
+
+		const own = within(cardFor('GitHub PAT'));
+		expect(own.queryByText('Shared with you')).not.toBeInTheDocument();
+		expect(own.getByRole('button', { name: 'Edit credential GitHub PAT' })).toBeInTheDocument();
+		expect(
+			own.getByRole('button', { name: 'Delete credential GitHub PAT' }),
+		).toBeInTheDocument();
+
+		await inventorySettled();
+		await checkA11y(document.body, { modal: true });
+	});
+});
+
+describe('CredentialInventorySheet — whose agents "used by" counts', () => {
+	const VIEWER = 'usr_viewer_1';
+
+	function seedViewer(permissions: string[]) {
+		worker.use(
+			http.get('/users/me', () =>
+				HttpResponse.json({
+					id: VIEWER,
+					email: 'viewer@local',
+					first_name: 'View',
+					last_name: 'Er',
+					active: true,
+					permissions,
+					must_change_password: false,
+					created_at: '2026-01-01T00:00:00Z',
+					updated_at: null,
+				}),
+			),
+		);
+	}
+
+	beforeEach(async () => {
+		await page.viewport(1280, 900);
+		setToken('test-token');
+		resetAgentsStore();
+		// A credential the viewer created that none of THEIR agents is bound to.
+		resetCredentialsStore([
+			makeMockCredential({
+				credential_id: 'cred_own_unbound',
+				name: 'Own Stripe key',
+				type: CredentialType.API_KEY,
+				api: { vendor: 'stripe.com', name: 'default', version: '1.0.0' },
+				created_by: VIEWER,
+			}),
+		]);
+		resetApisStore([]);
+	});
+
+	async function usedByCopy(): Promise<HTMLElement> {
+		const user = userEvent.setup();
+		renderWithProviders(
+			<AuthProvider>
+				<AgentsPage />
+			</AuthProvider>,
+			{ route: '/?agent=agnt_active_1' },
+		);
+		await screen.findByTestId('agent-dock');
+		await user.click(headerTrigger());
+		const sheet = await screen.findByTestId('sheet-primitive');
+		const card = (await within(sheet).findByText('Own Stripe key')).closest(
+			'[data-testid="credential-card"]',
+		) as HTMLElement;
+		return within(card).findByTestId('cred-used-by');
+	}
+
+	it('a non-admin creator reads "none of your agents": their roster holds only their own', async () => {
+		seedViewer(['agents:read', 'agents:write', 'credentials:read', 'credentials:write']);
+		expect(await usedByCopy()).toHaveTextContent('used by none of your agents');
+	});
+
+	it('an org:admin, whose roster is the whole org, reads the unscoped count', async () => {
+		seedViewer(['org:admin']);
+		expect(await usedByCopy()).toHaveTextContent('used by no agents');
+	});
+});
+
+/**
+ * The inventory sheet offers only what the viewer's permissions allow, and
+ * sends no read the server would refuse — pins #1543 items 5 and 4.
+ */
+describe('CredentialInventorySheet — what a reader may see and send', () => {
+	const VIEWER = 'usr_viewer_1';
+
+	function seedViewer(permissions: string[]) {
+		worker.use(
+			http.get('/users/me', () =>
+				HttpResponse.json({
+					id: VIEWER,
+					email: 'viewer@local',
+					first_name: 'View',
+					last_name: 'Er',
+					active: true,
+					permissions,
+					must_change_password: false,
+					created_at: '2026-01-01T00:00:00Z',
+					updated_at: null,
+				}),
+			),
+		);
+	}
+
+	/** Every request path the surface sends, in order. */
+	function trackRequests(): string[] {
+		const paths: string[] = [];
+		worker.events.on('request:start', ({ request }) => {
+			paths.push(new URL(request.url).pathname);
+		});
+		return paths;
+	}
+
+	beforeEach(async () => {
+		await page.viewport(1280, 900);
+		setToken('test-token');
+		resetAgentsStore();
+		resetApisStore([]);
+		resetCredentialsStore([
+			makeMockCredential({
+				credential_id: 'cred_own_1',
+				name: 'Own Stripe key',
+				type: CredentialType.API_KEY,
+				api: { vendor: 'stripe.com', name: 'default', version: '1.0.0' },
+				created_by: VIEWER,
+			}),
+			// An unconnected OAuth credential: the one shape that offers "Connect".
+			makeMockCredential({
+				credential_id: 'cred_oauth_1',
+				name: 'Slack OAuth',
+				type: CredentialType.OAUTH2,
+				api: { vendor: 'slack.com', name: 'default', version: '1.0.0' },
+				created_by: VIEWER,
+				details: { grant_type: 'authorization_code', connected: false },
+			}),
+		]);
+	});
+
+	async function openSheet(): Promise<HTMLElement> {
+		// Via the deep link, not the header trigger: a viewer without `agents:read`
+		// has no agent dock to click through.
+		renderWithProviders(
+			<AuthProvider>
+				<AgentsPage />
+				<Toaster />
+			</AuthProvider>,
+			{ route: '/?credentials=1' },
+		);
+		const sheet = await screen.findByTestId('sheet-primitive');
+		await within(sheet).findByText('Own Stripe key');
+		return sheet;
+	}
+
+	/**
+	 * Item 5. The sheet's "used by N agents" figure is a JOIN over every agent's
+	 * bindings, so it reads `GET /agents`, which needs `agents:read`. Fired for a
+	 * credentials-only viewer, that roster read takes a 403 — and because the
+	 * join treats a missing roster as an empty one, the 403 would render as
+	 * "nothing is bound", a WRONG answer rather than a missing one. So the read
+	 * is gated, and the figure withheld.
+	 */
+	it('sends no roster read, and asserts no binding count, without agents:read', async () => {
+		const paths = trackRequests();
+		seedViewer(['credentials:read', 'credentials:write', 'owner:credentials:read']);
+		const sheet = within(await openSheet());
+
+		// The forbidden roster read never goes out…
+		await new Promise((r) => setTimeout(r, 300));
+		expect(paths.some((p) => p === '/agents')).toBe(false);
+		// …so the sheet states nothing about who holds the credential rather than
+		// claiming — from a 403 — that nobody does.
+		expect(sheet.queryByTestId('cred-used-by')).not.toBeInTheDocument();
+		// And "Unbound" is not offered: it is an assertion over the whole roster,
+		// which this viewer can never obtain. ("Any agent" stays; only the
+		// unanswerable option is withheld.)
+		const usedBy = within(sheet.getByRole('group', { name: 'Filter by agent usage' }));
+		expect(usedBy.queryByRole('button', { name: /Unbound/ })).not.toBeInTheDocument();
+		expect(usedBy.getByRole('button', { name: 'Any agent' })).toBeInTheDocument();
+	});
+
+	/**
+	 * Item 4. "Connect" runs the provider sign-in and WRITES the resulting
+	 * tokens onto the credential, so it needs `credentials:write`. Shown to a
+	 * reader, the button would only produce an error on click.
+	 */
+	it('offers no Connect and no Add credential to a viewer without credentials:write', async () => {
+		seedViewer(['agents:read', 'credentials:read']);
+		const sheet = within(await openSheet());
+
+		expect(sheet.queryByRole('button', { name: /^Connect/ })).not.toBeInTheDocument();
+		expect(sheet.queryByRole('button', { name: 'Add credential' })).not.toBeInTheDocument();
+		// Nor the other credential writes, for the same reason.
+		expect(sheet.queryByRole('button', { name: /^Edit credential/ })).not.toBeInTheDocument();
+		expect(sheet.queryByRole('button', { name: /^Delete credential/ })).not.toBeInTheDocument();
+	});
+
+	it('offers Connect and Add credential once the viewer holds credentials:write', async () => {
+		seedViewer(['agents:read', 'credentials:read', 'credentials:write']);
+		const sheet = within(await openSheet());
+
+		// `findBy`: the credential rows can land before `/users/me` does, and the
+		// verbs follow the permissions, not the rows.
+		expect(await sheet.findByRole('button', { name: 'Add credential' })).toBeInTheDocument();
+		expect(await sheet.findByRole('button', { name: /^Connect/ })).toBeInTheDocument();
 	});
 });

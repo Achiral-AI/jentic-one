@@ -26,6 +26,42 @@ _ENCODED_BRACE_RE = re.compile(r"%7([BbDd])")
 # must be dropped (the ASGI server recomputes ``content-length``).
 _DECODED_BODY_HEADERS: frozenset[str] = frozenset({"content-length", "content-encoding"})
 
+# Inbound framing that describes the *caller's* body, not the outbound one. The
+# broker drops the body on body-less methods (GET, HEAD, OPTIONS) and httpx
+# frames whatever body it does send, so a forwarded ``content-length`` can only
+# be stale: the HTTP client rejects a declared length that the body does not
+# match, failing the request before it reaches the upstream.
+_INBOUND_FRAMING_HEADERS: frozenset[str] = frozenset({"content-length"})
+
+# Request headers an async (``Prefer: respond-async``) or held execution keeps
+# for its worker run. The job payload sits in the admin DB (a held one for its
+# whole approval window), so this is an explicit
+# allow-list of headers that describe the body, the response the caller wants,
+# and the API version a vendor requires — never the caller's credentials,
+# cookies, hop-by-hop or broker headers. The run re-injects upstream
+# credentials itself.
+REPLAY_HEADERS: frozenset[str] = frozenset(
+    {
+        "accept",
+        "accept-language",
+        "content-encoding",
+        "content-language",
+        "content-type",
+        "if-match",
+        "if-modified-since",
+        "if-none-match",
+        "if-unmodified-since",
+        # Vendor API version headers, several of them required on every call.
+        "anthropic-version",
+        "api-version",
+        "intercom-version",
+        "notion-version",
+        "stripe-version",
+        "x-api-version",
+        "x-github-api-version",
+    }
+)
+
 
 def reconstruct_upstream_url(scope: Mapping[str, Any]) -> str:
     """Rebuild the upstream URL from the raw ASGI scope, byte-exact.
@@ -61,7 +97,9 @@ def forward_headers(inbound: Mapping[str, str], injected: Mapping[str, str]) -> 
     """Filter inbound request headers for forwarding, then apply injected auth.
 
     Strips hop-by-hop (incl. ``Host``), broker-consumed, and spoofable
-    forwarding/topology headers. Injected auth headers win on conflict.
+    forwarding/topology headers, plus the inbound ``Content-Length``: httpx
+    computes the outbound length from the body actually sent. Injected auth
+    headers win on conflict.
 
     ``Cookie`` is intentionally **not** special-cased here: a cookie-located
     credential is merged explicitly at the call site by appending to the
@@ -73,9 +111,49 @@ def forward_headers(inbound: Mapping[str, str], injected: Mapping[str, str]) -> 
         if key.lower() not in HOP_BY_HOP_HEADERS
         and key.lower() not in BROKER_CONSUMED_HEADERS
         and key.lower() not in SPOOFABLE_HEADERS
+        and key.lower() not in _INBOUND_FRAMING_HEADERS
     }
     out.update(injected)
     return out
+
+
+# API version request headers beyond the named ones above. Many vendors refuse
+# a call without one, and the version chooses the body and response schema, so
+# a queued or held run must send it as the caller did. A header replays when its name
+# is one or more hyphen-separated alphanumeric labels ending in ``-version``
+# (every ``<vendor>-version``); a bare ``version`` and anything in the
+# ``jentic-``/``x-jentic-`` namespace do not. :func:`is_replay_header` excludes
+# the hop-by-hop, broker-consumed and spoofable sets regardless.
+_REPLAY_VERSION_HEADER_RE = re.compile(r"^(?:[a-z0-9]+-)+version$")
+_JENTIC_HEADER_PREFIXES: tuple[str, ...] = ("jentic-", "x-jentic-")
+
+
+def is_replay_header(name: str) -> bool:
+    """Whether a queued or held execution keeps the inbound header ``name``.
+
+    True for :data:`REPLAY_HEADERS` and API version headers (see
+    ``_REPLAY_VERSION_HEADER_RE``); never for hop-by-hop, broker-consumed,
+    spoofable or ``Jentic-*`` headers.
+    """
+    key = name.lower()
+    if (
+        key in HOP_BY_HOP_HEADERS
+        or key in BROKER_CONSUMED_HEADERS
+        or key in SPOOFABLE_HEADERS
+        or key.startswith(_JENTIC_HEADER_PREFIXES)
+    ):
+        return False
+    return key in REPLAY_HEADERS or _REPLAY_VERSION_HEADER_RE.fullmatch(key) is not None
+
+
+def replay_headers(inbound: Mapping[str, str]) -> dict[str, str]:
+    """The inbound headers :func:`is_replay_header` keeps, keyed lower-case.
+
+    What an async or held execution's job payload keeps so its run sends the
+    body as the caller described it (``Content-Type`` above all) and at the
+    API version the caller chose.
+    """
+    return {key.lower(): value for key, value in inbound.items() if is_replay_header(key)}
 
 
 def passthrough_response_headers(upstream: Mapping[str, str]) -> dict[str, str]:

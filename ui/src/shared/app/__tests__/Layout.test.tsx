@@ -1,12 +1,20 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, onTestFinished } from 'vitest';
 import { page } from 'vitest/browser';
-import { renderWithProviders, screen, userEvent, waitFor } from '@/__tests__/test-utils';
+import {
+	renderWithProviders,
+	screen,
+	stubLocalStorage,
+	userEvent,
+	waitFor,
+} from '@/__tests__/test-utils';
 import { Layout } from '@/shared/app/Layout';
 import { AuthProvider } from '@/shared/auth/AuthContext';
+import { setTheme } from '@/shared/lib/theme';
 import { setToken } from '@/shared/api';
 import { isNavItemActive, navItems, sortedNavItems } from '@/shared/app/nav';
 import { SheetPrimitive } from '@/shared/ui/SheetPrimitive';
 import { clearAllToasts, toast } from '@/shared/ui/toastStore';
+import { resetApprovalsStore } from '@/modules/agents/mocks/approvalsHandlers';
 
 /**
  * The Layout renders behind the AuthGuard, so it always has a user. These
@@ -64,11 +72,41 @@ describe('app shell / navbar', () => {
 		await page.viewport(1440, 900);
 	});
 
+	it('badges the Agents tab with the held calls awaiting the viewer', async () => {
+		// The default mock store holds one pending approval.
+		resetApprovalsStore();
+		await page.viewport(1440, 900);
+		renderShell();
+		expect(await screen.findByLabelText('1 call awaiting your approval')).toBeVisible();
+	});
+
+	it('folds held calls into the Agents tile badge on a phone', async () => {
+		resetApprovalsStore();
+		await page.viewport(375, 812);
+		renderShell();
+		expect(await screen.findByLabelText(/^\d+\+? waiting for you$/)).toBeVisible();
+		await page.viewport(1440, 900);
+	});
+
 	it('opens the user menu and exposes a sign-out action', async () => {
 		renderShell();
 		const user = userEvent.setup();
 		await user.click(await screen.findByRole('button', { name: 'User menu' }));
 		expect(await screen.findByRole('menuitem', { name: /sign out/i })).toBeVisible();
+	});
+
+	it('switches the palette from the user menu', async () => {
+		const restoreStorage = stubLocalStorage();
+		onTestFinished(() => {
+			setTheme('light');
+			restoreStorage();
+		});
+		renderShell();
+		const user = userEvent.setup();
+		await user.click(await screen.findByRole('button', { name: 'User menu' }));
+		await user.click(screen.getByRole('menuitem', { name: 'Dark theme' }));
+		expect(document.documentElement.dataset.theme).toBe('dark');
+		expect(screen.getByRole('menuitem', { name: 'Light theme' })).toBeVisible();
 	});
 });
 
@@ -107,44 +145,32 @@ describe('toast region', () => {
 		return shown.getBoundingClientRect();
 	}
 
-	it('stacks toasts bottom-right, lifted above a page’s floating action dock', async () => {
+	it('stacks toasts bottom-left, lifted above a page’s floating action dock', async () => {
 		await page.viewport(1024, 800);
 		renderShell();
 		await screen.findByRole('navigation', { name: 'Primary' });
 
 		const rect = await showToast();
-		expect(rect.right).toBeCloseTo(window.innerWidth - 16, 0);
+		expect(rect.left).toBeCloseTo(16, 0);
 		expect(window.innerHeight - rect.bottom).toBeGreaterThanOrEqual(64);
 	});
 
-	it('moves toasts beside an open side panel, off its footer actions, and back when it closes', async () => {
+	it('stays bottom-left while a side panel is open, clear of its footer actions', async () => {
 		await page.viewport(1440, 900);
 		// A page that carries the rail (Home and Monitor show the stream in-page).
 		renderShell('/agents');
 		await screen.findByRole('navigation', { name: 'Primary' });
-		const sheet = renderWithProviders(
+		renderWithProviders(
 			<SheetPrimitive open onClose={() => {}} ariaLabel="Panel">
 				<button type="button">Save</button>
 			</SheetPrimitive>,
 		);
 		const panel = await screen.findByRole('dialog', { name: 'Panel' });
 
-		// Measured by width: the panel may still be sliding in, and a transform
-		// moves its box but not the edge it lands on.
-		await expect
-			.poll(async () => (await showToast()).right)
-			.toBeCloseTo(window.innerWidth - panel.offsetWidth - 16, 0);
-
-		sheet.rerender(
-			<SheetPrimitive open={false} onClose={() => {}} ariaLabel="Panel">
-				<button type="button">Save</button>
-			</SheetPrimitive>,
-		);
-		// Back beside the rail, the only thing left on the right edge.
-		const rail = screen.getByRole('complementary', { name: 'Activity' });
-		await expect
-			.poll(async () => (await showToast()).right)
-			.toBeCloseTo(window.innerWidth - rail.offsetWidth - 16, 0);
+		const rect = await showToast();
+		expect(rect.left).toBeCloseTo(16, 0);
+		// Measured by width: the panel may still be sliding in.
+		expect(rect.right).toBeLessThan(window.innerWidth - panel.offsetWidth);
 	});
 
 	it('drops toasts under the header when a phone-width panel leaves no room beside it', async () => {
@@ -176,18 +202,15 @@ describe('isNavItemActive', () => {
 	});
 
 	it('leads with Agents, the home surface, and ends with Monitor', () => {
-		expect(sortedNavItems().map((item) => item.id)).toEqual([
-			'agents',
-			'discover',
-			'workspace',
-			'monitor',
-		]);
+		expect(sortedNavItems().map((item) => item.id)).toEqual(['agents', 'library', 'monitor']);
 	});
 
 	it('matches feature items by prefix so nested routes stay highlighted', () => {
-		const discover = navItems.find((i) => i.to === '/discover')!;
-		expect(isNavItemActive(discover, '/discover')).toBe(true);
-		expect(isNavItemActive(discover, '/discover/abc')).toBe(true);
-		expect(isNavItemActive(discover, '/discoverable')).toBe(false);
+		// One Library entry covers the catalog, the workspace view and API hubs.
+		const library = navItems.find((i) => i.to === '/library')!;
+		expect(isNavItemActive(library, '/library')).toBe(true);
+		expect(isNavItemActive(library, '/library/workspace')).toBe(true);
+		expect(isNavItemActive(library, '/library/workspace/stripe/stripe-api/1')).toBe(true);
+		expect(isNavItemActive(library, '/libraryish')).toBe(false);
 	});
 });

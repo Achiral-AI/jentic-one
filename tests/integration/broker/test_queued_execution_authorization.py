@@ -11,24 +11,30 @@ the job runs, with the same problem type the sync execute route returns.
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import delete, update
+import structlog
+from sqlalchemy import delete, select, update
 
-from jentic_one.admin.core.schema.actor_scope_grants import ActorScopeGrant
+from jentic_one.admin.core.schema.actor_permission_grants import ActorPermissionGrant
 from jentic_one.admin.core.schema.agent_credential_bindings import AgentCredentialBinding
 from jentic_one.admin.core.schema.agents import Agent
+from jentic_one.admin.core.schema.held_executions import HeldExecution
+from jentic_one.admin.core.schema.jobs import Job
 from jentic_one.admin.core.schema.users import User
 from jentic_one.broker.core.setup import build_queued_execution_authorizer
 from jentic_one.broker.repos.actor_status import ActorStatusResolver
+from jentic_one.broker.services.execution import authorization
 from jentic_one.control.core.schema.agent_permission_rules import AgentPermissionRule
 from jentic_one.control.core.schema.credentials import Credential
 from jentic_one.control.core.schema.customer_api_keys import CustomerAPIKey
+from jentic_one.shared.auth.permission_catalog import BROKER_EXECUTE_PERMISSION
 from jentic_one.shared.context import Context
 from jentic_one.shared.db.ids import generate_ksuid
 from jentic_one.shared.jobs.protocols import QueuedExecutionRequest
-from jentic_one.shared.models import StoredCredentialType
-from jentic_one.shared.scopes import BROKER_EXECUTE_SCOPE
+from jentic_one.shared.models import JobKind, JobStatus, StoredCredentialType
 
 pytestmark = pytest.mark.integration
 
@@ -45,7 +51,7 @@ async def clean_tables(integration_context: Context) -> AsyncGenerator[None, Non
     async def _truncate() -> None:
         async with ctx.admin_db.session() as session:
             await session.execute(delete(AgentCredentialBinding))
-            await session.execute(delete(ActorScopeGrant))
+            await session.execute(delete(ActorPermissionGrant))
             await session.execute(delete(Agent))
             await session.commit()
         async with ctx.control_db.session() as session:
@@ -93,7 +99,9 @@ async def _seed_bound_agent(ctx: Context) -> tuple[str, str]:
             )
         )
         session.add(
-            ActorScopeGrant(actor_id=agent.id, actor_type="agent", scope=BROKER_EXECUTE_SCOPE)
+            ActorPermissionGrant(
+                actor_id=agent.id, actor_type="agent", permission=BROKER_EXECUTE_PERMISSION
+            )
         )
         await session.commit()
         agent_id = agent.id
@@ -162,7 +170,9 @@ async def test_execute_scope_revoked_after_enqueue_is_denied(
 ) -> None:
     agent_id, credential_id = await _seed_bound_agent(integration_context)
     async with integration_context.admin_db.session() as session:
-        await session.execute(delete(ActorScopeGrant).where(ActorScopeGrant.actor_id == agent_id))
+        await session.execute(
+            delete(ActorPermissionGrant).where(ActorPermissionGrant.actor_id == agent_id)
+        )
         await session.commit()
 
     verdict = await build_queued_execution_authorizer(integration_context).authorize(
@@ -291,13 +301,355 @@ async def test_actor_status_resolver_refuses_retired_service_account_actors(
     ctx = integration_context
     async with ctx.admin_db.session() as session:
         session.add(
-            ActorScopeGrant(
-                actor_id="sva_queued", actor_type="service_account", scope=BROKER_EXECUTE_SCOPE
+            ActorPermissionGrant(
+                actor_id="sva_queued",
+                actor_type="service_account",
+                permission=BROKER_EXECUTE_PERMISSION,
             )
         )
         await session.commit()
     resolver = ActorStatusResolver(ctx.admin_db)
     assert await resolver.is_active(actor_id="sva_queued", actor_type="service_account") is False
-    assert not await resolver.holds_scope(
-        actor_id="sva_queued", actor_type="service_account", scope=BROKER_EXECUTE_SCOPE
+    assert not await resolver.holds_permission(
+        actor_id="sva_queued", actor_type="service_account", permission=BROKER_EXECUTE_PERMISSION
     )
+
+
+async def _set_rule(ctx: Context, agent_id: str, *, path: str, match_mode: str) -> None:
+    async with ctx.control_db.session() as session:
+        await session.execute(
+            update(AgentPermissionRule)
+            .where(AgentPermissionRule.agent_id == agent_id)
+            .values(path=path, match_mode=match_mode)
+        )
+        await session.commit()
+
+
+_BASE_PATH_URL = "http://localhost:18765/eu/widgets"
+
+
+@pytest.mark.parametrize(
+    ("rule_path", "relative_path", "allowed"),
+    [
+        # The spec-relative rule the UI authors allows the base-path call.
+        ("/widgets", "/widgets", True),
+        # A rule written against the full upstream path does not match.
+        ("/eu/widgets", "/widgets", False),
+        # A job enqueued without the relative path falls back to the
+        # normalized full upstream path — never broader than that.
+        ("/eu/widgets", None, True),
+        ("/widgets", None, False),
+    ],
+)
+async def test_rules_are_reauthorized_on_the_server_relative_path(
+    integration_context: Context,
+    clean_tables: None,
+    rule_path: str,
+    relative_path: str | None,
+    allowed: bool,
+) -> None:
+    """Pins #1424: for an API whose server URL carries a base path
+    (``http://{host}:18765/{region}``), binding rules match the spec-relative
+    path, the same basis the rule editor, preview and ``permissions:test`` use."""
+    agent_id, credential_id = await _seed_bound_agent(integration_context)
+    await _set_rule(integration_context, agent_id, path=rule_path, match_mode="prefix")
+    authorizer = build_queued_execution_authorizer(integration_context)
+
+    verdict = await authorizer.authorize(
+        QueuedExecutionRequest(
+            actor_id=agent_id,
+            actor_type="agent",
+            method="GET",
+            upstream_url=_BASE_PATH_URL,
+            api_vendor=_VENDOR,
+            api_name=_API_NAME,
+            api_version=_API_VERSION,
+            relative_path=relative_path,
+            credential_id=credential_id,
+        )
+    )
+
+    assert verdict.allowed is allowed
+    if not allowed:
+        assert verdict.problem is not None
+        assert verdict.problem["type"] == "action_denied"
+
+
+async def test_encoded_path_is_denied_by_a_deny_rule_on_fallback(
+    integration_context: Context, clean_tables: None
+) -> None:
+    """A percent-encoded spelling of a denied path cannot dodge a ``deny``
+    rule: the fallback matches on the normalized path discovery resolved."""
+    agent_id, credential_id = await _seed_bound_agent(integration_context)
+    async with integration_context.control_db.session() as session:
+        session.add(
+            AgentPermissionRule(
+                agent_id=agent_id,
+                credential_id=credential_id,
+                effect="deny",
+                methods=["GET"],
+                path="/v1/admin",
+                match_mode="prefix",
+                sequence=0,
+            )
+        )
+        await session.commit()
+    authorizer = build_queued_execution_authorizer(integration_context)
+
+    verdict = await authorizer.authorize(
+        QueuedExecutionRequest(
+            actor_id=agent_id,
+            actor_type="agent",
+            method="GET",
+            upstream_url="https://api.acme.com/v1/%61dmin/users",
+            api_vendor=_VENDOR,
+            api_name=_API_NAME,
+            api_version=_API_VERSION,
+            credential_id=credential_id,
+        )
+    )
+
+    assert verdict.allowed is False
+
+
+_DIVERGENCE_EVENT = "rule_written_with_server_base_path"
+
+
+async def _set_rules(ctx: Context, agent_id: str, rules: list[tuple[str, str]]) -> None:
+    """Replace the binding's rules with ``(effect, prefix path)`` pairs, in order."""
+    async with ctx.control_db.session() as session:
+        row = (
+            await session.execute(
+                select(AgentPermissionRule).where(AgentPermissionRule.agent_id == agent_id)
+            )
+        ).scalar_one()
+        credential_id = row.credential_id
+        await session.execute(
+            delete(AgentPermissionRule).where(AgentPermissionRule.agent_id == agent_id)
+        )
+        for seq, (effect, path) in enumerate(rules):
+            session.add(
+                AgentPermissionRule(
+                    agent_id=agent_id,
+                    credential_id=credential_id,
+                    effect=effect,
+                    methods=["GET"],
+                    path=path,
+                    match_mode="prefix",
+                    sequence=seq,
+                )
+            )
+        await session.commit()
+
+
+def _base_path_request(agent_id: str, credential_id: str) -> QueuedExecutionRequest:
+    return QueuedExecutionRequest(
+        actor_id=agent_id,
+        actor_type="agent",
+        method="GET",
+        upstream_url="https://api.acme.com/api/v3/admin/users",
+        api_vendor=_VENDOR,
+        api_name=_API_NAME,
+        api_version=_API_VERSION,
+        relative_path="/admin/users",
+        credential_id=credential_id,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _reset_divergence_log_window() -> None:
+    authorization._divergence_last_logged.clear()
+
+
+@pytest.mark.parametrize(
+    ("rules", "allowed", "kind"),
+    [
+        # Upgrade trap, fail-closed: a base-path ``allow`` stops matching.
+        ([("allow", "/api/v3/admin")], False, "legacy_allow_no_longer_matches"),
+        # Upgrade trap, fail-OPEN: a base-path ``deny`` stops matching and a
+        # broader ``allow`` now lets the call through. Must be flagged.
+        (
+            [("deny", "/api/v3/admin"), ("allow", "/")],
+            True,
+            "legacy_deny_no_longer_matches",
+        ),
+        # Correct spec-relative rules whose verdict merely differs on the
+        # upstream string: not a base-path rule, so no warning.
+        ([("deny", "/admin"), ("allow", "/")], False, None),
+        # A denial no base-path reading explains stays quiet.
+        ([("allow", "/gadgets")], False, None),
+    ],
+)
+async def test_flags_rules_written_with_the_server_base_path(
+    integration_context: Context,
+    clean_tables: None,
+    rules: list[tuple[str, str]],
+    allowed: bool,
+    kind: str | None,
+) -> None:
+    """A verdict that changed because a rule carries the server base path —
+    either direction — is logged with the rule's position and pattern; the
+    verdict itself is the spec-relative one."""
+    agent_id, credential_id = await _seed_bound_agent(integration_context)
+    await _set_rules(integration_context, agent_id, rules)
+    authorizer = build_queued_execution_authorizer(integration_context)
+
+    with structlog.testing.capture_logs() as logs:
+        verdict = await authorizer.authorize(_base_path_request(agent_id, credential_id))
+
+    assert verdict.allowed is allowed
+    flagged = [e for e in logs if e["event"] == _DIVERGENCE_EVENT]
+    if kind is None:
+        assert flagged == []
+        return
+    assert len(flagged) == 1
+    entry = flagged[0]
+    assert entry["log_level"] == "warning"
+    assert entry["kind"] == kind
+    assert entry["rule_position"] == 1
+    assert entry["rule_path"] == "/api/v3/admin"
+    assert entry["credential_id"] == credential_id
+    assert "rewrite-rule-base-paths" in entry["actionable_step"]
+    # Never the concrete request path (it can carry user data).
+    assert "/admin/users" not in str(entry)
+
+
+async def test_divergence_warning_is_rate_limited(
+    integration_context: Context, clean_tables: None
+) -> None:
+    agent_id, credential_id = await _seed_bound_agent(integration_context)
+    await _set_rules(integration_context, agent_id, [("allow", "/api/v3/admin")])
+    authorizer = build_queued_execution_authorizer(integration_context)
+
+    with structlog.testing.capture_logs() as logs:
+        for _ in range(5):
+            await authorizer.authorize(_base_path_request(agent_id, credential_id))
+
+    assert len([e for e in logs if e["event"] == _DIVERGENCE_EVENT]) == 1
+
+
+@pytest.mark.parametrize(
+    "upstream_url",
+    [
+        "https://api.acme.com/v1/admin%2F..%2Fpets",
+        "https://api.acme.com/v1/admin%5C..%5Cpets",
+        "https://api.acme.com/v1/admin/%2e%2e/pets",
+        "https://api.acme.com/v1/admin\\..\\pets",
+    ],
+)
+async def test_encoded_traversal_is_denied(
+    integration_context: Context, clean_tables: None, upstream_url: str
+) -> None:
+    """``deny /v1/admin`` + ``allow /``: a path that only resolves to an
+    allowed path by decoding an escaped separator/dot segment is refused —
+    upstream stacks disagree on what it means."""
+    agent_id, credential_id = await _seed_bound_agent(integration_context)
+    await _set_rules(integration_context, agent_id, [("deny", "/v1/admin"), ("allow", "/")])
+    authorizer = build_queued_execution_authorizer(integration_context)
+
+    verdict = await authorizer.authorize(
+        QueuedExecutionRequest(
+            actor_id=agent_id,
+            actor_type="agent",
+            method="GET",
+            upstream_url=upstream_url,
+            api_vendor=_VENDOR,
+            api_name=_API_NAME,
+            api_version=_API_VERSION,
+            credential_id=credential_id,
+        )
+    )
+
+    assert verdict.allowed is False
+    assert verdict.problem is not None
+    assert verdict.problem["type"] == "action_denied"
+
+
+async def _set_rule_effect(ctx: Context, agent_id: str, effect: str) -> None:
+    async with ctx.control_db.session() as session:
+        await session.execute(
+            update(AgentPermissionRule)
+            .where(AgentPermissionRule.agent_id == agent_id)
+            .values(effect=effect)
+        )
+        await session.commit()
+
+
+async def _job_with_approval(ctx: Context, agent_id: str, state: str | None) -> str:
+    """A job created by ``agent_id``, with an approval row in ``state`` (or none)."""
+    async with ctx.admin_db.session() as session:
+        job = Job(kind=JobKind.EXECUTION, status=JobStatus.RUNNING, created_by=agent_id)
+        session.add(job)
+        await session.flush()
+        if state is not None:
+            session.add(
+                HeldExecution(
+                    job_id=job.id,
+                    agent_id=agent_id,
+                    credential_id="cred_x",
+                    api_vendor=_VENDOR,
+                    api_name=_API_NAME,
+                    api_version=_API_VERSION,
+                    method="GET",
+                    path="/v1/pets",
+                    request_fingerprint=generate_ksuid("fp").ljust(64, "0"),
+                    state=state,
+                    expires_at=datetime.now(UTC) + timedelta(hours=1),
+                )
+            )
+        await session.commit()
+        return str(job.id)
+
+
+@pytest.fixture()
+async def clean_jobs(integration_context: Context) -> AsyncGenerator[None, None]:
+    yield
+    async with integration_context.admin_db.session() as session:
+        await session.execute(delete(Job))
+        await session.commit()
+
+
+async def test_require_approval_passes_only_for_the_approved_job(
+    integration_context: Context, clean_tables: None, clean_jobs: None
+) -> None:
+    """A require-approval verdict at run time is honoured for the job a reviewer
+    approved — and for no other job, pending or unapproved."""
+    ctx = integration_context
+    agent_id, credential_id = await _seed_bound_agent(ctx)
+    await _set_rule_effect(ctx, agent_id, "require-approval")
+    approved_job = await _job_with_approval(ctx, agent_id, "approved")
+    pending_job = await _job_with_approval(ctx, agent_id, "pending")
+    bare_job = await _job_with_approval(ctx, agent_id, None)
+    authorizer = build_queued_execution_authorizer(ctx)
+
+    allowed = await authorizer.authorize(
+        replace(_request(agent_id, credential_id), job_id=approved_job)
+    )
+    assert allowed.allowed is True
+    assert allowed.credential_id == credential_id
+
+    for job_id in (pending_job, bare_job, None):
+        verdict = await authorizer.authorize(
+            replace(_request(agent_id, credential_id), job_id=job_id)
+        )
+        assert verdict.allowed is False
+        assert verdict.problem is not None
+        assert verdict.problem["type"] == "approval_required"
+        assert verdict.problem["status"] == 403
+
+
+async def test_approved_job_still_fails_when_the_rule_now_denies(
+    integration_context: Context, clean_tables: None, clean_jobs: None
+) -> None:
+    """An approval only satisfies require-approval; a rule that now denies wins."""
+    ctx = integration_context
+    agent_id, credential_id = await _seed_bound_agent(ctx)
+    await _set_rule_effect(ctx, agent_id, "deny")
+    approved_job = await _job_with_approval(ctx, agent_id, "approved")
+
+    verdict = await build_queued_execution_authorizer(ctx).authorize(
+        replace(_request(agent_id, credential_id), job_id=approved_job)
+    )
+    assert verdict.allowed is False
+    assert verdict.problem is not None
+    assert verdict.problem["type"] == "action_denied"

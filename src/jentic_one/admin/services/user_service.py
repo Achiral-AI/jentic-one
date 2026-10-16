@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from jentic_one.admin.core.permissions import IMPLICATION_MAP, compute_effective
+from jentic_one.admin.core.schema.users import User
 from jentic_one.admin.repos import (
     AuditRepository,
     ExternalIdentityRepository,
@@ -11,6 +14,8 @@ from jentic_one.admin.repos import (
     UserRepository,
     UserSecretRepository,
 )
+from jentic_one.admin.scoping.filters import build_access_filters
+from jentic_one.admin.services._support.actor_jobs import cancel_queued_executions_for_actor
 from jentic_one.admin.services._support.pagination import Page, decode_cursor, encode_cursor
 from jentic_one.admin.services._support.user_management import (
     ensure_can_change_email,
@@ -98,39 +103,49 @@ class UserService:
         cursor: str | None = None,
         limit: int = 50,
         invite_state: InviteState | None = None,
+        *,
+        identity: Identity,
     ) -> Page[UserView]:
-        # NOTE: the `invite_state` filter matches the STORED column, so it can't
-        # filter by the derived EXPIRED state (never persisted) — `EXPIRED`
-        # returns nothing and `PENDING` may return rows that render as expired.
-        # If filtering by expired is ever needed, translate it to
-        # `PENDING AND user_id NOT IN (active)` here.
+        """List users, scoped to the caller (``build_access_filters`` on ``User``).
+
+        ``org:admin`` sees every user; anyone else sees only themselves.
+        ``invite_state`` filters on the derived state, so ``expired`` matches
+        pending users whose invite has lapsed and ``pending`` excludes them.
+        """
         cursor_dt = None
         if cursor is not None:
             cursor_dt, _ = decode_cursor(cursor)
 
+        access_filters = build_access_filters(identity, User)
         async with self._ctx.admin_db.session() as session:
             users = await UserRepository.list_all(
-                session, limit=limit + 1, cursor=cursor_dt, invite_state=invite_state
+                session,
+                limit=limit + 1,
+                cursor=cursor_dt,
+                invite_state=invite_state,
+                filters=access_filters,
             )
+            has_more = len(users) > limit
+            if has_more:
+                users = users[:limit]
 
-        has_more = len(users) > limit
-        if has_more:
-            users = users[:limit]
+            # Derive the EXPIRED invite state at read time (never persisted): a
+            # still-pending user with no unredeemed, unexpired token has a lapsed
+            # invite. A PENDING/EXPIRED filter already decided this in SQL, so
+            # reuse that verdict rather than re-checking against a later clock
+            # (a token lapsing in between would contradict the filter).
+            pending_ids = [u.id for u in users if u.invite_state == InviteState.PENDING]
+            active_invite_ids: set[str] = set()
+            if invite_state == InviteState.PENDING:
+                active_invite_ids = set(pending_ids)
+            elif invite_state is None and pending_ids:
+                active_invite_ids = await InviteTokenRepository.user_ids_with_active_invite(
+                    session, pending_ids
+                )
 
         user_ids = [u.id for u in users]
         perm_service = PermissionService(self._ctx)
         perms_map = await perm_service.project_for_users(user_ids)
-
-        # Derive the EXPIRED invite state at read time (never persisted): a
-        # still-pending user with no unredeemed,
-        # unexpired token has a lapsed invite. One batch query — no N+1.
-        pending_ids = [u.id for u in users if u.invite_state == InviteState.PENDING]
-        active_invite_ids: set[str] = set()
-        if pending_ids:
-            async with self._ctx.admin_db.session() as session:
-                active_invite_ids = await InviteTokenRepository.user_ids_with_active_invite(
-                    session, pending_ids
-                )
 
         views = [
             UserView(
@@ -213,9 +228,18 @@ class UserService:
             user=user_view, invite_token=invite.token, invite_expires_at=invite.expires_at
         )
 
+    async def get(self, user_id: str, *, identity: Identity) -> UserView:
+        """Read one user, scoped to the caller; out-of-scope reads as not found (404)."""
+        return await self._load_view(user_id, filters=build_access_filters(identity, User))
+
     async def get_by_id(self, user_id: str) -> UserView:
+        """Unscoped read for trusted callers: self-lookups and post-write re-reads."""
+        return await self._load_view(user_id, filters=None)
+
+    async def _load_view(self, user_id: str, *, filters: list[Any] | None) -> UserView:
+        """``filters`` comes from ``build_access_filters``; ``None`` means unscoped."""
         async with self._ctx.admin_db.session() as session:
-            user = await UserRepository.get_by_id(session, user_id)
+            user = await UserRepository.get_by_id(session, user_id, filters=filters)
             if user is None:
                 raise UserNotFoundError(user_id)
             # Derive EXPIRED at read time (see list_all): a pending user with no
@@ -251,10 +275,25 @@ class UserService:
     async def update(
         self, user_id: str, payload: UserUpdatePayload, *, identity: Identity
     ) -> UserView:
+        """Update a user's profile, scoped like :meth:`get`.
+
+        The target is resolved through the caller's ``User`` access filter, so
+        a user the caller cannot read answers not found (404) whatever the
+        payload. Every change then passes ``ensure_can_manage`` against the
+        caller's stored grants, and an email change additionally passes
+        ``ensure_can_change_email``. All checks run before any write or audit
+        entry, and the response is the scoped re-read.
+        """
+        access_filters = build_access_filters(identity, User)
         async with self._ctx.admin_db.transaction() as session:
-            user = await UserRepository.get_by_id(session, user_id)
+            user = await UserRepository.get_by_id(session, user_id, filters=access_filters)
             if user is None:
                 raise UserNotFoundError(user_id)
+
+            permission_sets = await UserPermissionGrantRepository.get_permission_sets(
+                session, [user_id, identity.sub]
+            )
+            ensure_can_manage(user_id, identity, permission_sets)
 
             before = {
                 "email": user.email,
@@ -266,9 +305,6 @@ class UserService:
                 payload.email is not None and payload.email.lower() != user.email.lower()
             )
             if email_changed:
-                permission_sets = await UserPermissionGrantRepository.get_permission_sets(
-                    session, [user_id, identity.sub]
-                )
                 ensure_can_change_email(user_id, identity, permission_sets)
 
             if payload.email is not None:
@@ -317,7 +353,7 @@ class UserService:
                 1, {"action": AuditAction.UPDATE, "target_type": AuditTargetType.USER}
             )
 
-        return await self.get_by_id(user_id)
+        return await self.get(user_id, identity=identity)
 
     async def delete(self, user_id: str, *, identity: Identity) -> None:
         async with self._ctx.admin_db.transaction() as session:
@@ -336,6 +372,13 @@ class UserService:
                 active=False,
             )
             await ExternalIdentityRepository.delete_for_user(session, user_id)
+            await cancel_queued_executions_for_actor(
+                session,
+                actor_id=user_id,
+                target_type=AuditTargetType.USER,
+                cause="was deleted",
+                identity=identity,
+            )
             await AuditRepository.record(
                 session,
                 action=AuditAction.DELETE,
@@ -359,6 +402,16 @@ class UserService:
             ensure_can_manage(user_id, identity, permission_sets)
             await ensure_not_last_active_admin(session, user_id)
             await UserRepository.disable(session, user_id)
+            # A queued execution job runs with its creator's authority, so
+            # one left queued would run for a user who can no longer act
+            # (#1674). Re-enabling does not requeue it.
+            await cancel_queued_executions_for_actor(
+                session,
+                actor_id=user_id,
+                target_type=AuditTargetType.USER,
+                cause="was disabled",
+                identity=identity,
+            )
             await AuditRepository.record(
                 session,
                 action=AuditAction.DISABLE,

@@ -21,6 +21,7 @@ import {
 	GroupBy,
 	MonitoringService,
 	OAuthService,
+	PermissionRuleSetsService,
 	PermissionsService,
 	SystemService,
 	type AgentResponse,
@@ -32,17 +33,18 @@ import {
 	type PermissionRuleSchema,
 	type PermissionTestRequest,
 	type PermissionTestResponse,
+	type RuleSetResponse,
 } from '@/shared/api';
+import { hasTrace } from '@/shared/lib';
 import {
 	agentToEntity,
-	type AgentBindableCredential,
 	type AgentEntity,
 	type ApiKeyHistoryEntry,
+	type BindingRuleSetEntity,
 	type ApiKeyInfoEntity,
 	type ApiKeyResult,
 	type CredentialBindingEntity,
 	type InstanceIdentityEntity,
-	type McpLastSeen,
 	type McpSessionEntity,
 	type OAuthGrantEntity,
 	type PermissionCatalogEntry,
@@ -63,6 +65,17 @@ export class AgentsApiError extends Error {
 		this.status = status;
 		this.cause = cause;
 	}
+}
+
+/** A refused read (403): the caller lacks the permission, and retrying cannot
+ * change the answer. A 401 is a different state — the session itself ended. */
+export function isAgentsAccessDenied(error: unknown): boolean {
+	return error instanceof AgentsApiError && error.status === 403;
+}
+
+/** The session is no longer valid (401). */
+export function isAgentsSessionEnded(error: unknown): boolean {
+	return error instanceof AgentsApiError && error.status === 401;
 }
 
 function toAgentsError(error: unknown, fallback: string): AgentsApiError {
@@ -114,14 +127,6 @@ export async function listAgents(params: {
 		};
 	} catch (error) {
 		throw toAgentsError(error, 'Failed to load agents.');
-	}
-}
-
-export async function getAgent(agentId: string): Promise<AgentEntity> {
-	try {
-		return agentToEntity(await AgentsService.getAgent({ agentId }));
-	} catch (error) {
-		throw toAgentsError(error, 'Failed to load the agent.');
 	}
 }
 
@@ -287,30 +292,6 @@ export async function resumeAgentCredentialBinding(
 	}
 }
 
-/**
- * Candidate credentials for the agent-side "Bind credential" picker. Reads the
- * org-wide `GET /credentials` surface through the shared API (the agents
- * module must not import the credentials page module) and projects to the
- * minimal picker shape.
- */
-export async function listBindableCredentialsForAgent(): Promise<AgentBindableCredential[]> {
-	try {
-		const res = await CredentialsService.listCredentials({ limit: 100 });
-		return res.data.map((c) => ({
-			credential_id: c.credential_id,
-			name: c.name,
-			type: c.type,
-			vendor: c.api?.vendor ?? null,
-			apiName: c.api?.name ?? null,
-			catalogApiId: c.catalog_api_id ?? null,
-			provider: c.provider ?? null,
-			createdBy: c.created_by ?? null,
-		}));
-	} catch (error) {
-		throw toAgentsError(error, 'Failed to load credentials.');
-	}
-}
-
 /** The ordered PBAC rules on one direct binding
  * (`GET /credentials/{cid}/agents/{aid}/permissions`). */
 export async function listAgentBindingPermissions(
@@ -346,6 +327,39 @@ export async function replaceAgentBindingPermissions(
 	}
 }
 
+function ruleSetToEntity(r: RuleSetResponse): BindingRuleSetEntity {
+	return {
+		id: r.rule_set_id,
+		name: r.name,
+		description: r.description ?? null,
+		curated: r.curated,
+		bindingCount: r.binding_count,
+		rules: r.rules,
+	};
+}
+
+/** One shared rule set with its ordered rules (`GET /permission-rule-sets/{id}`). */
+export async function getBindingRuleSet(ruleSetId: string): Promise<BindingRuleSetEntity> {
+	try {
+		return ruleSetToEntity(await PermissionRuleSetsService.getPermissionRuleSet({ ruleSetId }));
+	} catch (error) {
+		throw toAgentsError(error, 'Failed to load the rule set.');
+	}
+}
+
+/** Detach a binding's shared rule set (`DELETE …/agents/{aid}/rule-set`) — its
+ * inline rules become the effective policy again. */
+export async function detachAgentBindingRuleSet(
+	agentId: string,
+	credentialId: string,
+): Promise<void> {
+	try {
+		await CredentialsService.detachAgentCredentialRuleSet({ credentialId, agentId });
+	} catch (error) {
+		throw toAgentsError(error, 'Failed to detach the rule set.');
+	}
+}
+
 /**
  * Broker dry-run against one direct binding's SAVED rules
  * (`POST …/permissions:test`). There is no vendor
@@ -370,17 +384,17 @@ export async function testAgentBindingPermissions(
 export async function createAgent(params: {
 	name: string;
 	description?: string | null;
-	scopes?: string[] | null;
+	permissions?: string[] | null;
 }): Promise<AgentEntity> {
 	try {
 		const res = await AgentsService.createAgent({
 			requestBody: {
 				name: params.name,
 				description: params.description ?? null,
-				// Optional initial grants — POST /agents accepts scopes[] so a
+				// Optional initial grants — POST /agents accepts permissions[] so a
 				// manually created agent can start with the permissions it needs
 				// instead of a follow-up PUT from the detail page.
-				scopes: params.scopes?.length ? params.scopes : null,
+				permissions: params.permissions?.length ? params.permissions : null,
 			},
 		});
 		return agentToEntity(res);
@@ -466,12 +480,12 @@ export async function getAgentApiKeyHistory(agentId: string): Promise<ApiKeyHist
 }
 
 // ---------------------------------------------------------------------------
-// Scopes (#615) — platform permission catalogue + per-actor scope grants.
+// Permissions (#615) — platform permission catalogue + per-actor grants.
 //
-// Two scope vocabularies exist in this codebase; these are the PLATFORM
-// permission scopes (`org:admin`, `agents:write`, …) drawn from
-// `GET /permissions` — NOT the OAuth2 provider scopes the credentials picker
-// uses. `PUT .../scopes` replaces the entire set (no partial grant/revoke), so
+// These are internal-authorization PERMISSIONS (`org:admin`, `agents:write`, …)
+// drawn from `GET /permissions` — NOT the OAuth2 provider scopes the credentials
+// picker uses, which are a separate vocabulary. `PUT .../permissions` replaces
+// the entire set (no partial grant/revoke), so
 // callers read the full list, edit it, and write it back.
 // ---------------------------------------------------------------------------
 
@@ -489,24 +503,27 @@ export async function listPermissions(): Promise<PermissionCatalogEntry[]> {
 	}
 }
 
-export async function getAgentScopes(agentId: string): Promise<string[]> {
+export async function getAgentPermissions(agentId: string): Promise<string[]> {
 	try {
-		const res = await AgentsService.getAgentScopes({ agentId });
-		return res.scopes;
+		const res = await AgentsService.getAgentPermissions({ agentId });
+		return res.permissions;
 	} catch (error) {
-		throw toAgentsError(error, "Failed to load the agent's scopes.");
+		throw toAgentsError(error, "Failed to load the agent's permissions.");
 	}
 }
 
-export async function replaceAgentScopes(agentId: string, scopes: string[]): Promise<string[]> {
+export async function replaceAgentPermissions(
+	agentId: string,
+	permissions: string[],
+): Promise<string[]> {
 	try {
-		const res = await AgentsService.replaceAgentScopes({
+		const res = await AgentsService.replaceAgentPermissions({
 			agentId,
-			requestBody: { scopes },
+			requestBody: { permissions },
 		});
-		return res.scopes;
+		return res.permissions;
 	} catch (error) {
-		throw toAgentsError(error, "Failed to update the agent's scopes.");
+		throw toAgentsError(error, "Failed to update the agent's permissions.");
 	}
 }
 
@@ -518,7 +535,7 @@ export async function replaceAgentScopes(agentId: string, scopes: string[]): Pro
 // ---------------------------------------------------------------------------
 
 /** One time bucket of an actor's execution volume. */
-export interface UsageBucketEntity {
+interface UsageBucketEntity {
 	/** Bucket start, unix seconds. */
 	ts: number;
 	total: number;
@@ -538,8 +555,8 @@ export interface ActorUsageDetail {
 }
 
 /**
- * One actor's usage over the trailing `sinceDays` window — the detail page's
- * KPI strip and Activity chart. `agent_id` is the endpoint's (misnamed) actor
+ * One actor's usage over the trailing `sinceDays` window — the Agents page's
+ * stat strip and the Activity sheet's chart. `agent_id` is the endpoint's (misnamed) actor
  * filter: the backend maps it onto `actor_id`. `null` on 403 means the
  * viewer isn't an admin and the caller renders no stats — never an error.
  */
@@ -617,6 +634,63 @@ export async function fetchCredentialUsageTotals(
 	}
 }
 
+/** Per-credential call figures for one actor on one API over a window. */
+export interface ApiCredentialUsage {
+	total: number;
+	success: number;
+	failed: number;
+	avgMs: number;
+	/** Equal-width call counts across the window, oldest → newest. */
+	trend: number[];
+}
+
+/** One actor's usage of one API: per credential, plus the API-wide latency. */
+export interface ActorApiUsage {
+	/** Credential id → its calls on this API. A credential absent from a
+	 * complete map made no calls in the window. */
+	byCredential: ReadonlyMap<string, ApiCredentialUsage>;
+	/** Percentiles across the actor's calls to this API (every credential). */
+	p50Ms: number | null;
+	p95Ms: number | null;
+}
+
+/**
+ * One actor's calls to one API (`api_id` = `vendor/name`) over the trailing
+ * `sinceDays`, grouped by credential — the "Can call" row's figures. `null` on 403.
+ */
+export async function fetchActorApiUsage(
+	actorId: string,
+	apiId: string,
+	sinceDays = 7,
+): Promise<ActorApiUsage | null> {
+	try {
+		// Same minute-ceiled bounds as `fetchActorUsageDetail`, for the same reasons.
+		const until = (Math.floor(Date.now() / 60_000) + 1) * 60;
+		const res = await MonitoringService.getUsageStats({
+			since: until - sinceDays * 86400,
+			until,
+			agentId: actorId,
+			apiId,
+			groupBy: GroupBy.CREDENTIAL,
+			topLimit: CREDENTIAL_USAGE_TOP_LIMIT,
+		});
+		const byCredential = new Map<string, ApiCredentialUsage>();
+		for (const row of res.top) {
+			byCredential.set(row.key, {
+				total: row.total,
+				success: row.success,
+				failed: row.failed,
+				avgMs: row.avg_ms,
+				trend: row.trend,
+			});
+		}
+		return { byCredential, p50Ms: res.stats.p50_ms, p95Ms: res.stats.p95_ms };
+	} catch (error) {
+		if (error instanceof ApiError && error.status === 403) return null;
+		throw toAgentsError(error, 'Failed to load usage statistics.');
+	}
+}
+
 /** One row of an actor's execution feed (a trimmed `ExecutionResponse`). */
 export interface ActorExecutionEntity {
 	id: string;
@@ -640,20 +714,26 @@ export interface ActorExecutionEntity {
 	httpStatus: number | null;
 	error: string | null;
 	startedAt: string;
+	/** The API the call went to; null when the record carries none. */
+	api: { vendor: string; name: string } | null;
+	/** Opens the call's trace in Monitor; null when it ran untraced (or the
+	 * record holds the `"unknown"` placeholder). */
+	traceId: string | null;
 }
 
 /**
  * The most recent executions attributed to one actor
- * (`GET /executions?actor_id=…`). One page only — the detail page shows a
+ * (`GET /executions?actor_id=…`). One page only — the Activity sheet shows a
  * recent-activity feed and deep-links to Monitor (which owns cursor paging,
  * filters, and trace sheets) for the full history. `null` on 403.
  */
 export async function fetchActorExecutions(
 	actorId: string,
 	limit = 10,
+	from?: string,
 ): Promise<{ items: ActorExecutionEntity[]; hasMore: boolean } | null> {
 	try {
-		const res = await ExecutionsService.listExecutions({ actorId, limit });
+		const res = await ExecutionsService.listExecutions({ actorId, limit, from });
 		return {
 			items: res.data.map((r) => ({
 				id: r.execution_id,
@@ -669,6 +749,9 @@ export async function fetchActorExecutions(
 				httpStatus: r.http_status ?? null,
 				error: r.error ?? null,
 				startedAt: r.started_at,
+				api: r.api ? { vendor: r.api.vendor, name: r.api.name } : null,
+				// The backend's `"unknown"` placeholder opens no trace.
+				traceId: hasTrace(r.trace_id) ? r.trace_id : null,
 			})),
 			hasMore: res.has_more,
 		};
@@ -721,10 +804,10 @@ export async function listActorAudit(actorId: string, limit = 25): Promise<Audit
 // ---------------------------------------------------------------------------
 
 /** Wire value of the MCP session event type (`EventType.MCP_SESSION_STARTED`). */
-export const MCP_SESSION_STARTED_EVENT = 'mcp.session_started';
+const MCP_SESSION_STARTED_EVENT = 'mcp.session_started';
 
 /** The `origin` wire value stamped on MCP executions (`Origin.MCP`). */
-export const MCP_ORIGIN = 'mcp';
+const MCP_ORIGIN = 'mcp';
 
 function eventToMcpSession(e: EventResponse): McpSessionEntity {
 	// The emitter writes clientInfo + transport + session id into the internal
@@ -761,39 +844,6 @@ export async function fetchMcpSessions(actorId: string): Promise<McpSessionEntit
 			return null;
 		}
 		throw toAgentsError(error, 'Failed to load MCP sessions.');
-	}
-}
-
-/**
- * Latest MCP session per agent for the roster's "last seen via MCP" cell,
- * from ONE page of `mcp.session_started` events. The feed is newest-first, so
- * the first row per `actor_id` is that agent's latest session. Like the
- * usage top-50 leaderboard, this is bounded enrichment: an agent absent from
- * the newest 100 session events means "no recent MCP session known", not
- * "never" — callers render an em-dash. `null` when permission-gated.
- */
-export async function fetchMcpLastSeenByActor(): Promise<Map<string, McpLastSeen> | null> {
-	try {
-		const res = await EventsService.listEvents({
-			eventType: [MCP_SESSION_STARTED_EVENT],
-			limit: 100,
-		});
-		const out = new Map<string, McpLastSeen>();
-		for (const e of res.data) {
-			if (!e.actor_id || out.has(e.actor_id)) continue;
-			const s = eventToMcpSession(e);
-			out.set(e.actor_id, {
-				clientName: s.clientName,
-				clientVersion: s.clientVersion,
-				startedAt: s.startedAt,
-			});
-		}
-		return out;
-	} catch (error) {
-		if (error instanceof ApiError && (error.status === 403 || error.status === 401)) {
-			return null;
-		}
-		throw toAgentsError(error, 'Failed to load MCP session events.');
 	}
 }
 

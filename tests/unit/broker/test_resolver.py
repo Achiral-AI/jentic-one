@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -15,6 +15,8 @@ from jentic_one.broker.services.credentials.errors import (
 from jentic_one.broker.services.credentials.resolver import CredentialResolver, ResolvedCredential
 from jentic_one.shared.models.credentials import CredentialType, StoredCredentialType
 from jentic_one.shared.schemas import APIReference
+
+pytestmark = pytest.mark.usefixtures("load_material_spy")
 
 
 def _make_credential(
@@ -28,6 +30,7 @@ def _make_credential(
     active: bool = True,
     provider: str = "static",
     server_variables: dict[str, str] | None = None,
+    created_by: str | None = "usr_cred_owner",
 ) -> MagicMock:
     cred = MagicMock()
     cred.id = cred_id
@@ -38,6 +41,7 @@ def _make_credential(
     cred.api_version = api_version
     cred.active = active
     cred.provider = provider
+    cred.created_by = created_by
     cred.server_variables = server_variables
     cred.created_at = None
     cred.token_value_credential = None
@@ -45,6 +49,8 @@ def _make_credential(
     cred.basic_credential = None
     cred.oauth_client_credential = None
     cred.oauth_token = None
+    cred.sigv4_credential = None
+    cred.provider_account_ref = None
     return cred
 
 
@@ -469,3 +475,94 @@ async def test_resolve_credential_name_selects_less_specific_covering() -> None:
         )
 
     assert result.credential_id == "cred_wild"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stored_type",
+    [
+        StoredCredentialType.STATIC_BEARER_TOKEN,
+        StoredCredentialType.API_KEY,
+        StoredCredentialType.BASIC_AUTH,
+        StoredCredentialType.OAUTH2_AUTHORIZATION_CODE,
+        StoredCredentialType.NO_AUTH,
+        StoredCredentialType.AWS_SIGV4,
+    ],
+)
+@pytest.mark.parametrize("owner", ["usr_cred_owner", None])
+async def test_resolve_carries_credential_owner(
+    stored_type: StoredCredentialType, owner: str | None
+) -> None:
+    """Every wire type carries the stored row's ``created_by`` as the credential
+    owner, so use and health events can name it."""
+    cred = _make_credential(type=stored_type.value, created_by=owner)
+    ctx = _make_ctx_with_control_session(AsyncMock())
+    api = APIReference(vendor="stripe", name="payments", version="v1")
+
+    with patch(
+        "jentic_one.broker.services.credentials.resolver.CredentialRepository.list_by_vendor",
+        new_callable=AsyncMock,
+        return_value=[cred],
+    ):
+        result = await CredentialResolver(ctx).resolve(api=api, caller="agent_1")
+
+    assert result.stored_type == stored_type
+    assert result.created_by == owner
+
+
+@pytest.mark.asyncio
+async def test_resolve_loads_material_for_the_winner_only(load_material_spy: AsyncMock) -> None:
+    """Secret material is loaded for the single winning credential, never the others."""
+    unbound = _make_credential(cred_id="cred_unbound", api_name="payments", api_version="v1")
+    inactive = _make_credential(cred_id="cred_inactive", type="API_KEY", active=False)
+    wildcard = _make_credential(cred_id="cred_wild", api_name=None, api_version=None)
+    pinned = _make_credential(cred_id="cred_pin", api_name="payments", api_version="v1")
+
+    ctx = _make_ctx_with_control_session(AsyncMock())
+    api = APIReference(vendor="stripe", name="payments", version="v1")
+
+    with patch(
+        "jentic_one.broker.services.credentials.resolver.CredentialRepository.list_by_vendor",
+        new_callable=AsyncMock,
+        return_value=[unbound, inactive, wildcard, pinned],
+    ):
+        result = await CredentialResolver(ctx).resolve(
+            api=api,
+            caller="caller_1",
+            allowed_credential_ids={"cred_inactive", "cred_wild", "cred_pin"},
+        )
+
+    assert result.credential_id == "cred_pin"
+    load_material_spy.assert_awaited_once_with(ANY, [pinned])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("candidates", "error"),
+    [
+        ([_make_credential(api_version="v2")], CredentialNotProvisionedError),
+        (
+            [_make_credential(cred_id="cred_a"), _make_credential(cred_id="cred_b")],
+            AmbiguousCredentialError,
+        ),
+    ],
+    ids=["not-provisioned", "ambiguous"],
+)
+async def test_resolve_failure_loads_no_material(
+    load_material_spy: AsyncMock, candidates: list[MagicMock], error: type[Exception]
+) -> None:
+    """A 404/409 resolution never asks for any credential's secret material."""
+    ctx = _make_ctx_with_control_session(AsyncMock())
+    api = APIReference(vendor="stripe", name="payments", version="v1")
+
+    with (
+        patch(
+            "jentic_one.broker.services.credentials.resolver.CredentialRepository.list_by_vendor",
+            new_callable=AsyncMock,
+            return_value=candidates,
+        ),
+        pytest.raises(error),
+    ):
+        await CredentialResolver(ctx).resolve(api=api, caller="caller_1")
+
+    load_material_spy.assert_not_awaited()

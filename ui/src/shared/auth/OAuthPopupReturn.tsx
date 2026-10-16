@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router';
 import { Button } from '@/shared/ui/Button';
 import { AppLink } from '@/shared/ui/AppLink';
+import { AuthCard } from '@/shared/ui/AuthCard';
 import { ROUTE_PATHS } from '@/shared/app/routes';
 
 /**
@@ -65,7 +66,12 @@ export function OAuthPopupReturn() {
 	// Notify the opener (advisory) so it can short-circuit its poll. Restrict the
 	// target origin to our own — the opener is same-origin (SPA under /app), and
 	// a strict origin prevents the message leaking to an unexpected document.
+	// A one-shot ref keeps it to a single post per mount: StrictMode replays
+	// effects (mount → unmount → remount) and a post can't be undone in a cleanup.
+	const notifiedRef = useRef(false);
 	useEffect(() => {
+		if (notifiedRef.current) return;
+		notifiedRef.current = true;
 		try {
 			const message: OAuthConnectMessage = {
 				type: OAUTH_CONNECT_MESSAGE_TYPE,
@@ -115,30 +121,25 @@ export function OAuthPopupReturn() {
 	}, [showAffordance]);
 
 	return (
-		<main className="bg-background text-foreground flex min-h-screen items-center justify-center px-4">
-			<div
-				className="border-border bg-card w-full max-w-sm rounded-xl border p-6 text-center shadow-sm"
-				role={isError ? 'alert' : 'status'}
-			>
-				<h1 className="font-display text-lg font-semibold">{title}</h1>
-				<p className="text-muted-foreground mt-2 text-sm">{message}</p>
+		<AuthCard as="div" centered className="overflow-hidden" role={isError ? 'alert' : 'status'}>
+			<h1 className="font-heading text-foreground-name text-lg font-semibold">{title}</h1>
+			<p className="text-muted-foreground mt-2 text-sm">{message}</p>
 
-				{showAffordance && (
-					<div className="mt-5 flex flex-col items-stretch gap-2">
-						<Button ref={closeButtonRef} type="button" onClick={() => window.close()}>
-							Close window
-						</Button>
-						{sameTab && (
-							<AppLink
-								href={ROUTE_PATHS.credentialInventory()}
-								className="text-muted-foreground hover:text-foreground text-xs underline-offset-2 hover:underline"
-							>
-								Return to credentials
-							</AppLink>
-						)}
-					</div>
-				)}
-			</div>
-		</main>
+			{showAffordance && (
+				<div className="mt-5 flex flex-col items-stretch gap-2">
+					<Button ref={closeButtonRef} type="button" onClick={() => window.close()}>
+						Close window
+					</Button>
+					{sameTab && (
+						<AppLink
+							href={ROUTE_PATHS.credentialInventory()}
+							className="text-muted-foreground hover:text-foreground text-xs underline-offset-2 hover:underline"
+						>
+							Return to credentials
+						</AppLink>
+					)}
+				</div>
+			)}
+		</AuthCard>
 	);
 }

@@ -1,7 +1,7 @@
 ---
 name: jentic
-description: Use this skill whenever the user wants to work with a third-party or external API/tool through the Jentic platform — e.g. asks to "find the vessel-tracking API and add it", "get rows from this Google Sheet", connect Slack, import/search/discover an API, integrate or automate a SaaS, pull data from a service, or call an external endpoint. Prefer launching this before ToolSearch or hand-rolled HTTP: it drives the audited Jentic loop (identity → discover → check access → execute) over whichever Jentic surface the session has — `jentic` MCP tools or the `jentic` CLI — even inside a code repo. Do NOT use it for local-only work (editing code, finding files, adding a package/dependency, or questions with no external API call).
-version: 6
+description: Calls third-party APIs through a Jentic One instance — governed, credential-managed access where the agent searches for an operation, inspects it, and executes it through an audited broker that holds the credentials (identity → discover → check access → execute). Applies when the user asks to call an external API or use a connected service — e.g. "find the vessel-tracking API and add it", "get rows from this Google Sheet", connect Slack, import/search/discover an API, integrate or automate a SaaS, pull data from a service, or call an external endpoint. Works over whichever Jentic surface the session has, the `jentic` MCP tools or the `jentic` CLI. Not for local-only work (editing code, finding files, adding a package/dependency, or questions with no external API call).
+version: 7
 ---
 
 # Using Jentic
@@ -35,16 +35,15 @@ check; in a CLI session `jentic context view` reads the same facts.
   its SDK or credentials wired up.
 - The user asks to **find, add, import, connect, or search for an API/tool**
   ("find the vessel-tracking API and add it", "get rows from this Google
-  Sheet") — treat these as Jentic tasks, not local-repo or generic tool-search
-  tasks, even when you are running inside a code repository.
+  Sheet").
 - You want to discover what operations exist for a capability ("create a
-  payment", "list pull requests") instead of reading raw OpenAPI specs.
+  payment", "list pull requests") without reading raw OpenAPI specs.
 - You are an agent that should drive real API calls through one audited broker.
 
-Reach for your session's Jentic surface — the `jentic` MCP tools or the
-`jentic` CLI — **before** generic tool discovery (`ToolSearch`) or
-hand-rolling HTTP calls: the broker is the single audited path to external
-APIs and handles credentials for you.
+Your session's Jentic surface — the `jentic` MCP tools or the `jentic` CLI —
+reaches the APIs connected to this deployment through the broker, which
+audits each call and resolves credentials server-side, so you never handle
+the raw secret.
 
 ## Prerequisites
 
@@ -84,10 +83,10 @@ error), **stop and relay to your operator** — registration and approval block
 on a human and cannot be completed by an autonomous agent. Your lane's
 reference names the exact recovery for each state.
 
-### 2. Check what you can do, and report access gaps to your operator
+### 2. Check what you can do, and start connecting what's missing
 
-Your identity view (CLI `jentic api GET /me`; MCP `whoami`) lists your
-status, scopes, and credential bindings; each binding lists the APIs it
+Your identity view (CLI `jentic whoami`; MCP `whoami`) lists your
+status, permissions, and credential bindings; each binding lists the APIs it
 **serves** (`serves: [{api_vendor, api_name, api_version}]`). This tells you
 exactly what you can already call. Combined with the catalog (what's
 available to add — step 3), it's your map of the workspace.
@@ -99,8 +98,8 @@ can tell in advance:
 - If a binding already **serves** the API you need → you have access. Skip
   straight to inspect/execute.
 - If **nothing** you're bound to serves it → you do **not** have access yet.
-  Report the gap to your operator **before** your first execute — do not
-  "try execute and branch on the denial".
+  Start the connection (below) — or report the gap — **before** your first
+  execute; do not "try execute and branch on the denial".
 
 **Report once, richly — never thrash.** Work out the full access end-state
 up front — from your identity view, the catalog, and the task — and hand
@@ -112,18 +111,33 @@ declares, the operations you intend to call, and **why** — a clear one-liner
 faster.
 
 **Starting the credential connection is something you CAN do — approval is
-not.** When the missing credential is for a vendor in the deployment's
-connect registry (GitHub, Google, …), start the connect session yourself:
-run `jentic connect <vendor>` (CLI) or call `request_connection` (MCP). It
-returns an `approval_url` — relay it to your operator, who opens it in
-their browser and approves the connection and its scopes; you never open
-or approve it. Once they confirm, re-check your identity view (`whoami`) —
-an agent-initiated connect binds you at approval — and retry the blocked
-call. For APIs outside the registry, and always for **binding an existing
-credential or granting scopes**, the operator acts in the Jentic One
-dashboard: granting is always a human action — you report (or start the
-connect) and wait, you never grant yourself anything. Bindings take effect
-live: once the operator confirms, retry the call that was blocked.
+not.** For every API the job needs, start a connect session yourself and
+relay its URL: a vendor in the deployment's connect registry (GitHub,
+Google, …) by its key (`jentic connect <vendor>` / `request_connection
+{"vendor": …}`); any other registry API by its identity (`jentic connect
+--api <vendor/name/version>` / `request_connection {"api": {…}}`). Put your
+one-liner reason on the request — the approver reads it. It returns an
+`approval_url`: relay it to your operator, who opens it in their browser
+and approves (for an API key or token, they enter it there); you never open
+or approve it, and you never see the secret. Once they confirm, re-check
+your identity view (`whoami`) — an agent-initiated connect binds you at
+approval — and retry the blocked call.
+
+- **A human entering a credential can take hours** (`resolved_flow`
+  `manual_*` or `awaiting_app`): relay the URL, **end your turn**, and retry
+  the original call later — don't wait or poll. Asking again for the same
+  API returns the same request.
+- **Rejected means stop.** If a request comes back rejected (or
+  `recently_rejected`), don't ask again — tell your user what was rejected
+  and why you needed it.
+- **Where API connect requests aren't available** (the error says so), or
+  the spec declares no auth the flow can collect, fall back to reporting the
+  gap — once, richly, as above.
+
+Binding an existing credential and granting permissions stay human: the
+operator acts in the Jentic One dashboard (or from the approval page), and
+you never grant yourself anything. Bindings take effect live: once the
+operator confirms, retry the call that was blocked.
 
 #### Proposing permission rules from the spec
 
@@ -172,7 +186,7 @@ state **converges** either way — but the surfaces report the duplicate
 differently (a success on the HTTP mount, a dead-letter "identical content
 already exists" error on the stdio server and the CLI); your lane's
 reference names the exact shape. Treat it as "already there" — don't retry,
-and don't invent a made-up "catalog read" scope to ask for: reading
+and don't invent a made-up "catalog read" permission to ask for: reading
 the registry and importing a cataloged API need no grant.
 
 **Before concluding "the data is gone", confirm which backend you're on.**
@@ -203,10 +217,18 @@ search step. The broker authenticates you and injects the stored
 upstream credential server-side; credentials never pass through your
 session.
 
-A held or async execution does not answer inline: it returns a **job
-envelope** (`{job_id, status, …}`). Poll the job until its status is
-terminal — and **never re-send the original call while a job is pending**:
-approval happens out-of-band, and re-sending duplicates the side effect.
+An async execution does not answer inline: it returns a **job envelope**
+(`{job_id, status, …}`) to poll. A call held for human approval answers
+`status: "held"` with a `held_execution_id` and a `review_url`: **show the
+user that link** — a reviewer signs in there to approve or deny it. Follow
+`_links.self` (`/executions/holds/{held_execution_id}`) until its
+`execution_status` has finished (`completed` ran it; `failed` with a
+permission-denied problem means denied or expired; `cancelled` means
+withdrawn), then read `_links.result` — and **never re-send the original call
+while it is pending**: approval happens out-of-band, and re-sending duplicates
+the side effect. To abandon a held call instead, `POST` its `_links.withdraw`
+(`/executions/holds/{held_execution_id}:withdraw`; CLI `jentic api POST …`):
+the call never runs.
 
 A denied or failed execute carries a coded recovery (the CLI's stderr
 `agent_directive` + exit codes; MCP's coded error envelopes). Follow the
@@ -235,14 +257,14 @@ a failure by its symptom, not by assuming access: transport failures
   imported yet**, not that you lack access. Go through the catalog, then
   search again.
 - **Don't execute to test access.** Your identity view already tells you
-  what your bindings **serve**; if the API you need isn't there, report the
-  gap to your operator and wait. The recovery directive is a fallback for
-  surprises, not a discovery step.
+  what your bindings **serve**; if the API you need isn't there, start the
+  connect (or report the gap) and wait. The recovery directive is a fallback
+  for surprises, not a discovery step.
 - Access is granted by a human: your operator approves every connection and
-  binds you in the dashboard. You can *start* a registry vendor's connect
-  session yourself (`jentic connect <vendor>` / `request_connection`), but
-  you can't approve it, bind an existing credential, or grant yourself
-  scopes.
+  binds you in the dashboard. You can *start* a connect session yourself
+  (`jentic connect` / `request_connection`, by vendor key or API identity),
+  but you can't approve it, bind an existing credential, or grant yourself
+  permissions.
 - **Verify which backend you're talking to before diagnosing "missing" APIs
   or credentials** — compare `instance` stamps (see step 3) and stick to one
   surface for the whole task.

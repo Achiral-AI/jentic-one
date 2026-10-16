@@ -16,10 +16,18 @@ import {
 	RefreshButton,
 	SearchInput,
 	SegmentedToggle,
+	SheetBody,
+	SheetHeader,
 	SheetPrimitive,
 	toast,
 } from '@/shared/ui';
 import { useEagerCursorDrain } from '@/shared/hooks';
+import {
+	AGENTS_READ,
+	CREDENTIALS_WRITE,
+	useCanAccess,
+	useOptionalCurrentUser,
+} from '@/shared/auth';
 import {
 	useAgents,
 	useAgentsCredentialBindings,
@@ -30,20 +38,22 @@ import {
 import {
 	CREDENTIAL_TYPE_LABELS,
 	CREDENTIAL_TYPE_ORDER,
-	CredentialType,
+	type CredentialType,
 	useAllCredentials,
 	useDeleteCredential,
 	type Credential,
 } from '@/shared/credentials/api';
-import { useDeviceAwareConnect } from '@/shared/credentials/components/useDeviceAwareConnect';
-import { CredentialsList } from '@/shared/credentials/components/CredentialsList';
 import {
+	useConnectAfterCreate,
+	CredentialsList,
 	CreateCredentialFlow,
 	type CreatedCredentialInfo,
-} from '@/shared/credentials/components/CreateCredentialFlow';
-import { CredentialDeleteDialog } from '@/shared/credentials/components/CredentialDeleteDialog';
-import { EditCredentialSheet } from '@/shared/credentials/components/EditCredentialSheet';
-import { PostConnectBindMore } from '@/shared/credentials/components/PostConnectBindMore';
+	CredentialDeleteDialog,
+	EditCredentialSheet,
+	PostConnectBindMore,
+} from '@/shared/credentials/components';
+import { credentialEditableBy } from '@/shared/credentials/lib/credentialAuthority';
+import { viewerIsOrgAdmin } from '@/shared/credentials/lib/bindAuthority';
 
 type CredentialTypeFilter = 'all' | CredentialType;
 
@@ -62,19 +72,12 @@ export function CredentialInventorySheet({
 	open,
 	onClose,
 	autoOpenCreate = false,
-	approvalSession,
-	onApprovalClose,
 }: {
 	open: boolean;
 	onClose: () => void;
 	/** Open onto the create wizard — for a caller whose own label promised a new
 	 * credential. */
 	autoOpenCreate?: boolean;
-	/** An agent-initiated connect session to approve: opens the wizard in approve
-	 * mode. `onApprovalClose` fires when that wizard closes, so the caller can drop
-	 * the link that carried it. */
-	approvalSession?: { sessionId: string; pollToken: string };
-	onApprovalClose?: () => void;
 }) {
 	const headingId = 'credential-inventory-sheet-title';
 
@@ -98,9 +101,6 @@ export function CredentialInventorySheet({
 		createSignalSpent.current = true;
 		setCreateOpen(true);
 	}, [open, autoOpenCreate]);
-	useEffect(() => {
-		if (open && approvalSession) setCreateOpen(true);
-	}, [open, approvalSession]);
 
 	// Every page, not just the first: the header promises "Every credential in this
 	// workspace", and the Unbound count is taken over the whole inventory.
@@ -110,13 +110,17 @@ export function CredentialInventorySheet({
 	// is the `'credential'` scope, which is agent-agnostic by construction.
 	const invalidateBindingSurfaces = useInvalidateCredentialBindingSurfaces(null);
 	// A successful sign-in invalidates the whole credentials slice, so the flat
-	// surface's tiles and strip hints refresh along with this sheet's list.
-	const { connect: runConnect, deviceDialog } = useDeviceAwareConnect();
+	// surface's tiles and strip hints refresh along with this sheet's list. A
+	// just-created credential whose sign-in is abandoned is discarded.
+	const { afterCreate, connectExisting, deviceDialog } = useConnectAfterCreate();
 
 	// Which credentials the fleet uses, by inverting every agent's binding list — the
 	// same reads the agents surface already made. Archived agents are outside the
-	// join: archiving sweeps their bindings. Gated on `open`.
-	const fleet = useAgents({ status: 'all', enabled: open });
+	// join: archiving sweeps their bindings. Gated on `open`, and on `agents:read`:
+	// a `credentials:read` holder without it would otherwise fire a roster read the
+	// server refuses, and a 403 there reads as "nothing is bound" (#1543).
+	const canReadAgents = useCanAccess(AGENTS_READ);
+	const fleet = useAgents({ status: 'all', enabled: open && canReadAgents });
 	const {
 		fetchNextPage,
 		hasNextPage,
@@ -125,7 +129,7 @@ export function CredentialInventorySheet({
 		isPending: fleetPending,
 	} = fleet;
 	useEagerCursorDrain({
-		hasNextPage: open && hasNextPage,
+		hasNextPage: open && canReadAgents && hasNextPage,
 		isFetchingNextPage,
 		isError: fleetError,
 		fetchNextPage,
@@ -137,12 +141,15 @@ export function CredentialInventorySheet({
 				.map((a) => a.id),
 		[fleet.data],
 	);
-	const bindingsByAgent = useAgentsCredentialBindings(open ? fleetAgentIds : []);
+	const bindingsByAgent = useAgentsCredentialBindings(open && canReadAgents ? fleetAgentIds : []);
 	const refreshFleetBindings = useRefreshFleetCredentialBindings();
 
 	// Credential id → how many agents hold it. `null` = cannot be proved, which is
 	// NOT "nothing is bound": a partial fleet makes a bound credential look unbound.
+	// A viewer who may not read the roster can never prove it, so it stays `null`
+	// without a read ever going out.
 	const agentsPerCredential = useMemo(() => {
+		if (!canReadAgents) return null;
 		if (fleetPending || hasNextPage || fleetError) return null;
 		if (fleetAgentIds.some((id) => !bindingsByAgent.has(id))) return null;
 		const counts = new Map<string, number>();
@@ -154,11 +161,13 @@ export function CredentialInventorySheet({
 			}
 		}
 		return counts;
-	}, [fleetPending, hasNextPage, fleetError, fleetAgentIds, bindingsByAgent]);
+	}, [canReadAgents, fleetPending, hasNextPage, fleetError, fleetAgentIds, bindingsByAgent]);
 	const unboundUnknown = bindingFilter === 'unbound' && agentsPerCredential == null;
 	// The roster drain is the one phase provably still in flight, so anything past it
-	// omits the figure rather than pulsing a skeleton forever.
-	const fleetJoinLoading = fleetPending || hasNextPage || isFetchingNextPage;
+	// omits the figure rather than pulsing a skeleton forever. A roster the viewer
+	// may not read is never in flight: without this the cards' usage figures pulse
+	// a skeleton forever, waiting on a request that is never made.
+	const fleetJoinLoading = canReadAgents && (fleetPending || hasNextPage || isFetchingNextPage);
 
 	const credentials = credentialsSource.items;
 
@@ -171,12 +180,20 @@ export function CredentialInventorySheet({
 	const bindingFilterOptions = useMemo(
 		() => [
 			{ value: 'any' as BindingFilter, label: 'Any agent' },
-			{
-				value: 'unbound' as BindingFilter,
-				label: unboundCount == null ? 'Unbound' : `Unbound (${unboundCount})`,
-			},
+			// Unbound is an assertion over every agent's bindings. A viewer who may
+			// not read the roster can never get that answer, so the filter is not
+			// offered at all rather than offered and then withheld behind a dead
+			// "Try again".
+			...(canReadAgents
+				? [
+						{
+							value: 'unbound' as BindingFilter,
+							label: unboundCount == null ? 'Unbound' : `Unbound (${unboundCount})`,
+						},
+					]
+				: []),
 		],
-		[unboundCount],
+		[canReadAgents, unboundCount],
 	);
 	const filtered = useMemo(() => {
 		const q = search.trim().toLowerCase();
@@ -196,12 +213,18 @@ export function CredentialInventorySheet({
 
 	// Both usage figures are three-state with different gates: the fleet count is
 	// exact or withheld; a credential missing from a TRUNCATED top-N is unknown.
+	// The fleet count is joined from the viewer's own roster, which holds every
+	// agent only for an `org:admin`: for anyone else it counts their agents
+	// alone, even on a credential they created, and the card says so.
 	const usage = useCredentialUsageTotals(open);
+	const viewer = useOptionalCurrentUser();
+	const usedByYoursOnly = viewer != null && !viewerIsOrgAdmin(viewer);
 	const usageFor = useCallback(
 		(cred: Credential) => ({
 			usedByAgentCount:
 				agentsPerCredential?.get(cred.credential_id) ??
 				(agentsPerCredential != null ? 0 : fleetJoinLoading ? undefined : null),
+			usedByYoursOnly,
 			callsLast7d: usage.isLoading
 				? undefined
 				: usage.data == null
@@ -209,7 +232,17 @@ export function CredentialInventorySheet({
 					: (usage.data.totals.get(cred.credential_id) ??
 						(usage.data.complete ? 0 : null)),
 		}),
-		[agentsPerCredential, fleetJoinLoading, usage.isLoading, usage.data],
+		[agentsPerCredential, fleetJoinLoading, usedByYoursOnly, usage.isLoading, usage.data],
+	);
+
+	// The list includes credentials shared with the viewer; only the owner or an
+	// admin can change those, so their cards offer no edit or delete. Everything
+	// that writes a credential — Connect, Add credential, Edit, Delete — also
+	// needs `credentials:write`, so a reader's cards carry none of them.
+	const canWriteCredentials = useCanAccess(CREDENTIALS_WRITE);
+	const readOnlyFor = useCallback(
+		(cred: Credential) => !canWriteCredentials || !credentialEditableBy(cred, viewer),
+		[canWriteCredentials, viewer],
 	);
 
 	// The nested sheets each have a document-level Escape handler firing on the same
@@ -223,111 +256,6 @@ export function CredentialInventorySheet({
 	const openEdit = (cred: Credential): void => {
 		setStickyEditId(cred.credential_id);
 		setEditId(cred.credential_id);
-	};
-
-	// Connect right after create: an abandoned OAuth handshake discards the
-	// credential, which was never usable. `redirected` must NOT clean up — the
-	// user is mid-flow.
-	const handleConnectAfterCreate = async (
-		credentialId: string,
-		credentialName: string,
-	): Promise<void> => {
-		toast({ title: 'Opening sign-in…' });
-		const discard = async (): Promise<void> => {
-			try {
-				await deleteMutation.mutateAsync(credentialId);
-			} catch {
-				// Best-effort cleanup; the row stays listed if the delete fails.
-			}
-		};
-		try {
-			const outcome = await runConnect(credentialId, credentialName);
-			switch (outcome.status) {
-				case 'connected':
-					// The connect hook invalidated the credentials slice, which
-					// refetches this sheet's list along with every other join.
-					toast({ title: 'Connected', variant: 'success' });
-					break;
-				case 'redirected':
-					break;
-				case 'cancelled':
-					await discard();
-					toast({
-						title: 'Sign-in cancelled',
-						description: 'The unconnected credential was discarded.',
-					});
-					break;
-				case 'timeout':
-					await discard();
-					toast({
-						title: 'Sign-in timed out',
-						description: 'The unconnected credential was discarded. Try again.',
-						variant: 'error',
-					});
-					break;
-				case 'unsupported_challenge':
-					await discard();
-					toast({
-						title: 'Unsupported sign-in challenge',
-						description: 'The unconnected credential was discarded.',
-						variant: 'error',
-					});
-					break;
-				case 'unsafe_challenge_url':
-					await discard();
-					toast({
-						title: 'Sign-in link refused',
-						description:
-							'The provider returned an unsafe sign-in URL. The unconnected credential was discarded.',
-						variant: 'error',
-					});
-					break;
-			}
-		} catch {
-			await discard();
-			toast({
-				title: 'Could not complete sign-in',
-				description: 'The unconnected credential was discarded.',
-				variant: 'error',
-			});
-		}
-	};
-
-	// Standalone connect keeps the row whatever the outcome.
-	const handleConnect = async (cred: Credential): Promise<void> => {
-		toast({ title: `Opening sign-in for ${cred.name}…` });
-		try {
-			const outcome = await runConnect(cred.credential_id, cred.name);
-			switch (outcome.status) {
-				case 'connected':
-					toast({ title: 'Connected', variant: 'success' });
-					break;
-				case 'redirected':
-					break;
-				case 'cancelled':
-					toast({ title: 'Connection cancelled' });
-					break;
-				case 'timeout':
-					toast({
-						title: 'Connection timed out',
-						description: 'Finish the sign-in and refresh to see the result.',
-						variant: 'error',
-					});
-					break;
-				case 'unsupported_challenge':
-					toast({ title: 'Unsupported sign-in challenge', variant: 'error' });
-					break;
-				case 'unsafe_challenge_url':
-					toast({
-						title: 'Sign-in link refused',
-						description: 'The provider returned an unsafe sign-in URL.',
-						variant: 'error',
-					});
-					break;
-			}
-		} catch {
-			toast({ title: 'Could not start the OAuth flow', variant: 'error' });
-		}
 	};
 
 	const confirmDelete = (): void => {
@@ -353,20 +281,29 @@ export function CredentialInventorySheet({
 				className="sm:w-[640px] xl:w-[880px]"
 			>
 				<div className="flex h-full flex-col">
-					<header className="border-border flex items-start justify-between gap-3 border-b px-5 py-4">
+					<SheetHeader className="justify-between">
 						<div className="min-w-0">
-							<h2 id={headingId} className="text-foreground text-base font-semibold">
+							<h2
+								id={headingId}
+								className="font-heading text-foreground-name text-base font-semibold"
+							>
 								Credentials
 							</h2>
+							{/* Only an `org:admin` lists the whole workspace; anyone else lists
+							    the credentials they created and the ones shared with them. */}
 							<p className="text-muted-foreground text-xs">
-								Every credential in this workspace — any agent can be bound to them.
+								{usedByYoursOnly
+									? 'Your credentials and the ones shared with you — your agents can be bound to them.'
+									: 'Every credential in this workspace — any agent can be bound to them.'}
 							</p>
 						</div>
 						<div className="flex shrink-0 items-center gap-2">
-							<Button size="sm" onClick={(): void => setCreateOpen(true)}>
-								<Plus className="h-4 w-4" />
-								Add credential
-							</Button>
+							{canWriteCredentials && (
+								<Button size="sm" onClick={(): void => setCreateOpen(true)}>
+									<Plus className="h-4 w-4" />
+									Add credential
+								</Button>
+							)}
 							{/* The help the retired Credentials page carried. It takes `⌘ /`
 							    over from the Agents page while the sheet is open. */}
 							<PageHelp
@@ -391,17 +328,16 @@ export function CredentialInventorySheet({
 							/>
 							<Button
 								variant="ghost"
-								size="sm"
+								size="icon-xs"
 								aria-label="Close"
 								onClick={onClose}
-								className="text-muted-foreground hover:text-foreground"
 							>
 								<X className="h-4 w-4" />
 							</Button>
 						</div>
-					</header>
+					</SheetHeader>
 
-					<div className="border-border flex flex-wrap items-center gap-2 border-b px-5 py-3">
+					<div className="flex shrink-0 flex-wrap items-center gap-2 px-5 pb-3">
 						{/* A credential bound to zero agents is reachable from no agent's screen —
 						    the sheet's one unique power, so it leads the toolbar. */}
 						<div className="flex shrink-0 items-center gap-2">
@@ -412,7 +348,6 @@ export function CredentialInventorySheet({
 								onChange={setBindingFilter}
 								layoutId="credential-inventory-binding-filter"
 								ariaLabel="Filter by agent usage"
-								className="border-primary/30 bg-primary/5"
 							/>
 						</div>
 						<SearchInput
@@ -437,13 +372,13 @@ export function CredentialInventorySheet({
 						/>
 					</div>
 
-					<div className="flex-1 overflow-y-auto px-5 py-4">
+					<SheetBody className="pt-3">
 						{unboundUnknown ? (
 							// Withheld, not guessed: the list would read as "used by nobody",
 							// and the next move on that reading is to delete them.
 							<div
 								role="status"
-								className="border-border bg-muted/40 flex flex-wrap items-center gap-3 rounded-lg border px-4 py-3"
+								className="bg-surface-inset flex flex-wrap items-center gap-3 rounded-lg px-4 py-3"
 							>
 								<p className="text-muted-foreground min-w-0 flex-1 text-sm">
 									Which credentials no agent uses can&rsquo;t be shown yet — that
@@ -452,8 +387,8 @@ export function CredentialInventorySheet({
 									see the full inventory meanwhile.
 								</p>
 								<Button
-									variant="secondary"
-									size="sm"
+									variant="tonal"
+									size="xs"
 									onClick={(): void => {
 										if (fleetError || hasNextPage) void fetchNextPage();
 										refreshFleetBindings();
@@ -467,14 +402,27 @@ export function CredentialInventorySheet({
 								credentials={filtered}
 								isLoading={credentialsSource.isPending}
 								error={credentialsSource.error}
-								onAdd={(): void => setCreateOpen(true)}
+								onAdd={
+									canWriteCredentials
+										? (): void => setCreateOpen(true)
+										: undefined
+								}
 								onEdit={openEdit}
 								onDelete={setDeleteTarget}
-								onConnect={(cred): void => void handleConnect(cred)}
+								// Connect runs the provider sign-in and writes the
+								// resulting tokens: without `credentials:write` the
+								// server refuses it, so the button isn't offered.
+								onConnect={
+									canWriteCredentials
+										? (cred): void =>
+												void connectExisting(cred.credential_id, cred.name)
+										: undefined
+								}
 								// A drawer is not a page: three columns inside it are
 								// what clip a credential's name mid-word.
 								columns={2}
 								usageFor={usageFor}
+								readOnlyFor={readOnlyFor}
 								emptyState={
 									credentials.length > 0 ? (
 										<EmptyState
@@ -494,7 +442,7 @@ export function CredentialInventorySheet({
 								}
 							/>
 						)}
-					</div>
+					</SheetBody>
 				</div>
 			</SheetPrimitive>
 
@@ -503,11 +451,7 @@ export function CredentialInventorySheet({
 			{createOpen && (
 				<CreateCredentialFlow
 					open
-					onClose={(): void => {
-						setCreateOpen(false);
-						if (approvalSession) onApprovalClose?.();
-					}}
-					approvalSession={approvalSession}
+					onClose={(): void => setCreateOpen(false)}
 					renderPostConnect={({ credentialId, boundAgentId }) => (
 						<PostConnectBindMore
 							credentialId={credentialId}
@@ -516,13 +460,7 @@ export function CredentialInventorySheet({
 					)}
 					onCreated={(info: CreatedCredentialInfo): void => {
 						setCreateOpen(false);
-						if (
-							info.type === CredentialType.OAUTH2 &&
-							info.provider !== 'static' &&
-							info.needsConnect
-						) {
-							void handleConnectAfterCreate(info.credentialId, info.name);
-						}
+						afterCreate(info);
 					}}
 				/>
 			)}

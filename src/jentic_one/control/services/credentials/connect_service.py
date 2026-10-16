@@ -6,10 +6,13 @@ import datetime as dt
 
 import structlog
 
+from jentic_one.control.core.schema.credentials import Credential
 from jentic_one.control.repos import (
     CredentialRepository,
     OAuthTokenRepository,
 )
+from jentic_one.control.repos.prerequisite_repo import PrerequisiteRepository
+from jentic_one.control.scoping.filters import build_access_filters
 from jentic_one.control.services.credentials.errors import CredentialNotFoundError
 from jentic_one.control.services.credentials.schemas.connect import (
     ConnectCallback,
@@ -22,12 +25,17 @@ from jentic_one.control.services.credentials.state import (
     consume_callback_state,
 )
 from jentic_one.shared.audit import AuditAction, AuditTargetType, record_audit_best_effort
+from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.context import Context
 from jentic_one.shared.events import emit_event_best_effort
 from jentic_one.shared.models import ActorType
 from jentic_one.shared.models.events import EventSeverity, EventType
 
 logger = structlog.get_logger()
+
+# Bound agents read for the re-authorize re-check: the permitted agent plus any
+# other is enough to refuse.
+_SOLE_BINDING_PROBE = 2
 
 
 class ConnectFlowError(Exception):
@@ -45,13 +53,24 @@ class ConnectService:
         credential_id: str,
         request: ConnectRequest,
         *,
-        actor_id: str | None = None,
-        actor_type: ActorType | None = None,
+        identity: Identity,
         redirect_uri: str | None = None,
+        sole_agent_id: str | None = None,
     ) -> ConnectChallenge:
-        """Load credential, resolve provider, initiate connect flow."""
+        """Load the caller's credential, resolve provider, initiate connect flow.
+
+        Connecting writes tokens onto the credential, so it is scoped like any
+        other credential write: a credential the caller cannot see is a 404.
+
+        ``sole_agent_id`` marks a re-authorize that must stay sole-bound; it is
+        only honoured from this keyword, never from ``request.extra``, so an
+        HTTP caller cannot inject it through the request body.
+        """
+        access_filters = build_access_filters(identity, Credential)
         async with self._ctx.control_db.session() as session:
-            credential = await CredentialRepository.get_by_id(session, credential_id)
+            credential = await CredentialRepository.get_by_id(
+                session, credential_id, filters=access_filters
+            )
             if credential is None:
                 raise CredentialNotFoundError(credential_id)
 
@@ -64,14 +83,17 @@ class ConnectService:
 
         provider = self._ctx.providers.get(provider_name)
 
+        extra = {k: v for k, v in request.extra.items() if k != "sole_agent_id"}
+        extra.update(
+            credential_id=credential_id,
+            actor_id=identity.sub,
+            actor_type=str(identity.actor_type),
+        )
+        if sole_agent_id is not None:
+            extra["sole_agent_id"] = sole_agent_id
         enriched_request = ConnectRequest(
             scopes=request.scopes,
-            extra={
-                **request.extra,
-                "credential_id": credential_id,
-                "actor_id": actor_id or "",
-                "actor_type": str(actor_type) if actor_type else "",
-            },
+            extra=extra,
             redirect_uri=redirect_uri,
         )
 
@@ -106,6 +128,8 @@ class ConnectService:
             # theme-8 Phase 4): that actor can no longer own a credential.
             raise ConnectFlowError(f"Unsupported actor_type in state: {state.actor_type}") from exc
         try:
+            if state.sole_agent_id is not None:
+                await self._require_sole_binding(state.credential_id, state.sole_agent_id)
             provider = self._ctx.providers.get(state.provider)
             result = await provider.complete_connect(self._ctx, state=state, callback=callback)
 
@@ -197,6 +221,25 @@ class ConnectService:
             actor_type=actor_type,
         )
         return state.credential_id
+
+    async def _require_sole_binding(self, credential_id: str, sole_agent_id: str) -> None:
+        """Refuse a re-authorize whose credential gained another bound agent meanwhile.
+
+        Checked before the code is exchanged, so the wider grant is never
+        stored. Suspended bindings count: lifting the suspension would hand
+        that agent the wider scopes too.
+        """
+        async with self._ctx.admin_db.session() as admin_session:
+            rows = await PrerequisiteRepository.list_agents_for_credential(
+                admin_session, credential_id=credential_id, limit=_SOLE_BINDING_PROBE
+            )
+        if any(row.agent_id != sole_agent_id for row in rows):
+            logger.warning(
+                "oauth_reauthorize_refused_other_agent_bound",
+                credential_id=credential_id,
+                agent_id=sole_agent_id,
+            )
+            raise ConnectFlowError("re-authorize refused: another agent is bound to the credential")
 
     async def _emit_connect_telemetry(
         self, *, type: str, summary: str, created_by: str, actor_type: ActorType

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from jentic_one.shared.web import openapi_examples as ex
 
 
 class OAuthSessionContinueRequest(BaseModel):
@@ -20,7 +22,10 @@ class OAuthSessionContinueRequest(BaseModel):
     additionally requires an authenticated platform user).
     """
 
-    state: str
+    state: str = Field(
+        description="Signed login carry-through token (`ls`) issued for this authorize request.",
+        examples=[ex.SIGNED_FLOW_STATE],
+    )
 
 
 class OAuthSessionContinueResponse(BaseModel):
@@ -34,4 +39,10 @@ class OAuthSessionContinueResponse(BaseModel):
     absolute URL.
     """
 
-    redirect_url: str
+    redirect_url: str = Field(
+        description="Relative `/authorize` URL to navigate to in order to resume the flow.",
+        examples=[
+            f"/authorize?response_type=code&client_id={ex.OAUTH_PUBLIC_CLIENT_ID}"
+            f"&state={ex.OAUTH_STATE}"
+        ],
+    )

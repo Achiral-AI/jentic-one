@@ -26,7 +26,7 @@ from typing import Any
 import pytest
 import structlog
 from alembic import command
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, insert, select, text
 
 from jentic_one.control.core.schema.credentials import Credential
 from jentic_one.control.core.schema.permission_rule_sets import (
@@ -38,7 +38,7 @@ from jentic_one.control.services.toolkit_flattening import Finding, ToolkitFlatt
 from jentic_one.shared.config import AppConfig
 from jentic_one.shared.context import Context
 from jentic_one.shared.db.session import DatabaseSession
-from tests.integration.conftest import _alembic_config_for
+from tests.harness.postgres import alembic_config_for
 from tests.integration.service_account_schema import restore_pre_sa_drop_admin
 
 pytestmark = pytest.mark.integration
@@ -85,8 +85,8 @@ def legacy_tables(integration_config: AppConfig) -> Iterator[None]:
     the teardown re-upgrade passes the drop gates because the suite leaves the
     tables empty again — the fresh-install path of the guard.
     """
-    control_cfg = _alembic_config_for("control", integration_config.databases.control)
-    admin_cfg = _alembic_config_for("admin", integration_config.databases.admin)
+    control_cfg = alembic_config_for("control", integration_config.databases.control)
+    admin_cfg = alembic_config_for("admin", integration_config.databases.admin)
     command.downgrade(control_cfg, _CONTROL_PRE_DROP)
     # The theme-8 Phase-4 drop above the 6b one is irreversible (its
     # downgrade raises): model the pre-upgrade admin snapshot, then walk on.
@@ -178,8 +178,10 @@ async def _seed_graph(control_db: DatabaseSession, admin_db: DatabaseSession) ->
             (_CRED_DUP1, "fl-dup"),
             (_CRED_DUP2, "fl-dup"),
         ):
-            session.add(
-                Credential(
+            # Core insert (not ``session.add``): renders only the given columns,
+            # so it works on the downgraded schema, which lacks later columns.
+            await session.execute(
+                insert(Credential).values(
                     id=cred_id,
                     type="token_value",
                     name=name,
@@ -409,9 +411,13 @@ async def test_flattening_creates_all_pairs_with_expected_semantics(
     inactive_set_id = bindings[(_AGENT_B, _CRED_TWO)].rule_set_id
     assert inactive_set_id is not None
     async with control_db.session() as session:
-        rule_set = await session.get(PermissionRuleSet, inactive_set_id)
-        assert rule_set is not None
-        assert rule_set.name == f"theme5-flattening:{_TK_INACTIVE}:{_CRED_TWO}"
+        # Column-scoped: the control schema here predates ``curated``.
+        rule_set_name = (
+            await session.execute(
+                select(PermissionRuleSet.name).where(PermissionRuleSet.id == inactive_set_id)
+            )
+        ).scalar_one_or_none()
+        assert rule_set_name == f"theme5-flattening:{_TK_INACTIVE}:{_CRED_TWO}"
         copied = (
             (
                 await session.execute(
@@ -511,7 +517,7 @@ async def test_second_run_and_diff_only_create_nothing(
         rule_sets = (
             (
                 await session.execute(
-                    select(PermissionRuleSet).where(
+                    select(PermissionRuleSet.id).where(
                         PermissionRuleSet.name.like("theme5-flattening:%")
                     )
                 )
@@ -543,7 +549,7 @@ async def test_diff_only_previews_without_writing(
         rule_sets = (
             (
                 await session.execute(
-                    select(PermissionRuleSet).where(
+                    select(PermissionRuleSet.id).where(
                         PermissionRuleSet.name.like("theme5-flattening:%")
                     )
                 )
@@ -715,8 +721,10 @@ async def test_cross_owner_pair_is_bound_and_reported_for_review(
             # Another vendor, so the pair adds no pooled-rule drift line.
             (foreign_cred, "fltest-foreign.local", other_user),
         ):
-            session.add(
-                Credential(
+            # Core insert (not ``session.add``): renders only the given columns,
+            # so it works on the downgraded schema, which lacks later columns.
+            await session.execute(
+                insert(Credential).values(
                     id=cred_id,
                     type="token_value",
                     name=cred_id,

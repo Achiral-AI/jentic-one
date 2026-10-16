@@ -11,8 +11,11 @@ import structlog.testing
 from jentic_one.shared.auth.api_key_resolver import ApiKeyResolver
 from jentic_one.shared.models import ActorType
 
-Row = namedtuple("Row", ["scope"])
-AgentRow = namedtuple("AgentRow", ["agent_id", "status", "owner_id"])
+Row = namedtuple("Row", ["permission"])
+# Mirrors the resolver's agent-arm SELECT. ``name`` rides off the already-joined
+# ``agents`` row so the Identity can carry a display name (#1543); it defaults
+# here so only the tests that care about naming have to mention it.
+AgentRow = namedtuple("AgentRow", ["agent_id", "status", "owner_id", "name"], defaults=(None,))
 
 
 @pytest.fixture()
@@ -27,8 +30,10 @@ def resolver(admin_db: MagicMock) -> ApiKeyResolver:
 
 @pytest.mark.asyncio
 async def test_resolve_agent_key_active(resolver: ApiKeyResolver, admin_db: MagicMock) -> None:
-    agent_row = AgentRow(agent_id="agnt_123", status="active", owner_id="usr_owner")
-    scope_rows = [Row(scope="broker:execute"), Row(scope="toolkit:read")]
+    agent_row = AgentRow(
+        agent_id="agnt_123", status="active", owner_id="usr_owner", name="billing-bot"
+    )
+    permission_rows = [Row(permission="broker:execute"), Row(permission="toolkit:read")]
 
     session_mock = AsyncMock()
     call_count = 0
@@ -40,7 +45,7 @@ async def test_resolve_agent_key_active(resolver: ApiKeyResolver, admin_db: Magi
         if call_count == 1:
             result.one_or_none.return_value = agent_row
         else:
-            result.all.return_value = scope_rows
+            result.all.return_value = permission_rows
         return result
 
     session_mock.execute = _execute
@@ -56,6 +61,8 @@ async def test_resolve_agent_key_active(resolver: ApiKeyResolver, admin_db: Magi
     assert identity.actor_type == ActorType.AGENT
     assert identity.parent_actor_id == "usr_owner"
     assert identity.active is True
+    # Carried off the joined row, so audit summaries can name the agent (#1543).
+    assert identity.actor_name == "billing-bot"
     assert "broker:execute" in identity.permissions
     assert "toolkit:read" in identity.permissions
 

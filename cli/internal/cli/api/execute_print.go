@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -21,7 +22,59 @@ import (
 // the UX side: which stream, which format, and the recovery rendering.
 func (a *app) executeOutput(cmd *cobra.Command, opts *executeOptions, res *agentops.ExecuteResult) error {
 	denial := agentops.Classify(res)
+	// A broker-origin error that is not a denial (unknown credential, unregistered
+	// operation) also means the call never reached the upstream (#1429).
+	brokerErr := agentops.BrokerError(res)
+	// A broker-origin 5xx/429 (circuit open, runner degraded, rate limited) is a
+	// transport failure, not an upstream response (#1531).
+	transportErr := agentops.BrokerTransportError(res, opts.retrySafe)
 
+	if opts.heldExecutionID != "" {
+		return a.heldExecuteOutput(cmd, opts, res, denial, brokerErr, transportErr)
+	}
+	return a.renderExecuteOutput(cmd, opts, res, denial, brokerErr, transportErr)
+}
+
+// heldExecuteOutput renders the finished outcome of a followed held call:
+// exactly like a call that ran at once, with its held execution id named on
+// stderr, in the success envelope and in the error envelope's details.
+func (a *app) heldExecuteOutput(
+	cmd *cobra.Command, opts *executeOptions, res *agentops.ExecuteResult, denial *agentops.Denial,
+	brokerErr, transportErr *ux.CodedError,
+) error {
+	ran := denial == nil && brokerErr == nil && transportErr == nil
+	if ran {
+		ux.RenderHeldFinished(cmd.Context(), a.Err, opts.heldExecutionID, fmt.Sprintf("the call ran (HTTP %d)", res.Status))
+	}
+	err := a.renderExecuteOutput(cmd, opts, res, denial, brokerErr, transportErr)
+	if !ran {
+		ux.RenderHeldFinished(cmd.Context(), a.Err, opts.heldExecutionID, "")
+	}
+	if coded := asCodedOrNil(err); coded != nil {
+		if coded.Details == nil {
+			coded.Details = map[string]any{}
+		}
+		coded.Details["held_execution_id"] = opts.heldExecutionID
+		if !strings.Contains(coded.Msg, opts.heldExecutionID) {
+			coded.Msg = fmt.Sprintf("%s (held execution %s)", coded.Msg, opts.heldExecutionID)
+		}
+	}
+	return err
+}
+
+// asCodedOrNil is err's *ux.CodedError, or nil when it carries none.
+func asCodedOrNil(err error) *ux.CodedError {
+	var coded *ux.CodedError
+	if errors.As(err, &coded) {
+		return coded
+	}
+	return nil
+}
+
+func (a *app) renderExecuteOutput(
+	cmd *cobra.Command, opts *executeOptions, res *agentops.ExecuteResult, denial *agentops.Denial,
+	brokerErr, transportErr *ux.CodedError,
+) error {
 	if opts.raw {
 		// Redact before streaming, so --raw matches the redaction guarantee of
 		// the JSON and `jentic api` paths (SEC-2). A secret in an upstream body
@@ -33,6 +86,12 @@ func (a *app) executeOutput(cmd *cobra.Command, opts *executeOptions, res *agent
 		if denial != nil {
 			return denial.Err()
 		}
+		if brokerErr != nil {
+			return brokerErr
+		}
+		if transportErr != nil {
+			return transportErr
+		}
 		return nil
 	}
 
@@ -42,7 +101,9 @@ func (a *app) executeOutput(cmd *cobra.Command, opts *executeOptions, res *agent
 		// path — its body is arbitrary upstream data, outside ux.Render's
 		// three-layer funnel, so WriteJSON's byte-level redaction backstop
 		// applies.
-		if err := cmdcore.WriteJSON(a.Out, res.Envelope()); err != nil {
+		env := res.Envelope()
+		env.HeldExecutionID = opts.heldExecutionID
+		if err := cmdcore.WriteJSON(a.Out, env); err != nil {
 			return err
 		}
 	} else {
@@ -55,6 +116,19 @@ func (a *app) executeOutput(cmd *cobra.Command, opts *executeOptions, res *agent
 	// agent_directive (see agentops.Classify). When a directive *is* present it
 	// enriches the message with recovery steps.
 	if denial != nil {
+		if denial.Directive == nil {
+			// A held call that never ran (denied, expired, unresumable) has its
+			// own recovery: the status-keyed binding hint would mislead.
+			if detail := problemDetail(res.Body); ux.RenderApprovalOutcome(cmd.Context(), a.Err, denial.ProblemType, detail) {
+				coded := denial.Err()
+				coded.Msg = fmt.Sprintf("this held call never ran (%s)", denial.ProblemType)
+				if opts.heldExecutionID != "" {
+					coded.Msg = fmt.Sprintf("held execution %s never ran (%s)", opts.heldExecutionID, denial.ProblemType)
+				}
+				coded.Details["problem_type"] = denial.ProblemType
+				return coded
+			}
+		}
 		if denial.Directive != nil {
 			a.printAgentDirective(cmd.Context(), *denial.Directive)
 		} else {
@@ -65,6 +139,18 @@ func (a *app) executeOutput(cmd *cobra.Command, opts *executeOptions, res *agent
 			a.printSynthesizedDenialRecovery(cmd.Context(), denial.Status)
 		}
 		return denial.Err()
+	}
+	// A broker resolve failure carries its recovery (and any relayed candidate
+	// credentials) in Actionable, which the root error reporter renders once on
+	// stderr: a styled "Next Step" for humans, actionable_step in the agent
+	// envelope.
+	if brokerErr != nil {
+		return brokerErr
+	}
+	// A broker transport failure carries its retryable hint and any Retry-After
+	// in Details, and its recovery in Actionable, rendered the same way.
+	if transportErr != nil {
+		return transportErr
 	}
 	return nil
 }
@@ -99,4 +185,16 @@ func (a *app) executePrettyOutput(ctx context.Context, res *agentops.ExecuteResu
 		}
 		fmt.Fprintln(a.Out)
 	}
+}
+
+// problemDetail returns a problem body's detail line, or "" when the body has
+// none.
+func problemDetail(body []byte) string {
+	var p struct {
+		Detail string `json:"detail"`
+	}
+	if json.Unmarshal(body, &p) != nil {
+		return ""
+	}
+	return p.Detail
 }

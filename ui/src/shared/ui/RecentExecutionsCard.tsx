@@ -1,6 +1,6 @@
 /**
  * RecentExecutionsCard — the console-standard "Recent executions" feed used
- * by the agent detail page. One visual grammar: a status-dot row with the mono operation
+ * by an agent's Activity sheet. One visual grammar: a status-dot row with the mono operation
  * label, inline HTTP status, optional error line, optional attribution slot,
  * duration, and relative time — ending in a pre-filtered "Open Monitor"
  * deep-link. Monitor owns the full history (paging, filters, trace sheets);
@@ -75,7 +75,7 @@ function ExecutionRow({ item }: { item: RecentExecutionItem }) {
 	return (
 		<div
 			data-testid="execution-feed-row"
-			className="bg-muted/30 border-border/60 flex flex-wrap items-center gap-3 rounded-lg border px-4 py-2.5"
+			className="bg-field flex flex-wrap items-center gap-3 rounded-lg px-4 py-2.5"
 		>
 			<span
 				className={`h-2 w-2 shrink-0 rounded-full ${dotClass}`}

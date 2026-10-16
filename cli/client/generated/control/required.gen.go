@@ -12,20 +12,27 @@ package control
 func (APIReference) RequiredFields() []string        { return []string{"name", "vendor", "version"} }
 func (APIReferenceRequest) RequiredFields() []string { return []string{"vendor"} }
 func (ActorListResponse) RequiredFields() []string   { return []string{"data", "has_more"} }
+func (ActorLookupEntryResponse) RequiredFields() []string {
+	return []string{"active", "actor_type", "id", "name"}
+}
+func (ActorLookupResponse) RequiredFields() []string { return []string{"data"} }
 func (ActorSummaryResponse) RequiredFields() []string {
 	return []string{"active", "actor_type", "created_at", "id", "name"}
 }
-func (AgentCreateRequest) RequiredFields() []string { return []string{"name"} }
-func (AgentListResponse) RequiredFields() []string  { return []string{"data", "has_more"} }
+func (AgentCreateRequest) RequiredFields() []string       { return []string{"name"} }
+func (AgentListResponse) RequiredFields() []string        { return []string{"data", "has_more"} }
+func (AgentPermissionsRequest) RequiredFields() []string  { return []string{"permissions"} }
+func (AgentPermissionsResponse) RequiredFields() []string { return []string{"permissions"} }
 func (AgentResponse) RequiredFields() []string {
 	return []string{"created_at", "id", "name", "registered_by", "status"}
 }
-func (AgentScopesRequest) RequiredFields() []string     { return []string{"scopes"} }
-func (AgentScopesResponse) RequiredFields() []string    { return []string{"scopes"} }
 func (ApiImportLinksResponse) RequiredFields() []string { return []string{"self"} }
 func (ApiImportRequest) RequiredFields() []string       { return []string{"sources"} }
 func (ApiImportResponse) RequiredFields() []string      { return []string{"_links", "job_id", "status"} }
 func (ApiInfoResponse) RequiredFields() []string        { return []string{"name", "vendor", "version"} }
+func (ApiKeyConfirmSessionRequest) RequiredFields() []string {
+	return []string{"digest", "key", "kind", "permission_rules"}
+}
 func (ApiKeyCreateRequest) RequiredFields() []string {
 	return []string{"api", "field_name", "key", "location", "name", "type"}
 }
@@ -46,14 +53,24 @@ func (ApiResponse) RequiredFields() []string {
 }
 func (ApiSourceInline) RequiredFields() []string   { return []string{"content", "filename", "type"} }
 func (ApiSourceUrl) RequiredFields() []string      { return []string{"type", "url"} }
+func (ApiTargetRequest) RequiredFields() []string  { return []string{"name", "vendor", "version"} }
 func (AuditListResponse) RequiredFields() []string { return []string{"data", "has_more"} }
 func (AuditResponse) RequiredFields() []string {
 	return []string{"action", "actor_type", "id", "occurred_at", "target_id", "target_type"}
+}
+func (AuthorizationCodeRegistrationCreateRequest) RequiredFields() []string {
+	return []string{"api_vendor", "authorize_url", "catalog_api_id", "client_id", "client_secret", "display_name", "flow_kind", "name", "token_url"}
 }
 func (BasicAuthCreateRequest) RequiredFields() []string {
 	return []string{"api", "name", "password", "type", "username"}
 }
 func (BasicAuthUpdateRequest) RequiredFields() []string { return []string{"type"} }
+func (BasicConfirmSessionRequest) RequiredFields() []string {
+	return []string{"digest", "kind", "password", "permission_rules", "username"}
+}
+func (BearerConfirmSessionRequest) RequiredFields() []string {
+	return []string{"digest", "kind", "permission_rules", "token"}
+}
 func (BearerTokenCreateRequest) RequiredFields() []string {
 	return []string{"api", "name", "token", "type"}
 }
@@ -72,10 +89,9 @@ func (ChangePasswordRequest) RequiredFields() []string {
 	return []string{"current_password", "new_password"}
 }
 func (ClaimRequest) RequiredFields() []string               { return []string{"token"} }
-func (ConfirmSessionRequest) RequiredFields() []string      { return []string{"confirmed_scopes"} }
 func (ConnectSessionListResponse) RequiredFields() []string { return []string{"data", "has_more"} }
 func (ConnectSessionSummaryResponse) RequiredFields() []string {
-	return []string{"created_at", "requested_by_actor_id", "session_id", "state", "vendor_display_name", "vendor_key"}
+	return []string{"created_at", "credential_id", "requested_by_actor_id", "session_id", "state", "vendor_display_name", "vendor_key"}
 }
 func (ConsentAgentStatusResponse) RequiredFields() []string  { return []string{"status"} }
 func (CreateAdminRequest) RequiredFields() []string          { return []string{"email", "password"} }
@@ -100,14 +116,17 @@ func (CurrentUserResponse) RequiredFields() []string {
 func (DailyExecutionBucket) RequiredFields() []string {
 	return []string{"date", "failed", "success", "total"}
 }
-func (DenyRequest) RequiredFields() []string             { return []string{"reason"} }
-func (EffectivePermission) RequiredFields() []string     { return []string{"name"} }
-func (ErrorItem) RequiredFields() []string               { return []string{"detail"} }
-func (EventAcknowledgeRequest) RequiredFields() []string { return []string{"acknowledged"} }
-func (EventLinks) RequiredFields() []string              { return []string{"self"} }
-func (EventListResponse) RequiredFields() []string       { return []string{"data", "has_more"} }
+func (DecideHeldExecutionRequest) RequiredFields() []string { return []string{"decision"} }
+func (DenyRequest) RequiredFields() []string                { return []string{"reason"} }
+func (DeviceAuthorizationRegistrationCreateRequest) RequiredFields() []string {
+	return []string{"api_vendor", "authorization_endpoint", "catalog_api_id", "client_id", "display_name", "flow_kind", "name", "token_endpoint"}
+}
+func (EffectivePermission) RequiredFields() []string { return []string{"name"} }
+func (ErrorItem) RequiredFields() []string           { return []string{"detail"} }
+func (EventLinks) RequiredFields() []string          { return []string{"self"} }
+func (EventListResponse) RequiredFields() []string   { return []string{"data", "has_more"} }
 func (EventResponse) RequiredFields() []string {
-	return []string{"_links", "acknowledged", "created_at", "event_id", "requires_action", "severity", "summary", "type"}
+	return []string{"_links", "created_at", "event_id", "requires_action", "severity", "summary", "type"}
 }
 func (ExecutionListResponse) RequiredFields() []string { return []string{"data", "has_more"} }
 func (ExecutionRecordLinks) RequiredFields() []string  { return []string{"self"} }
@@ -117,20 +136,31 @@ func (ExecutionResponse) RequiredFields() []string {
 func (ExecutionStatsResponse) RequiredFields() []string {
 	return []string{"daily_buckets", "success_rate_percent", "top_operations", "total_executions"}
 }
+func (ExistingCredentialConfirmSessionRequest) RequiredFields() []string {
+	return []string{"credential_id", "digest", "kind", "permission_rules"}
+}
 func (GovernedHostsResponse) RequiredFields() []string { return []string{"data", "digest"} }
 func (HealthResponse) RequiredFields() []string {
 	return []string{"setup_required", "status", "surface"}
 }
+func (HeldExecutionDetailResponse) RequiredFields() []string {
+	return []string{"_links", "agent_id", "api_name", "api_vendor", "api_version", "created_at", "credential_id", "expires_at", "id", "method", "path", "review_url", "state"}
+}
+func (HeldExecutionLinksResponse) RequiredFields() []string { return []string{"self"} }
+func (HeldExecutionListResponse) RequiredFields() []string  { return []string{"data", "has_more"} }
+func (HeldExecutionResponse) RequiredFields() []string {
+	return []string{"_links", "agent_id", "api_name", "api_vendor", "api_version", "created_at", "credential_id", "expires_at", "id", "method", "path", "review_url", "state"}
+}
+func (HeldRequestResponse) RequiredFields() []string { return []string{"method", "url"} }
 func (InstanceIdentityResponse) RequiredFields() []string {
 	return []string{"backend", "canonical_base_url", "host"}
 }
-func (IntegrationsConnectRequest) RequiredFields() []string { return []string{"vendor"} }
-func (IntrospectResponse) RequiredFields() []string         { return []string{"active"} }
-func (InviteIssuedResponse) RequiredFields() []string       { return []string{"expires_at", "token"} }
-func (JobLinksResponse) RequiredFields() []string           { return []string{"self"} }
-func (JobListResponse) RequiredFields() []string            { return []string{"data", "has_more"} }
+func (IntrospectResponse) RequiredFields() []string   { return []string{"active"} }
+func (InviteIssuedResponse) RequiredFields() []string { return []string{"expires_at", "token"} }
+func (JobLinksResponse) RequiredFields() []string     { return []string{"self"} }
+func (JobListResponse) RequiredFields() []string      { return []string{"data", "has_more"} }
 func (JobResponse) RequiredFields() []string {
-	return []string{"_links", "created_at", "job_id", "kind", "status"}
+	return []string{"_links", "actor_type", "created_at", "job_id", "kind", "status"}
 }
 func (JwksUpdateRequest) RequiredFields() []string { return []string{"jwks"} }
 func (LoginRequest) RequiredFields() []string      { return []string{"email", "password"} }
@@ -142,16 +172,25 @@ func (McpConfigRegistrationResponse) RequiredFields() []string {
 	return []string{"recorded", "runtime"}
 }
 func (MeAgent) RequiredFields() []string {
-	return []string{"id", "name", "scopes", "status", "token_scopes"}
+	return []string{"id", "name", "permissions", "status", "token_permissions"}
 }
 func (MeUser) RequiredFields() []string {
-	return []string{"admin", "email", "id", "must_change_password", "name", "scopes", "status"}
+	return []string{"admin", "email", "id", "must_change_password", "name", "permissions", "status"}
 }
-func (NoAuthCreateRequest) RequiredFields() []string          { return []string{"api", "name", "type"} }
-func (NoteApiReference) RequiredFields() []string             { return []string{"name", "vendor", "version"} }
-func (NoteCreateRequest) RequiredFields() []string            { return []string{"body", "resource"} }
-func (OAuth2CreateRequest) RequiredFields() []string          { return []string{"api", "name", "type"} }
-func (OAuth2UpdateRequest) RequiredFields() []string          { return []string{"type"} }
+func (NoAuthCreateRequest) RequiredFields() []string { return []string{"api", "name", "type"} }
+func (NoteApiReference) RequiredFields() []string    { return []string{"name", "vendor", "version"} }
+func (NoteCreateRequest) RequiredFields() []string   { return []string{"body", "resource"} }
+func (OAuth2CreateRequest) RequiredFields() []string { return []string{"api", "name", "type"} }
+func (OAuth2UpdateRequest) RequiredFields() []string { return []string{"type"} }
+func (OAuthAppRegistrationListResponse) RequiredFields() []string {
+	return []string{"data", "has_more"}
+}
+func (OAuthAppRegistrationResponse) RequiredFields() []string {
+	return []string{"api_vendor", "catalog_api_id", "client_id", "created_at", "created_by", "dependent_credential_count", "display_name", "flow_kind", "has_client_secret", "id", "is_active", "name", "secret_last_rotated_at", "updated_at"}
+}
+func (OAuthAppRegistrationRotateSecretRequest) RequiredFields() []string {
+	return []string{"client_secret"}
+}
 func (OAuthApprovalDecisionRequest) RequiredFields() []string { return []string{"action", "state"} }
 func (OAuthApprovalStatusResponse) RequiredFields() []string  { return []string{"status"} }
 func (OAuthClientCreateRequest) RequiredFields() []string     { return []string{"name", "redirect_uris"} }
@@ -169,6 +208,8 @@ func (OAuthClientResponse) RequiredFields() []string {
 	return []string{"active", "allowed_scopes", "approval_status", "client_id", "consent_model", "created_at", "created_by", "description", "id", "name", "redirect_uris", "registration_source", "require_consent", "software_id", "token_endpoint_auth_method", "updated_at"}
 }
 func (OAuthClientRotateSecretResponse) RequiredFields() []string { return []string{"client_secret"} }
+func (OAuthConfirmSessionRequest) RequiredFields() []string      { return []string{"confirmed_scopes"} }
+func (OAuthErrorResponse) RequiredFields() []string              { return []string{"error"} }
 func (OAuthGrantAdminListResponse) RequiredFields() []string     { return []string{"data", "has_more"} }
 func (OAuthGrantAdminResponse) RequiredFields() []string {
 	return []string{"agent_id", "can_revoke", "client_name", "client_origin", "created_at", "id", "last_used_at", "oauth_client_id", "revoked_at", "scopes", "status", "user_id"}
@@ -177,8 +218,6 @@ func (OAuthGrantListResponse) RequiredFields() []string { return []string{"data"
 func (OAuthGrantResponse) RequiredFields() []string {
 	return []string{"agent_id", "can_revoke", "client_name", "client_origin", "created_at", "id", "last_used_at", "oauth_client_id", "revoked_at", "scopes", "status", "user_id"}
 }
-func (OAuthSessionContinueRequest) RequiredFields() []string  { return []string{"state"} }
-func (OAuthSessionContinueResponse) RequiredFields() []string { return []string{"redirect_url"} }
 func (OperationPreviewListResponse) RequiredFields() []string {
 	return []string{"data", "info", "offset", "security_schemes", "total", "truncated"}
 }
@@ -195,7 +234,10 @@ func (OverlayListResponse) RequiredFields() []string  { return []string{"data", 
 func (OverlayResponse) RequiredFields() []string {
 	return []string{"_links", "api_id", "confirmed_at", "confirmed_by_execution_id", "contributed_by", "created_at", "deprecated_at", "document", "id", "status", "target_revision_id", "updated_at"}
 }
-func (OverlaySubmitRequest) RequiredFields() []string   { return []string{"document"} }
+func (OverlaySubmitRequest) RequiredFields() []string { return []string{"document"} }
+func (OwnOAuthClientConfirmSessionRequest) RequiredFields() []string {
+	return []string{"authorize_url", "client_id", "client_secret", "digest", "kind", "permission_rules", "token_url"}
+}
 func (PermissionListResponse) RequiredFields() []string { return []string{"data"} }
 func (PermissionResponse) RequiredFields() []string {
 	return []string{"description", "grantable_by_caller", "implies", "name"}
@@ -225,21 +267,26 @@ func (ProviderDiscoveryEntryResponse) RequiredFields() []string {
 	return []string{"configured", "id", "label", "managed", "types"}
 }
 func (ProviderDiscoveryResponse) RequiredFields() []string { return []string{"providers"} }
-func (RedeemInviteRequest) RequiredFields() []string       { return []string{"invite_token", "password"} }
-func (RegisterRequest) RequiredFields() []string           { return []string{"client_name", "jwks"} }
+func (ReauthorizeConfirmSessionRequest) RequiredFields() []string {
+	return []string{"credential_id", "digest", "kind", "permission_rules"}
+}
+func (RedeemInviteRequest) RequiredFields() []string { return []string{"invite_token", "password"} }
+func (RegisterRequest) RequiredFields() []string     { return []string{"client_name", "jwks"} }
 func (RegisterResponse) RequiredFields() []string {
 	return []string{"client_id", "registration_access_token", "registration_client_uri", "status"}
 }
 func (RegistrationStatusResponse) RequiredFields() []string { return []string{"client_id", "status"} }
 func (RevokeRequest) RequiredFields() []string              { return []string{"token"} }
+func (RootHealthResponse) RequiredFields() []string         { return []string{"status"} }
+func (RouteNotFoundResponse) RequiredFields() []string      { return []string{"detail"} }
 func (RuleSetAttachRequest) RequiredFields() []string       { return []string{"rule_set_id"} }
 func (RuleSetCreateRequest) RequiredFields() []string       { return []string{"name"} }
 func (RuleSetListResponse) RequiredFields() []string        { return []string{"data", "has_more"} }
 func (RuleSetResponse) RequiredFields() []string {
-	return []string{"binding_count", "created_at", "name", "rule_set_id", "rules"}
+	return []string{"binding_count", "created_at", "curated", "name", "rule_set_id", "rules"}
 }
 func (RuleSetSummaryResponse) RequiredFields() []string {
-	return []string{"created_at", "name", "rule_count", "rule_set_id"}
+	return []string{"created_at", "curated", "name", "rule_count", "rule_set_id"}
 }
 func (SearchLinksResponse) RequiredFields() []string        { return []string{"inspect"} }
 func (SearchRequest) RequiredFields() []string              { return []string{"query"} }
@@ -281,6 +328,6 @@ func (UserResponse) RequiredFields() []string {
 }
 func (VendorListResponse) RequiredFields() []string { return []string{"data"} }
 func (VendorSummaryResponse) RequiredFields() []string {
-	return []string{"display_name", "flow_kinds", "key", "vendor"}
+	return []string{"display_name", "entry_id", "flow_kinds", "key", "name", "source", "vendor"}
 }
 func (VersionResponse) RequiredFields() []string { return []string{"current", "update_available"} }

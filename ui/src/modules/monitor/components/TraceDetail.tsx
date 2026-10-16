@@ -6,19 +6,25 @@
  * placeholder "unknown". Shows the outcome up top, then who made the call,
  * what it hit, and the raw ids with copy buttons. "View in audit" (org:admin)
  * opens the audit log scoped to this trace.
+ *
+ * A call the caller can't see reads as not found, whichever way it was opened:
+ * an execution id the server answers 404 for, or a trace whose list comes back
+ * with no execution the caller may see.
  */
 import { useMemo } from 'react';
-import { ArrowUpRight } from 'lucide-react';
+import { ArrowUpRight, SearchX } from 'lucide-react';
 import {
 	ActorLabel,
 	AppLink,
 	CopyButton,
+	EmptyState,
 	ErrorAlert,
 	LoadingState,
 	StatusBadge,
 	VendorIcon,
 } from '@/shared/ui';
 import {
+	MonitorApiError,
 	useActorForTrace,
 	useExecution,
 	useExecutions,
@@ -34,10 +40,10 @@ import {
 import { StatusGlyph } from '@/modules/monitor/components/LogList';
 import { ExecutionStatusPill } from '@/modules/monitor/components/StatusPill';
 import { formatDuration, formatTimestamp } from '@/modules/monitor/lib/format';
-import { hasTrace, monitorHref } from '@/modules/monitor/lib/links';
+import { monitorHref } from '@/modules/monitor/lib/links';
 import { originLabel, EXECUTION_LABEL, EXECUTION_TONE } from '@/modules/monitor/lib/logVocabulary';
-import { ORG_ADMIN, usePermission } from '@/modules/monitor/lib/usePermission';
-import { formatOperation } from '@/shared/lib';
+import { AUDIT_READ, useCanAccess } from '@/shared/auth';
+import { formatOperation, hasTrace } from '@/shared/lib';
 
 function apiName(exec: ExecutionResponse): string {
 	return exec.api?.name ?? exec.api?.host ?? 'Unknown API';
@@ -60,7 +66,8 @@ export function TraceDetail({
 	executionId: string | null;
 	frame: DetailFrameContext;
 }) {
-	const isAdmin = usePermission(ORG_ADMIN);
+	// The audit log (`GET /audit`) needs `audit:read` or `org:admin`.
+	const canReadAudit = useCanAccess(AUDIT_READ);
 	// Opened by execution id, the record must still find that execution's
 	// trace: fetch it whenever we have its id and read the trace off it.
 	const singleQuery = useExecution(executionId);
@@ -75,7 +82,7 @@ export function TraceDetail({
 	const listQuery = useExecutions(traceable ? { traceId: effectiveTraceId } : {}, {
 		enabled: traceable,
 	});
-	const traceActor = useActorForTrace(effectiveTraceId, { canReadAudit: isAdmin }).actor;
+	const traceActor = useActorForTrace(effectiveTraceId, { canReadAudit }).actor;
 	const actor =
 		single && (single.actor_id || single.actor_type)
 			? { actorId: single.actor_id || null, actorType: single.actor_type }
@@ -99,6 +106,12 @@ export function TraceDetail({
 		return single ? [single] : [];
 	}, [traceable, listQuery.data, single, effectiveTraceId]);
 
+	// Opened by execution id alone: the server's 404 is the answer. Opened by
+	// trace: an empty list is — the server scopes it to what the caller may see.
+	const notFound = traceable
+		? listQuery.isSuccess && executions.length === 0
+		: singleQuery.error instanceof MonitorApiError && singleQuery.error.status === 404;
+
 	const first = executions[0];
 	const heading =
 		executions.length > 1
@@ -116,6 +129,12 @@ export function TraceDetail({
 		>
 			{isResolving || query.isLoading ? (
 				<LoadingState />
+			) : notFound ? (
+				<EmptyState
+					icon={<SearchX className="h-8 w-8" />}
+					title="Call not found"
+					description="It doesn't exist, or you don't have access to it."
+				/>
 			) : query.isError ? (
 				<ErrorAlert
 					message={
@@ -151,7 +170,7 @@ export function TraceDetail({
 					<DetailSection
 						title={executions.length > 1 ? `Calls (${executions.length})` : 'Call'}
 						action={
-							traceable && isAdmin ? (
+							traceable && canReadAudit ? (
 								<AppLink
 									href={monitorHref({ show: 'audit', traceId: effectiveTraceId })}
 									className="text-primary inline-flex items-center gap-1 text-xs font-medium hover:underline"
@@ -178,7 +197,7 @@ export function TraceDetail({
 function ExecutionCard({ exec }: { exec: ExecutionResponse }) {
 	const status = toExecutionStatus(exec.status);
 	return (
-		<li className="border-border/70 bg-muted/20 rounded-lg border p-3">
+		<li className="bg-field rounded-lg p-3">
 			<div className="flex items-start gap-2">
 				<StatusGlyph tone={EXECUTION_TONE[status]} label={EXECUTION_LABEL[status]} />
 				<p className="text-foreground min-w-0 flex-1 font-mono text-[13px] break-all">

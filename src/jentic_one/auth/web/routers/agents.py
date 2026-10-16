@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, Request, Response
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Path, Query, Request, Response
 from jentic.problem_details import Forbidden
 
 from jentic_one.auth.services.agent_auth_service import AgentAuthService
@@ -17,9 +19,9 @@ from jentic_one.auth.web.schemas.agents import (
     AgentCreateRequest,
     AgentListResponse,
     AgentPatchRequest,
+    AgentPermissionsRequest,
+    AgentPermissionsResponse,
     AgentResponse,
-    AgentScopesRequest,
-    AgentScopesResponse,
     ApiKeyHistoryEntryResponse,
     ApiKeyHistoryResponse,
     ApiKeyInfoResponse,
@@ -34,8 +36,20 @@ from jentic_one.auth.web.schemas.agents import (
 from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.models import ActorType
 from jentic_one.shared.web import get_current_identity
+from jentic_one.shared.web import openapi_examples as ex
 
 router = APIRouter()
+
+AgentIdPath = Annotated[
+    str, Path(description="ID of the agent.", openapi_examples=ex.example(ex.AGENT_ID))
+]
+CredentialIdPath = Annotated[
+    str,
+    Path(
+        description="ID of the credential bound to the agent.",
+        openapi_examples=ex.example(ex.CREDENTIAL_ID),
+    ),
+]
 
 
 def _agent_response(view: AgentView) -> AgentResponse:
@@ -56,18 +70,33 @@ def _agent_response(view: AgentView) -> AgentResponse:
     )
 
 
-@router.post("/agents", status_code=201)
+@router.post("/agents", status_code=201, summary="Create an agent")
 async def create_agent(
     body: AgentCreateRequest,
     identity: Identity = get_current_identity(required_permissions=["agents:write"]),
     agent_svc: AgentService = Depends(get_agent_service),
 ) -> AgentResponse:
-    """Create a new agent manually."""
+    """Create an agent owned by the caller.
+
+    The agent is `active` immediately and owned by the caller (an agent caller's
+    owner owns it, and the caller is recorded as `parent_agent_id`). Supply `name`
+    (required), an optional `description`, and optional `permissions`. When
+    `permissions` is omitted the agent gets the default agent permission set.
+    When supplied, every permission must be one the caller may grant (see
+    `grantable_by_caller` on `GET /permissions`); otherwise the request fails
+    with 403 (`agent_permission_not_grantable`). Returns the created agent.
+
+    The agent has no way to authenticate yet. Follow up with
+    `POST /agents/{agent_id}:generate-api-key` (or `PUT /agents/{agent_id}/jwks`
+    for JWT-bearer), and bind credentials with `POST /agents/{agent_id}/credentials`.
+    """
     # agents.owner_id references users: an agent caller's own owner owns the
     # new agent, and the caller is recorded as its parent agent.
     by_agent = identity.actor_type is ActorType.AGENT
     view = await agent_svc.create(
-        AgentCreatePayload(name=body.name, description=body.description, scopes=body.scopes),
+        AgentCreatePayload(
+            name=body.name, description=body.description, permissions=body.permissions
+        ),
         owner_id=identity.parent_actor_id if by_agent else identity.sub,
         parent_agent_id=identity.sub if by_agent else None,
         identity=identity,
@@ -75,15 +104,40 @@ async def create_agent(
     return _agent_response(view)
 
 
-@router.get("/agents")
+@router.get("/agents", summary="List visible agents")
 async def list_agents(
     identity: Identity = get_current_identity(required_permissions=["agents:read"]),
     agent_svc: AgentService = Depends(get_agent_service),
-    cursor: str | None = None,
-    limit: int = Query(default=50, ge=1, le=200),
-    status: str | None = Query(default=None),
+    cursor: str | None = Query(
+        default=None,
+        description="Cursor from a previous page's `next_cursor`; omit for the first page.",
+        openapi_examples=ex.example(ex.CURSOR),
+    ),
+    limit: int = Query(
+        default=50,
+        ge=1,
+        le=200,
+        description="Maximum number of agents to return (1-200, default 50).",
+        openapi_examples=ex.example(25),
+    ),
+    status: str | None = Query(
+        default=None,
+        description=(
+            "Only return agents in this lifecycle status: `pending`, `active`, `rejected`,"
+            " `disabled` or `archived`."
+        ),
+        openapi_examples=ex.example("active"),
+    ),
 ) -> AgentListResponse:
-    """List agents — scoped by identity via dynamic query scoping."""
+    """List the agents the caller can see, newest first.
+
+    Visibility is scoped to the caller: `org:admin` sees every agent; anyone
+    else sees the agents they own. An agent caller also sees itself, and with
+    `owner:agents:read` its owner's agents. Filter by lifecycle `status`
+    (`pending`, `active`, `rejected`, `disabled`, `archived`). Results are
+    cursor-paginated: pass `next_cursor` from the previous page as `cursor`
+    while `has_more` is true.
+    """
     page = await agent_svc.list_agents(limit=limit, status=status, cursor=cursor, identity=identity)
     return AgentListResponse(
         data=[_agent_response(a) for a in page.data],
@@ -92,27 +146,42 @@ async def list_agents(
     )
 
 
-@router.get("/agents/{agent_id}")
+@router.get("/agents/{agent_id}", summary="Get an agent")
 async def get_agent(
-    agent_id: str,
+    agent_id: AgentIdPath,
     request: Request,
     identity: Identity = get_current_identity(allow_expired_password=True),
     agent_svc: AgentService = Depends(get_agent_service),
 ) -> AgentResponse:
-    """Get agent by ID — requires agents:read or self-read."""
+    """Get one agent's profile and lifecycle state.
+
+    Returns the agent's name, description, owner, `status`, approval or
+    denial details, and whether it currently has an API key (`has_api_key`).
+    Readable by the agent itself, its owner, and `org:admin`; an agent outside
+    the caller's visibility answers 404.
+    """
     view = await agent_svc.get_agent(agent_id, identity=identity)
     _check_read_access(identity, view, request)
     return _agent_response(view)
 
 
-@router.patch("/agents/{agent_id}", status_code=200)
+@router.patch("/agents/{agent_id}", status_code=200, summary="Update an agent")
 async def update_agent(
-    agent_id: str,
+    agent_id: AgentIdPath,
     body: AgentPatchRequest,
     identity: Identity = get_current_identity(required_permissions=["agents:write"]),
     agent_svc: AgentService = Depends(get_agent_service),
 ) -> AgentResponse:
-    """Partially update an agent — name, description, or owner_id."""
+    """Partially update an agent's `name`, `description` or `owner_id`.
+
+    Only the fields present in the body change; an empty body returns the
+    agent unchanged. Allowed for the agent's owner or an `org:admin` (anyone
+    else gets 404). Changing `owner_id` transfers ownership, is
+    `org:admin`-only, and revokes every active OAuth client grant bound to
+    the agent, so the new owner must re-consent any connected client. The
+    agent's API key, permissions and credential bindings are unaffected. An
+    archived agent cannot be updated (409). Returns the updated agent.
+    """
     update_data = body.model_dump(exclude_unset=True)
     if not update_data:
         view = await agent_svc.get_agent(agent_id, identity=identity)
@@ -123,18 +192,25 @@ async def update_agent(
 
 @router.post("/agents/{agent_id}:approve", status_code=200)
 async def approve_agent(
-    agent_id: str,
+    agent_id: AgentIdPath,
     identity: Identity = get_current_identity(required_permissions=["agents:write"]),
     agent_svc: AgentService = Depends(get_agent_service),
 ) -> AgentResponse:
-    """Approve a pending agent."""
+    """Approve a pending agent.
+
+    Allowed for the agent's owner or an ``org:admin``. An agent with no owner
+    (an unclaimed self-registration) can be approved only by an ``org:admin``,
+    who becomes its owner. Any other caller gets a 404, whatever the agent's
+    status, so the response does not reveal agents outside the caller's
+    ownership.
+    """
     view = await agent_svc.approve(agent_id, identity=identity)
     return _agent_response(view)
 
 
 @router.post("/agents/{agent_id}:claim", status_code=200)
 async def claim_agent(
-    agent_id: str,
+    agent_id: AgentIdPath,
     body: ClaimRequest,
     identity: Identity = get_current_identity(
         allow_expired_password=True, require_actor_type=ActorType.USER
@@ -156,7 +232,7 @@ async def claim_agent(
     ``allow_expired_password=True`` is intentional (matching ``GET /agents/{id}``):
     claiming is an onboarding step a brand-new user may hit before they have
     rotated a temporary password, so a must-change-password state must not block
-    it. The claim only sets ownership — it grants no scopes and cannot act as the
+    it. The claim only sets ownership — it grants no permissions and cannot act as the
     agent — so allowing it under an expired password is low-risk.
     """
     view = await agent_svc.claim(agent_id, token=body.token, identity=identity)
@@ -165,19 +241,24 @@ async def claim_agent(
 
 @router.post("/agents/{agent_id}:deny", status_code=200)
 async def deny_agent(
-    agent_id: str,
+    agent_id: AgentIdPath,
     body: DenyRequest,
     identity: Identity = get_current_identity(required_permissions=["agents:write"]),
     agent_svc: AgentService = Depends(get_agent_service),
 ) -> AgentResponse:
-    """Deny a pending agent."""
+    """Deny a pending agent.
+
+    Same authorization as approve: the agent's owner or an ``org:admin``, and
+    only an ``org:admin`` for an agent with no owner. Any other caller gets a
+    404.
+    """
     view = await agent_svc.deny(agent_id, reason=body.reason, identity=identity)
     return _agent_response(view)
 
 
 @router.post("/agents/{agent_id}:disable", status_code=204)
 async def disable_agent(
-    agent_id: str,
+    agent_id: AgentIdPath,
     identity: Identity = get_current_identity(required_permissions=["agents:write"]),
     agent_svc: AgentService = Depends(get_agent_service),
 ) -> Response:
@@ -188,7 +269,7 @@ async def disable_agent(
 
 @router.post("/agents/{agent_id}:enable", status_code=204)
 async def enable_agent(
-    agent_id: str,
+    agent_id: AgentIdPath,
     identity: Identity = get_current_identity(required_permissions=["agents:write"]),
     agent_svc: AgentService = Depends(get_agent_service),
 ) -> Response:
@@ -199,42 +280,63 @@ async def enable_agent(
 
 @router.delete("/agents/{agent_id}", status_code=204)
 async def archive_agent(
-    agent_id: str,
+    agent_id: AgentIdPath,
+    purge: bool = Query(
+        default=False,
+        description=(
+            "Default false: the agent is archived (terminal-but-kept; its row"
+            " stays for history). true hard-deletes the agent from any status,"
+            " together with its tokens, consent grants, permission grants and"
+            " rules, bindings and connect sessions, and cancels its queued and"
+            " running jobs. History (audit entries, events, execution records,"
+            " finished jobs, notes) and the credentials it created are kept;"
+            " once the agent is gone that history is visible to org:admin only."
+        ),
+        openapi_examples=ex.example(True),
+    ),
     identity: Identity = get_current_identity(required_permissions=["agents:write"]),
     agent_svc: AgentService = Depends(get_agent_service),
 ) -> Response:
-    """Archive an agent — terminal-but-kept.
+    """Archive an agent — or, with ``purge=true``, hard-delete it.
 
-    The row is retained for history, but the action is not reversible and
-    the agent's authority is swept: scope grants, credential bindings, and
+    Archive keeps the row for history, but the action is not reversible and
+    the agent's authority is swept: permission grants, credential bindings, and
     OAuth consent grants are revoked. For the reversible kill switch use
     ``:disable`` / ``:enable`` instead.
+
+    Purge removes the agent and its authority and session rows; it archives
+    first if needed, so the agent's authority is gone before any cleanup runs,
+    and a failed purge leaves the agent archived and can be retried. Archive
+    returns 409 for an already-archived agent; purge accepts any status.
     """
-    await agent_svc.archive(agent_id, identity=identity)
+    if purge:
+        await agent_svc.purge(agent_id, identity=identity)
+    else:
+        await agent_svc.archive(agent_id, identity=identity)
     return Response(status_code=204)
 
 
-@router.get("/agents/{agent_id}/scopes", operation_id="getAgentScopes")
-async def get_agent_scopes(
-    agent_id: str,
+@router.get("/agents/{agent_id}/permissions", operation_id="getAgentPermissions")
+async def get_agent_permissions(
+    agent_id: AgentIdPath,
     identity: Identity = get_current_identity(required_permissions=["agents:read"]),
     agent_svc: AgentService = Depends(get_agent_service),
-) -> AgentScopesResponse:
-    """List scopes granted to an agent."""
-    scopes = await agent_svc.get_scopes(agent_id, identity=identity)
-    return AgentScopesResponse(scopes=scopes)
+) -> AgentPermissionsResponse:
+    """List permissions granted to an agent."""
+    permissions = await agent_svc.get_permissions(agent_id, identity=identity)
+    return AgentPermissionsResponse(permissions=permissions)
 
 
-@router.put("/agents/{agent_id}/scopes", operation_id="replaceAgentScopes")
-async def replace_agent_scopes(
-    agent_id: str,
-    body: AgentScopesRequest,
+@router.put("/agents/{agent_id}/permissions", operation_id="replaceAgentPermissions")
+async def replace_agent_permissions(
+    agent_id: AgentIdPath,
+    body: AgentPermissionsRequest,
     identity: Identity = get_current_identity(required_permissions=["agents:write"]),
     agent_svc: AgentService = Depends(get_agent_service),
-) -> AgentScopesResponse:
-    """Replace all scopes for an agent."""
-    scopes = await agent_svc.replace_scopes(agent_id, body.scopes, identity=identity)
-    return AgentScopesResponse(scopes=scopes)
+) -> AgentPermissionsResponse:
+    """Replace all permissions for an agent."""
+    permissions = await agent_svc.replace_permissions(agent_id, body.permissions, identity=identity)
+    return AgentPermissionsResponse(permissions=permissions)
 
 
 def _credential_binding_response(view: CredentialBindingView) -> CredentialBindingResponse:
@@ -251,31 +353,52 @@ def _credential_binding_response(view: CredentialBindingView) -> CredentialBindi
     )
 
 
-@router.get("/agents/{agent_id}/credentials", operation_id="listAgentCredentials")
+@router.get(
+    "/agents/{agent_id}/credentials",
+    operation_id="listAgentCredentials",
+    summary="List an agent's credential bindings",
+)
 async def list_credentials(
-    agent_id: str,
+    agent_id: AgentIdPath,
     request: Request,
     identity: Identity = get_current_identity(allow_expired_password=True),
     agent_svc: AgentService = Depends(get_agent_service),
 ) -> CredentialBindingListResponse:
-    """List direct credential bindings for an agent — requires agents:read or self."""
+    """List the credentials bound directly to an agent.
+
+    Each binding names the credential, the API it serves, when it was bound,
+    whether it is `suspended` (and why), and any attached permission
+    `rule_set_id`. Credential secrets are never returned. Readable by the
+    agent itself, its owner, and `org:admin` (404 otherwise). The list is not
+    paginated.
+    """
     view = await agent_svc.get_agent(agent_id, identity=identity)
     _check_read_access(identity, view, request)
     bindings = await agent_svc.list_credentials(agent_id, identity=identity)
     return CredentialBindingListResponse(data=[_credential_binding_response(b) for b in bindings])
 
 
-@router.post("/agents/{agent_id}/credentials", status_code=201, operation_id="bindAgentCredential")
+@router.post(
+    "/agents/{agent_id}/credentials",
+    status_code=201,
+    operation_id="bindAgentCredential",
+    summary="Bind a credential to an agent",
+)
 async def bind_credential(
-    agent_id: str,
+    agent_id: AgentIdPath,
     body: CredentialBindRequest,
     identity: Identity = get_current_identity(required_permissions=["agents:write"]),
     agent_svc: AgentService = Depends(get_agent_service),
 ) -> CredentialBindingResponse:
-    """Directly bind a credential to an agent (theme 5 phase 1).
+    """Let an agent use a credential by binding it directly.
 
-    The caller must own the target credential (or hold ``org:admin``); a
-    credential that does not exist or that the caller does not own returns 404.
+    A new binding starts with no permission rules, so the agent can make no
+    calls with it until rules are set or a rule set is attached. The caller
+    must be able to see the agent and must own the credential (or hold
+    `org:admin`). A credential that does not exist or that the caller does
+    not own returns 404; binding the same credential twice returns 409
+    (`credential_binding_conflict`).
+    Returns the new binding.
     """
     binding = await agent_svc.bind_credential(
         agent_id, credential_id=body.credential_id, identity=identity
@@ -287,10 +410,11 @@ async def bind_credential(
     "/agents/{agent_id}/credentials/{credential_id}",
     status_code=204,
     operation_id="unbindAgentCredential",
+    summary="Suspend or remove a credential binding",
 )
 async def unbind_credential(
-    agent_id: str,
-    credential_id: str,
+    agent_id: AgentIdPath,
+    credential_id: CredentialIdPath,
     purge: bool = Query(
         default=False,
         description=(
@@ -298,11 +422,21 @@ async def unbind_credential(
             " rules survive and :resume restores access). true deletes the"
             " binding row outright, together with its inline permission rules."
         ),
+        openapi_examples=ex.example(True),
     ),
     identity: Identity = get_current_identity(required_permissions=["agents:write"]),
     agent_svc: AgentService = Depends(get_agent_service),
 ) -> Response:
-    """Unbind a credential from an agent — suspend by default, purge on request."""
+    """Stop an agent using a credential: suspend the binding, or purge it.
+
+    By default the binding is **suspended**: the agent loses access at once,
+    but the binding and its permission rules are kept, and
+    `POST /agents/{agent_id}/credentials/{credential_id}:resume` restores it.
+    With `purge=true` the binding and its inline permission rules are deleted
+    outright, so a later re-bind starts from deny-all. An agent may suspend
+    its own binding but not purge it. Both modes are audited. Returns 204; a
+    missing binding returns 404.
+    """
     await agent_svc.unbind_credential(
         agent_id, credential_id=credential_id, purge=purge, identity=identity
     )
@@ -313,14 +447,22 @@ async def unbind_credential(
     "/agents/{agent_id}/credentials/{credential_id}:resume",
     status_code=200,
     operation_id="resumeAgentCredentialBinding",
+    summary="Resume a suspended credential binding",
 )
 async def resume_credential_binding(
-    agent_id: str,
-    credential_id: str,
+    agent_id: AgentIdPath,
+    credential_id: CredentialIdPath,
     identity: Identity = get_current_identity(required_permissions=["agents:write"]),
     agent_svc: AgentService = Depends(get_agent_service),
 ) -> CredentialBindingResponse:
-    """Lift a suspended credential binding — the reverse of the default unbind."""
+    """Restore an agent's access to a credential whose binding was suspended.
+
+    Reverses the default (non-purge) unbind; a purged binding is gone and must
+    be bound again instead. Because resuming re-grants the credential, the
+    caller must own the credential (or hold `org:admin`) as well as see the
+    agent, and an agent cannot resume its own binding. Returns the binding;
+    404 when no binding exists.
+    """
     binding = await agent_svc.resume_credential(
         agent_id, credential_id=credential_id, identity=identity
     )
@@ -329,7 +471,7 @@ async def resume_credential_binding(
 
 @router.post("/agents/{agent_id}:generate-api-key", status_code=200)
 async def generate_agent_api_key(
-    agent_id: str,
+    agent_id: AgentIdPath,
     identity: Identity = get_current_identity(required_permissions=["agents:write"]),
     auth_svc: AgentAuthService = Depends(get_agent_auth_service),
 ) -> ApiKeyResponse:
@@ -340,7 +482,7 @@ async def generate_agent_api_key(
 
 @router.put("/agents/{agent_id}/jwks", status_code=200)
 async def update_agent_jwks(
-    agent_id: str,
+    agent_id: AgentIdPath,
     body: JwksUpdateRequest,
     identity: Identity = get_current_identity(required_permissions=["agents:write"]),
     agent_svc: AgentService = Depends(get_agent_service),
@@ -357,7 +499,7 @@ async def update_agent_jwks(
 
 @router.post("/agents/{agent_id}:revoke-api-key", status_code=204)
 async def revoke_agent_api_key(
-    agent_id: str,
+    agent_id: AgentIdPath,
     identity: Identity = get_current_identity(required_permissions=["agents:write"]),
     auth_svc: AgentAuthService = Depends(get_agent_auth_service),
 ) -> Response:
@@ -366,13 +508,24 @@ async def revoke_agent_api_key(
     return Response(status_code=204)
 
 
-@router.get("/agents/{agent_id}/api-key", operation_id="getAgentApiKeyInfo")
+@router.get(
+    "/agents/{agent_id}/api-key",
+    operation_id="getAgentApiKeyInfo",
+    summary="Get an agent's API key metadata",
+)
 async def get_agent_api_key_info(
-    agent_id: str,
+    agent_id: AgentIdPath,
     identity: Identity = get_current_identity(required_permissions=["agents:read"]),
     auth_svc: AgentAuthService = Depends(get_agent_auth_service),
 ) -> ApiKeyInfoResponse | None:
-    """Get API key metadata for an agent. Returns info even after revocation."""
+    """Describe an agent's API key without revealing it.
+
+    Returns the key record's `id`, `status` (`active`, or `revoked` once
+    revoked), `created_at`, `rotated_at` and `created_by`. The plaintext key
+    is never returned — it is shown once, by `:generate-api-key`. Metadata
+    stays available after revocation; the body is `null` if the agent never
+    had a key. Allowed for the agent's owner or an `org:admin`.
+    """
     info = await auth_svc.get_api_key_info(agent_id, identity=identity)
     if info is None:
         return None
@@ -385,13 +538,24 @@ async def get_agent_api_key_info(
     )
 
 
-@router.get("/agents/{agent_id}/api-key/history", operation_id="getAgentApiKeyHistory")
+@router.get(
+    "/agents/{agent_id}/api-key/history",
+    operation_id="getAgentApiKeyHistory",
+    summary="Get an agent's API key history",
+)
 async def get_agent_api_key_history(
-    agent_id: str,
+    agent_id: AgentIdPath,
     identity: Identity = get_current_identity(required_permissions=["agents:read"]),
     auth_svc: AgentAuthService = Depends(get_agent_auth_service),
 ) -> ApiKeyHistoryResponse:
-    """Get the audit history of API key operations for an agent."""
+    """List recent API key rotations and revocations for an agent.
+
+    Each entry gives the audit `action`, its `reason` (key rotated or key
+    revoked), the acting `actor_id`, and `occurred_at`. Drawn from the agent's
+    50 most recent audit entries, newest first, so very old key events may
+    not appear; it is not paginated. Allowed for the agent's owner or an
+    `org:admin`.
+    """
     entries = await auth_svc.get_api_key_history(agent_id, identity=identity)
     return ApiKeyHistoryResponse(
         data=[

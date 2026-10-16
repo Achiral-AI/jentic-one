@@ -32,8 +32,8 @@ class _FakeActorStatus:
         self.calls.append((actor_id, actor_type))
         return self._active
 
-    async def holds_scope(self, *, actor_id: str, actor_type: str, scope: str) -> bool:
-        self.scope_calls.append((actor_id, actor_type, scope))
+    async def holds_permission(self, *, actor_id: str, actor_type: str, permission: str) -> bool:
+        self.scope_calls.append((actor_id, actor_type, permission))
         return self._scoped
 
 
@@ -159,6 +159,7 @@ async def test_policy_denial_carries_the_sync_problem_body() -> None:
         "type": "action_denied",
         "title": "Denied by rule",
         "status": 403,
+        "detail": "Denied by rule",
         "error_origin": "broker",
         "instance": "/api.example.com/v1/things",
         "agent_directive": {

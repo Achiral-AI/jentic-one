@@ -150,8 +150,21 @@
       "BadRequest": {
         "content": {
           "application/problem+json": {
+            "examples": {
+              "invalid_upstream_url": {
+                "summary": "Upstream URL rejected by the broker's egress policy.",
+                "value": {
+                  "detail": "upstream URL resolves to a blocked address range",
+                  "error_origin": "broker",
+                  "instance": "/169.254.169.254/latest/meta-data",
+                  "status": 400,
+                  "title": "upstream URL resolves to a blocked address range",
+                  "type": "invalid_upstream_url"
+                }
+              }
+            },
             "schema": {
-              "$ref": "https://raw.githubusercontent.com/jentic/api-problem-details/c741877182d2deea2bb38859e3df4caa76265d98/schemas/problem-details.yaml"
+              "$ref": "#/components/schemas/BrokerProblem"
             }
           }
         },
@@ -160,8 +173,59 @@
       "Conflict": {
         "content": {
           "application/problem+json": {
+            "examples": {
+              "ambiguous_credential_binding": {
+                "summary": "Two bound credentials cover the API; pick one with a header.",
+                "value": {
+                  "agent_directive": {
+                    "human_readable_instruction": "Multiple bound credentials cover this API. Resend the same request with the Jentic-Credential-Id header set to one of the ids in parameters.candidates (Jentic-Credential-Name also works when names are unique).",
+                    "parameters": {
+                      "candidates": [
+                        "cred_01HXAMPLE7Q2",
+                        "cred_01HXAMPLE9K4"
+                      ],
+                      "headers": {
+                        "Jentic-Credential-Id": "cred_01HXAMPLE7Q2"
+                      }
+                    },
+                    "strategy": "modify_headers"
+                  },
+                  "candidates": [
+                    {
+                      "created_at": "2026-09-01T00:00:00Z",
+                      "id": "cred_01HXAMPLE7Q2",
+                      "last4": "7Q2a",
+                      "name": "github-work"
+                    },
+                    {
+                      "created_at": "2026-09-12T00:00:00Z",
+                      "id": "cred_01HXAMPLE9K4",
+                      "last4": "9K4b",
+                      "name": "github-personal"
+                    }
+                  ],
+                  "detail": "Ambiguous: 2 active credentials match api (api.github.com, main, 1.1.4)",
+                  "error_origin": "broker",
+                  "instance": "/api.github.com/user/repos",
+                  "status": 409,
+                  "title": "Ambiguous: 2 active credentials match api (api.github.com, main, 1.1.4)",
+                  "type": "ambiguous_credential_binding"
+                }
+              },
+              "idempotency_conflict": {
+                "summary": "Idempotency-Key reused with a different request.",
+                "value": {
+                  "detail": "Idempotency-Key reused with a different request.",
+                  "error_origin": "broker",
+                  "instance": "/api.example.com/v1/orders",
+                  "status": 409,
+                  "title": "Idempotency-Key reused with a different request.",
+                  "type": "idempotency_conflict"
+                }
+              }
+            },
             "schema": {
-              "$ref": "https://raw.githubusercontent.com/jentic/api-problem-details/c741877182d2deea2bb38859e3df4caa76265d98/schemas/problem-details.yaml"
+              "$ref": "#/components/schemas/BrokerProblem"
             }
           }
         },
@@ -170,18 +234,65 @@
       "CredentialNotProvisioned": {
         "content": {
           "application/problem+json": {
+            "examples": {
+              "credential_not_provisioned": {
+                "summary": "No credential connected for the API; ask a human to connect one.",
+                "value": {
+                  "agent_directive": {
+                    "human_readable_instruction": "No credential is connected for 'api.example.com'; ask the user to connect the account before retrying.",
+                    "parameters": {
+                      "intent_id": "intent_3f2a9c0d1b8e4f6a9d7c5b3e1a0f2d4c",
+                      "vendor": "api.example.com"
+                    },
+                    "strategy": "prompt_human"
+                  },
+                  "detail": "No credential provisioned for 'api.example.com'.",
+                  "error_origin": "broker",
+                  "instance": "/api.example.com/v1/users",
+                  "intent_id": "intent_3f2a9c0d1b8e4f6a9d7c5b3e1a0f2d4c",
+                  "status": 424,
+                  "title": "No credential provisioned for 'api.example.com'.",
+                  "type": "credential_not_provisioned"
+                }
+              }
+            },
             "schema": {
-              "$ref": "https://raw.githubusercontent.com/jentic/api-problem-details/c741877182d2deea2bb38859e3df4caa76265d98/schemas/problem-details.yaml"
+              "$ref": "#/components/schemas/BrokerProblem"
             }
           }
         },
-        "description": "A bound credential is an unusable dependency, so the broker cannot\nsign the upstream call. Body is RFC 9457\n`application/problem+json`; the `type` discriminates two cases with\nopposite recovery paths:\n- `credential_not_provisioned` — no credential is connected for the\n  resolved upstream API. The `agent_directive` is a `prompt_human`\n  instruction carrying a non-secret `provisioning_url` (when\n  account-linking is configured) and an `intent_id` correlation id,\n  so an autonomous agent stops and asks the user to connect the\n  account rather than retrying or guessing the credential.\n- `credential_undecryptable` — a credential is connected but its\n  stored secret can no longer be decrypted (typically the\n  deployment's encryption key rotated underneath it, e.g. a\n  reinstall over existing data). The caller cannot self-provision\n  and retrying will not help; the `prompt_human` directive tells\n  the agent to ask an operator to remove and re-add the credential.\n"
+        "description": "A bound credential is an unusable dependency, so the broker cannot\nsign the upstream call. Body is RFC 9457\n`application/problem+json`; the `type` discriminates two cases with\nopposite recovery paths:\n- `credential_not_provisioned` — no credential is connected for the\n  resolved upstream API. The `agent_directive` is a `prompt_human`\n  instruction carrying an `intent_id` correlation id, so an\n  autonomous agent stops and asks the user to connect the account\n  rather than retrying or guessing the credential. When the agent\n  already has an open connect session for the API, the directive\n  also carries a non-secret `provisioning_url` — that session's\n  owner approval link (`/app/agents?approve=<session_id>`) — for\n  the agent to relay instead of starting another connect.\n- `credential_undecryptable` — a credential is connected but its\n  stored secret can no longer be decrypted (typically the\n  deployment's encryption key rotated underneath it, e.g. a\n  reinstall over existing data). The caller cannot self-provision\n  and retrying will not help; the `prompt_human` directive tells\n  the agent to ask an operator to remove and re-add the credential.\n"
       },
       "Default": {
         "content": {
           "application/problem+json": {
+            "examples": {
+              "upstream_response_too_large": {
+                "summary": "The broker aborted an upstream response over its size cap.",
+                "value": {
+                  "detail": "The upstream response exceeded the 10485760-byte response-size cap.",
+                  "error_origin": "broker",
+                  "instance": "/api.example.com/v1/reports",
+                  "max_response_bytes": 10485760,
+                  "status": 502,
+                  "title": "The upstream response exceeded the 10485760-byte response-size cap.",
+                  "type": "upstream_response_too_large"
+                }
+              },
+              "upstream_timeout": {
+                "summary": "Upstream did not respond within the broker's deadline.",
+                "value": {
+                  "detail": "The upstream did not respond within the deadline.",
+                  "error_origin": "broker",
+                  "instance": "/api.example.com/v1/reports",
+                  "status": 504,
+                  "title": "The upstream did not respond within the deadline.",
+                  "type": "upstream_timeout"
+                }
+              }
+            },
             "schema": {
-              "$ref": "https://raw.githubusercontent.com/jentic/api-problem-details/c741877182d2deea2bb38859e3df4caa76265d98/schemas/problem-details.yaml"
+              "$ref": "#/components/schemas/BrokerProblem"
             }
           }
         },
@@ -191,27 +302,60 @@
         "content": {
           "application/json": {
             "examples": {
+              "held": {
+                "summary": "Call held for human approval by a require-approval rule.",
+                "value": {
+                  "_links": {
+                    "result": "https://control.your-instance.example/executions/holds/held_abc123/result",
+                    "self": "https://control.your-instance.example/executions/holds/held_abc123",
+                    "withdraw": "https://control.your-instance.example/executions/holds/held_abc123:withdraw"
+                  },
+                  "agent_directive": "This call needs human approval. Most important: show the user the review_url, since they cannot approve it without that link, and end your turn so they see it. Do not call get_execution_result until the user replies; then call it once with held_execution_id. It waits up to 30 seconds (timeout, at most 30). If it is still held, show the user the review_url again and end your turn again. Do not re-send the call.",
+                  "expires_at": "2026-10-06T12:00:00Z",
+                  "held_execution_id": "held_abc123",
+                  "review_url": "https://your-instance.example/app/agents/approvals/held_abc123",
+                  "status": "held"
+                }
+              },
               "queued": {
                 "summary": "Freshly queued async execution.",
                 "value": {
                   "_links": {
                     "self": "https://control.your-instance.example/jobs/job_abc123"
                   },
-                  "job_id": "job_abc123"
+                  "job_id": "job_abc123",
+                  "status": "queued"
                 }
               }
             },
             "schema": {
-              "$ref": "#/components/schemas/AsyncQueuedResponse"
+              "discriminator": {
+                "mapping": {
+                  "held": "#/components/schemas/HeldExecutionAcceptedResponse",
+                  "queued": "#/components/schemas/AsyncQueuedResponse"
+                },
+                "propertyName": "status"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/AsyncQueuedResponse"
+                },
+                {
+                  "$ref": "#/components/schemas/HeldExecutionAcceptedResponse"
+                }
+              ]
             }
           }
         },
-        "description": "Execution queued. Follow `_links.self` to the control plane\nto poll the job and collect the upstream response body once\n`status` is `completed`. The body is delivered once and then\nevicted from the platform's pickup buffer.\n",
+        "description": "Execution queued — or held for human approval when a\n`require-approval` permission rule matched (`status: held`; see\n`HeldExecutionAcceptedResponse`). For a queued call, follow\n`_links.self` to the control plane to poll the job and collect the\nupstream response body once `status` is `completed`. The body is\ndelivered once and then evicted from the platform's pickup buffer.\n",
         "headers": {
           "Idempotent-Replayed": {
             "description": "Present and `true` when this `202` is a replay of a\npreviously-queued job under the same `Idempotency-Key`.\nThe `job_id` will match the original.\n",
             "schema": {
               "enum": [
+                "true"
+              ],
+              "examples": [
                 "true"
               ],
               "type": "string"
@@ -284,6 +428,9 @@
               "enum": [
                 "true"
               ],
+              "examples": [
+                "true"
+              ],
               "type": "string"
             }
           },
@@ -343,18 +490,66 @@
       "Forbidden": {
         "content": {
           "application/problem+json": {
+            "examples": {
+              "insufficient_scope": {
+                "summary": "Token lacks the `capabilities:execute` permission.",
+                "value": {
+                  "detail": "Insufficient scope: 'capabilities:execute' required",
+                  "instance": "/api.example.com/v1/users",
+                  "status": 403,
+                  "title": "Forbidden",
+                  "type": "insufficient_scope"
+                }
+              },
+              "no_credential_binding": {
+                "summary": "Caller is not bound to any credential covering this API.",
+                "value": {
+                  "agent_directive": {
+                    "human_readable_instruction": "You have no credential binding for 'api.example.com/main', but a credential already serves it. Ask your operator to bind this agent to that credential (in the dashboard, or via POST /agents/{agent_id}/credentials) — only a human can grant the binding. Once bound, retry this call.",
+                    "parameters": {
+                      "api": {
+                        "name": "main",
+                        "vendor": "api.example.com",
+                        "version": "1.0.0"
+                      },
+                      "api_served": true
+                    },
+                    "strategy": "prompt_human"
+                  },
+                  "detail": "No credential binding for this API",
+                  "error_origin": "broker",
+                  "instance": "/api.example.com/v1/users",
+                  "status": 403,
+                  "title": "No credential binding for this API",
+                  "type": "no_credential_binding"
+                }
+              }
+            },
             "schema": {
-              "$ref": "https://raw.githubusercontent.com/jentic/api-problem-details/c741877182d2deea2bb38859e3df4caa76265d98/schemas/problem-details.yaml"
+              "$ref": "#/components/schemas/BrokerProblem"
             }
           }
         },
-        "description": "Caller authenticated but not entitled to execute — most often a\ntoken lacking the required `capabilities:execute` scope\n(`type: insufficient_scope`), attempting to pin a `draft`\nrevision they don't own, using a credential they aren't bound to\n(`no_credential_binding`), or being denied by a binding's\npermission rules. Body is RFC 9457 `application/problem+json`.\n"
+        "description": "Caller authenticated but not entitled to execute — most often a\ntoken lacking the required `capabilities:execute` permission\n(`type: insufficient_scope`, the RFC 6750 code), attempting to pin a `draft`\nrevision they don't own, using a credential they aren't bound to\n(`no_credential_binding`), or being denied by a binding's\npermission rules. Body is RFC 9457 `application/problem+json`.\n"
       },
       "NotFound": {
         "content": {
           "application/problem+json": {
+            "examples": {
+              "operation_not_found": {
+                "summary": "Upstream URL does not match any registered API operation.",
+                "value": {
+                  "detail": "Operation not found — unregistered upstream URL.",
+                  "error_origin": "broker",
+                  "instance": "/api.example.com/v1/unknown",
+                  "status": 404,
+                  "title": "Operation not found — unregistered upstream URL.",
+                  "type": "operation_not_found"
+                }
+              }
+            },
             "schema": {
-              "$ref": "https://raw.githubusercontent.com/jentic/api-problem-details/c741877182d2deea2bb38859e3df4caa76265d98/schemas/problem-details.yaml"
+              "$ref": "#/components/schemas/BrokerProblem"
             }
           }
         },
@@ -363,8 +558,21 @@
       "PayloadTooLarge": {
         "content": {
           "application/problem+json": {
+            "examples": {
+              "payload_too_large": {
+                "summary": "Request body exceeded the per-Content-Type size cap.",
+                "value": {
+                  "detail": "Request body exceeds the 10485760-byte cap.",
+                  "error_origin": "broker",
+                  "instance": "/api.example.com/v1/uploads",
+                  "status": 413,
+                  "title": "Request body exceeds the 10485760-byte cap.",
+                  "type": "payload_too_large"
+                }
+              }
+            },
             "schema": {
-              "$ref": "https://raw.githubusercontent.com/jentic/api-problem-details/c741877182d2deea2bb38859e3df4caa76265d98/schemas/problem-details.yaml"
+              "$ref": "#/components/schemas/BrokerProblem"
             }
           }
         },
@@ -373,8 +581,20 @@
       "ServerError": {
         "content": {
           "application/problem+json": {
+            "examples": {
+              "server_error": {
+                "summary": "Unhandled broker-side failure (details are logged, never echoed).",
+                "value": {
+                  "detail": "An unexpected error occurred.",
+                  "instance": "/api.example.com/v1/users",
+                  "status": 500,
+                  "title": "Internal Server Error",
+                  "type": "server_error"
+                }
+              }
+            },
             "schema": {
-              "$ref": "https://raw.githubusercontent.com/jentic/api-problem-details/c741877182d2deea2bb38859e3df4caa76265d98/schemas/problem-details.yaml"
+              "$ref": "#/components/schemas/BrokerProblem"
             }
           }
         },
@@ -383,8 +603,30 @@
       "ServiceUnavailable": {
         "content": {
           "application/problem+json": {
+            "examples": {
+              "circuit_open": {
+                "summary": "Upstream circuit breaker is open; the broker is fast-failing.",
+                "value": {
+                  "detail": "Upstream circuit open; the broker is fast-failing to let it recover.",
+                  "error_origin": "broker",
+                  "status": 503,
+                  "title": "Upstream circuit open; the broker is fast-failing to let it recover.",
+                  "type": "circuit_open"
+                }
+              },
+              "server_at_capacity": {
+                "summary": "Instance shed the request at its in-flight admission cap.",
+                "value": {
+                  "detail": "Server at capacity; retry shortly.",
+                  "error_origin": "broker",
+                  "status": 503,
+                  "title": "Server at capacity; retry shortly.",
+                  "type": "server_at_capacity"
+                }
+              }
+            },
             "schema": {
-              "$ref": "https://raw.githubusercontent.com/jentic/api-problem-details/c741877182d2deea2bb38859e3df4caa76265d98/schemas/problem-details.yaml"
+              "$ref": "#/components/schemas/BrokerProblem"
             }
           }
         },
@@ -404,8 +646,20 @@
       "TooManyRequests": {
         "content": {
           "application/problem+json": {
+            "examples": {
+              "rate_limit_exceeded": {
+                "summary": "Caller exhausted their per-actor rate-limit window.",
+                "value": {
+                  "detail": "Rate limit exceeded; slow down and retry after the indicated delay.",
+                  "error_origin": "broker",
+                  "status": 429,
+                  "title": "Rate limit exceeded; slow down and retry after the indicated delay.",
+                  "type": "rate_limit_exceeded"
+                }
+              }
+            },
             "schema": {
-              "$ref": "https://raw.githubusercontent.com/jentic/api-problem-details/c741877182d2deea2bb38859e3df4caa76265d98/schemas/problem-details.yaml"
+              "$ref": "#/components/schemas/BrokerProblem"
             }
           }
         },
@@ -443,8 +697,20 @@
       "Unauthorized": {
         "content": {
           "application/problem+json": {
+            "examples": {
+              "invalid_token": {
+                "summary": "Token missing, unknown, revoked, or expired.",
+                "value": {
+                  "detail": "Invalid or expired access token",
+                  "instance": "/api.example.com/v1/users",
+                  "status": 401,
+                  "title": "Unauthorized",
+                  "type": "unauthorized"
+                }
+              }
+            },
             "schema": {
-              "$ref": "https://raw.githubusercontent.com/jentic/api-problem-details/c741877182d2deea2bb38859e3df4caa76265d98/schemas/problem-details.yaml"
+              "$ref": "#/components/schemas/BrokerProblem"
             }
           }
         },
@@ -453,8 +719,21 @@
       "ValidationError": {
         "content": {
           "application/problem+json": {
+            "examples": {
+              "unknown_revision_pin": {
+                "summary": "Jentic-Revision pins a revision that does not exist.",
+                "value": {
+                  "detail": "Unknown revision pin: api.example.com/main/9.9.9",
+                  "error_origin": "broker",
+                  "instance": "/api.example.com/v1/users",
+                  "status": 422,
+                  "title": "Unknown revision pin: api.example.com/main/9.9.9",
+                  "type": "unknown_revision_pin"
+                }
+              }
+            },
             "schema": {
-              "$ref": "https://raw.githubusercontent.com/jentic/api-problem-details/c741877182d2deea2bb38859e3df4caa76265d98/schemas/problem-details.yaml"
+              "$ref": "#/components/schemas/BrokerProblem"
             }
           }
         },
@@ -462,11 +741,86 @@
       }
     },
     "schemas": {
+      "AgentDirective": {
+        "description": "Machine-actionable recovery instruction embedded in a Broker\nproblem body. The fixed `strategy` vocabulary lets an agent\nhard-code its recovery loop — e.g. on `wait` sleep\n`parameters.retry_after_seconds`; on `modify_headers` add\n`parameters.headers` and retry once; on `prompt_human` stop and\nrelay `human_readable_instruction` to the user.\n",
+        "examples": [
+          {
+            "human_readable_instruction": "Multiple bound credentials cover this API. Resend the same request with the Jentic-Credential-Id header set to one of the ids in parameters.candidates (Jentic-Credential-Name also works when names are unique).",
+            "parameters": {
+              "candidates": [
+                "cred_01HXAMPLE7Q2",
+                "cred_01HXAMPLE9K4"
+              ],
+              "headers": {
+                "Jentic-Credential-Id": "cred_01HXAMPLE7Q2"
+              }
+            },
+            "strategy": "modify_headers"
+          }
+        ],
+        "properties": {
+          "human_readable_instruction": {
+            "description": "Plain-language instruction an agent can relay to a human or follow itself.",
+            "examples": [
+              "Resend the same request with the Jentic-Credential-Id header set to one of the ids in parameters.candidates."
+            ],
+            "type": "string"
+          },
+          "parameters": {
+            "additionalProperties": true,
+            "description": "Strategy-specific inputs (e.g. `headers` for `modify_headers`,\n`retry_after_seconds` for `wait`, `intent_id` / `provisioning_url`\nfor `prompt_human`). Empty when the strategy needs none.\n",
+            "examples": [
+              {
+                "headers": {
+                  "Jentic-Credential-Id": "cred_01HXAMPLE7Q2"
+                }
+              }
+            ],
+            "type": "object"
+          },
+          "strategy": {
+            "description": "Recovery strategy the agent should apply.",
+            "enum": [
+              "wait",
+              "retry",
+              "modify_headers",
+              "prompt_human",
+              "switch_toolkit",
+              "fatal"
+            ],
+            "examples": [
+              "modify_headers"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy",
+          "parameters",
+          "human_readable_instruction"
+        ],
+        "title": "AgentDirective",
+        "type": "object"
+      },
       "AsyncQueuedResponse": {
         "description": "Returned as the `202` body on async executions. The Broker\ndoes not expose a polling surface of its own; `_links.self`\nis an absolute URL into the platform's control plane, where\nthe queued work surfaces as a `kind: execution` job. Poll\nthat URL for status, and follow its `_links.result` to\ncollect the upstream response body once `status` is\n`completed`.\n",
+        "examples": [
+          {
+            "_links": {
+              "self": "https://control.your-instance.example/jobs/job_abc123"
+            },
+            "job_id": "job_abc123",
+            "status": "queued"
+          }
+        ],
         "properties": {
           "_links": {
             "description": "HAL-style link relations for the queued job. `self` always\npoints at the control-plane job record; the broker does\nnot expose its own polling surface.\n",
+            "examples": [
+              {
+                "self": "https://control.your-instance.example/jobs/job_abc123"
+              }
+            ],
             "properties": {
               "self": {
                 "description": "Absolute URL of the control-plane job record. Poll this for status and result links.",
@@ -491,9 +845,21 @@
             ],
             "title": "Job Id",
             "type": "string"
+          },
+          "status": {
+            "description": "Always `queued` on this body; a call held for approval answers `held` instead.",
+            "enum": [
+              "queued"
+            ],
+            "examples": [
+              "queued"
+            ],
+            "title": "Status",
+            "type": "string"
           }
         },
         "required": [
+          "status",
           "job_id",
           "_links"
         ],
@@ -501,25 +867,159 @@
         "title": "AsyncQueuedResponse",
         "type": "object"
       },
-      "HealthResponse": {
-        "description": "Body returned by `GET /health` when the Broker is ready to\naccept traffic. Shape follows the IETF [Health Check Response\nFormat for HTTP APIs](https://datatracker.ietf.org/doc/html/draft-inadarei-api-health-check)\ndraft (`application/health+json`). Intentionally minimal —\nclients treat `200` + `status: pass` as the green signal; the\nbody is informational.\n",
+      "BrokerProblem": {
+        "allOf": [
+          {
+            "$ref": "https://raw.githubusercontent.com/jentic/api-problem-details/c741877182d2deea2bb38859e3df4caa76265d98/schemas/problem-details.yaml"
+          },
+          {
+            "properties": {
+              "agent_directive": {
+                "$ref": "#/components/schemas/AgentDirective"
+              },
+              "candidates": {
+                "description": "The caller's own credentials that matched ambiguously\n(`ambiguous_credential_binding`, `ambiguous_credential`) or\nthat a credential-selection header failed to match\n(`credential_id_not_found`, `credential_name_not_found`).\nPick one and resend with `Jentic-Credential-Id`.\n",
+                "examples": [
+                  [
+                    {
+                      "created_at": "2026-09-01T00:00:00Z",
+                      "id": "cred_01HXAMPLE7Q2",
+                      "last4": "7Q2a",
+                      "name": "github-work"
+                    }
+                  ]
+                ],
+                "items": {
+                  "$ref": "#/components/schemas/CredentialCandidate"
+                },
+                "type": "array"
+              },
+              "error_origin": {
+                "description": "Who generated the error response: `broker` (the Broker\nitself — overloaded, misconfigured, rejecting the request\nshape, or giving up on the call: an upstream timeout or\nconnect failure, the overall deadline, a failed token\nrefresh, an oversized upstream response) or `upstream` (the\nexternal API answered with this error and the Broker\nmirrored it). Mirrored in the `Jentic-Error-Origin`\nresponse header. Absent on authentication errors.\n",
+                "enum": [
+                  "broker",
+                  "upstream"
+                ],
+                "examples": [
+                  "broker"
+                ],
+                "type": "string"
+              },
+              "intent_id": {
+                "description": "Correlation id for a `credential_not_provisioned` denial,\nalso carried in `agent_directive.parameters.intent_id`, so\nthe human hand-off can be tied back to this request.\n",
+                "examples": [
+                  "intent_3f2a9c0d1b8e4f6a9d7c5b3e1a0f2d4c"
+                ],
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        ],
+        "description": "RFC 9457 Problem Details body for every Broker error. Extends the\nshared Jentic `ProblemDetails` schema with the Broker's\nagent-recovery members: `error_origin` says *who* failed, and\n`agent_directive` (when present) is a machine-actionable recovery\ninstruction an agent can follow without parsing prose. `title`\nrepeats `detail` on Broker-originated errors.\n",
+        "examples": [
+          {
+            "detail": "No credential binding for this API",
+            "error_origin": "broker",
+            "instance": "/api.example.com/v1/users",
+            "status": 403,
+            "title": "No credential binding for this API",
+            "type": "no_credential_binding"
+          }
+        ],
+        "title": "BrokerProblem"
+      },
+      "CredentialCandidate": {
+        "description": "One of the caller's own credentials, distinguishable even when names\ncollide. Holds no secret material — `last4` is the last four\ncharacters of the credential **id**.\n",
+        "examples": [
+          {
+            "created_at": "2026-09-01T00:00:00Z",
+            "id": "cred_01HXAMPLE7Q2",
+            "last4": "7Q2a",
+            "name": "github-work"
+          }
+        ],
         "properties": {
+          "created_at": {
+            "description": "When the credential was created, to tell same-named candidates apart.",
+            "examples": [
+              "2026-09-01T00:00:00Z"
+            ],
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "Stable credential id; send it as `Jentic-Credential-Id` to pick this credential.",
+            "examples": [
+              "cred_01HXAMPLE7Q2"
+            ],
+            "type": "string"
+          },
+          "last4": {
+            "description": "Last four characters of the credential id, as a display hint.",
+            "examples": [
+              "7Q2a"
+            ],
+            "type": "string"
+          },
+          "name": {
+            "description": "Credential display name (not guaranteed unique).",
+            "examples": [
+              "github-work"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "last4"
+        ],
+        "title": "CredentialCandidate",
+        "type": "object"
+      },
+      "HealthResponse": {
+        "description": "Body returned by `GET /health` while the Broker process is\nserving requests. Intentionally minimal — clients treat `200` +\n`status: ok` as the green signal; the body is informational.\n",
+        "examples": [
+          {
+            "status": "ok",
+            "surface": "broker",
+            "version": "0.43.0"
+          }
+        ],
+        "properties": {
+          "reason": {
+            "description": "Why the deployment is not entitled. Present only on the `not_entitled` body.",
+            "examples": [
+              "Subscription for this deployment is not active."
+            ],
+            "type": "string"
+          },
           "status": {
-            "description": "Health indicator per the IETF Health Check draft.\n`pass` — service is healthy. `fail` — service is unhealthy.\n`warn` — service is healthy but with concerns. The Broker\nreturns `pass` on every `200`; `fail` / `warn` are reserved\nfor future degraded-mode reporting.\n",
+            "description": "`ok` while the process is serving requests. A metered\nmarketplace deployment whose entitlement lapsed answers\n`not_entitled` (still HTTP `200`, so orchestrators don't\nrestart it).\n",
             "enum": [
-              "pass",
-              "fail",
-              "warn"
+              "ok",
+              "not_entitled"
             ],
             "examples": [
-              "pass"
+              "ok"
+            ],
+            "type": "string"
+          },
+          "surface": {
+            "description": "Name of the surface reporting health; always `broker`. Absent on the `not_entitled` body.",
+            "examples": [
+              "broker"
             ],
             "type": "string"
           },
           "version": {
-            "description": "Service build version, mirrors `info.version` in this spec.",
+            "description": "Running Jentic One release (the same version as `info.version`\nin this spec). Absent on the `not_entitled` body.\n",
             "examples": [
-              "beta.1"
+              "0.43.0"
             ],
             "type": "string"
           }
@@ -531,25 +1031,115 @@
         "title": "HealthResponse",
         "type": "object"
       },
+      "HeldExecutionAcceptedResponse": {
+        "description": "Returned as the `202` body when the call matches a permission rule\nwith `effect: require-approval`. The call has not run: it waits\nuntil a reviewer (the agent's owner or an `org:admin`) approves or\ndenies it on `review_url`, or it expires. Follow `_links.self`\n(`/executions/holds/{held_execution_id}`) to see where it stands;\nonce it has finished, `_links.result` returns the upstream response,\nor the problem explaining why it never ran (denied, expired, or\nrefused at run time). To abandon the call, `POST` to\n`_links.withdraw`. Never re-send the call: an identical call while\none is pending joins the same held execution.\n",
+        "properties": {
+          "_links": {
+            "properties": {
+              "result": {
+                "description": "The call's outcome, once it has finished.",
+                "examples": [
+                  "https://control.your-instance.example/executions/holds/held_abc123/result"
+                ],
+                "type": "string"
+              },
+              "self": {
+                "description": "The held execution — its decision and where the call stands.",
+                "examples": [
+                  "https://control.your-instance.example/executions/holds/held_abc123"
+                ],
+                "type": "string"
+              },
+              "withdraw": {
+                "description": "`POST` here to withdraw the call before it is decided (only\nthe agent that made the call may). The call never runs.\n",
+                "examples": [
+                  "https://control.your-instance.example/executions/holds/held_abc123:withdraw"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "self",
+              "result",
+              "withdraw"
+            ],
+            "type": "object"
+          },
+          "agent_directive": {
+            "description": "What the calling agent should do next.",
+            "type": "string"
+          },
+          "expires_at": {
+            "description": "When the call expires undecided and fails.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "held_execution_id": {
+            "description": "The held execution.",
+            "examples": [
+              "held_abc123"
+            ],
+            "type": "string"
+          },
+          "review_url": {
+            "description": "Review page; the reviewer signs in to decide. Carries no credential.",
+            "examples": [
+              "https://your-instance.example/app/agents/approvals/held_abc123"
+            ],
+            "format": "uri",
+            "type": "string"
+          },
+          "status": {
+            "description": "Always `held`.",
+            "enum": [
+              "held"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "held_execution_id",
+          "review_url",
+          "expires_at",
+          "agent_directive",
+          "_links"
+        ],
+        "summary": "Handle returned when a permission rule holds the call for human approval.",
+        "title": "HeldExecutionAcceptedResponse",
+        "type": "object"
+      },
       "ReadinessResponse": {
         "description": "Body returned by `GET /ready`. `status: ready` (HTTP `200`) means the\ninstance is below the saturation threshold; `status: unready` (HTTP\n`503`) means in-flight load is at/near the admission cap and the load\nbalancer should drain this instance. `saturation` is the current\nin-flight count as a fraction of the configured cap.\n",
+        "examples": [
+          {
+            "saturation": 0.12,
+            "status": "ready"
+          }
+        ],
         "properties": {
           "reason": {
             "description": "Why the instance is unready (present only on `unready`).",
+            "enum": [
+              "saturated",
+              "draining"
+            ],
             "examples": [
               "saturated"
             ],
             "type": "string"
           },
           "saturation": {
-            "description": "In-flight requests as a fraction of the admission cap.",
+            "description": "In-flight requests as a fraction of the admission cap (`0`–`1`,\nbriefly above `1` at the cap edge). Omitted when the instance is\n`draining`.\n",
             "examples": [
               0.12
             ],
             "format": "float",
+            "minimum": 0,
             "type": "number"
           },
           "status": {
+            "description": "`ready` while in-flight load is below the saturation threshold\n(HTTP `200`); `unready` once it nears the admission cap (HTTP\n`503`) and the load balancer should drain this instance.\n",
             "enum": [
               "ready",
               "unready"
@@ -570,9 +1160,23 @@
     },
     "securitySchemes": {
       "BearerAuth": {
-        "description": "Credential authorizing a Broker call, sent as\n`Authorization: Bearer <token>`. The Broker accepts several\ninterchangeable credential formats, dispatched by prefix/shape:\n\n- **Opaque access tokens** (`at_…`) — the *same* tokens the control\n  plane issues from `POST /oauth/token`. A random string validated by\n  server-side lookup (it is **not** a JWT and cannot be decoded by the\n  client). Broker and control plane share one token store, so a token\n  minted for the control plane authenticates here too.\n- **API keys** — agent (`jak_…`) keys.\n  May alternatively be sent in the `x-jentic-api-key` header. The\n  `jntc_live_…` toolkit-key form is **retired** (theme-5): a value\n  migrated before the toolkit tables were dropped still authenticates\n  as its successor agent until the deprecation window closes (no\n  earlier than 2026-12-01); rotate holders to that agent's `jak_` key.\n  The `sak_…` service-account-key form is retired the same way\n  (theme-8): a migrated value authenticates as its successor agent\n  until its deprecation window closes.\n- **Self-contained JWTs** — verified by signature (a dev HS256 shared\n  secret or a configured trusted issuer with JWKS rotation). The Broker\n  is identity-provider-agnostic: the IdP, federation strategy, and\n  token-issuance flow are deployment concerns outside this spec.\n\nEvery protected operation requires the `capabilities:execute` scope,\nwhatever the credential format. Authorization beyond \"may execute\"\n(agent-credential bindings, permission rules, revision pinning) is\nenforced per-request and is not modelled here.\n",
+        "description": "Credential authorizing a Broker call, sent as\n`Authorization: Bearer <token>`. The Broker accepts several\ninterchangeable credential formats, dispatched by prefix/shape:\n\n- **Opaque access tokens** (`at_…`) — the *same* tokens the control\n  plane issues from `POST /oauth/token`. A random string validated by\n  server-side lookup (it is **not** a JWT and cannot be decoded by the\n  client). Broker and control plane share one token store, so a token\n  minted for the control plane authenticates here too.\n- **API keys** — agent (`jak_…`) keys.\n  May alternatively be sent in the `x-jentic-api-key` header. The\n  `jntc_live_…` toolkit-key form is **retired** (theme-5): a value\n  migrated before the toolkit tables were dropped still authenticates\n  as its successor agent until the deprecation window closes (no\n  earlier than 2026-12-01); rotate holders to that agent's `jak_` key.\n  The `sak_…` service-account-key form is retired the same way\n  (theme-8): a migrated value authenticates as its successor agent\n  until its deprecation window closes.\n- **Self-contained JWTs** — verified by signature (a dev HS256 shared\n  secret or a configured trusted issuer with JWKS rotation). The Broker\n  is identity-provider-agnostic: the IdP, federation strategy, and\n  token-issuance flow are deployment concerns outside this spec.\n\nEvery protected operation requires the `capabilities:execute` permission,\nwhatever the credential format. Authorization beyond \"may execute\"\n(agent-credential bindings, permission rules, revision pinning) is\nenforced per-request and is not modelled here.\n",
         "scheme": "bearer",
         "type": "http"
+      },
+      "OAuth2": {
+        "description": "OAuth 2.0 authorization code flow with PKCE (`S256` only), run by the\ncontrol plane's authorization server. The resulting access token is\nthe same opaque `at_…` bearer token `BearerAuth` describes — the\nBroker and control plane share one token store — sent as\n`Authorization: Bearer <token>`.\n\nScopes are permission names; executing through the Broker requires\n`capabilities:execute`. A scope only narrows a grant to a subset of\nthe actor's permissions, never widens it. Agents normally\nauthenticate with an agent API key or the control plane's\nJWT-bearer grant instead — see `BearerAuth`.\n",
+        "flows": {
+          "authorizationCode": {
+            "authorizationUrl": "https://control.your-instance.example/authorize",
+            "refreshUrl": "https://control.your-instance.example/oauth/token",
+            "scopes": {
+              "capabilities:execute": "Execute capabilities via the broker."
+            },
+            "tokenUrl": "https://control.your-instance.example/oauth/token"
+          }
+        },
+        "type": "oauth2"
       }
     }
   },
@@ -583,26 +1187,38 @@
       "url": "https://jentic.com"
     },
     "description": "## Overview\n\nThe Broker is the platform's stateless data plane. Send it any\nHTTP request with the upstream URL as the path; it injects the\ncaller's stored credentials, forwards method/headers/body as-is,\nand returns the upstream response.\n\n```\nPOST https://broker.your-instance.example/petstore.swagger.io/v2/pet\n```\n\nSecrets stay off agents and end-user devices, outbound traffic\nhas one auditable choke-point, and credentials rotate centrally\nwithout redeploying callers. Sync responses return `200` with the\nupstream body; long calls fall back to `202` with a polling link\ninto the control plane (see `Prefer` on `/{upstream_url}`).\n\nAuth: every operation expects `Authorization: Bearer <token>` except\n`GET /health`. Broker-added metadata is confined to the `Jentic-*`\nheader namespace — anything else on a response belongs to the\nupstream.\n\nCredential, agent-binding, and API-revision management live on the\n[control plane](https://control.your-instance.example), not here.\n\n## Path format\n\nThe request path **is** the upstream URL. The broker reconstructs the\nfull target from your path, adding `https://` when no scheme is present:\n\n| You send | Broker proxies to |\n|----------|-------------------|\n| `GET /api.example.com/v1/users` | `https://api.example.com/v1/users` |\n| `POST /petstore.swagger.io/v2/pet` | `https://petstore.swagger.io/v2/pet` |\n| `GET /http://127.0.0.1:8080/get` | `http://127.0.0.1:8080/get` |\n| `GET /https://api.example.com/v1/users` | `https://api.example.com/v1/users` |\n\nFor HTTPS upstream targets (the common case), omit the scheme — just use\n`/{host}/{path}`. For plain HTTP targets (e.g. local development), include\nthe full `http://` scheme in the path so the broker doesn't upgrade to HTTPS.\n\nQuery strings pass through as-is: `/api.example.com/search?q=foo` works.\n\n## Tracing and audit\n\nEvery brokered response carries W3C trace context (`traceparent`,\n`tracestate`) and a `Jentic-*` header layer with the execution ID\n(`exec_…`), the credential used (`Jentic-Credential-Id` /\n`Jentic-Credential-Name`), and the upstream API reference\n(`vendor:name:version`). OpenTelemetry clients pick this up\nautomatically; nothing else needs to parse `tracestate`.\n\nTo see what happened, ask the control plane:\n\n- `GET /executions/{exec_id}` — full execution metadata (latency,\n  status, pinned revisions, caller).\n- `GET /executions` — list and filter recent executions.\n- `GET /executions/{exec_id}/steps` — per-step trace for workflow\n  executions.\n- `GET /jobs/{job_id}` and `GET /jobs/{job_id}/result` — async\n  job status and pickup of the upstream body.\n- `GET /events` / `GET /events/stream` — audit event feed.\n\nRequest and response bodies are not persisted by default. Execution\nmetadata is retained for 30 days (configurable). Body capture is\nexplicit opt-in. Async response bodies live in a short-lived\npickup buffer collected via `/jobs/{id}/result`, not in the audit\nstore.\n",
+    "license": {
+      "identifier": "Apache-2.0",
+      "name": "Apache-2.0"
+    },
     "summary": "Secure execution proxy for upstream APIs — credentials never leave the Broker.",
     "title": "Broker API",
-    "version": "beta.1"
+    "version": "0.43.0"
   },
   "openapi": "3.1.0",
   "paths": {
     "/health": {
       "get": {
-        "description": "Liveness / readiness probe for the Broker service. Returns `200`\nwith a small `application/health+json` body (IETF Health Check\nResponse Format draft) when the broker can accept traffic.\nIntended for load balancers, container orchestrators, and uptime\nmonitors — not for human or agent consumption beyond green/red\nsignalling.\n",
+        "description": "Unauthenticated liveness probe for the Broker service. Returns `200`\nwith a small JSON body while the process is serving requests,\nreporting the surface name and the running Jentic One release.\nIntended for load balancers, container orchestrators, and uptime\nmonitors — not for human or agent consumption beyond green/red\nsignalling. Use `/ready` for saturation-aware readiness.\n",
         "operationId": "getHealth",
         "responses": {
           "200": {
             "content": {
-              "application/health+json": {
+              "application/json": {
                 "examples": {
                   "healthy": {
                     "summary": "Broker reporting healthy.",
                     "value": {
-                      "status": "pass",
-                      "version": "beta.1"
+                      "status": "ok",
+                      "surface": "broker",
+                      "version": "0.43.0"
+                    }
+                  },
+                  "notEntitled": {
+                    "summary": "Metered marketplace deployment whose entitlement lapsed.",
+                    "value": {
+                      "reason": "Subscription for this deployment is not active.",
+                      "status": "not_entitled"
                     }
                   }
                 },
@@ -611,7 +1227,7 @@
                 }
               }
             },
-            "description": "Service is healthy and ready to accept traffic."
+            "description": "Service is up and serving requests."
           },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
@@ -698,6 +1314,14 @@
         "requestBody": {
           "content": {
             "*/*": {
+              "examples": {
+                "delete_reason": {
+                  "summary": "Optional body some upstreams accept on delete, forwarded as-is.",
+                  "value": {
+                    "reason": "duplicate"
+                  }
+                }
+              },
               "schema": {}
             }
           },
@@ -936,6 +1560,15 @@
         "requestBody": {
           "content": {
             "*/*": {
+              "examples": {
+                "update_issue": {
+                  "summary": "Partial-update body for the upstream resource, forwarded as-is.",
+                  "value": {
+                    "state": "closed",
+                    "state_reason": "completed"
+                  }
+                }
+              },
               "schema": {}
             }
           },
@@ -997,6 +1630,18 @@
         "requestBody": {
           "content": {
             "*/*": {
+              "examples": {
+                "create_pet": {
+                  "summary": "JSON body for the upstream's create operation, forwarded as-is.",
+                  "value": {
+                    "name": "Rex",
+                    "photoUrls": [
+                      "https://example.com/rex.jpg"
+                    ],
+                    "status": "available"
+                  }
+                }
+              },
               "schema": {}
             }
           },
@@ -1058,6 +1703,19 @@
         "requestBody": {
           "content": {
             "*/*": {
+              "examples": {
+                "replace_pet": {
+                  "summary": "Full replacement body for the upstream resource, forwarded as-is.",
+                  "value": {
+                    "id": 10,
+                    "name": "Rex",
+                    "photoUrls": [
+                      "https://example.com/rex.jpg"
+                    ],
+                    "status": "sold"
+                  }
+                }
+              },
               "schema": {}
             }
           },
@@ -1118,6 +1776,11 @@
   "security": [
     {
       "BearerAuth": []
+    },
+    {
+      "OAuth2": [
+        "capabilities:execute"
+      ]
     }
   ],
   "servers": [

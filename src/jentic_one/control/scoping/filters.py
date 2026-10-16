@@ -5,13 +5,13 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from sqlalchemy import or_
+from sqlalchemy import and_, or_, select
 from sqlalchemy.sql.elements import ColumnElement
 
 from jentic_one.control.core.schema.connect_sessions import ConnectSession
 from jentic_one.control.core.schema.credentials import Credential
 from jentic_one.shared.auth.identity import Identity
-from jentic_one.shared.scopes import (
+from jentic_one.shared.auth.permission_catalog import (
     ORG_ADMIN,
     OWNER_CREDENTIALS_READ,
 )
@@ -25,10 +25,23 @@ _OWNER_MODELS: dict[type[Any], Any] = {
     ConnectSession: ConnectSession.initiator_actor_id,
 }
 
-_DELEGATION_SCOPES: dict[type[Any], str] = {
+_DELEGATION_PERMISSIONS: dict[type[Any], str] = {
     Credential: OWNER_CREDENTIALS_READ,
     ConnectSession: OWNER_CREDENTIALS_READ,
 }
+
+# Models a human may additionally read because an agent they own asked for them.
+# An agent-started connect session (and its pending credential) records the agent
+# as initiator/creator, so without this axis its owner could not find the request
+# the agent is waiting on. Read-only: the ids come from ``owned_agent_ids``, which
+# write call sites never pass, and the clause is keyed on the caller's own ``sub``
+# only — never widened through ``parent_actor_id`` delegation.
+_OWNED_AGENT_MODELS: frozenset[type[Any]] = frozenset({ConnectSession, Credential})
+
+# Session states that still hold a pending credential. Mirrors
+# ``connect_session_repo.LIVE_STATES`` (kept local so this module imports
+# only ORM models; a unit test pins the two together).
+_LIVE_SESSION_STATES: tuple[str, ...] = ("created", "awaiting_app", "polling")
 
 # ---------------------------------------------------------------------------
 # Extra access-filter providers (extension seam).
@@ -87,11 +100,39 @@ def _binding_visibility_clause(
     return None
 
 
+def _owned_agent_visibility_clause(
+    model: type[Any],
+    owned_agent_ids: list[str] | None = None,
+) -> ColumnElement[bool] | None:
+    """Extra read visibility for the owner of the agent behind a connect session.
+
+    ``ConnectSession``: any session whose target ``agent_id`` is one of
+    ``owned_agent_ids``. ``Credential``: only a still-``pending`` credential
+    held by an open (live-state) session for one of those agents —
+    once the session ends the credential is visible through its own
+    ``created_by`` and bindings, never through this clause. Returns ``None``
+    when there is nothing to add.
+    """
+    if not owned_agent_ids or model not in _OWNED_AGENT_MODELS:
+        return None
+    if model is ConnectSession:
+        return ConnectSession.agent_id.in_(owned_agent_ids)
+    open_session_credentials = select(ConnectSession.credential_id).where(
+        ConnectSession.agent_id.in_(owned_agent_ids),
+        ConnectSession.state.in_(_LIVE_SESSION_STATES),
+    )
+    return and_(
+        Credential.state == "pending",
+        Credential.id.in_(open_session_credentials),
+    )
+
+
 def build_access_filters(
     identity: Identity,
     model: type[Any],
     *,
     bound_credential_ids: list[str] | None = None,
+    owned_agent_ids: list[str] | None = None,
     include_shared: bool = False,
 ) -> list[ColumnElement[bool]]:
     """Build SQLAlchemy filter expressions scoping queries to the caller's visibility.
@@ -113,6 +154,14 @@ def build_access_filters(
     ``None``/empty leaves the owner-only behaviour unchanged. Read call sites
     only; writes stay owner-scoped.
 
+    ``owned_agent_ids`` (READ call sites only) widens ``ConnectSession`` and
+    ``Credential`` to what the caller's own agents asked for: their connect
+    sessions, and the pending credential of each open session. Agents live in
+    the admin DB, so the service resolves the ids there (via
+    :meth:`PrerequisiteRepository.list_agent_ids_owned_by`) and passes them in,
+    exactly like ``bound_credential_ids``. It never grants write access and is
+    not routed through owner delegation.
+
     ``include_shared`` (READ call sites only) invokes any registered
     access-filter providers (see :func:`register_access_filter_provider`) and
     OR-merges their clauses — e.g. an extension's "shared-with-me" grant. It must
@@ -129,10 +178,10 @@ def build_access_filters(
 
     if model in _OWNER_MODELS:
         col = _OWNER_MODELS[model]
-        delegation_scope = _DELEGATION_SCOPES.get(model)
+        delegation_permission = _DELEGATION_PERMISSIONS.get(model)
         if (
-            delegation_scope is not None
-            and delegation_scope in identity.permissions
+            delegation_permission is not None
+            and delegation_permission in identity.permissions
             and identity.parent_actor_id is not None
         ):
             owner_clause: ColumnElement[bool] = or_(
@@ -144,6 +193,9 @@ def build_access_filters(
         binding_clause = _binding_visibility_clause(model, bound_credential_ids)
         if binding_clause is not None:
             clauses.append(binding_clause)
+        owned_agent_clause = _owned_agent_visibility_clause(model, owned_agent_ids)
+        if owned_agent_clause is not None:
+            clauses.append(owned_agent_clause)
         if include_shared:
             clauses.extend(_provider_clauses(identity, model))
         return [or_(*clauses)] if len(clauses) > 1 else clauses

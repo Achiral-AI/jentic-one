@@ -14,6 +14,7 @@ pipeline stages / runner decorators (``services/execution/pipeline.py``,
 from __future__ import annotations
 
 import base64
+import json
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlencode, urlparse, urlunparse
@@ -29,12 +30,15 @@ from jentic_one.broker.adapters.runners.base import (
     UpstreamRunner,
 )
 from jentic_one.broker.core.exceptions import (
+    ApprovalHoldUnavailableError,
+    ApprovalPendingLimitError,
     IdempotencyConflictError,
     IdempotencyInProgressError,
     OperationNotFoundError,
     PayloadTooLargeError,
     UpgradeNotSupportedError,
     UpstreamUrlNotAllowedError,
+    approval_pending_limit_directive,
     switch_toolkit_directive,
 )
 from jentic_one.broker.core.execution import mint_execution_id
@@ -50,12 +54,15 @@ from jentic_one.broker.core.proxy_headers import (
     forward_headers,
     passthrough_response_headers,
     reconstruct_upstream_url,
+    replay_headers,
 )
 from jentic_one.broker.core.revisions import parse_revisions
 from jentic_one.broker.core.schemas import (
     AsyncQueuedResponse,
     AsyncQueuedResponseLinks,
     ExecuteRequestContext,
+    HeldExecutionAcceptedLinks,
+    HeldExecutionAcceptedResponse,
 )
 from jentic_one.broker.services.credentials.orchestrator import CredentialService
 from jentic_one.broker.services.credentials.resolver import ResolvedCredential
@@ -64,7 +71,10 @@ from jentic_one.broker.services.discovery import (
     discover_via_pins,
     resolve_pin_for_api,
 )
-from jentic_one.broker.services.execution.authorization import authorize_execution
+from jentic_one.broker.services.execution.authorization import (
+    ExecutionAuthorization,
+    authorize_execution,
+)
 from jentic_one.broker.services.execution.pipeline import ExecutionOutcome
 from jentic_one.broker.services.execution.service import (
     default_broker,
@@ -91,18 +101,30 @@ from jentic_one.shared.broker.protocols import (
     CredentialDeriverProtocol,
     RegistryResolverProtocol,
     ResolveResult,
+    RuleVerdict,
 )
 from jentic_one.shared.config import UpstreamClientConfig
 from jentic_one.shared.context import Context
 from jentic_one.shared.events import (
+    MAX_EVENT_SUMMARY_FIELD_LEN,
+    emit_event_best_effort,
     mint_trace_id,
     valid_trace_id_or_none,
 )
 from jentic_one.shared.jobs.enqueue import enqueue_job
+from jentic_one.shared.jobs.hold import (
+    ENCRYPTED_PAYLOAD_KEY,
+    HELD_AGENT_DIRECTIVE,
+    PendingApprovalLimitError,
+    file_hold,
+    review_page_path,
+)
 from jentic_one.shared.jobs.protocols import InjectedAuth
 from jentic_one.shared.metrics import get_meter
 from jentic_one.shared.models import ExecutionStatus
+from jentic_one.shared.models.events import EventSeverity, EventType
 from jentic_one.shared.models.jobs import JobKind
+from jentic_one.shared.permissions.evaluation import rule_request_path
 from jentic_one.shared.tracing import (
     JENTIC_TRACESTATE_KEY,
     current_trace_id,
@@ -111,6 +133,7 @@ from jentic_one.shared.tracing import (
 from jentic_one.shared.url import apply_server_variables, has_host_server_variable
 from jentic_one.shared.url_validation import validate_upstream_url
 from jentic_one.shared.web.deps import get_ctx
+from jentic_one.shared.web.links import build_link
 from jentic_one.shared.web.protocols import UnregisteredUrlHandler
 
 logger = structlog.get_logger(__name__)
@@ -569,7 +592,10 @@ async def _handle(
         api=resolved.api,
         operation_id=resolved.operation.id,
         method=method,
-        path=urlparse(upstream_url).path,
+        path=rule_request_path(
+            resolved.operation.relative_path, upstream_url, operation_id=resolved.operation.id
+        ),
+        upstream_url=upstream_url,
         instance=request.url.path,
         credential_deriver=credential_deriver,
         agent_rule_evaluator=agent_rule_evaluator,
@@ -586,6 +612,12 @@ async def _handle(
         # the same values from the injection result).
         ctx_req.credential_id = selected_credential.credential_id
         ctx_req.credential_name = selected_credential.name
+
+    # A require-approval rule matched — hold the execution before any upstream
+    # call. Both the async and sync request paths enter the hold path (async
+    # preference makes no difference: the result is always a 202 held envelope).
+    if authorization.verdict == RuleVerdict.REQUIRE_APPROVAL:
+        return await _handle_hold(request, ctx_req, ctx, identity, authorization)
 
     if _should_async(ctx_req.prefer):
         return await _handle_async(
@@ -842,12 +874,17 @@ def _async_job_payload(
     selected_credential_id: str | None = None,
     allowed_credential_ids: list[str] | None = None,
     body: bytes | None = None,
+    headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build the job payload for an async (202) execution.
 
-    Extracted from the enqueue path so the operation dual-write below is
-    unit-testable at the producer: the worker seams (handler forwarding,
-    executor rebuild) each have their own pins, and this is the third leg.
+    ``headers`` are the request headers the run replays (see
+    ``REPLAY_HEADERS``) — without them a JSON body would reach the upstream
+    with no ``Content-Type``.
+
+    A standalone builder so the payload contract is unit-testable at the
+    producer: the worker seams (handler forwarding, executor rebuild) each
+    have their own pins, and this is the third leg.
     """
     payload: dict[str, Any] = {
         "execution_id": execution_id,
@@ -855,11 +892,6 @@ def _async_job_payload(
         "method": ctx_req.method,
         "trace_id": ctx_req.trace_id,
         "operation": ctx_req.operation.model_dump() if ctx_req.operation else None,
-        # Rolling-deploy shim (#1382): a pre-``operation``-dict worker draining
-        # this job reads only the flat key — without it the record would persist
-        # with operation_id NULL and the repeated-failure detector would skip
-        # it. Drop once no pre-operation-dict workers remain (#1382).
-        "operation_id": ctx_req.operation_id,
         "api_vendor": ctx_req.api_vendor,
         "api_name": ctx_req.api_name,
         "api_version": ctx_req.api_version,
@@ -879,7 +911,154 @@ def _async_job_payload(
         payload["server_variables_unresolved"] = True
     if body:
         payload["body_b64"] = base64.b64encode(body).decode()
+    if headers:
+        payload["headers"] = dict(headers)
     return payload
+
+
+def _review_url(ctx: Context, request: Request, approval_id: str) -> str:
+    """Absolute URL of the approval's review page in the web UI.
+
+    The UI is served under ``/app`` beside the admin API, so the admin API's
+    public origin (``broker.jobs_api_base_url``) wins, then this deployment's
+    ``server.public_base_url``, then the request's own origin (combined
+    deployment). The URL carries no credential: the reviewer signs in.
+    """
+    path = review_page_path(approval_id)
+    base = ctx.config.broker.jobs_api_base_url or ctx.config.server.public_base_url
+    if base:
+        return f"{base.rstrip('/')}{path}"
+    return build_link(request, path)
+
+
+async def _handle_hold(
+    request: Request,
+    ctx_req: ExecuteRequestContext,
+    ctx: Context,
+    identity: Identity,
+    authorization: ExecutionAuthorization,
+) -> Response:
+    """File (or join) a require-approval hold and answer the 202 held envelope.
+
+    The held job's payload is the async-job payload encrypted with the platform
+    key — it can sit for the whole approval TTL — and the worker decrypts it on
+    claim. Filing, the approval row and ``execution.approval_requested`` share
+    one admin-DB transaction; an identical pending request joins its existing
+    hold (even at the cap), and an agent at its pending cap is otherwise denied
+    before anything is written.
+    """
+    if not ctx.has_encryption_keyset:
+        raise ApprovalHoldUnavailableError(
+            "This call needs human approval, but the deployment has no credentials "
+            "encryption keyset to keep the held request in (credentials.encryption)",
+            type="approval_hold_unavailable",
+            instance=request.url.path,
+        )
+    cfg = ctx.config.held_executions
+    credential_id = authorization.selected_credential.credential_id
+    parsed_url = urlparse(ctx_req.upstream_url)
+    path = parsed_url.path
+    execution_id = mint_execution_id()
+    body = await _read_request_body(request, ctx_req.method, ctx)
+    raw_payload = _async_job_payload(
+        ctx_req,
+        execution_id=execution_id,
+        origin=identity.origin.value,
+        selected_credential_id=credential_id,
+        allowed_credential_ids=authorization.allowed_credential_ids,
+        body=body,
+        headers=replay_headers(request.headers),
+    )
+    payload: dict[str, object] = {
+        ENCRYPTED_PAYLOAD_KEY: ctx.encryption.encrypt(json.dumps(raw_payload))
+    }
+
+    async with ctx.admin_db.transaction() as session:
+        try:
+            hold = await file_hold(
+                session,
+                agent_id=identity.sub,
+                actor_type=identity.actor_type.value,
+                credential_id=credential_id,
+                matched_rule_id=authorization.matched_rule_id,
+                api_vendor=ctx_req.api_vendor or "",
+                api_name=ctx_req.api_name or "",
+                api_version=ctx_req.api_version or "",
+                operation_id=ctx_req.operation_id,
+                method=ctx_req.method,
+                path=path,
+                query=parsed_url.query,
+                body=body,
+                trace_id=valid_trace_id_or_none(ctx_req.trace_id),
+                execution_id=execution_id,
+                payload=payload,
+                ttl_seconds=cfg.ttl_seconds,
+                max_pending=cfg.max_pending_per_agent,
+            )
+        except PendingApprovalLimitError as exc:
+            raise ApprovalPendingLimitError(
+                f"Agent '{identity.sub}' already has {exc.pending} executions pending "
+                f"approval (limit {exc.limit})",
+                type="approval_pending_limit_reached",
+                extra={"pending": exc.pending, "limit": exc.limit},
+                directive=approval_pending_limit_directive(pending=exc.pending, limit=exc.limit),
+                instance=request.url.path,
+            ) from exc
+        review_url = _review_url(ctx, request, hold.approval_id)
+        if not hold.joined:
+            summary_path = path[:MAX_EVENT_SUMMARY_FIELD_LEN]
+            await emit_event_best_effort(
+                session,
+                type=EventType.EXECUTION_APPROVAL_REQUESTED,
+                severity=EventSeverity.WARNING,
+                summary=f"Agent {identity.sub} wants to {ctx_req.method} {summary_path}",
+                requires_action=True,
+                trace_id=valid_trace_id_or_none(ctx_req.trace_id),
+                execution_id=execution_id,
+                job_id=hold.job_id,
+                created_by=identity.sub,
+                actor_id=identity.sub,
+                actor_type=identity.actor_type.value,
+                data={
+                    "held_execution_id": hold.approval_id,
+                    "agent_id": identity.sub,
+                    "method": ctx_req.method,
+                    "path": path,
+                    "api_vendor": ctx_req.api_vendor,
+                    "api_name": ctx_req.api_name,
+                    "api_version": ctx_req.api_version,
+                    "review_url": review_url,
+                    "expires_at": hold.expires_at.isoformat(),
+                },
+            )
+
+    logger.info(
+        "execution_held",
+        approval_id=hold.approval_id,
+        job_id=hold.job_id,
+        joined=hold.joined,
+        method=ctx_req.method,
+    )
+    base = ctx.config.broker.jobs_api_base_url or ""
+    held = f"{base}/executions/holds/{hold.approval_id}"
+    resp_body = HeldExecutionAcceptedResponse(
+        held_execution_id=hold.approval_id,
+        review_url=review_url,
+        expires_at=hold.expires_at,
+        agent_directive=HELD_AGENT_DIRECTIVE,
+        links=HeldExecutionAcceptedLinks(
+            self_link=held, result=f"{held}/result", withdraw=f"{held}:withdraw"
+        ),
+    )
+    return Response(
+        content=resp_body.model_dump_json(by_alias=True),
+        status_code=202,
+        media_type="application/json",
+        headers={
+            **_metadata_headers(ctx_req, hold.execution_id or execution_id),
+            "Preference-Applied": "respond-async",
+        },
+    )
 
 
 async def _handle_async(
@@ -908,6 +1087,7 @@ async def _handle_async(
         selected_credential_id=selected_credential_id,
         allowed_credential_ids=allowed_credential_ids,
         body=body,
+        headers=replay_headers(request.headers),
     )
 
     async with ctx.admin_db.transaction() as session:

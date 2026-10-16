@@ -12,6 +12,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from jentic_one.shared.web import openapi_examples as ex
+
 REDACTED = "***"
 
 
@@ -28,10 +30,12 @@ class ProviderConfigSetRequest(BaseModel):
         json_schema_extra={
             "examples": [
                 {
-                    "project_id": "proj_abc123",
-                    "client_id": "client_abc123",
-                    "client_secret": "<redacted>",  # pragma: allowlist secret
-                    "environment": "production",
+                    "config": {
+                        "project_id": "proj_abc123",
+                        "client_id": "client_abc123",
+                        "client_secret": "<redacted>",  # pragma: allowlist secret
+                        "environment": "production",
+                    }
                 }
             ]
         }
@@ -39,6 +43,14 @@ class ProviderConfigSetRequest(BaseModel):
 
     config: dict[str, Any] = Field(
         description="Provider-specific configuration fields, validated by provider name.",
+        examples=[
+            {
+                "project_id": "proj_abc123",
+                "client_id": "client_abc123",
+                "client_secret": "example-secret",  # pragma: allowlist secret
+                "environment": "production",
+            }
+        ],
     )
 
 
@@ -64,13 +76,31 @@ class ProviderConfigResponse(BaseModel):
         }
     )
 
-    name: str = Field(description="Provider name (e.g. 'pipedream').")
-    config: dict[str, Any] = Field(description="Stored config with secret fields redacted.")
-    created_at: datetime
-    updated_at: datetime | None = None
+    name: str = Field(description="Provider name (e.g. 'pipedream').", examples=[ex.PROVIDER_NAME])
+    config: dict[str, Any] = Field(
+        description="Stored config with secret fields redacted.",
+        examples=[
+            {
+                "kind": "pipedream",
+                "project_id": "proj_abc123",
+                "client_id": "client_abc123",
+                "client_secret": REDACTED,
+                "environment": "production",
+            }
+        ],
+    )
+    created_at: datetime = Field(
+        description="When the provider config was created (RFC 3339).",
+        examples=["2026-01-15T09:30:00Z"],
+    )
+    updated_at: datetime | None = Field(
+        default=None,
+        description="When the provider config was last updated (RFC 3339); null if never updated.",
+        examples=["2026-01-20T14:05:00Z"],
+    )
 
 
 class ProviderConfigListResponse(BaseModel):
     """A list of stored provider configs (secrets redacted)."""
 
-    data: list[ProviderConfigResponse]
+    data: list[ProviderConfigResponse] = Field(description="The stored provider configs.")

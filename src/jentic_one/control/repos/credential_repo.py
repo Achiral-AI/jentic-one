@@ -2,15 +2,47 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from datetime import datetime
+from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import lazyload, raiseload
+from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.sql.elements import ColumnElement
 
 from jentic_one.control.core.schema.credentials import Credential
+from jentic_one.control.core.schema.oauth_app_registrations import OAuthAppRegistration
 from jentic_one.shared.models.api_identity import slugify_api_field
+from jentic_one.shared.models.credentials import StoredCredentialType
+
+# Secret-material child relationships on ``Credential`` (one row per credential).
+_CHILD_RELATIONSHIPS: tuple[str, ...] = (
+    "customer_api_key",
+    "oauth_client_credential",
+    "basic_credential",
+    "token_value_credential",
+    "oauth_token",
+    "sigv4_credential",
+    "device_authorization_credential",
+)
+
+# The child relationship the broker resolver reads for each stored type.
+# ``NO_AUTH`` carries no material; OAuth client/device-flow rows are not read
+# at resolution time.
+_MATERIAL_RELATIONSHIP: Mapping[str, str] = {
+    StoredCredentialType.API_KEY: "customer_api_key",  # pragma: allowlist secret
+    StoredCredentialType.BASIC_AUTH: "basic_credential",
+    StoredCredentialType.STATIC_BEARER_TOKEN: "token_value_credential",
+    StoredCredentialType.SESSION_TOKEN: "token_value_credential",
+    StoredCredentialType.OAUTH2_CLIENT_CREDENTIALS: "oauth_token",
+    StoredCredentialType.OAUTH2_AUTHORIZATION_CODE: "oauth_token",
+    StoredCredentialType.OAUTH2_DEVICE_CODE: "oauth_token",
+    StoredCredentialType.OAUTH2_IMPLICIT: "oauth_token",
+    StoredCredentialType.AWS_SIGV4: "sigv4_credential",
+}
 
 
 class CredentialRepository:
@@ -23,7 +55,7 @@ class CredentialRepository:
         *,
         filters: Sequence[ColumnElement[bool]] | None = None,
     ) -> Credential | None:
-        if filters is None:
+        if not filters:
             return await session.get(Credential, credential_id)
         stmt = select(Credential).where(Credential.id == credential_id)
         for f in filters:
@@ -68,7 +100,14 @@ class CredentialRepository:
 
     @staticmethod
     async def list_by_vendor(session: AsyncSession, api_vendor: str) -> list[Credential]:
-        """Fetch candidates for a vendor.
+        """Fetch candidate credential headers for a vendor — no secret material.
+
+        This is the broker's per-call resolution query. Every secret-material
+        child relationship ``raise``s on access instead of being loaded (the
+        model's default is a ``selectin`` fan-out over every child table), so
+        material of candidates the caller filters out is never read. A caller
+        that needs material calls :meth:`load_material` on the credential(s)
+        it actually uses.
 
         Widen the prefilter to also match the caller's raw (un-slugified) input so
         historical rows persisted before vendor normalization still surface as
@@ -76,9 +115,50 @@ class CredentialRepository:
         """
         normalized = slugify_api_field(api_vendor)
         result = await session.execute(
-            select(Credential).where(Credential.api_vendor.in_({api_vendor, normalized}))
+            select(Credential)
+            .where(Credential.api_vendor.in_({api_vendor, normalized}))
+            .options(*(raiseload(getattr(Credential, rel)) for rel in _CHILD_RELATIONSHIPS))
         )
         return list(result.scalars().all())
+
+    @staticmethod
+    async def load_material(session: AsyncSession, credentials: Sequence[Credential]) -> None:
+        """Populate each credential's type-matching secret-material child.
+
+        Issues one ``WHERE credential_id IN (…)`` query per distinct child
+        relationship needed by ``credentials`` and none for ``NO_AUTH``, so a
+        single credential costs at most one query that reads only its own row.
+        Child relationships not matching a credential's ``type`` are left as
+        they were (``raise`` on access for :meth:`list_by_vendor` results).
+
+        Credentials without a child row get ``None`` (as the ``selectin`` default
+        would). With duplicate child rows the first one wins, mirroring the
+        ``uselist=False`` selectin behaviour.
+        """
+        owners_by_rel: dict[str, list[Credential]] = defaultdict(list)
+        for credential in credentials:
+            rel = _MATERIAL_RELATIONSHIP.get(credential.type)
+            if rel is not None:
+                owners_by_rel[rel].append(credential)
+
+        for rel, owners in owners_by_rel.items():
+            prop = Credential.__mapper__.relationships[rel]
+            child_cls: Any = prop.mapper.class_
+            back = prop.back_populates
+            stmt = select(child_cls).where(child_cls.credential_id.in_([c.id for c in owners]))
+            if back:
+                # The parent is already in the identity map; set it below rather
+                # than letting the child's own ``selectin`` back-reference query.
+                stmt = stmt.options(lazyload(getattr(child_cls, back)))
+            rows = await session.execute(stmt)
+            child_by_owner: dict[str, Any] = {}
+            for child in rows.scalars():
+                child_by_owner.setdefault(child.credential_id, child)
+            for owner in owners:
+                child = child_by_owner.get(owner.id)
+                set_committed_value(owner, rel, child)
+                if child is not None and back:
+                    set_committed_value(child, back, owner)
 
     @staticmethod
     async def list_all(
@@ -134,15 +214,6 @@ class CredentialRepository:
         return credential
 
     @staticmethod
-    async def get_names_by_ids(session: AsyncSession, ids: list[str]) -> dict[str, str]:
-        """Batch-resolve credential IDs to their human-readable names."""
-        if not ids:
-            return {}
-        stmt = select(Credential.id, Credential.name).where(Credential.id.in_(ids))
-        result = await session.execute(stmt)
-        return {row.id: row.name for row in result}
-
-    @staticmethod
     async def get_creators_by_ids(session: AsyncSession, ids: list[str]) -> dict[str, str | None]:
         """Batch-resolve credential IDs to their ``created_by`` (missing ids omitted)."""
         if not ids:
@@ -150,6 +221,128 @@ class CredentialRepository:
         stmt = select(Credential.id, Credential.created_by).where(Credential.id.in_(ids))
         result = await session.execute(stmt)
         return {row.id: row.created_by for row in result}
+
+    @staticmethod
+    async def get_registration_display_names(
+        session: AsyncSession, ids: list[str]
+    ) -> dict[str, str]:
+        """Batch-resolve credential IDs to the display name of their OAuth app registration.
+
+        Credentials with no registration (or missing ids) are omitted.
+        """
+        if not ids:
+            return {}
+        stmt = (
+            select(Credential.id, OAuthAppRegistration.display_name)
+            .join(
+                OAuthAppRegistration,
+                OAuthAppRegistration.id == Credential.oauth_app_registration_id,
+            )
+            .where(Credential.id.in_(ids))
+        )
+        result = await session.execute(stmt)
+        return {row.id: row.display_name for row in result}
+
+    @staticmethod
+    async def set_created_by(
+        session: AsyncSession,
+        credential_id: str,
+        *,
+        created_by: str,
+    ) -> Credential | None:
+        """Re-attribute a credential to a different creator (connect-session confirm)."""
+        credential = await session.get(Credential, credential_id)
+        if credential is None:
+            return None
+        credential.created_by = created_by
+        await session.flush()
+        return credential
+
+    @staticmethod
+    async def set_oauth_app_registration(
+        session: AsyncSession,
+        credential_id: str,
+        *,
+        registration_id: str,
+    ) -> Credential | None:
+        """Bind a credential to a shared ``oauth_app_registrations`` row.
+
+        Sanctioned writer for ``credentials.oauth_app_registration_id`` — see
+        ``tests/arch/test_oauth_app_registration_invariants.py``.
+        """
+        credential = await session.get(Credential, credential_id)
+        if credential is None:
+            return None
+        credential.oauth_app_registration_id = registration_id
+        await session.flush()
+        return credential
+
+    @staticmethod
+    async def set_state(session: AsyncSession, credential_id: str, state: str) -> Credential | None:
+        """Set a credential's lifecycle state (``pending`` → ``connected`` on a connect)."""
+        credential = await session.get(Credential, credential_id)
+        if credential is None:
+            return None
+        credential.state = state
+        await session.flush()
+        return credential
+
+    @staticmethod
+    async def set_type_and_provider(
+        session: AsyncSession,
+        credential_id: str,
+        *,
+        type: str,
+        provider: str,
+        catalog_api_id: str | None = None,
+    ) -> Credential | None:
+        """Re-type a still-pending connect-session credential once its flow is known."""
+        credential = await session.get(Credential, credential_id)
+        if credential is None:
+            return None
+        credential.type = type
+        credential.provider = provider
+        if catalog_api_id is not None:
+            credential.catalog_api_id = catalog_api_id
+        await session.flush()
+        return credential
+
+    @staticmethod
+    async def list_connected_covering(
+        session: AsyncSession,
+        *,
+        vendor: str,
+        name: str | None,
+        version: str | None,
+        exclude_ids: Sequence[str] = (),
+        filters: Sequence[ColumnElement[bool]] | None = None,
+        limit: int = 50,
+    ) -> list[Credential]:
+        """Connected, active credentials whose API scope covers the identity.
+
+        A NULL ``api_name`` / ``api_version`` on the credential is a wildcard;
+        a ``None`` reference axis matches any value. ``filters`` carries the
+        caller's access scoping.
+        """
+        stmt = select(Credential).where(
+            Credential.api_vendor == vendor,
+            Credential.state == "connected",
+            Credential.active.is_(True),
+        )
+        if name is not None:
+            stmt = stmt.where(or_(Credential.api_name.is_(None), Credential.api_name == name))
+        if version is not None:
+            stmt = stmt.where(
+                or_(Credential.api_version.is_(None), Credential.api_version == version)
+            )
+        if exclude_ids:
+            stmt = stmt.where(Credential.id.not_in(list(exclude_ids)))
+        if filters is not None:
+            for f in filters:
+                stmt = stmt.where(f)
+        stmt = stmt.order_by(Credential.created_at.desc(), Credential.id.desc()).limit(limit)
+        result = await session.execute(stmt)
+        return list(result.scalars().all())
 
     @staticmethod
     async def delete(session: AsyncSession, credential_id: str) -> bool:

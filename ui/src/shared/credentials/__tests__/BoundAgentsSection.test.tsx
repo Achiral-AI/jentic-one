@@ -3,6 +3,7 @@ import { http, HttpResponse } from 'msw';
 import { worker } from '@/mocks/browser';
 import { renderWithProviders, screen, within, userEvent, checkA11y } from '@/__tests__/test-utils';
 import { setToken } from '@/shared/api';
+import { AuthProvider } from '@/shared/auth';
 import { resetCredentialsStore, makeMockCredential } from '@/shared/credentials/mocks/handlers';
 import { EditCredentialSheet } from '@/shared/credentials/components/EditCredentialSheet';
 
@@ -18,7 +19,12 @@ import { EditCredentialSheet } from '@/shared/credentials/components/EditCredent
  */
 function seedBoundAgents(
 	credentialId: string,
-	rows: Array<{ agent_id: string; agent_name: string; suspended?: boolean }>,
+	rows: Array<{
+		agent_id: string;
+		agent_name: string;
+		suspended?: boolean;
+		suspended_reason?: string | null;
+	}>,
 ) {
 	worker.use(
 		http.get('/credentials/:cid/agents', ({ params }) => {
@@ -33,6 +39,7 @@ function seedBoundAgents(
 					rule_set_id: null,
 					status: 'active',
 					suspended: r.suspended ?? false,
+					suspended_reason: r.suspended_reason ?? null,
 				})),
 				has_more: false,
 				next_cursor: null,
@@ -130,7 +137,27 @@ describe('BoundAgentsSection (edit-credential sheet)', () => {
 		renderSheet('cred_github_1');
 
 		const row = await screen.findByTestId('bound-agent-row');
-		expect(within(row).getByTestId('bound-agent-suspended')).toHaveTextContent('Suspended');
+		expect(within(row).getByTestId('bound-agent-suspended')).toHaveTextContent(/^Suspended$/);
+	});
+
+	it('says when a binding was suspended because its API was deleted', async () => {
+		resetCredentialsStore([
+			makeMockCredential({ credential_id: 'cred_github_1', name: 'GitHub PAT' }),
+		]);
+		seedBoundAgents('cred_github_1', [
+			{
+				agent_id: 'agnt_active_1',
+				agent_name: 'support-agent',
+				suspended: true,
+				suspended_reason: 'api_deleted',
+			},
+		]);
+		renderSheet('cred_github_1');
+
+		const row = await screen.findByTestId('bound-agent-row');
+		expect(within(row).getByTestId('bound-agent-suspended')).toHaveTextContent(
+			'Suspended · API deleted',
+		);
 	});
 
 	it('shows an honest empty state when no agent is bound', async () => {
@@ -142,6 +169,70 @@ describe('BoundAgentsSection (edit-credential sheet)', () => {
 
 		expect(await screen.findByTestId('bound-agents-empty')).toHaveTextContent(
 			/no agents are bound to this credential/i,
+		);
+	});
+});
+
+describe('BoundAgentsSection — whose agents the list holds', () => {
+	beforeEach(() => {
+		setToken('test-token');
+	});
+
+	function seedViewer(id: string, permissions: string[]) {
+		worker.use(
+			http.get('/users/me', () =>
+				HttpResponse.json({
+					id,
+					email: 'viewer@local',
+					first_name: 'View',
+					last_name: 'Er',
+					active: true,
+					permissions,
+					must_change_password: false,
+					created_at: '2026-01-01T00:00:00Z',
+					updated_at: null,
+				}),
+			),
+		);
+	}
+
+	function renderAuthed(credentialId: string) {
+		return renderWithProviders(
+			<AuthProvider>
+				<EditCredentialSheet credentialId={credentialId} open onClose={() => {}} />
+			</AuthProvider>,
+		);
+	}
+
+	it.each([
+		['the owner', 'usr_owner', [] as string[]],
+		['an org:admin', 'usr_admin', ['org:admin']],
+	])('reads unscoped for %s', async (_label, id, permissions) => {
+		seedViewer(id, permissions);
+		resetCredentialsStore([
+			makeMockCredential({ credential_id: 'cred_team_1', created_by: 'usr_owner' }),
+		]);
+		seedBoundAgents('cred_team_1', []);
+		renderAuthed('cred_team_1');
+
+		expect(await screen.findByText('Bound agents (0)')).toBeInTheDocument();
+		expect(await screen.findByTestId('bound-agents-empty')).toHaveTextContent(
+			'No agents are bound to this credential.',
+		);
+	});
+
+	it('says "your agents" to a viewer the credential is shared with', async () => {
+		seedViewer('usr_sharee', []);
+		resetCredentialsStore([
+			makeMockCredential({ credential_id: 'cred_team_1', created_by: 'usr_owner' }),
+		]);
+		seedBoundAgents('cred_team_1', []);
+		renderAuthed('cred_team_1');
+
+		expect(await screen.findByText('Your bound agents (0)')).toBeInTheDocument();
+		expect(screen.getByText(/Other users' agents aren't listed\./)).toBeInTheDocument();
+		expect(await screen.findByTestId('bound-agents-empty')).toHaveTextContent(
+			'None of your agents are bound to this credential.',
 		);
 	});
 });

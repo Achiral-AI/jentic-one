@@ -15,6 +15,8 @@ from jentic_one.broker.services.credentials.errors import (
 from jentic_one.broker.services.credentials.resolver import CredentialResolver
 from jentic_one.shared.schemas import APIReference
 
+pytestmark = pytest.mark.usefixtures("load_material_spy")
+
 
 def _make_credential(
     *,
@@ -26,6 +28,7 @@ def _make_credential(
     api_version: str | None = "v1",
     active: bool = True,
     provider: str = "static",
+    created_by: str | None = "usr_cred_owner",
 ) -> MagicMock:
     cred = MagicMock()
     cred.id = cred_id
@@ -36,6 +39,7 @@ def _make_credential(
     cred.api_version = api_version
     cred.active = active
     cred.provider = provider
+    cred.created_by = created_by
     cred.server_variables = None
     cred.created_at = None
     cred.token_value_credential = MagicMock(encrypted_token_value="enc:tok")

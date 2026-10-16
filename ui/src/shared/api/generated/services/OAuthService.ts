@@ -3,15 +3,11 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { Body_consentAgentCreate } from '../models/Body_consentAgentCreate';
-import type { Body_consentSubmit } from '../models/Body_consentSubmit';
-import type { Body_loginSubmit } from '../models/Body_loginSubmit';
 import type { ConsentAgentStatusResponse } from '../models/ConsentAgentStatusResponse';
 import type { IntrospectResponse } from '../models/IntrospectResponse';
 import type { OAuthApprovalDecisionRequest } from '../models/OAuthApprovalDecisionRequest';
 import type { OAuthApprovalStatusResponse } from '../models/OAuthApprovalStatusResponse';
 import type { OAuthGrantAdminListResponse } from '../models/OAuthGrantAdminListResponse';
-import type { OAuthSessionContinueRequest } from '../models/OAuthSessionContinueRequest';
-import type { OAuthSessionContinueResponse } from '../models/OAuthSessionContinueResponse';
 import type { RevokeRequest } from '../models/RevokeRequest';
 import type { TokenResponse } from '../models/TokenResponse';
 import type { CancelablePromise } from '../core/CancelablePromise';
@@ -27,6 +23,9 @@ export class OAuthService {
      * and redirect-URI origin plus the consenting ``user_id`` — after an agent
      * ownership transfer the grant stays with the original consenter, so this
      * column is how an admin spots stranded grants.
+     *
+     * Scoped to the caller: org admins see every grant. Anyone else sees grants
+     * they consented to and grants bound to agents they own.
      * @returns OAuthGrantAdminListResponse Successful Response
      * @throws ApiError
      */
@@ -54,7 +53,13 @@ export class OAuthService {
          * Filter by grant lifecycle state.
          */
         status?: ('active' | 'revoked' | null),
+        /**
+         * Maximum number of grants to return (1-200, default 50).
+         */
         limit?: number,
+        /**
+         * Opaque cursor from a previous page's `next_cursor`; omit for the first page.
+         */
         cursor?: (string | null),
     }): CancelablePromise<OAuthGrantAdminListResponse> {
         return __request(OpenAPI, {
@@ -79,61 +84,6 @@ export class OAuthService {
         });
     }
     /**
-     * Authorize Endpoint
-     * RFC 6749 Authorization endpoint with PKCE (S256 only).
-     *
-     * If an external IdP is configured, redirects to the upstream provider.
-     * Otherwise returns an error (direct login requires a separate credential exchange).
-     * @returns any Successful Response
-     * @throws ApiError
-     */
-    public static authorizeEndpoint({
-        responseType,
-        clientId,
-        redirectUri,
-        codeChallenge,
-        codeChallengeMethod,
-        scope = 'openid',
-        state,
-        nonce,
-        sc,
-    }: {
-        responseType: string,
-        clientId: string,
-        redirectUri: string,
-        codeChallenge: string,
-        codeChallengeMethod: string,
-        scope?: string,
-        state?: (string | null),
-        nonce?: (string | null),
-        /**
-         * Signed session-continuation blob minted by POST /oauth/session/continue (identity-ladder rung 1). Optional; an invalid or absent value leaves the flow byte-identical to before.
-         */
-        sc?: (string | null),
-    }): CancelablePromise<any> {
-        return __request(OpenAPI, {
-            method: 'GET',
-            url: '/authorize',
-            query: {
-                'response_type': responseType,
-                'client_id': clientId,
-                'redirect_uri': redirectUri,
-                'code_challenge': codeChallenge,
-                'code_challenge_method': codeChallengeMethod,
-                'scope': scope,
-                'state': state,
-                'nonce': nonce,
-                'sc': sc,
-            },
-            errors: {
-                400: `Bad Request`,
-                422: `Unprocessable Entity`,
-                500: `Internal Server Error`,
-                503: `Service Unavailable`,
-            },
-        });
-    }
-    /**
      * Error Page
      * Minimal error endpoint for browser-facing authorization failures.
      * @returns string Successful Response
@@ -142,6 +92,9 @@ export class OAuthService {
     public static errorPage({
         error = 'unknown_error',
     }: {
+        /**
+         * Error code to display; returned as-is in the response body.
+         */
         error?: string,
     }): CancelablePromise<Record<string, string>> {
         return __request(OpenAPI, {
@@ -152,79 +105,6 @@ export class OAuthService {
             },
             errors: {
                 400: `Bad Request`,
-                422: `Unprocessable Entity`,
-                500: `Internal Server Error`,
-                503: `Service Unavailable`,
-            },
-        });
-    }
-    /**
-     * Local-account login form (authorization flow)
-     * Render the local-account login form for an in-flight ``/authorize`` request.
-     *
-     * Verifies the ``ls`` signature/TTL/purpose **before** rendering — an
-     * expired, forged, or wrong-purpose token never gets a form — re-checks the
-     * D7 client gate (a client denied or deactivated while the user holds the
-     * ``ls`` must not be asked for a password), rejects an already-spent ``ls``,
-     * and embeds ``ls`` plus a fresh single-use CSRF nonce bound to it.
-     * @returns string Successful Response
-     * @throws ApiError
-     */
-    public static loginPage({
-        ls,
-    }: {
-        /**
-         * Signed authorization-flow state (carry-through token)
-         */
-        ls: string,
-    }): CancelablePromise<string> {
-        return __request(OpenAPI, {
-            method: 'GET',
-            url: '/login',
-            query: {
-                'ls': ls,
-            },
-            errors: {
-                400: `Bad Request`,
-                404: `Local-account login is unavailable (\`auth.local_login.enabled=false\`, or an external IdP is configured — \`auth.idp.enabled=true\` — which always wins): the route answers the framework's plain route-not-found 404, so the gate state is unobservable.`,
-                422: `Unprocessable Entity`,
-                500: `Internal Server Error`,
-                503: `Service Unavailable`,
-            },
-        });
-    }
-    /**
-     * Local-account login submit (authorization flow)
-     * Authenticate the local account and rejoin the authorization flow.
-     *
-     * Success never mints a JWT — it flows straight into code issuance (platform
-     * client) or the consent handle (registered third-party client), exactly
-     * where the IdP callback rejoins, and burns the single-use ``ls``.
-     * Credential failures re-render the form with one generic message: lockout
-     * state, unknown email, and wrong password are indistinguishable (no
-     * user-enumeration response oracle), while the shared
-     * ``AuthService.authenticate`` core still increments the failed-login count
-     * and applies the lockout threshold. An account flagged
-     * ``must_change_password`` authenticates but is told to rotate via the UI
-     * first — the OAuth plane must not hand a fully-scoped token to a
-     * temporary-password principal the UI would have boxed into
-     * change-password-only.
-     * @returns any Successful Response
-     * @throws ApiError
-     */
-    public static loginSubmit({
-        formData,
-    }: {
-        formData: Body_loginSubmit,
-    }): CancelablePromise<any> {
-        return __request(OpenAPI, {
-            method: 'POST',
-            url: '/login',
-            formData: formData,
-            mediaType: 'application/x-www-form-urlencoded',
-            errors: {
-                400: `Bad Request`,
-                404: `Local-account login is unavailable (\`auth.local_login.enabled=false\`, or an external IdP is configured — \`auth.idp.enabled=true\` — which always wins): the route answers the framework's plain route-not-found 404, so the gate state is unobservable.`,
                 422: `Unprocessable Entity`,
                 500: `Internal Server Error`,
                 503: `Service Unavailable`,
@@ -246,6 +126,9 @@ export class OAuthService {
     public static revokeOauthGrant({
         grantId,
     }: {
+        /**
+         * ID of the OAuth grant.
+         */
         grantId: string,
     }): CancelablePromise<void> {
         return __request(OpenAPI, {
@@ -283,6 +166,22 @@ export class OAuthService {
     public static approvalDecisionEndpoint({
         requestBody,
     }: {
+        /**
+         * Inline admin approve/deny posted from the approval-pending page.
+         *
+         * ``state`` is the signed approval-state blob minted by ``/authorize`` for
+         * this exact authorize request — the decision endpoint never accepts a bare
+         * ``client_id``.
+         *
+         * ``state`` is deliberately NOT marked x-sensitive: the CLI's GEN-21
+         * redaction backstop unions every sensitive field's BARE name globally, and
+         * "state" is generic enough to redact unrelated CLI output (e.g. the MCP
+         * session-diagnosis ``state`` field). The blob is not a lasting bearer
+         * credential — it is HMAC-signed, purpose-discriminated, TTL'd (600 s), and
+         * the decision endpoint additionally requires an authenticated admin with
+         * ``oauth-clients:write`` — so global redaction buys nothing worth that
+         * collision.
+         */
         requestBody: OAuthApprovalDecisionRequest,
     }): CancelablePromise<OAuthApprovalStatusResponse> {
         return __request(OpenAPI, {
@@ -336,96 +235,6 @@ export class OAuthService {
         });
     }
     /**
-     * Authorize Oauth Callback
-     * External IdP callback — exchanges upstream code and issues platform auth code.
-     * @returns any Successful Response
-     * @throws ApiError
-     */
-    public static authorizeOauthCallback({
-        code,
-        state,
-    }: {
-        code: string,
-        state: string,
-    }): CancelablePromise<any> {
-        return __request(OpenAPI, {
-            method: 'GET',
-            url: '/oauth/callback',
-            query: {
-                'code': code,
-                'state': state,
-            },
-            errors: {
-                400: `Bad Request`,
-                422: `Unprocessable Entity`,
-                500: `Internal Server Error`,
-                503: `Service Unavailable`,
-            },
-        });
-    }
-    /**
-     * Consent Page
-     * Display the OAuth consent screen.
-     * @returns string Successful Response
-     * @throws ApiError
-     */
-    public static consentPage({
-        ch,
-    }: {
-        /**
-         * Opaque consent-flow handle
-         */
-        ch: string,
-    }): CancelablePromise<string> {
-        return __request(OpenAPI, {
-            method: 'GET',
-            url: '/oauth/consent',
-            query: {
-                'ch': ch,
-            },
-            errors: {
-                400: `Bad Request`,
-                422: `Unprocessable Entity`,
-                500: `Internal Server Error`,
-                503: `Service Unavailable`,
-            },
-        });
-    }
-    /**
-     * Consent Submit
-     * Process the consent form submission. Mints the auth code only on approval.
-     *
-     * ``consent_token`` is the opaque handle emitted by the callback. It never
-     * leaves the state backend as anything more than an ID — the actual consent
-     * parameters (user_id, email, scopes, redirect_uri) live server-side and
-     * can't be tampered with or captured from browser history/proxy logs.
-     *
-     * ``agent_id`` is posted only by the agent-picker variant
-     * (``consent_model='agent'`` clients); it is validated and the scope math
-     * recomputed entirely server-side — the browser's selection is never
-     * trusted.
-     * @returns any Successful Response
-     * @throws ApiError
-     */
-    public static consentSubmit({
-        formData,
-    }: {
-        formData: Body_consentSubmit,
-    }): CancelablePromise<any> {
-        return __request(OpenAPI, {
-            method: 'POST',
-            url: '/oauth/consent',
-            formData: formData,
-            mediaType: 'application/x-www-form-urlencoded',
-            errors: {
-                400: `Bad Request`,
-                422: `Unprocessable Entity`,
-                500: `Internal Server Error`,
-                503: `Service Unavailable`,
-            },
-        });
-    }
-    /**
      * Create the consenting user's first agent inline (consent page)
      * Create the consenting user's first agent from the zero-agents consent page (P4).
      *
@@ -463,6 +272,9 @@ export class OAuthService {
     public static consentAgentCreate({
         formData,
     }: {
+        /**
+         * Request payload for the `consentAgentCreate` operation.
+         */
         formData: Body_consentAgentCreate,
     }): CancelablePromise<any> {
         return __request(OpenAPI, {
@@ -538,6 +350,9 @@ export class OAuthService {
     public static introspectEndpoint({
         requestBody,
     }: {
+        /**
+         * Introspection endpoint request (RFC 7662) — JSON or form-encoded.
+         */
         requestBody: {
             token: string;
             token_type_hint?: (string | null);
@@ -594,6 +409,16 @@ export class OAuthService {
     public static revokeEndpoint({
         requestBody,
     }: {
+        /**
+         * Revocation endpoint request (RFC 7009) — JSON or form-encoded.
+         *
+         * ``token`` is required either way. ``token_type_hint``
+         * (``access_token``/``refresh_token``) is a lookup-order optimization only —
+         * the server falls through both types regardless (RFC 7009 §2.1).
+         * ``client_id`` belongs to the form-encoded public-client arm (G11): the
+         * secret-less client's lineage binding; ignored on the bearer-authenticated
+         * JSON arm, where the platform identity scopes the revocation instead.
+         */
         requestBody: RevokeRequest,
     }): CancelablePromise<any> {
         return __request(OpenAPI, {
@@ -608,51 +433,6 @@ export class OAuthService {
                 413: `Form-encoded (RFC 7009) requests only: declared Content-Length exceeds the 64 KiB raw-body cap (RFC 6749 §5.2 dialect).`,
                 422: `Unprocessable Entity`,
                 429: `Form-encoded (RFC 7009) requests only: per-IP rate limit exceeded (\`Retry-After\` header set; RFC 6749 §5.2 dialect body, \`error=slow_down\` per RFC 8628 §3.5).`,
-                500: `Internal Server Error`,
-                503: `Service Unavailable`,
-            },
-        });
-    }
-    /**
-     * Exchange a live platform session for an authorize continuation
-     * Rung 1 of the /authorize identity ladder: reuse the platform session.
-     *
-     * The login page's script posts the pending authorize state (the ``ls``
-     * carry-through token) with the SPA's bearer token in the Authorization
-     * header — no cookies, no ambient credentials, so a cross-site form cannot
-     * drive it (same CSRF posture as the consent POST and the inline approval
-     * decision). The platform token is validated by the standard auth
-     * dependency (users only), and the ``active`` / ``must_change_password``
-     * fences are re-checked with a LIVE user-row read — not the token's baked
-     * claims — matching rung 3's ``password_rotation_required`` posture, so an
-     * admin-forced reset fences the exchange immediately even while pre-reset
-     * SPA tokens are still in flight. The D7 client gate is re-checked, and on
-     * success the response carries a relative ``/authorize`` resume URL bearing
-     * a short-TTL, ``session``-purpose continuation blob that pins THIS
-     * caller's ``user_id`` — the identity is fixed at exchange time, before the
-     * consent page renders it with its "Not you?" escape.
-     *
-     * Every failure after authentication is the same generic 400: an invalid
-     * blob must not let the caller learn anything about the client or the flow.
-     * @returns OAuthSessionContinueResponse Successful Response
-     * @throws ApiError
-     */
-    public static sessionContinueEndpoint({
-        requestBody,
-    }: {
-        requestBody: OAuthSessionContinueRequest,
-    }): CancelablePromise<OAuthSessionContinueResponse> {
-        return __request(OpenAPI, {
-            method: 'POST',
-            url: '/oauth/session/continue',
-            body: requestBody,
-            mediaType: 'application/json',
-            errors: {
-                400: `Malformed, tampered, expired, or otherwise unusable authorize state — one generic rejection, never a reason.`,
-                401: `Unauthorized`,
-                403: `Forbidden`,
-                404: `Local-account login is unavailable (\`auth.local_login.enabled=false\`, or an external IdP is configured — \`auth.idp.enabled=true\` — which always wins): the route answers the framework's plain route-not-found 404, so the gate state is unobservable.`,
-                422: `Unprocessable Entity`,
                 500: `Internal Server Error`,
                 503: `Service Unavailable`,
             },
@@ -676,6 +456,9 @@ export class OAuthService {
     public static tokenEndpoint({
         requestBody,
     }: {
+        /**
+         * Token endpoint request — accepts both JSON and form-encoded (RFC 6749).
+         */
         requestBody: {
             assertion?: (string | null);
             client_id?: (string | null);

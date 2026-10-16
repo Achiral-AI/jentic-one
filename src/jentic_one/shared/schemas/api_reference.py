@@ -2,6 +2,14 @@
 
 from pydantic import BaseModel, Field
 
+# Literal mirrors of ``shared.web.openapi_examples`` (API_VENDOR, API_NAME,
+# API_VERSION, CATALOG_API_ID): importing that module from here would pull in
+# the ``shared.web`` package and create an import cycle.
+_EX_API_VENDOR = "stripe.com"
+_EX_API_NAME = "stripe"
+_EX_API_VERSION = "2024-04-10"
+_EX_CATALOG_API_ID = "stripe.com"
+
 
 class APIReference(BaseModel):
     """Identifies a target API — the strict (all-required) variant.
@@ -9,23 +17,44 @@ class APIReference(BaseModel):
     Used in responses and as the canonical identity tuple.
     """
 
-    vendor: str
-    name: str
-    version: str
+    vendor: str = Field(
+        description="Vendor of the API (for example `stripe.com`).", examples=[_EX_API_VENDOR]
+    )
+    name: str = Field(description="Name of the API within the vendor.", examples=[_EX_API_NAME])
+    version: str = Field(description="Version of the API.", examples=[_EX_API_VERSION])
 
 
 class APIReferenceRequest(BaseModel):
     """Relaxed variant for request bodies where partial identification is allowed."""
 
-    vendor: str
-    name: str = ""
-    version: str = ""
+    vendor: str = Field(
+        description="Vendor of the API (for example `stripe.com`).", examples=[_EX_API_VENDOR]
+    )
+    name: str = Field(
+        default="",
+        description="Name of the API within the vendor; empty to cover every API of the vendor.",
+        examples=[_EX_API_NAME],
+    )
+    version: str = Field(
+        default="",
+        description="Version of the API; empty to cover every version.",
+        examples=[_EX_API_VERSION],
+    )
     # The catalog identity slug of the API this credential targets
     # (`domain[/sub-api]`, e.g. `nytimes.com/article_search`), when the client
     # knows it (catalog imports and workspace APIs carry it). Stored verbatim
     # so credential surfaces can derive friendly titles; purely display-side —
     # never part of credential-resolution identity.
-    catalog_api_id: str | None = Field(default=None, max_length=255)
+    catalog_api_id: str | None = Field(
+        default=None,
+        max_length=255,
+        description=(
+            "Catalog identity of the API (`domain[/sub-api]`, for example "
+            "`nytimes.com/article_search`), when known; used for display only, not for "
+            "matching."
+        ),
+        examples=[_EX_CATALOG_API_ID],
+    )
 
 
 class ServedApiRef(BaseModel):
@@ -38,6 +67,14 @@ class ServedApiRef(BaseModel):
     ``/me`` web schema use ONE model instead of two identical copies.
     """
 
-    api_vendor: str
-    api_name: str | None = None
-    api_version: str | None = None
+    api_vendor: str = Field(description="Vendor of the served API.", examples=[_EX_API_VENDOR])
+    api_name: str | None = Field(
+        default=None,
+        description="Name of the served API; null means every API of the vendor.",
+        examples=[_EX_API_NAME],
+    )
+    api_version: str | None = Field(
+        default=None,
+        description="Version of the served API; null means every version.",
+        examples=[_EX_API_VERSION],
+    )

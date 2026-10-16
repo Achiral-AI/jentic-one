@@ -3,13 +3,15 @@
  *
  * The header carries what the agent-scoped dock cannot: the org-wide credential
  * inventory (a sheet reached through `?credentials`, `=new` for the wizard, and
- * `?approve=&poll_token=` for an agent's connect approval link), the
- * fleet filter and `New agent`. It owns the keyboard map documented in `PageHelp`;
- * everything else is `FlatAgentsSection`, which keeps its selection in `?agent=`.
+ * `?approve=<sid>` for an agent's connect approval link), the agents'
+ * held calls (the Approvals subsection), the fleet filter and `New agent`. It
+ * owns the keyboard map documented in `PageHelp`; below it sit "Waiting for
+ * you" (connect requests and held calls) and `FlatAgentsSection`, which keeps
+ * its selection in `?agent=`.
  */
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { useSearchParams } from 'react-router';
-import { Filter, Plus, Wallet } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { useNavigate, useSearchParams } from 'react-router';
+import { CheckSquare, Filter, Plus, Wallet } from 'lucide-react';
 import {
 	Button,
 	FOOTER_ACTION_BAR_PAGE_PADDING,
@@ -20,19 +22,33 @@ import {
 	SearchInput,
 	type KeyboardShortcut,
 } from '@/shared/ui';
+import { ROUTES } from '@/shared/app/routes';
+import { PendingApprovalsBadge } from '@/shared/approvals';
 import { useHotkey } from '@/shared/hooks';
+import { commandChordLabel } from '@/shared/lib/keyboard';
 import { FlatAgentsSection } from '@/modules/agents/components/flat/FlatAgentsSection';
 import { CredentialInventorySheet } from '@/modules/agents/components/flat/CredentialInventorySheet';
+import { WaitingForYouSection } from '@/modules/agents/components/flat/WaitingForYouSection';
+import { CreateCredentialFlow, PostConnectBindMore } from '@/shared/credentials/components';
+
+/** The connect session the approve wizard is open on. */
+interface ApprovalSession {
+	sessionId: string;
+	/** Only from an older link that still carries one; owners approve without it. */
+	pollToken?: string;
+}
 
 /** The surface's whole keyboard map, listed on demand in `PageHelp`. */
 const SHORTCUTS: KeyboardShortcut[] = [
 	{ keys: ['a'], label: 'add API' },
 	{ keys: ['n'], label: 'new agent' },
 	{ keys: ['/'], label: 'search' },
+	{ keys: [commandChordLabel('k')], label: 'switch agent' },
 	{ keys: ['Esc'], label: 'close' },
 ];
 
 export default function AgentsPage() {
+	const navigate = useNavigate();
 	const [agentCreateOpen, setAgentCreateOpen] = useState(false);
 	const [inventoryOpen, setInventoryOpen] = useState(false);
 	const [inventoryWantsCreate, setInventoryWantsCreate] = useState(false);
@@ -43,6 +59,9 @@ export default function AgentsPage() {
 	const filterRef = useRef<HTMLInputElement | null>(null);
 	useHotkey('/', () => filterRef.current?.focus());
 	useHotkey('n', () => setAgentCreateOpen(true));
+	// Reported by the section below, so the header steps back exactly while the
+	// zero-agents landing is on screen.
+	const [firstRun, setFirstRun] = useState(false);
 
 	const [searchParams, setSearchParams] = useSearchParams();
 	const inventoryParam = searchParams.get('credentials');
@@ -63,23 +82,28 @@ export default function AgentsPage() {
 	}, [inventoryParam, setSearchParams]);
 
 	// An agent-initiated connect session hands its owner an approval link (see
-	// `connect_session_service.py::_approval_url_for`) carrying
-	// `?approve=<sid>&poll_token=<tok>`. Those params open the inventory's wizard in
-	// approve mode and stay in the URL until it closes, so a reload mid-approval
-	// reopens it rather than losing the prompt.
-	const approveSessionId = searchParams.get('approve');
-	const approvePollToken = searchParams.get('poll_token');
-	const approvalSession = useMemo(
-		() =>
-			approveSessionId && approvePollToken
-				? { sessionId: approveSessionId, pollToken: approvePollToken }
-				: undefined,
-		[approveSessionId, approvePollToken],
-	);
+	// `connect_session_service.py::_approval_url_for`): `?approve=<sid>`. The
+	// owner or an org admin approves without a poll token; an older link that
+	// still carries `&poll_token=` keeps it for its holder. The params open the
+	// approve wizard on its own over this page — not over the credential
+	// inventory, so closing it lands back here — and are stripped from the URL
+	// at once (history, bookmarks and shared screens never keep them); the
+	// session is held in state until the wizard closes. A reload drops the
+	// prompt, and the "Waiting for you" section below re-offers it while the
+	// request is open.
+	const approveParam = searchParams.get('approve');
+	const pollTokenParam = searchParams.get('poll_token');
+	const [approvalSession, setApprovalSession] = useState<ApprovalSession | undefined>();
 	useEffect(() => {
-		if (approvalSession) setInventoryOpen(true);
-	}, [approvalSession]);
-	const clearApprovalParams = (): void => {
+		if (approveParam == null && pollTokenParam == null) return;
+		if (approveParam) {
+			setApprovalSession(
+				pollTokenParam
+					? { sessionId: approveParam, pollToken: pollTokenParam }
+					: { sessionId: approveParam },
+			);
+		}
+		// `replace`, and only these keys: `?agent=` must survive the rewrite.
 		setSearchParams(
 			(prev) => {
 				const next = new URLSearchParams(prev);
@@ -89,7 +113,7 @@ export default function AgentsPage() {
 			},
 			{ replace: true },
 		);
-	};
+	}, [approveParam, pollTokenParam, setSearchParams]);
 
 	return (
 		// The surface mounts the fixed AgentDock, so the page pads its bottom to keep
@@ -100,7 +124,7 @@ export default function AgentsPage() {
 				subtitle="Approve, deny, and govern agents across their lifecycle."
 				actions={
 					<>
-						<div className="relative">
+						<div className="relative min-w-0 flex-1 sm:flex-none">
 							<SearchInput
 								ref={filterRef}
 								size="sm"
@@ -109,7 +133,8 @@ export default function AgentsPage() {
 								icon={<Filter className="h-3.5 w-3.5" />}
 								placeholder="Filter agents…"
 								aria-label="Filter agents"
-								className="w-40 lg:w-48"
+								// Fills the row's spare width on a phone; fixed from `sm`.
+								className="w-full sm:w-40 lg:w-48"
 							/>
 							{!agentFilter && (
 								<Kbd className="pointer-events-none absolute top-1/2 right-2 hidden -translate-y-1/2 sm:inline-flex">
@@ -117,15 +142,40 @@ export default function AgentsPage() {
 								</Kbd>
 							)}
 						</div>
-						<Button size="sm" onClick={() => setAgentCreateOpen(true)}>
+						{/* Opens the New agent panel. Secondary while the landing is up: its
+						    register card is the recommended way in, and the panel opens on
+						    "Create here" there. */}
+						<Button
+							size="sm"
+							variant={firstRun ? 'outline' : 'primary'}
+							data-emphasis={firstRun ? 'secondary' : 'primary'}
+							onClick={() => setAgentCreateOpen(true)}
+						>
 							<Plus className="h-4 w-4" />
 							New agent
 						</Button>
 						{/* The org-wide inventory trigger — page level, not the dock, whose every
 						    verb is agent-scoped. */}
-						<Button variant="outline" size="sm" onClick={() => setInventoryOpen(true)}>
+						<Button
+							variant="secondary"
+							size="sm"
+							onClick={() => setInventoryOpen(true)}
+						>
 							<Wallet className="h-4 w-4" />
-							Credentials
+							{/* Icon-only on a phone, so the header's verbs fit one row at
+							    390px; the name stays for assistive tech. */}
+							<span className="sr-only sm:not-sr-only">Credentials</span>
+						</Button>
+						{/* Calls an agent made that an Ask rule holds for its
+						    owner's (or an org admin's) decision. */}
+						<Button
+							variant="outline"
+							size="sm"
+							onClick={() => navigate(ROUTES.approvals)}
+						>
+							<CheckSquare className="h-4 w-4" />
+							Approvals
+							<PendingApprovalsBadge />
 						</Button>
 						<PageHelp
 							title="About Agents"
@@ -151,13 +201,24 @@ export default function AgentsPage() {
 									),
 								},
 								{
+									heading: 'Held calls',
+									body: (
+										<p>
+											A call that matches an <strong>Ask</strong> rule is held
+											until the agent's owner or an org admin approves or
+											denies it under <strong>Approvals</strong>.
+										</p>
+									),
+								},
+								{
 									heading: 'Looking for service accounts?',
 									body: (
 										<p>
 											Service accounts have been retired. Active and disabled
-											ones were migrated to agents that keep their scopes,
-											credential bindings, and API key, so they appear in this
-											list. Create an agent for any new non-human caller.
+											ones were migrated to agents that keep their
+											permissions, credential bindings, and API key, so they
+											appear in this list. Create an agent for any new
+											non-human caller.
 										</p>
 									),
 								},
@@ -168,10 +229,13 @@ export default function AgentsPage() {
 				}
 			/>
 
+			<WaitingForYouSection />
+
 			<FlatAgentsSection
 				createOpen={agentCreateOpen}
 				setCreateOpen={setAgentCreateOpen}
 				filter={agentFilter}
+				onLandingChange={setFirstRun}
 			/>
 
 			{/* The org-wide credential inventory — a page-level surface, since it is
@@ -179,13 +243,31 @@ export default function AgentsPage() {
 			<CredentialInventorySheet
 				open={inventoryOpen}
 				autoOpenCreate={inventoryWantsCreate}
-				approvalSession={approvalSession}
-				onApprovalClose={clearApprovalParams}
 				onClose={() => {
 					setInventoryOpen(false);
 					setInventoryWantsCreate(false);
 				}}
 			/>
+
+			{approvalSession && (
+				<CreateCredentialFlow
+					// A different request is a different wizard: remount so one
+					// session's review state never carries into the next.
+					key={approvalSession.sessionId}
+					open
+					approvalSession={approvalSession}
+					onClose={() => setApprovalSession(undefined)}
+					// Approve mode finishes inside the wizard; a create it hands back
+					// is just as finished.
+					onCreated={() => setApprovalSession(undefined)}
+					renderPostConnect={({ credentialId, boundAgentId }) => (
+						<PostConnectBindMore
+							credentialId={credentialId}
+							boundAgentId={boundAgentId}
+						/>
+					)}
+				/>
+			)}
 		</PageShell>
 	);
 }

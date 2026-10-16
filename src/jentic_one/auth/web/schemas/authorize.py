@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from jentic_one.shared.web import openapi_examples as ex
 
 
 class OAuthApprovalStatusResponse(BaseModel):
@@ -15,7 +17,10 @@ class OAuthApprovalStatusResponse(BaseModel):
     details out of the registry.
     """
 
-    status: Literal["pending", "approved", "denied"]
+    status: Literal["pending", "approved", "denied"] = Field(
+        description="Approval state of the client: `pending`, `approved` or `denied`.",
+        examples=["approved"],
+    )
 
 
 class ConsentAgentStatusResponse(BaseModel):
@@ -29,7 +34,13 @@ class ConsentAgentStatusResponse(BaseModel):
     oracle either.
     """
 
-    status: Literal["pending", "approved", "denied"]
+    status: Literal["pending", "approved", "denied"] = Field(
+        description=(
+            "Approval state of the agent: `pending`, `approved` or `denied`; any state"
+            " other than approved or denied reads as `pending`."
+        ),
+        examples=["pending"],
+    )
 
 
 class OAuthApprovalDecisionRequest(BaseModel):
@@ -49,5 +60,11 @@ class OAuthApprovalDecisionRequest(BaseModel):
     collision.
     """
 
-    state: str
-    action: Literal["approve", "deny"]
+    state: str = Field(
+        description="Signed approval-state token issued by `/authorize` for this request.",
+        examples=[ex.SIGNED_FLOW_STATE],
+    )
+    action: Literal["approve", "deny"] = Field(
+        description="The decision: `approve` or `deny` the pending client.",
+        examples=["approve"],
+    )

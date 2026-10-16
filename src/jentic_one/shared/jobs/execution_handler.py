@@ -27,6 +27,7 @@ protocols satisfied by broker-side implementations injected at worker startup.
 from __future__ import annotations
 
 import base64
+import json
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlencode, urlparse, urlunparse
@@ -35,6 +36,7 @@ import structlog
 
 from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.config import SecurityConfig
+from jentic_one.shared.crypto.encryption import EncryptionService
 from jentic_one.shared.events import (
     MAX_EVENT_SUMMARY_FIELD_LEN,
     emit_event,
@@ -43,6 +45,7 @@ from jentic_one.shared.events import (
 )
 from jentic_one.shared.events.repeated_failure import maybe_emit_repeated_failure
 from jentic_one.shared.jobs.handlers import JobResultPayload
+from jentic_one.shared.jobs.hold import ENCRYPTED_PAYLOAD_KEY
 from jentic_one.shared.jobs.operation_payload import operation_from_job_payload
 from jentic_one.shared.jobs.protocols import (
     CredentialInjector,
@@ -62,6 +65,18 @@ from jentic_one.shared.url_validation import validate_upstream_url
 
 logger = structlog.get_logger(__name__)
 
+#: Result problem of a held payload this worker has no keyset to decrypt.
+_HELD_PAYLOAD_UNDECRYPTABLE_PROBLEM: dict[str, Any] = {
+    "type": "approval_hold_unavailable",
+    "title": "Held execution could not run",
+    "status": 503,
+    "detail": (
+        "The worker has no credentials encryption keyset to read this held execution; "
+        "it was not run"
+    ),
+    "error_origin": "broker",
+}
+
 # The resolved-identity dataclass needs an ``active`` flag; the worker only
 # injects after the job passed the run-time ``ExecutionAuthorizer`` re-check
 # (which includes the actor-still-active check), so it is always True here.
@@ -80,6 +95,7 @@ class ExecutionHandler:
         egress: Any | None = None,
         security_config: SecurityConfig | None = None,
         execution_authorizer: ExecutionAuthorizer | None = None,
+        encryption: EncryptionService | None = None,
     ) -> None:
         if credential_injector is not None and execution_authorizer is None:
             # Fail closed at wiring time: injecting credentials for a queued
@@ -92,6 +108,7 @@ class ExecutionHandler:
         self._credential_injector = credential_injector
         self._egress = egress
         self._security_config = security_config or SecurityConfig()
+        self._encryption = encryption
 
     async def execute(
         self,
@@ -108,6 +125,23 @@ class ExecutionHandler:
         if payload is None:
             payload = {}
 
+        # Held-job payloads are encrypted at rest with the platform key; decrypt
+        # before reading any field.
+        if ENCRYPTED_PAYLOAD_KEY in payload:
+            if self._encryption is None:
+                # Fail closed with a result the agent can read, never a run.
+                logger.error("held_payload_undecryptable", job_id=job_id)
+                return JobResultPayload(
+                    body={
+                        "execution_id": f"exec_{job_id}",
+                        "status": ExecutionStatus.FAILED,
+                        "http_status": 503,
+                        "duration_ms": 0,
+                        "problem": _HELD_PAYLOAD_UNDECRYPTABLE_PROBLEM,
+                    }
+                )
+            payload = json.loads(self._encryption.decrypt(str(payload[ENCRYPTED_PAYLOAD_KEY])))
+
         upstream_url = payload.get("upstream_url", "")
         method = payload.get("method", "GET")
         # Minted-if-invalid so the credential audit event, the lifecycle
@@ -120,8 +154,7 @@ class ExecutionHandler:
         api_version = payload.get("api_version")
         origin = payload.get("origin")
         # The repeated-failure detector keys on the operation id and renders the
-        # human identity; fold the payload's dual-written keys (the dict wins;
-        # legacy in-flight jobs carry only the flat id).
+        # human identity; fold the payload's ``operation`` dict once.
         operation = operation_from_job_payload(payload)
         server_variables = _str_map(payload.get("server_variables"))
         server_variable_defaults = _str_map(payload.get("server_variable_defaults"))
@@ -150,9 +183,11 @@ class ExecutionHandler:
                     api_name=api_name or "",
                     api_version=api_version or "",
                     operation_id=operation.id if operation else None,
+                    relative_path=operation.relative_path if operation else None,
                     credential_id=payload.get("credential_id"),
                     server_variables=server_variables,
                     server_variables_unresolved=server_variables_unresolved,
+                    job_id=job_id,
                 )
             )
             if not verdict.allowed:
@@ -169,7 +204,9 @@ class ExecutionHandler:
             allowed = verdict.allowed_credential_ids
             pinned_credential_id = verdict.credential_id
 
-        headers: dict[str, str] = {}
+        # The request headers the broker kept for the run (Content-Type and
+        # friends); injected credentials are applied over them.
+        headers: dict[str, str] = _str_map(payload.get("headers")) or {}
         credential_id: str | None = None
         credential_name: str | None = None
         signing = None
@@ -190,7 +227,8 @@ class ExecutionHandler:
                 server_variables_unresolved=server_variables_unresolved,
             )
             applied = _apply_injection(upstream_url, injection, server_variable_defaults)
-            upstream_url, headers = applied.url, applied.headers
+            upstream_url = applied.url
+            headers = _merge_headers(headers, applied.headers)
             credential_id = injection.credential_id
             credential_name = injection.credential_name
             signing = injection.signing
@@ -219,11 +257,8 @@ class ExecutionHandler:
                         "toolkit_id": payload.get("toolkit_id"),
                         # The resolved operation (id + path template + method)
                         # as one dict — the already-folded value, so a malformed
-                        # payload dict is validated (and warned about) once;
-                        # ``operation_id`` rides alongside for legacy in-flight
-                        # jobs that carry only the flat id.
+                        # payload dict is validated (and warned about) once.
                         "operation": operation.model_dump() if operation else None,
-                        "operation_id": payload.get("operation_id"),
                         "api_vendor": api_vendor,
                         "api_name": api_name,
                         "api_version": api_version,
@@ -439,6 +474,14 @@ def _str_map(value: Any) -> dict[str, str] | None:
     if not isinstance(value, dict):
         return None
     return {str(k): str(v) for k, v in value.items()} or None
+
+
+def _merge_headers(replayed: dict[str, str], injected: dict[str, str]) -> dict[str, str]:
+    """``replayed`` overlaid by ``injected``; an injected name wins in any case."""
+    injected_names = {name.lower() for name in injected}
+    merged = {k: v for k, v in replayed.items() if k.lower() not in injected_names}
+    merged.update(injected)
+    return merged
 
 
 def _apply_injection(

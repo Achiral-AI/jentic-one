@@ -24,13 +24,17 @@ class ExecutionRecord(AuditableMixin, AdminBase):
         Index("ix_execution_records_status", "status"),
         Index("ix_execution_records_actor", "actor_id", "actor_type"),
         Index("ix_execution_records_credential_id", "credential_id"),
+        # Covers the repeated-failure count in ``shared/events/repeated_failure.py``:
+        # equality on actor, credential (the live consumer axis) and operation,
+        # then the ``started_at`` window range, over failed rows only.
         Index(
-            "ix_execution_records_repeated_failure_scan",
+            "ix_execution_records_repeated_failure_credential_scan",
             "actor_id",
-            "toolkit_id",
+            "credential_id",
             "operation_id",
             "started_at",
             postgresql_where=text("status = 'failed'"),
+            sqlite_where=text("status = 'failed'"),
         ),
     )
 
@@ -59,12 +63,12 @@ class ExecutionRecord(AuditableMixin, AdminBase):
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     operation_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
     # Human-readable operation identity, nullable in three cases: rows predating
-    # these columns, legacy in-flight jobs that carry only ``operation_id``,
-    # and executions where discovery resolved no operation at all (then all
-    # three operation_* columns are NULL). ``operation_path`` is the spec's path
-    # template (e.g. ``/repos/{owner}/{repo}``); it mirrors its unbounded
-    # registry source (``operations.path``, Text) so no write seam has to
-    # truncate and no backend silently disagrees about the limit.
+    # these columns, rows written from async jobs that carried only an
+    # ``operation_id``, and executions where discovery resolved no operation at
+    # all (then all three operation_* columns are NULL). ``operation_path`` is
+    # the spec's path template (e.g. ``/repos/{owner}/{repo}``); it mirrors its
+    # unbounded registry source (``operations.path``, Text) so no write seam has
+    # to truncate and no backend silently disagrees about the limit.
     # ``operation_method``'s width mirrors registry ``operations.method``.
     operation_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     operation_method: Mapped[str | None] = mapped_column(String(10), nullable=True)

@@ -6,8 +6,13 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode
 
+from jentic_one.control.core.schema.oauth_app_registrations import OAuthAppRegistration
 from jentic_one.control.repos import CredentialRepository, OAuthClientCredentialRepository
+from jentic_one.control.repos.oauth_app_registration_repo import (
+    OAuthAppRegistrationRepository,
+)
 from jentic_one.control.services.credentials.providers.base import (
+    InactiveRegistrationError,
     NotConnectableError,
     ProviderError,
 )
@@ -44,9 +49,21 @@ from jentic_one.shared.context import Context
 # ``providers.direct_oauth2`` (they now live on the shared OAuth2 base).
 __all__ = [
     "DirectOAuth2Provider",
+    "InactiveRegistrationError",
     "InvalidGrantError",
     "TokenExchangeError",
 ]
+
+
+def _true_expiry(token_data: dict[str, Any]) -> datetime | None:
+    """The access token's true expiry from an RFC 6749 ``expires_in`` response.
+
+    No safety margin is subtracted: the broker's refresher applies
+    ``expiry_skew_seconds`` once, at comparison time.
+    """
+    if "expires_in" not in token_data:
+        return None
+    return datetime.now(UTC) + timedelta(seconds=int(token_data["expires_in"]))
 
 
 class DirectOAuth2Provider(OAuth2Provider):
@@ -76,23 +93,63 @@ class DirectOAuth2Provider(OAuth2Provider):
         if not credential_id:
             raise ProviderError("credential_id required in request.extra")
 
+        # Resolve (client_id, authorize_url, default_scope_str) with the same
+        # registration-first / legacy-fallback shape ``_resolve_client_material``
+        # uses for the token-endpoint side. Kept inline rather than sharing a
+        # helper because the two paths need different fields off each source.
         async with ctx.control_db.session() as session:
             credential = await CredentialRepository.get_by_id(session, credential_id)
             if credential is None:
                 raise ProviderError(f"Credential '{credential_id}' not found")
 
-            occ = await OAuthClientCredentialRepository.get_by_credential(session, credential_id)
-            if occ is None:
-                raise ProviderError(f"No oauth_client_credentials for credential '{credential_id}'")
+            client_id_value: str
+            authorize_url: str
+            default_scope_str: str
 
-            if not occ.authorize_url:
-                raise NotConnectableError(
-                    "Credential has no authorize_url — cannot initiate connect flow"
+            if credential.oauth_app_registration_id is not None:
+                registration = await OAuthAppRegistrationRepository.get_by_id(
+                    session, credential.oauth_app_registration_id
                 )
+                if registration is None:
+                    raise ProviderError(
+                        f"Credential '{credential_id}' references missing "
+                        f"oauth_app_registration '{credential.oauth_app_registration_id}'"
+                    )
+                if not registration.is_active:
+                    raise InactiveRegistrationError(
+                        f"oauth_app_registration {registration.id!r} is inactive — "
+                        "refuse to begin a new connect through a disabled shared app"
+                    )
+                ac = registration.authorization_code_details
+                if ac is None:
+                    raise ProviderError(
+                        f"oauth_app_registration {registration.id!r} is missing its "
+                        "authorization_code_details extension"
+                    )
+                client_id_value = registration.client_id
+                authorize_url = ac.authorize_url
+                default_scope_str = " ".join(ac.default_scopes) if ac.default_scopes else ""
+                # Shared registrations carry no per-credential client options.
+                options = OAuthClientOptions()
+            else:
+                occ = await OAuthClientCredentialRepository.get_by_credential(
+                    session, credential_id
+                )
+                if occ is None:
+                    raise ProviderError(
+                        f"No oauth_client_credentials for credential '{credential_id}'"
+                    )
+                if not occ.authorize_url:
+                    raise NotConnectableError(
+                        "Credential has no authorize_url — cannot initiate connect flow"
+                    )
+                client_id_value = occ.client_id
+                authorize_url = occ.authorize_url
+                default_scope_str = occ.scope or ""
+                options = OAuthClientOptions.from_stored(occ.client_options)
 
         scopes = request.scopes or self._default_scopes
-        scope_str = " ".join(scopes) if scopes else (occ.scope or "")
-        options = OAuthClientOptions.from_stored(occ.client_options)
+        scope_str = " ".join(scopes) if scopes else default_scope_str
 
         # The credential's own redirect_uri wins, then explicit config, then
         # the callback URL the web layer derived for this request
@@ -118,12 +175,13 @@ class DirectOAuth2Provider(OAuth2Provider):
             issued_at=datetime.now(UTC),
             nonce=nonce,
             redirect_uri=redirect_uri,
+            sole_agent_id=request.extra.get("sole_agent_id") or None,
         )
         signed_state = encode_state(state_secret, connect_state, ttl)
 
         params: dict[str, str] = {
             "response_type": "code",
-            "client_id": occ.client_id,
+            "client_id": client_id_value,
             "redirect_uri": redirect_uri,
             "state": signed_state,
         }
@@ -142,8 +200,10 @@ class DirectOAuth2Provider(OAuth2Provider):
         # the protocol parameters (OAuthClientOptions refuses those).
         params.update(options.authorize_params)
 
-        authorize_url = f"{occ.authorize_url}?{urlencode(params)}"
-        return AuthCodeChallenge(authorize_url=authorize_url, state=signed_state)
+        return AuthCodeChallenge(
+            authorize_url=f"{authorize_url}?{urlencode(params)}",
+            state=signed_state,
+        )
 
     async def complete_connect(
         self,
@@ -158,17 +218,9 @@ class DirectOAuth2Provider(OAuth2Provider):
         if not callback.code:
             raise ProviderError("No authorization code in callback")
 
-        async with ctx.control_db.session() as session:
-            occ = await OAuthClientCredentialRepository.get_by_credential(
-                session, state.credential_id
-            )
-            if occ is None:
-                raise ProviderError(
-                    f"No oauth_client_credentials for credential '{state.credential_id}'"
-                )
-
-        client_secret = ctx.encryption.decrypt(occ.encrypted_client_secret)
-        options = OAuthClientOptions.from_stored(occ.client_options)
+        client_id, token_url, client_secret, options = await self._resolve_client_material(
+            ctx, credential_id=state.credential_id
+        )
 
         # Replay the exact redirect_uri the authorize request used (carried in
         # the signed state); RFC 6749 requires the token exchange to match. Fall
@@ -187,14 +239,10 @@ class DirectOAuth2Provider(OAuth2Provider):
             state_secret = ctx.config.credentials.connect.state_secret.get_secret_value()
             payload["code_verifier"] = pkce_verifier(state_secret, state.nonce)
         token_data = await self._post_client_token(
-            occ.token_url, payload, occ.client_id, client_secret, options
+            token_url, payload, client_id, client_secret, options
         )
 
-        expires_at = None
-        if "expires_in" in token_data:
-            expires_at = datetime.now(UTC) + timedelta(
-                seconds=int(token_data["expires_in"]) - self._expiry_skew_seconds
-            )
+        expires_at = _true_expiry(token_data)
 
         return ProvisionResult(
             access_token=token_data.get("access_token"),
@@ -211,31 +259,20 @@ class DirectOAuth2Provider(OAuth2Provider):
         *,
         token: OAuthTokenView,
     ) -> RefreshResult:
-        async with ctx.control_db.session() as session:
-            occ = await OAuthClientCredentialRepository.get_by_credential(
-                session, token.credential_id
-            )
-            if occ is None:
-                raise ProviderError(
-                    f"No oauth_client_credentials for credential '{token.credential_id}'"
-                )
-
-        client_secret = ctx.encryption.decrypt(occ.encrypted_client_secret)
+        client_id, token_url, client_secret, options = await self._resolve_client_material(
+            ctx, credential_id=token.credential_id
+        )
         refresh_token_value = await token.decrypt()
 
         token_data = await self._post_client_token(
-            occ.token_url,
+            token_url,
             {"grant_type": "refresh_token", "refresh_token": refresh_token_value},
-            occ.client_id,
+            client_id,
             client_secret,
-            OAuthClientOptions.from_stored(occ.client_options),
+            options,
         )
 
-        expires_at = None
-        if "expires_in" in token_data:
-            expires_at = datetime.now(UTC) + timedelta(
-                seconds=int(token_data["expires_in"]) - self._expiry_skew_seconds
-            )
+        expires_at = _true_expiry(token_data)
 
         return RefreshResult(
             access_token=token_data["access_token"],
@@ -243,6 +280,59 @@ class DirectOAuth2Provider(OAuth2Provider):
             refresh_token=token_data.get("refresh_token"),
             scope=token_data.get("scope"),
         )
+
+    async def _resolve_client_material(
+        self,
+        ctx: Context,
+        *,
+        credential_id: str,
+    ) -> tuple[str, str, str, OAuthClientOptions]:
+        """Return ``(client_id, token_url, client_secret, options)`` for a credential.
+
+        Prefers the shared ``oauth_app_registrations`` row when the credential's
+        ``oauth_app_registration_id`` is set (mints for this credential are
+        going through admin-registered material). Falls back to the legacy
+        embedded ``oauth_client_credentials`` row when the FK is null.
+
+        A referenced registration that has been flipped ``is_active=False``
+        is refused loudly: refresh / new grants must not silently continue
+        through a disabled shared app, and the operator flipped the switch
+        expecting exactly that behaviour.
+        """
+        async with ctx.control_db.session() as session:
+            credential = await CredentialRepository.get_by_id(session, credential_id)
+            if credential is None:
+                raise ProviderError(f"Credential {credential_id!r} not found")
+            registration: OAuthAppRegistration | None = None
+            if credential.oauth_app_registration_id is not None:
+                registration = await OAuthAppRegistrationRepository.get_by_id(
+                    session, credential.oauth_app_registration_id
+                )
+            if registration is not None:
+                if not registration.is_active:
+                    raise InactiveRegistrationError(
+                        f"oauth_app_registration {registration.id!r} is inactive — "
+                        "refuse to mint / refresh through a disabled shared app"
+                    )
+                ac = registration.authorization_code_details
+                if ac is None:
+                    raise ProviderError(
+                        f"oauth_app_registration {registration.id!r} is missing its "
+                        "authorization_code_details extension"
+                    )
+                client_secret = ctx.encryption.decrypt(ac.encrypted_client_secret)
+                return registration.client_id, ac.token_url, client_secret, OAuthClientOptions()
+
+            occ = await OAuthClientCredentialRepository.get_by_credential(session, credential_id)
+            if occ is None:
+                raise ProviderError(f"No oauth_client_credentials for credential {credential_id!r}")
+            client_secret = ctx.encryption.decrypt(occ.encrypted_client_secret)
+            return (
+                occ.client_id,
+                occ.token_url,
+                client_secret,
+                OAuthClientOptions.from_stored(occ.client_options),
+            )
 
     async def _post_client_token(
         self,

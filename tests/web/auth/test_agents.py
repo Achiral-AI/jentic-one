@@ -10,13 +10,13 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, update
 
-from jentic_one.admin.core.schema.actor_scope_grants import ActorScopeGrant
+from jentic_one.admin.core.schema.actor_permission_grants import ActorPermissionGrant
 from jentic_one.admin.core.schema.agent_credential_bindings import AgentCredentialBinding
 from jentic_one.admin.core.schema.agents import Agent
 from jentic_one.admin.core.schema.events import Event
 from jentic_one.admin.core.schema.users import User
 from jentic_one.admin.repos import (
-    ActorScopeGrantRepository,
+    ActorPermissionGrantRepository,
     AgentCredentialBindingRepository,
     AgentRepository,
     EventRepository,
@@ -143,11 +143,11 @@ async def archive_target_agent_id(
             registered_by=owner_user_id,
             created_by="usr_test",
         )
-        await ActorScopeGrantRepository.grant(
+        await ActorPermissionGrantRepository.grant(
             session,
             actor_id=agent.id,
             actor_type="agent",
-            scope="test:scope",
+            permission="test:scope",
             created_by="usr_test",
         )
         await AgentCredentialBindingRepository.bind(
@@ -156,7 +156,9 @@ async def archive_target_agent_id(
     yield agent.id
 
     async with web_context.admin_db.session() as session:
-        await session.execute(delete(ActorScopeGrant).where(ActorScopeGrant.actor_id == agent.id))
+        await session.execute(
+            delete(ActorPermissionGrant).where(ActorPermissionGrant.actor_id == agent.id)
+        )
         await session.execute(
             delete(AgentCredentialBinding).where(AgentCredentialBinding.agent_id == agent.id)
         )
@@ -174,7 +176,9 @@ async def test_archive_agent(
         agent = await AgentRepository.get_by_id(session, archive_target_agent_id)
         assert agent is not None
         assert agent.status == "archived"
-        grants = await ActorScopeGrantRepository.list_for_actor(session, archive_target_agent_id)
+        grants = await ActorPermissionGrantRepository.list_for_actor(
+            session, archive_target_agent_id
+        )
         assert grants == []
         bindings = await AgentCredentialBindingRepository.list_for_agent(
             session, archive_target_agent_id
@@ -186,6 +190,73 @@ def test_archive_already_archived(admin_client: TestClient, test_agent_id: str) 
     admin_client.delete(f"/agents/{test_agent_id}")
     resp = admin_client.delete(f"/agents/{test_agent_id}")
     assert resp.status_code == 409
+
+
+async def test_purge_agent_hard_deletes_from_any_status(
+    owner_client: TestClient, web_context: Context, archive_target_agent_id: str
+) -> None:
+    """``?purge=true`` hard-deletes a non-archived agent (204); a repeat is 404."""
+    resp = owner_client.delete(f"/agents/{archive_target_agent_id}", params={"purge": "true"})
+    assert resp.status_code == 204
+
+    async with web_context.admin_db.session() as session:
+        assert await AgentRepository.get_by_id(session, archive_target_agent_id) is None
+        assert (
+            await ActorPermissionGrantRepository.list_for_actor(session, archive_target_agent_id)
+            == []
+        )
+        assert (
+            await AgentCredentialBindingRepository.list_for_agent(session, archive_target_agent_id)
+            == []
+        )
+
+    resp = owner_client.delete(f"/agents/{archive_target_agent_id}", params={"purge": "true"})
+    assert resp.status_code == 404
+    assert resp.json()["type"] == "actor_not_found"
+
+
+def test_purge_archived_agent(admin_client: TestClient, test_agent_id: str) -> None:
+    """Purge also accepts an agent that is already archived."""
+    assert admin_client.delete(f"/agents/{test_agent_id}").status_code == 204
+    resp = admin_client.delete(f"/agents/{test_agent_id}", params={"purge": "true"})
+    assert resp.status_code == 204
+    assert admin_client.get(f"/agents/{test_agent_id}").status_code == 404
+
+
+def test_purge_agent_unauthenticated(unauthed_client: TestClient, test_agent_id: str) -> None:
+    resp = unauthed_client.delete(f"/agents/{test_agent_id}", params={"purge": "true"})
+    assert resp.status_code == 401
+
+
+async def test_purge_agent_without_write_permission(
+    web_context: Context, owner_user_id: str, test_agent_id: str
+) -> None:
+    """The owner holding only ``agents:read`` is refused (403); the agent stays."""
+    token = _make_token(web_context, owner_user_id, OWNER_EMAIL, ["agents:read"])
+    with TestClient(
+        _build_app(web_context), headers={"Authorization": f"Bearer {token}"}
+    ) as client:
+        resp = client.delete(f"/agents/{test_agent_id}", params={"purge": "true"})
+    assert resp.status_code == 403
+    async with web_context.admin_db.session() as session:
+        assert await AgentRepository.get_by_id(session, test_agent_id) is not None
+
+
+async def test_purge_foreign_agent_is_not_found(
+    web_context: Context, admin_user_id: str, test_agent_id: str
+) -> None:
+    """A caller with ``agents:write`` who does not own the agent gets the uniform 404."""
+    token = _make_token(
+        web_context, admin_user_id, "stranger@example.com", ["agents:read", "agents:write"]
+    )
+    with TestClient(
+        _build_app(web_context), headers={"Authorization": f"Bearer {token}"}
+    ) as client:
+        resp = client.delete(f"/agents/{test_agent_id}", params={"purge": "true"})
+    assert resp.status_code == 404
+    assert resp.json()["type"] == "actor_not_found"
+    async with web_context.admin_db.session() as session:
+        assert await AgentRepository.get_by_id(session, test_agent_id) is not None
 
 
 def test_verbs_on_archived_agent(admin_client: TestClient, test_agent_id: str) -> None:
@@ -212,7 +283,9 @@ async def binding_agent_id(web_context: Context, owner_user_id: str) -> AsyncGen
     yield agent.id
 
     async with web_context.admin_db.session() as session:
-        await session.execute(delete(ActorScopeGrant).where(ActorScopeGrant.actor_id == agent.id))
+        await session.execute(
+            delete(ActorPermissionGrant).where(ActorPermissionGrant.actor_id == agent.id)
+        )
         await session.execute(
             delete(AgentCredentialBinding).where(AgentCredentialBinding.agent_id == agent.id)
         )
@@ -701,13 +774,14 @@ async def self_registered_alert_id(
         await session.commit()
 
 
-async def test_approve_settles_self_registered_alert(
+async def test_approve_emits_decision_event(
     admin_client: TestClient,
     web_context: Context,
     dcr_agent_id: str,
     self_registered_alert_id: str,
 ) -> None:
-    """Approving IS the review: the pending alert must not stay actionable.
+    """Approving emits the decision event; the self-registered event stays as
+    append-only history.
 
     Also pins the decision event's payload contract — `data.agent_id` is what
     lets the UI deep-link the rail row to the agent page (the top-level actor
@@ -719,8 +793,7 @@ async def test_approve_settles_self_registered_alert(
     async with web_context.admin_db.session() as session:
         alert = await EventRepository.get_by_id(session, self_registered_alert_id)
         assert alert is not None
-        assert alert.acknowledged is True
-        assert alert.acknowledged_by is not None
+        assert alert.requires_action is True
 
         decisions = await EventRepository.list_all(
             session, event_type=[EventType.AGENT_REGISTRATION_APPROVED]
@@ -732,7 +805,7 @@ async def test_approve_settles_self_registered_alert(
         await session.commit()
 
 
-async def test_deny_settles_self_registered_alert(
+async def test_deny_emits_decision_event(
     admin_client: TestClient,
     web_context: Context,
     dcr_agent_id: str,
@@ -744,9 +817,7 @@ async def test_deny_settles_self_registered_alert(
     async with web_context.admin_db.session() as session:
         alert = await EventRepository.get_by_id(session, self_registered_alert_id)
         assert alert is not None
-        assert alert.acknowledged is True
-        # The audit trail must record WHO decided, on deny as well as approve.
-        assert alert.acknowledged_by is not None
+        assert alert.requires_action is True
 
         decisions = await EventRepository.list_all(
             session, event_type=[EventType.AGENT_REGISTRATION_DENIED]
@@ -763,10 +834,10 @@ async def test_approve_leaves_other_agents_alerts_untouched(
     dcr_agent_id: str,
     self_registered_alert_id: str,
 ) -> None:
-    """Settlement is scoped to the decided agent — no blanket acknowledge.
+    """Deciding one agent never touches another agent's self-registered event.
 
-    Two agents awaiting review is the normal fleet-onboarding case; deciding
-    one must never clear the other's actionable row from the rail/dashboard.
+    Two agents awaiting review is the normal fleet-onboarding case; both events
+    stay as append-only history regardless of which agent is decided.
     """
     async with web_context.admin_db.transaction() as session:
         other = await EventRepository.create(
@@ -787,14 +858,13 @@ async def test_approve_leaves_other_agents_alerts_untouched(
         assert resp.status_code == 200
 
         async with web_context.admin_db.session() as session:
-            settled = await EventRepository.get_by_id(session, self_registered_alert_id)
-            assert settled is not None
-            assert settled.acknowledged is True
+            decided = await EventRepository.get_by_id(session, self_registered_alert_id)
+            assert decided is not None
+            assert decided.requires_action is True
 
             untouched = await EventRepository.get_by_id(session, other_id)
             assert untouched is not None
-            assert untouched.acknowledged is False
-            assert untouched.acknowledged_by is None
+            assert untouched.requires_action is True
     finally:
         async with web_context.admin_db.session() as session:
             await session.execute(delete(Event).where(Event.id == other_id))

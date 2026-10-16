@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, NamedTuple
 
 import structlog
+from pydantic import SecretStr
 
 from jentic_one.control.core.schema.agent_permission_rules import AgentPermissionRule
 from jentic_one.control.core.schema.credentials import Credential
@@ -19,6 +21,7 @@ from jentic_one.control.repos import (
     BasicCredentialRepository,
     CredentialRepository,
     CustomerAPIKeyRepository,
+    OAuthAppRegistrationRepository,
     OAuthClientCredentialRepository,
     PermissionRuleSetRepository,
     Sigv4CredentialRepository,
@@ -27,11 +30,14 @@ from jentic_one.control.repos import (
 from jentic_one.control.repos.device_authorization_credential_repo import (
     DeviceAuthorizationCredentialRepository,
 )
+from jentic_one.control.repos.pending_import_lookup_repo import PendingImportLookupRepository
 from jentic_one.control.repos.prerequisite_repo import (
     AgentCredentialBindingRow,
+    AgentVisibility,
     CredentialBoundAgentRow,
     PrerequisiteRepository,
 )
+from jentic_one.control.repos.registry_api_lookup_repo import RegistryApiLookupRepository
 from jentic_one.control.scoping.filters import build_access_filters
 from jentic_one.control.services.credentials.errors import (
     AgentBindingNotFoundError,
@@ -39,6 +45,7 @@ from jentic_one.control.services.credentials.errors import (
     ImmutableFieldError,
     InvalidCredentialInputError,
     RuleSetAccessDeniedError,
+    RuleSetAttachDeniedError,
     RuleSetInUseError,
     RuleSetNameConflictError,
     RuleSetNotFoundError,
@@ -68,20 +75,63 @@ from jentic_one.control.services.credentials.schemas.credentials import (
 )
 from jentic_one.control.services.credentials.schemas.permission_test import PermissionTestResult
 from jentic_one.control.services.credentials.schemas.provision import APIReference
+from jentic_one.control.services.credentials.typed_secrets import (
+    write_api_key_secret,
+    write_basic_secret,
+    write_bearer_token_secret,
+    write_sigv4_secret,
+)
 from jentic_one.shared.audit import AuditAction, AuditTargetType, record_audit_best_effort
 from jentic_one.shared.auth.identity import Identity
+from jentic_one.shared.auth.permission_catalog import ORG_ADMIN, OWNER_AGENTS_READ
 from jentic_one.shared.config import DirectOAuth2ProviderConfig
 from jentic_one.shared.context import Context
-from jentic_one.shared.events import emit_event_best_effort
-from jentic_one.shared.models.api_identity import CredentialScope, canonical_credential_scope
+from jentic_one.shared.events import emit_event_best_effort, summary_label
+from jentic_one.shared.models import ActorType
+from jentic_one.shared.models.api_identity import (
+    CredentialScope,
+    canonical_credential_scope,
+    credential_covers,
+    slugify_api_field,
+)
 from jentic_one.shared.models.credentials import CredentialType, StoredCredentialType
 from jentic_one.shared.models.events import EventSeverity, EventType
 from jentic_one.shared.pagination import decode_cursor_str, encode_cursor
+from jentic_one.shared.permissions.evaluation import (
+    PermissionRule,
+    first_matching_rule,
+    normalize_methods,
+)
 from jentic_one.shared.permissions.matching import compile_matcher
-from jentic_one.shared.scopes import ORG_ADMIN
+from jentic_one.shared.url_path import has_ambiguous_traversal, normalize_path
 from jentic_one.shared.url_validation import validate_upstream_url
 
 logger = structlog.get_logger()
+
+# Upper bound on the advisory registry probe at credential create (#1020). The
+# probe is purely best-effort, so a hung registry DB (network blackhole, dying
+# node) must not drag POST /credentials to the driver's connect timeout (~60s);
+# on expiry the TimeoutError lands in the probe's own except-and-skip fallback.
+_REGISTRY_PROBE_TIMEOUT_S = 2.0
+# How many of the vendor's imported identities the unmatched-scope hint names.
+_SIBLING_HINT_LIMIT = 5
+
+
+class _UnmatchedScopeWarning(NamedTuple):
+    """One advisory warning: the human message plus the scope it names."""
+
+    reference: str
+    message: str
+
+
+def _scope_reference(scope: CredentialScope) -> str:
+    """Render a credential scope as ``vendor/name/version`` with ``*`` for wildcards.
+
+    Every axis is always shown so the position is unambiguous: a name-wildcard,
+    version-pinned scope reads ``stripe-com/*/2024-04-10`` rather than collapsing
+    to ``stripe-com/2024-04-10``, which reads as a name.
+    """
+    return f"{scope.vendor}/{scope.name or '*'}/{scope.version or '*'}"
 
 
 class CredentialService:
@@ -104,6 +154,25 @@ class CredentialService:
         async with self._ctx.admin_db.session() as session:
             return await PrerequisiteRepository.list_credential_ids_for_agent(
                 session, agent_id=identity.sub
+            )
+
+    async def _owned_agent_ids(self, identity: Identity) -> list[str]:
+        """Agent ids the caller owns, for the read-only owned-agent scoping clause.
+
+        Lets a human read the pending credential of a connect session one of
+        their agents opened (see ``build_access_filters``). Only humans own
+        agents and ``org:admin`` is unrestricted already, so both skip the
+        lookup.
+        """
+        if (
+            ORG_ADMIN in identity.permissions
+            or identity.actor_type != ActorType.USER
+            or not identity.sub
+        ):
+            return []
+        async with self._ctx.admin_db.session() as session:
+            return await PrerequisiteRepository.list_agent_ids_owned_by(
+                session, owner_id=identity.sub
             )
 
     def list_providers(
@@ -156,6 +225,7 @@ class CredentialService:
         # identity at execute time (#775), and stores github.com as github-com
         # rather than a dead-on-arrival identity (#746).
         api_scope = self._canonical_api_scope(payload.api)
+        api_scope = await self._catalog_registered_scope(api_scope, payload.catalog_api_id)
 
         stored_type = to_stored(payload.type, grant_type=payload.grant_type)
         encryption = self._ctx.encryption
@@ -184,48 +254,39 @@ class CredentialService:
 
             if payload.type == CredentialType.BEARER_TOKEN:
                 assert payload.token
-                encrypted = encryption.encrypt(payload.token)
-                preview = encryption.preview(payload.token)
-                await TokenValueCredentialRepository.create(
+                secret = await write_bearer_token_secret(
                     session,
+                    encryption,
                     credential_id=credential.id,
-                    encrypted_token_value=encrypted,
-                    token_preview=preview,
+                    token=SecretStr(payload.token),
                     created_by=identity.sub,
                 )
-                secret = BearerTokenFull(token=payload.token)
 
             elif payload.type == CredentialType.API_KEY:
                 assert payload.key
                 assert payload.location
                 assert payload.field_name
-                encrypted = encryption.encrypt(payload.key)
-                preview = encryption.preview(payload.key)
-                await CustomerAPIKeyRepository.create(
+                secret = await write_api_key_secret(
                     session,
+                    encryption,
                     credential_id=credential.id,
-                    encrypted_key=encrypted,
-                    key_preview=preview,
+                    key=SecretStr(payload.key),
                     location=payload.location,
                     field_name=payload.field_name,
                     created_by=identity.sub,
-                )
-                secret = ApiKeyFull(
-                    key=payload.key, location=payload.location, field_name=payload.field_name
                 )
 
             elif payload.type == CredentialType.BASIC:
                 assert payload.username
                 assert payload.password
-                encrypted_pw = encryption.encrypt(payload.password)
-                await BasicCredentialRepository.create(
+                secret = await write_basic_secret(
                     session,
+                    encryption,
                     credential_id=credential.id,
                     username=payload.username,
-                    encrypted_password=encrypted_pw,
+                    password=SecretStr(payload.password),
                     created_by=identity.sub,
                 )
-                secret = BasicAuthFull(username=payload.username, password=payload.password)
 
             elif payload.type == CredentialType.OAUTH2:
                 validated_token_url: str | None = None
@@ -307,28 +368,20 @@ class CredentialService:
                 assert payload.secret_access_key
                 assert payload.aws_region
                 assert payload.aws_service
-                encrypted = encryption.encrypt(payload.secret_access_key)
-                preview = encryption.preview(payload.secret_access_key)
-                encrypted_session = (
-                    encryption.encrypt(payload.session_token) if payload.session_token else None
-                )
-                await Sigv4CredentialRepository.create(
+                secret = await write_sigv4_secret(
                     session,
+                    encryption,
                     credential_id=credential.id,
                     access_key_id=payload.access_key_id,
-                    encrypted_secret_access_key=encrypted,
-                    secret_preview=preview,
-                    encrypted_session_token=encrypted_session,
+                    secret_access_key=SecretStr(payload.secret_access_key),
+                    session_token=(
+                        SecretStr(payload.session_token)
+                        if payload.session_token is not None
+                        else None
+                    ),
                     region=payload.aws_region,
                     service=payload.aws_service,
                     created_by=identity.sub,
-                )
-                secret = Sigv4Full(
-                    access_key_id=payload.access_key_id,
-                    secret_access_key=payload.secret_access_key,
-                    session_token=payload.session_token,
-                    aws_region=payload.aws_region,
-                    aws_service=payload.aws_service,
                 )
             else:
                 raise InvalidCredentialInputError(f"Unsupported credential type: {payload.type}")
@@ -345,10 +398,19 @@ class CredentialService:
                 catalog_api_id=credential.catalog_api_id,
                 provider=credential.provider,
                 active=credential.active,
+                created_by=credential.created_by,
                 created_at=credential.created_at,
                 server_variables=credential.server_variables,
                 secret=secret,
             )
+
+        # Advisory check (#1020), run only once the create has committed: a scope
+        # that covers no imported API is legal (the API may be imported later) but
+        # every execute through it would 403 — surface the mismatch now instead of
+        # at execute time.
+        unmatched = await self._unmatched_scope_warning(api_scope)
+        if unmatched is not None:
+            view = view.model_copy(update={"warnings": [unmatched.message]})
 
         await record_audit_best_effort(
             self._ctx,
@@ -367,18 +429,58 @@ class CredentialService:
         )
         try:
             async with self._ctx.admin_db.transaction() as session:
-                await emit_event_best_effort(
-                    session,
-                    type=EventType.CREDENTIAL_STORED,
-                    severity=EventSeverity.INFO,
-                    summary=f"Credential {view.credential_id} stored",
-                    created_by=identity.sub,
-                    actor_id=identity.sub,
-                    actor_type=identity.actor_type.value,
-                )
+                # Each best-effort emit runs in its own SAVEPOINT: a failed INSERT
+                # aborts the enclosing Postgres transaction, so without it one
+                # emit's swallowed failure would make the commit raise and drop
+                # every other event in this transaction with it.
+                async with session.begin_nested():
+                    await emit_event_best_effort(
+                        session,
+                        type=EventType.CREDENTIAL_STORED,
+                        severity=EventSeverity.INFO,
+                        summary=f"Credential {summary_label(view.name, view.credential_id)} stored",
+                        data={"credential_id": view.credential_id},
+                        created_by=identity.sub,
+                        actor_id=identity.sub,
+                        actor_type=identity.actor_type.value,
+                    )
+                if unmatched is not None:
+                    async with session.begin_nested():
+                        await emit_event_best_effort(
+                            session,
+                            type=EventType.CREDENTIAL_UNMATCHED_API,
+                            severity=EventSeverity.WARNING,
+                            # Keep the summary short and bounded (the events column
+                            # caps at 512 chars and every UI surface truncates to
+                            # one line); the actionable remedy + sibling-identity
+                            # hint travel in `detail`, which the events page renders
+                            # in full. The reference is caller-shaped (version is
+                            # free-text), so clamp it defensively.
+                            summary=(
+                                f"Credential {view.credential_id}: API scope "
+                                f"'{unmatched.reference[:200]}' matches no imported API"
+                            ),
+                            detail=unmatched.message,
+                            # The canonical scope rides along for consumers that
+                            # correlate the warning with a later import.
+                            data={
+                                "credential_id": view.credential_id,
+                                "api_vendor": api_scope.vendor,
+                                "api_name": api_scope.name,
+                                "api_version": api_scope.version,
+                            },
+                            created_by=identity.sub,
+                            actor_id=identity.sub,
+                            actor_type=identity.actor_type.value,
+                        )
         except Exception:
+            # Per-emit failures are swallowed inside emit_event_best_effort; what
+            # lands here is the shared admin transaction itself failing, which
+            # can't be attributed to a single event type.
             logger.warning(
-                "telemetry_emit_failed", event_type=EventType.CREDENTIAL_STORED, exc_info=True
+                "credential_event_emit_failed",
+                credential_id=view.credential_id,
+                exc_info=True,
             )
         return view
 
@@ -388,6 +490,7 @@ class CredentialService:
             identity,
             Credential,
             bound_credential_ids=await self._bound_credential_ids(identity),
+            owned_agent_ids=await self._owned_agent_ids(identity),
             include_shared=True,
         )
         async with self._ctx.control_db.session() as session:
@@ -396,7 +499,10 @@ class CredentialService:
             )
             if credential is None:
                 raise CredentialNotFoundError(credential_id)
-            return self._to_redacted(credential)
+            names = await OAuthAppRegistrationRepository.get_names_by_ids(
+                session, _registration_ids([credential])
+            )
+            return self._to_redacted(credential, registration_names=names)
 
     async def list_agents(
         self,
@@ -413,11 +519,17 @@ class CredentialService:
         able to see the credential itself before enumerating who is bound to
         it (hard problem 7/9 owner-gating; existence never leaks past the
         filters).
+
+        ``org:admin`` and the credential's creator see every bound agent. Any
+        other caller who can see the credential (a bound agent, a delegated
+        agent, a shared-read grant) sees only the agents it can see itself:
+        see :meth:`_bound_agent_visibility`.
         """
         access_filters = build_access_filters(
             identity,
             Credential,
             bound_credential_ids=await self._bound_credential_ids(identity),
+            owned_agent_ids=await self._owned_agent_ids(identity),
             include_shared=True,
         )
         async with self._ctx.control_db.session() as session:
@@ -434,7 +546,11 @@ class CredentialService:
 
         async with self._ctx.admin_db.session() as session:
             rows = await PrerequisiteRepository.list_agents_for_credential(
-                session, credential_id=credential_id, cursor=decoded_cursor, limit=limit + 1
+                session,
+                credential_id=credential_id,
+                cursor=decoded_cursor,
+                limit=limit + 1,
+                visible_to=self._bound_agent_visibility(credential, identity),
             )
 
         has_more = len(rows) > limit
@@ -447,6 +563,26 @@ class CredentialService:
             next_cursor = encode_cursor(last.bound_at, last.binding_id)
 
         return rows, has_more, next_cursor
+
+    @staticmethod
+    def _bound_agent_visibility(
+        credential: Credential, identity: Identity
+    ) -> AgentVisibility | None:
+        """Bound agents the caller may enumerate; ``None`` means all of them.
+
+        ``org:admin`` and the credential's creator see every bound agent.
+        Anyone else sees the agents it owns and itself (when the caller is an
+        agent), plus its owner's agents when it holds ``owner:agents:read`` —
+        the same agent visibility the admin surface applies.
+        """
+        if ORG_ADMIN in identity.permissions:
+            return None
+        if credential.created_by is not None and credential.created_by == identity.sub:
+            return None
+        owner_ids = [identity.sub]
+        if OWNER_AGENTS_READ in identity.permissions and identity.parent_actor_id is not None:
+            owner_ids.append(identity.parent_actor_id)
+        return AgentVisibility(self_id=identity.sub, owner_ids=tuple(owner_ids))
 
     # --- Per-binding permission rules (theme 5 phase 1) ---
 
@@ -489,14 +625,21 @@ class CredentialService:
         themselves live control-side, so this is the cross-DB seam). Returns
         the binding row so callers can see its attached ``rule_set_id``.
 
+        The bound agent must also be one the caller may see
+        (:meth:`_bound_agent_visibility`, the same rule as ``list_agents``):
+        a binding of an agent outside that set answers the same 404 as a
+        binding that does not exist.
+
         ``for_write`` additionally requires :meth:`_may_write_binding_rules`;
         a caller who can see the credential but not write its rules gets the
-        same 404 as one who cannot see it at all.
+        same 404 as one who cannot see it at all. Writes are therefore
+        owner-or-admin only, and both of those callers see every bound agent.
         """
         access_filters = build_access_filters(
             identity,
             Credential,
             bound_credential_ids=await self._bound_credential_ids(identity),
+            owned_agent_ids=await self._owned_agent_ids(identity),
             include_shared=True,
         )
         async with self._ctx.control_db.session() as session:
@@ -509,16 +652,29 @@ class CredentialService:
                 raise CredentialNotFoundError(credential_id)
         async with self._ctx.admin_db.session() as session:
             binding = await PrerequisiteRepository.get_agent_credential_binding(
-                session, agent_id=agent_id, credential_id=credential_id
+                session,
+                agent_id=agent_id,
+                credential_id=credential_id,
+                visible_to=self._bound_agent_visibility(credential, identity),
             )
         if binding is None:
             raise AgentBindingNotFoundError(credential_id, agent_id)
-        return binding
+        return binding._replace(credential_name=credential.name)
 
     async def _record_rules_change(
-        self, credential_id: str, agent_id: str, *, identity: Identity, reason: str
+        self,
+        credential_id: str,
+        agent_id: str,
+        binding: AgentCredentialBindingRow,
+        *,
+        identity: Identity,
+        reason: str,
     ) -> None:
-        """Audit + telemetry for a rules mutation (mirrors the toolkit path)."""
+        """Audit + telemetry for a rules mutation (mirrors the toolkit path).
+
+        ``binding`` is the row :meth:`_require_visible_binding` returned; its
+        agent and credential names label the event summary.
+        """
         await record_audit_best_effort(
             self._ctx,
             action=AuditAction.UPDATE,
@@ -537,9 +693,13 @@ class CredentialService:
                     type=EventType.CREDENTIAL_PERMISSION_RULE_SET,
                     severity=EventSeverity.INFO,
                     summary=(
-                        f"Permission rules set on agent {agent_id} for credential {credential_id}"
+                        "Permission rules set on agent "
+                        f"{summary_label(binding.agent_name, agent_id)} for credential "
+                        f"{summary_label(binding.credential_name, credential_id)}"
                     ),
-                    created_by=identity.sub,
+                    data={"agent_id": agent_id, "credential_id": credential_id},
+                    # Subject is the agent, so its owner sees the rules change.
+                    created_by=agent_id,
                     actor_id=identity.sub,
                     actor_type=identity.actor_type.value,
                 )
@@ -567,7 +727,7 @@ class CredentialService:
         identity: Identity,
     ) -> list[AgentPermissionRule]:
         """Replace the full user-rule list for a binding (idempotent PUT)."""
-        await self._require_visible_binding(
+        binding = await self._require_visible_binding(
             credential_id, agent_id, identity=identity, for_write=True
         )
         async with self._ctx.control_db.transaction() as session:
@@ -575,7 +735,7 @@ class CredentialService:
                 session, agent_id, credential_id, rules, created_by=identity.sub
             )
         await self._record_rules_change(
-            credential_id, agent_id, identity=identity, reason="replace permission rules"
+            credential_id, agent_id, binding, identity=identity, reason="replace permission rules"
         )
         return result
 
@@ -589,7 +749,7 @@ class CredentialService:
         remove: list[int] | None = None,
     ) -> list[AgentPermissionRule]:
         """Additively add and/or remove user rules on a binding."""
-        await self._require_visible_binding(
+        binding = await self._require_visible_binding(
             credential_id, agent_id, identity=identity, for_write=True
         )
         async with self._ctx.control_db.transaction() as session:
@@ -597,7 +757,7 @@ class CredentialService:
                 session, agent_id, credential_id, add=add, remove=remove, created_by=identity.sub
             )
         await self._record_rules_change(
-            credential_id, agent_id, identity=identity, reason="patch permission rules"
+            credential_id, agent_id, binding, identity=identity, reason="patch permission rules"
         )
         return result
 
@@ -619,9 +779,9 @@ class CredentialService:
         shared ``permission_rule_set`` the set's list is what gets evaluated —
         inline rules are dormant while a set is attached, and the dry-run must
         not lie about that. Default-deny when nothing matches. The broker's
-        condition-less-``allow`` skip is honoured so a bare ``allow`` with no
-        constraints doesn't unlock a dry-run any more than it unlocks a real
-        request.
+        condition-less skip is honoured so a bare ``allow`` or
+        ``require-approval`` with no constraints matches a dry-run no more than
+        it matches a real request.
         """
         binding = await self._require_visible_binding(credential_id, agent_id, identity=identity)
         async with self._ctx.control_db.session() as session:
@@ -634,24 +794,38 @@ class CredentialService:
                     session, agent_id, credential_id
                 )
 
-        method_upper = method.upper()
-        for idx, rule in enumerate(rules):
-            rule_methods = rule.methods
-            rule_path = rule.path
-            rule_ops = rule.operations
-            is_condition_less = rule_methods is None and rule_path is None and rule_ops is None
-            if is_condition_less and rule.effect.lower() == "allow":
-                continue
-            if rule_methods is not None:
-                methods_set = {m.upper() for m in rule_methods}
-                if method_upper not in methods_set:
-                    continue
-            if rule_path is not None:
-                matcher = compile_matcher(rule_path, str(rule.match_mode or "regex"))
-                if matcher is not None and not matcher.matches(path):
-                    continue
-            if rule_ops is not None and (operation_id is None or operation_id not in rule_ops):
-                continue
+        # The broker refuses a path whose dot segments are spelled ambiguously
+        # (``ambiguous_path``) before any rule runs; the dry-run must not
+        # report such a path as allowed.
+        if has_ambiguous_traversal(path):
+            return PermissionTestResult(
+                allowed=False,
+                matched=False,
+                effect=None,
+                rule_index=None,
+                credential_id=None,
+                is_system=None,
+            )
+        compiled = [
+            PermissionRule(
+                effect=rule.effect,
+                methods=normalize_methods(rule.methods),
+                path=compile_matcher(rule.path, str(rule.match_mode or "regex")),
+                operations=tuple(rule.operations) if rule.operations is not None else None,
+            )
+            for rule in rules
+        ]
+        # The broker enforces on the normalized server-relative path; normalize
+        # the dry-run input the same way so ``/%61dmin`` previews as ``/admin``.
+        idx = first_matching_rule(
+            compiled,
+            method=method,
+            path=normalize_path(path),
+            operation_id=operation_id,
+            binding=f"{agent_id}:{credential_id}",
+        )
+        if idx is not None:
+            rule = rules[idx]
             return PermissionTestResult(
                 allowed=rule.effect.lower() == "allow",
                 matched=True,
@@ -686,13 +860,24 @@ class CredentialService:
         when the set is detached). The set must exist — the pointer is FK-less
         across the DB seam, so this check plus the delete-time
         ``rule_set_in_use`` refusal are the integrity guard.
+
+        The caller must also be allowed to attach the set
+        (:meth:`_may_attach_rule_set`), because whoever may edit the set then
+        decides what the agent may do. Re-attaching the set a binding already
+        points at is an idempotent no-op that skips that check, so an existing
+        attachment keeps working for the binding's owner.
         """
-        await self._require_visible_binding(
+        binding = await self._require_visible_binding(
             credential_id, agent_id, identity=identity, for_write=True
         )
         async with self._ctx.control_db.session() as session:
-            if await PermissionRuleSetRepository.get_by_id(session, rule_set_id) is None:
-                raise RuleSetNotFoundError(rule_set_id)
+            rule_set = await PermissionRuleSetRepository.get_by_id(session, rule_set_id)
+        if rule_set is None:
+            raise RuleSetNotFoundError(rule_set_id)
+        if binding.rule_set_id == rule_set_id:
+            return
+        if not self._may_attach_rule_set(rule_set, identity):
+            raise RuleSetAttachDeniedError(rule_set_id)
         async with self._ctx.admin_db.transaction() as session:
             await PrerequisiteRepository.set_binding_rule_set(
                 session, agent_id=agent_id, credential_id=credential_id, rule_set_id=rule_set_id
@@ -700,6 +885,7 @@ class CredentialService:
         await self._record_rules_change(
             credential_id,
             agent_id,
+            binding,
             identity=identity,
             reason=f"attach rule set {rule_set_id}",
         )
@@ -724,19 +910,38 @@ class CredentialService:
         await self._record_rules_change(
             credential_id,
             agent_id,
+            binding,
             identity=identity,
             reason=f"detach rule set {binding.rule_set_id}",
         )
 
-    def _may_mutate_rule_set(self, rule_set: PermissionRuleSet, identity: Identity) -> bool:
-        """Provisional creator-or-admin write gate (theme plan OQ-6 is open).
+    @staticmethod
+    def _may_mutate_rule_set(rule_set: PermissionRuleSet, identity: Identity) -> bool:
+        """Write gate for a shared rule set: ``org:admin``, or the creator of a non-curated set.
 
-        Everyone passing the route's read scope may *see* a shared set —
+        Everyone passing the route's read permission may *see* a shared set —
         it carries policy, not secrets, and a binding pointing at it makes
-        its contents the binding owner's business. Widening the write gate
-        later needs no schema change.
+        its contents the binding owner's business. Editing a set changes the
+        policy of every binding attached to it, so a curated set (which any
+        ``credentials:write`` holder may attach) is editable only by
+        ``org:admin``, including after its creator loses that permission.
         """
-        return ORG_ADMIN in identity.permissions or rule_set.created_by == identity.sub
+        if ORG_ADMIN in identity.permissions:
+            return True
+        return not rule_set.curated and rule_set.created_by == identity.sub
+
+    @staticmethod
+    def _may_attach_rule_set(rule_set: PermissionRuleSet, identity: Identity) -> bool:
+        """Attach gate for a shared rule set: ``org:admin``, the creator, or any caller if curated.
+
+        The caller already holds ``credentials:write`` (the route requires it)
+        and may write the binding's rules. Attaching another user's
+        non-curated set is refused: its creator could later rewrite the
+        attached agent's policy.
+        """
+        if ORG_ADMIN in identity.permissions or rule_set.curated:
+            return True
+        return rule_set.created_by is not None and rule_set.created_by == identity.sub
 
     async def create_rule_set(
         self,
@@ -746,12 +951,20 @@ class CredentialService:
         rules: list[dict[str, object]],
         identity: Identity,
     ) -> tuple[PermissionRuleSet, list[PermissionRuleSetRule]]:
-        """Create a named shared rule set, optionally with its initial ordered rules."""
+        """Create a named shared rule set, optionally with its initial ordered rules.
+
+        A set an ``org:admin`` creates is recorded as curated (see
+        :meth:`_may_attach_rule_set`).
+        """
         async with self._ctx.control_db.transaction() as session:
             if await PermissionRuleSetRepository.get_by_name(session, name) is not None:
                 raise RuleSetNameConflictError(name)
             rule_set = await PermissionRuleSetRepository.create(
-                session, name=name, description=description, created_by=identity.sub
+                session,
+                name=name,
+                description=description,
+                created_by=identity.sub,
+                curated=ORG_ADMIN in identity.permissions,
             )
             set_rules = await PermissionRuleSetRepository.replace_user_rules(
                 session, rule_set.id, rules, created_by=identity.sub
@@ -804,13 +1017,13 @@ class CredentialService:
         name: str | None = None,
         description: str | None = None,
     ) -> PermissionRuleSet:
-        """Rename or re-describe a rule set (creator or org admin)."""
+        """Rename or re-describe a rule set (see :meth:`_may_mutate_rule_set`)."""
         async with self._ctx.control_db.transaction() as session:
             rule_set = await PermissionRuleSetRepository.get_by_id(session, rule_set_id)
             if rule_set is None:
                 raise RuleSetNotFoundError(rule_set_id)
             if not self._may_mutate_rule_set(rule_set, identity):
-                raise RuleSetAccessDeniedError(rule_set_id)
+                raise RuleSetAccessDeniedError(rule_set_id, curated=rule_set.curated)
             if name is not None and name != rule_set.name:
                 if await PermissionRuleSetRepository.get_by_name(session, name) is not None:
                     raise RuleSetNameConflictError(name)
@@ -838,7 +1051,7 @@ class CredentialService:
             if rule_set is None:
                 raise RuleSetNotFoundError(rule_set_id)
             if not self._may_mutate_rule_set(rule_set, identity):
-                raise RuleSetAccessDeniedError(rule_set_id)
+                raise RuleSetAccessDeniedError(rule_set_id, curated=rule_set.curated)
             result = await PermissionRuleSetRepository.replace_user_rules(
                 session, rule_set_id, rules, created_by=identity.sub
             )
@@ -859,7 +1072,7 @@ class CredentialService:
             if rule_set is None:
                 raise RuleSetNotFoundError(rule_set_id)
             if not self._may_mutate_rule_set(rule_set, identity):
-                raise RuleSetAccessDeniedError(rule_set_id)
+                raise RuleSetAccessDeniedError(rule_set_id, curated=rule_set.curated)
         async with self._ctx.admin_db.session() as session:
             binding_count = await PrerequisiteRepository.count_bindings_for_rule_set(
                 session, rule_set_id
@@ -922,6 +1135,7 @@ class CredentialService:
             identity,
             Credential,
             bound_credential_ids=await self._bound_credential_ids(identity),
+            owned_agent_ids=await self._owned_agent_ids(identity),
             include_shared=True,
         )
 
@@ -934,7 +1148,10 @@ class CredentialService:
             if has_more:
                 rows = rows[:limit]
 
-            data = [self._to_redacted(r) for r in rows]
+            names = await OAuthAppRegistrationRepository.get_names_by_ids(
+                session, _registration_ids(rows)
+            )
+            data = [self._to_redacted(r, registration_names=names) for r in rows]
             next_cursor = None
             if has_more and rows:
                 last = rows[-1]
@@ -1100,7 +1317,10 @@ class CredentialService:
             if changed:
                 credential.updated_at = datetime.now(UTC)
             await session.flush()
-            view = self._to_redacted(credential)
+            names = await OAuthAppRegistrationRepository.get_names_by_ids(
+                session, _registration_ids([credential])
+            )
+            view = self._to_redacted(credential, registration_names=names)
             after_state = {"name": credential.name, "active": credential.active}
 
         # A PATCH that persisted nothing (e.g. only echoed field_name/location)
@@ -1146,7 +1366,9 @@ class CredentialService:
             origin=identity.origin.value,
         )
 
-    def _to_redacted(self, credential: Any) -> CredentialRedactedView:
+    def _to_redacted(
+        self, credential: Any, *, registration_names: dict[str, str]
+    ) -> CredentialRedactedView:
         """Project an ORM Credential to a redacted view."""
         stored_type = StoredCredentialType(credential.type)
         wire_type = to_wire(stored_type)
@@ -1241,6 +1463,14 @@ class CredentialService:
         else:
             details = BearerTokenRedacted(token_preview=None)
 
+        # Shared-registration provenance. ``registration_names`` is batch-
+        # loaded by the caller: ``Credential.oauth_app_registration`` is
+        # ``lazy="raise"`` so credential reads never drag in the registration
+        # and its sealed client secret. ``None`` when the credential wasn't
+        # minted through a shared registration.
+        oar_id = credential.oauth_app_registration_id
+        oar_name = registration_names.get(oar_id) if oar_id is not None else None
+
         return CredentialRedactedView(
             credential_id=credential.id,
             type=wire_type,
@@ -1259,6 +1489,8 @@ class CredentialService:
             updated_at=credential.updated_at,
             details=details,
             server_variables=credential.server_variables,
+            oauth_app_registration_id=oar_id,
+            oauth_app_registration_name=oar_name,
         )
 
     def _validate_create_fields(self, payload: CredentialCreate, *, managed: bool) -> None:
@@ -1311,3 +1543,142 @@ class CredentialService:
                     f"api.{axis} '{value}' is not an identity — it looks like a spec path"
                 )
         return canonical_credential_scope(vendor=api.vendor, name=api.name, version=api.version)
+
+    async def _catalog_registered_scope(
+        self, scope: CredentialScope, catalog_api_id: str | None
+    ) -> CredentialScope:
+        """The scope naming the API actually imported from ``catalog_api_id``.
+
+        A client picking a catalog entry derives the API name from its id, and
+        that derivation is not the importer's: a ``domain/sub`` entry registers
+        under its sub segment (or its whole id when sub segments collide), and an
+        API imported by an older release keeps the name it was created with. The
+        imported row is the authority, so when one carries this catalog id and
+        the same vendor, its name replaces the client's. A vendor-wide scope (no
+        name) and a scope on another vendor are the caller's choice and stay.
+        Best effort, like the coverage check: no registry DB, a slow one, or no
+        imported row leaves the scope as given.
+        """
+        if not catalog_api_id or scope.name is None or not self._ctx.has_db("registry"):
+            return scope
+        try:
+            async with asyncio.timeout(_REGISTRY_PROBE_TIMEOUT_S):
+                async with self._ctx.registry_db.session() as session:
+                    registered = await RegistryApiLookupRepository.identity_for_catalog_api_id(
+                        session, catalog_api_id
+                    )
+        except Exception:
+            logger.warning(
+                "credential_catalog_identity_lookup_failed",
+                catalog_api_id=catalog_api_id,
+                exc_info=True,
+            )
+            return scope
+        if registered is None:
+            return scope
+        vendor, name = registered
+        if vendor != scope.vendor or name == scope.name:
+            return scope
+        logger.info(
+            "credential_catalog_identity_resolved",
+            catalog_api_id=catalog_api_id,
+            requested_name=scope.name,
+            registered_name=name,
+        )
+        return CredentialScope(vendor=vendor, name=name, version=scope.version)
+
+    async def _unmatched_scope_warning(
+        self, scope: CredentialScope
+    ) -> _UnmatchedScopeWarning | None:
+        """Advisory check: does the canonical scope cover any imported API? (#1020)
+
+        Creating a credential before importing its API is a legitimate order of
+        operations (and a standalone control process is not granted the registry
+        DB), so this never blocks or fails the create — best-effort only, with a
+        hard time bound so a hung registry DB can't stall the create either.
+        One registry read fetches the vendor's identities; coverage is evaluated
+        here with the broker's ``credential_covers`` semantics, and when nothing is
+        covered the same rows name the vendor's imported identities so a near-miss
+        (e.g. a #1020 vendor-doubled workspace name) is visible at create time
+        rather than as an execute-time 403.
+
+        Events are append-only, so a warning about an API whose import is
+        already queued (the UI and ``ensure_imported`` enqueue the import and
+        create the credential back to back) would stay false forever; the
+        check is skipped when a pending import job may land a covered identity.
+        """
+        if not self._ctx.has_db("registry"):
+            return None
+        try:
+            async with asyncio.timeout(_REGISTRY_PROBE_TIMEOUT_S):
+                async with self._ctx.registry_db.session() as session:
+                    identities = await RegistryApiLookupRepository.identities_for_vendor(
+                        session, scope.vendor
+                    )
+        except Exception:
+            logger.warning(
+                "credential_api_match_check_failed", api_vendor=scope.vendor, exc_info=True
+            )
+            return None
+        if any(
+            credential_covers(scope, vendor=scope.vendor, name=name, version=version)
+            for name, version in identities
+        ):
+            return None
+        if await self._pending_import_may_cover(scope):
+            return None
+        reference = _scope_reference(scope)
+        # The scope is immutable after create, so "import the API" is only half
+        # the remedy — a mis-scoped credential must be re-created.
+        message = (
+            f"API scope '{reference}' matches no imported API — executions using this "
+            "credential will fail. Import a matching API, or delete this credential "
+            "and re-create it scoped to an imported identity"
+        )
+        if identities:
+            listed = ", ".join(
+                f"{scope.vendor}/{name} ({version})"
+                for name, version in identities[:_SIBLING_HINT_LIMIT]
+            )
+            message += f"; imported APIs for this vendor: {listed}"
+        logger.warning(
+            "credential_unmatched_api",
+            api_vendor=scope.vendor,
+            api_name=scope.name,
+            api_version=scope.version,
+        )
+        return _UnmatchedScopeWarning(reference=reference, message=message)
+
+    async def _pending_import_may_cover(self, scope: CredentialScope) -> bool:
+        """Whether a queued/running import job may land an identity ``scope`` covers.
+
+        Matches the job source's ``vendor`` / ``api_name`` seeds against the
+        scope's vendor and name axes (the version is only known once the spec
+        is fetched, so it is not compared). Best-effort and time-bounded like
+        the registry read: on failure it answers ``False`` so the advisory
+        still fires.
+        """
+        try:
+            async with asyncio.timeout(_REGISTRY_PROBE_TIMEOUT_S):
+                async with self._ctx.admin_db.session() as session:
+                    sources = await PendingImportLookupRepository.pending_import_sources(session)
+        except Exception:
+            logger.warning(
+                "credential_pending_import_check_failed", api_vendor=scope.vendor, exc_info=True
+            )
+            return False
+        for source in sources:
+            vendor = source.get("vendor")
+            if not isinstance(vendor, str) or slugify_api_field(vendor) != scope.vendor:
+                continue
+            if scope.name is None:
+                return True
+            name = source.get("api_name")
+            if isinstance(name, str) and slugify_api_field(name) == scope.name:
+                return True
+        return False
+
+
+def _registration_ids(credentials: Sequence[Credential]) -> list[str]:
+    """Distinct ``oauth_app_registration_id`` values across ``credentials``."""
+    return sorted({c.oauth_app_registration_id for c in credentials if c.oauth_app_registration_id})

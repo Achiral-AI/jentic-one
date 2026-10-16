@@ -114,7 +114,14 @@ def _payload(result: Any) -> dict[str, Any]:
 
 def _job(status: str, *, error: str | None = None, kind: str = "import") -> JobView:
     return JobView(
-        id="job_9", kind=kind, status=status, error=error, created_at=_NOW, updated_at=_NOW
+        id="job_9",
+        kind=kind,
+        status=status,
+        error=error,
+        created_at=_NOW,
+        updated_at=_NOW,
+        actor_id="usr_test",
+        actor_type="user",
     )
 
 
@@ -274,7 +281,7 @@ async def test_missing_jobs_read_degrades_to_the_filed_envelope_without_polling(
     leg does (GET /jobs/{id}). An identity with catalog:import but not
     jobs:read files successfully and gets the queued envelope — NOT an error
     (the filing succeeded) — and the job service is never touched. Both
-    scopes ride DEFAULT_AGENT_SCOPES, so defaults are unaffected."""
+    permissions ride DEFAULT_AGENT_PERMISSIONS, so defaults are unaffected."""
     env = _env(["catalog:import"])  # no jobs:read
     result = await dispatch_tool_call(env, "import_api", {"api_id": "googleapis.com/sheets"})
     assert not result.is_error, "a missing poll scope degrades; the filing still succeeded"
@@ -565,7 +572,7 @@ async def test_promote_without_apis_write_soft_fails_without_calling_the_service
     result = await dispatch_tool_call(env, "import_api", {"api_id": "googleapis.com/sheets"})
     assert not result.is_error, "a promote failure is never a hard error"
     payload = _payload(result)
-    assert payload["promoted"] == {"rev_1": "promote failed: missing apis:write scope"}
+    assert payload["promoted"] == {"rev_1": "promote failed: missing apis:write permission"}
     assert _FakeRevisionService.promotes == []
 
 

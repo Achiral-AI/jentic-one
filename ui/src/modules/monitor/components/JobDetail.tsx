@@ -1,22 +1,23 @@
 /**
  * Job record — the detail for one async job.
  *
- * Shows the job's state and timing, the execution it produced (if any), its
- * resolved actor (from the audit log via `job_id` — jobs carry no actor on
- * the wire) and a "View in audit" link. Cancel is org:admin-only and offered
- * only while the job is still queued or running.
+ * Shows the job's state and timing, the execution it produced (if any), who
+ * enqueued it (`actor_id`/`actor_type` straight off the job record) and a
+ * "View in audit" link. Cancel is org:admin-only and offered only while the
+ * job is still queued or running.
  */
 import { useState } from 'react';
+import { useNavigate } from 'react-router';
 import { ArrowUpRight } from 'lucide-react';
-import { ActorLabel, AppLink, Button, ErrorAlert, LoadingState } from '@/shared/ui';
+import { ROUTES } from '@/shared/app/routes';
+import { ActorLabel, AppLink, Button, ErrorAlert, LoadingState, ConfirmDialog } from '@/shared/ui';
 import {
+	isCancellableJob,
 	isTerminalJobStatus,
 	toJobStatus,
-	useActorForJob,
 	useCancelJob,
 	useJob,
 } from '@/modules/monitor/api';
-import { ConfirmDialog } from '@/modules/monitor/components/ConfirmDialog';
 import { DetailRow, DetailSection } from '@/modules/monitor/components/Detail';
 import {
 	DetailFrame,
@@ -32,14 +33,20 @@ import { ORG_ADMIN, usePermission } from '@/modules/monitor/lib/usePermission';
 export function JobDetail({ jobId, frame }: { jobId: string; frame: DetailFrameContext }) {
 	const query = useJob(jobId);
 	const isAdmin = usePermission(ORG_ADMIN);
-	const { actor } = useActorForJob(jobId, { canReadAudit: isAdmin });
 	const cancel = useCancelJob();
 	const [confirmOpen, setConfirmOpen] = useState(false);
 
 	const job = query.data;
 	const status = job ? toJobStatus(job.status) : null;
-	const canCancel = isAdmin && status != null && !isTerminalJobStatus(status);
+	const canCancel =
+		isAdmin && job != null && status != null && isCancellableJob(status, job.kind);
 	const span = job ? formatSpan(job.created_at, job.updated_at) : null;
+	const navigate = useNavigate();
+	// A held execution settles through its review on the Approvals page, never
+	// by cancelling the job.
+	const heldExecution = status === 'held' && job?.kind === 'execution';
+	// A held call's execution record is written only once it runs.
+	const hasExecutionRecord = status !== 'held';
 
 	const confirmCancel = () => {
 		if (!job) return;
@@ -54,7 +61,16 @@ export function JobDetail({ jobId, frame }: { jobId: string; frame: DetailFrameC
 			id={jobId}
 			idLabel="job id"
 			actions={
-				canCancel && job ? (
+				heldExecution ? (
+					<Button
+						variant="primary"
+						size={frame.mode === 'pane' ? 'sm' : undefined}
+						onClick={() => navigate(ROUTES.approvals)}
+						className={frame.mode === 'sheet' ? 'flex-1' : undefined}
+					>
+						Open approvals
+					</Button>
+				) : canCancel && job ? (
 					<Button
 						variant="danger"
 						size={frame.mode === 'pane' ? 'sm' : undefined}
@@ -114,19 +130,15 @@ export function JobDetail({ jobId, frame }: { jobId: string; frame: DetailFrameC
 						}
 					>
 						<div className="text-sm">
-							{actor ? (
-								actor.actorId ? (
-									<ActorLabel
-										actorId={actor.actorId}
-										actorType={actor.actorType}
-										className="font-medium"
-									/>
-								) : (
-									<span className="font-medium">{actor.actorType}</span>
-								)
+							{job.actor_id ? (
+								<ActorLabel
+									actorId={job.actor_id}
+									actorType={job.actor_type}
+									className="font-medium"
+								/>
 							) : (
 								<span className="text-muted-foreground">
-									No actor recorded in the audit log for this job.
+									No actor recorded for this job.
 								</span>
 							)}
 						</div>
@@ -135,7 +147,7 @@ export function JobDetail({ jobId, frame }: { jobId: string; frame: DetailFrameC
 					<DetailSection title="Ids">
 						<IdRow label="Job id" value={job.job_id} />
 						<DetailRow label="Raw kind" value={job.kind} mono />
-						{job.execution_id && (
+						{job.execution_id && hasExecutionRecord && (
 							<DetailRow
 								label="Execution"
 								value={
@@ -167,6 +179,7 @@ export function JobDetail({ jobId, frame }: { jobId: string; frame: DetailFrameC
 					</>
 				}
 				confirmLabel="Cancel job"
+				cancelLabel="Keep job"
 				onConfirm={confirmCancel}
 				onClose={() => setConfirmOpen(false)}
 				pending={cancel.isPending}

@@ -1,7 +1,7 @@
 import type { ReactElement, ReactNode } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter, Routes, Route } from 'react-router';
-import { render, type RenderOptions } from '@testing-library/react';
+import { render, screen, waitFor, type RenderOptions } from '@testing-library/react';
 import { http, HttpResponse } from 'msw';
 
 interface Options extends Omit<RenderOptions, 'wrapper'> {
@@ -22,9 +22,13 @@ interface Options extends Omit<RenderOptions, 'wrapper'> {
 export function renderWithProviders(ui: ReactElement, options: Options = {}) {
 	const { route = '/', path, ...renderOptions } = options;
 
+	// `gcTime: Infinity`: StrictMode (enabled in setup.ts) unmounts and remounts
+	// every effect, which briefly leaves a query with no observer. A finite
+	// gcTime can collect it in that gap and fire a second fetch on remount. The
+	// client is per-render, so nothing outlives the test.
 	const queryClient = new QueryClient({
 		defaultOptions: {
-			queries: { retry: false, gcTime: 0 },
+			queries: { retry: false, gcTime: Infinity },
 			mutations: { retry: false },
 		},
 	});
@@ -50,6 +54,62 @@ export function renderWithProviders(ui: ReactElement, options: Options = {}) {
 
 export * from '@testing-library/react';
 export { default as userEvent } from '@testing-library/user-event';
+
+/**
+ * Wait until every finite animation and transition touching `root` has
+ * finished. axe reads colours from one frame, so a row still fading in from
+ * opacity 0 (a framer-motion entrance, a sheet sliding in, a tick's colour
+ * transition) reports a colour-contrast failure the settled UI doesn't have.
+ * Call it right before `checkA11y` on a surface that animates. Infinite loops
+ * (spinners, pulses) never end, so they are left out.
+ */
+export async function settleAnimations(root: Element = document.body): Promise<void> {
+	await waitFor(
+		() => {
+			const moving = document.getAnimations().filter((animation) => {
+				if (animation.playState !== 'running') return false;
+				const target =
+					animation.effect instanceof KeyframeEffect ? animation.effect.target : null;
+				if (!target || !root.contains(target)) return false;
+				return animation.effect?.getComputedTiming().endTime !== Infinity;
+			});
+			if (moving.length > 0) {
+				throw new Error(`${moving.length} animation(s) still running under the root`);
+			}
+		},
+		{ timeout: 3000 },
+	);
+}
+
+/**
+ * Wait until the topmost sheet has finished entering, so axe measures contrast
+ * against the settled surface. The backdrop's opacity fade only starts once the
+ * sheet flips to `open` (a double rAF after mount), so `settleAnimations` alone
+ * can pass before it has begun; reading the computed opacity can't. `items`
+ * returns content that fades in on its own (a framer-motion stagger from
+ * opacity 0): each must reach opacity 1, and an empty list fails rather than
+ * passing vacuously. axe blends a translucent ancestor into the colours it
+ * measures, so auditing a half-faded row reads its text as low-contrast.
+ */
+export async function sheetSettled(items?: () => Element[]): Promise<void> {
+	await waitFor(
+		() => {
+			const backdrops = screen.getAllByTestId('sheet-backdrop');
+			const backdrop = backdrops[backdrops.length - 1];
+			if (getComputedStyle(backdrop).opacity !== '1') {
+				throw new Error('the sheet backdrop is still fading in');
+			}
+			if (!items) return;
+			const list = items();
+			if (list.length === 0) throw new Error('no sheet items to wait on');
+			const fading = list.filter((item) => getComputedStyle(item).opacity !== '1');
+			if (fading.length > 0) {
+				throw new Error(`${fading.length} sheet item(s) still fading in`);
+			}
+		},
+		{ timeout: 3000 },
+	);
+}
 
 /**
  * Run axe against a rendered container and assert no critical/serious violations.
@@ -97,6 +157,36 @@ export async function checkA11y(
 			.join('\n');
 		throw new Error(`axe found ${critical.length} critical/serious violation(s):\n${summary}`);
 	}
+}
+
+/**
+ * Swap `window.localStorage` for an in-memory store until the returned restore
+ * runs. Test files share one origin, so a real write reaches every other file
+ * as a `storage` event; tests that write app-wide preferences (the theme) use
+ * this so their writes stay inside the file. `failWrites` makes `setItem`
+ * throw, as a browser with storage blocked does.
+ */
+export function stubLocalStorage(options: { failWrites?: boolean } = {}): () => void {
+	const real = Object.getOwnPropertyDescriptor(window, 'localStorage');
+	const data = new Map<string, string>();
+	const memory: Storage = {
+		get length() {
+			return data.size;
+		},
+		clear: () => data.clear(),
+		getItem: (key) => data.get(key) ?? null,
+		key: (index) => [...data.keys()][index] ?? null,
+		removeItem: (key) => void data.delete(key),
+		setItem: (key, value) => {
+			if (options.failWrites) throw new DOMException('Storage is blocked', 'SecurityError');
+			data.set(key, String(value));
+		},
+	};
+	Object.defineProperty(window, 'localStorage', { configurable: true, value: memory });
+	return () => {
+		if (real) Object.defineProperty(window, 'localStorage', real);
+		else delete (window as { localStorage?: Storage }).localStorage;
+	};
 }
 
 /**

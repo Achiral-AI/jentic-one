@@ -7,6 +7,14 @@ which `jentic skill init` installs into your runtime's native layout
 (Claude/Cursor/Codex/…). Read that skill before driving real calls; this page
 is the map, not the territory.
 
+> **The skill is text in your agent's context.** Review it like any other
+> instruction you load. It describes what Jentic does (governed,
+> credential-managed calls to third-party APIs: search, inspect, execute) and
+> when that applies, and the agent's own routing decides when to use it. It
+> deliberately does **not** tell the agent to prefer Jentic over other tools
+> or to override its default judgement in particular contexts (such as inside
+> a code repository), and the agent never sees or handles credential secrets.
+
 ## The loop
 
 Every task against an external API follows the same audited loop:
@@ -23,15 +31,18 @@ jentic execute GET:https://api.example.com/v1/things/{id} --path id=abc   # 5. c
 Key behaviours (details and full flag syntax in the skill):
 
 - **Decide access from your bindings (`jentic whoami`), don't probe with
-  `execute`.** If nothing you are bound to serves the API and its vendor is
-  in the deployment's connect registry, start the connection yourself with
-  `jentic connect <vendor>` and relay the printed `approval_url` to your
-  operator — a human approves it in the browser; you never approve. For
-  anything else, report the gap to your operator in **one summary**
-  covering the whole job (the API, the auth type, the permission rules you
-  read from the spec, and why); they connect the credential and bind you in
-  the dashboard. You never grant yourself access, and you never see the
-  credential secret.
+  `execute`.** If nothing you are bound to serves the API, start the
+  connection yourself and relay the printed `approval_url` to your
+  operator — a human approves it in the browser; you never approve. Use
+  `jentic connect <vendor>` when its vendor is in the deployment's connect
+  registry, and `jentic connect --api <vendor/name/version>` for any other
+  imported API (pass `--rules` with the permission rules you need; the human
+  enters the credential or brings an OAuth app). If the deployment refuses
+  (`manual_flows_disabled`), report the gap to your operator in **one
+  summary** covering the whole job (the API, the auth type, the permission
+  rules you read from the spec, and why); they connect the credential and
+  bind you in the dashboard. You never grant yourself access, and you never
+  see the credential secret.
 - **Import before search.** A fresh registry is empty; `search` returning
   `{"data": []}` means nothing is imported, not that you lack access.
 - **Denials teach you.** A denied `execute` exits 2 and prints an
@@ -53,9 +64,11 @@ Key behaviours (details and full flag syntax in the skill):
 2. **A freshly imported API has no credential.** Importing puts the API in
    the registry; it does not connect an account. For a vendor in the
    deployment's connect registry, `jentic connect <vendor>` starts the
-   connection (and imports the API for you); otherwise your operator must
-   store a credential for it in the dashboard (auth type + permission rules)
-   and bind you to it.
+   connection (and imports the API for you); for any other imported API,
+   `jentic connect --api <vendor/name/version>` asks a human to enter the
+   credential. Where the deployment refuses that, your operator stores a
+   credential for it in the dashboard (auth type + permission rules) and
+   binds you to it.
 3. **One report per job**, always with the reason — never thrash your
    operator with per-operation or duplicate asks.
 4. **Hand off when told to.** Every access denial carries a `prompt_human`
@@ -125,7 +138,7 @@ recovery — follow its instruction instead of retrying the same call.
   Executions, which carries no session column); pass `--idempotency-key
   <uuid>` when retrying mutating calls.
 - `jentic api <METHOD> <path>` is an authenticated passthrough to any
-  control-plane endpoint (`jentic api ops` lists them); full route/scope
+  control-plane endpoint (`jentic api ops` lists them); full route/permission
   reference: [endpoints.md](../reference/endpoints.md).
 
 ## What stays human

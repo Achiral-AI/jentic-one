@@ -10,11 +10,18 @@ from jentic_one.admin.services.errors import (
     EventNotFoundError,
     ExecutionNotFoundError,
     ExecutionRetentionElapsedError,
+    HeldExecutionAlreadyDecidedError,
+    HeldExecutionForbiddenError,
+    HeldExecutionJobNotHeldError,
+    HeldExecutionNotFoundError,
+    HeldExecutionResultExpiredError,
+    HeldExecutionResultNotReadyError,
     InvalidCredentialsError,
     InvalidInputError,
     InviteTokenAlreadyRedeemedError,
     InviteTokenExpiredError,
     InviteTokenNotFoundError,
+    JobAwaitingApprovalError,
     JobNotCancellableError,
     JobNotCompletedError,
     JobNotFoundError,
@@ -39,14 +46,26 @@ _ERROR_MAP: dict[type[Exception], tuple[int, str]] = {
     EventNotFoundError: (404, "event_not_found"),
     ExecutionRetentionElapsedError: (404, "execution_retention_elapsed"),
     ExecutionNotFoundError: (404, "execution_not_found"),
+    HeldExecutionNotFoundError: (404, "held_execution_not_found"),
+    HeldExecutionAlreadyDecidedError: (409, "held_execution_already_settled"),
+    HeldExecutionJobNotHeldError: (409, "held_execution_not_held"),
+    HeldExecutionForbiddenError: (403, "held_execution_decide_forbidden"),
+    HeldExecutionResultNotReadyError: (409, "held_execution_result_not_ready"),
+    HeldExecutionResultExpiredError: (410, "held_execution_result_expired"),
     AuditEntryNotFoundError: (404, "audit_entry_not_found"),
     InviteTokenNotFoundError: (404, "invite_token_not_found"),
     NotFoundError: (404, "not_found"),
     InvalidCredentialsError: (401, "invalid_credentials"),
     SessionExpiredError: (401, "session_expired"),
-    AccountLockedError: (423, "account_locked"),
+    # A locked account answers exactly like any other credential failure so an
+    # unauthenticated caller cannot use the response to confirm an account
+    # exists (or is under attack). The lockout stays visible server-side: the
+    # service audits it (reason ``account_locked``) and the handler logs the raw
+    # message as ``raw_detail``.
+    AccountLockedError: (401, "invalid_credentials"),
     EmailAlreadyExistsError: (409, "email_in_use"),
     InviteTokenAlreadyRedeemedError: (409, "invite_already_redeemed"),
+    JobAwaitingApprovalError: (409, "job_awaiting_approval"),
     JobNotCancellableError: (409, "job_not_cancellable"),
     JobNotCompletedError: (409, "job_not_completed"),
     LastActiveAdminError: (409, "last_active_admin"),
@@ -62,7 +81,13 @@ _ERROR_MAP: dict[type[Exception], tuple[int, str]] = {
     InvalidCursorError: (400, "invalid_cursor"),
 }
 
-service_error_handler = make_service_error_handler(_ERROR_MAP)
+# ``str(AccountLockedError)`` names the user id; the client gets the same
+# detail as a wrong password instead.
+_SERVICE_SAFE_DETAILS: dict[type[Exception], str] = {
+    AccountLockedError: str(InvalidCredentialsError()),
+}
+
+service_error_handler = make_service_error_handler(_ERROR_MAP, safe_details=_SERVICE_SAFE_DETAILS)
 
 # A DB constraint violation that escapes a service unmapped (e.g. a unique-index
 # collision the service didn't anticipate) is a conflict, not a server fault.

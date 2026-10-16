@@ -115,6 +115,12 @@ observability:
     exporter: none     # or "otlp" / "prometheus"
   tracing:
     exporter: none     # or "otlp"
+
+# Anonymous product telemetry: a fixed, closed-schema event set under a random
+# instance id (generated on first boot) — no credentials, request data, or PII
+# (docs/reference/config.md#telemetry). Set `enabled: false` to opt out.
+telemetry:
+  enabled: true
 ```
 
 **Connection-pool sizing:** each process holds up to `pool_max` connections
@@ -319,13 +325,16 @@ server {
 }
 ```
 
-Two worked compose examples as an alternative to the two `docker run`s:
+Three worked compose examples as an alternative to the two `docker run`s:
 
 - [app + broker against an external Postgres](docker-compose.md)
   — migrate → app + broker with health checks; the production shape of this page.
 - [the whole stack including Postgres](../agent/install.md#4-write-the-compose-file--jenticdocker-composeyaml)
   — the agent runbook's self-contained compose file (app, broker, and a
   `postgres:16` service with the schema init baked in).
+- [the SQLite trial stack](../../deploy/docker/quickstart/docker-compose.yaml)
+  — the README quickstart as one file (SQLite on a volume, dev-mode secrets);
+  trial use only.
 
 ## 7. Connect the CLIs
 

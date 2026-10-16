@@ -3,6 +3,7 @@ package golden
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -14,6 +15,10 @@ import (
 //	resolve ok   × upstream 4xx pass-through   → envelope, exit 0 (origin: upstream)
 //	resolve ok   × broker denial + directive   → envelope + recovery stderr, exit 2
 //	resolve ok   × broker denial, no directive → envelope + synthesized stderr, exit 2
+//	resolve ok   × held for approval           → held envelope + review link, exit 3
+//	resolve ok   × held, --wait, denied        → denial envelope + reviewer reason, exit 2
+//	resolve ok   × broker-origin 5xx           → envelope + coded TRANSPORT_ERROR, exit 1
+//	resolve ok   × upstream 5xx pass-through   → envelope, exit 0 (origin: upstream)
 //	resolve ok   × transport failure           → coded TRANSPORT_ERROR, exit 1
 //	resolve fail (404 / backend error)         → coded RESOLVE_FAILED, exit 2
 //
@@ -67,7 +72,8 @@ func TestGolden_ExecuteContract(t *testing.T) {
 	// A broker denial carrying a rich agent_directive: every rendering branch
 	// (instruction, run:, open:, candidates, retry-after, stuck?) is frozen.
 	// The wire type is no_credential_binding with a suggested_command (the
-	// disambiguation header form; access requests are retired).
+	// disambiguation header form; access requests are retired), plus the
+	// structured connect target and suggested_rules, which ride stdout verbatim.
 	brokerDenial403Directive := func(w http.ResponseWriter, _ *http.Request) {
 		w.Header()["Date"] = nil
 		w.Header().Set("Content-Type", "application/problem+json")
@@ -84,7 +90,9 @@ func TestGolden_ExecuteContract(t *testing.T) {
 					"suggested_command": "jentic execute --header Jentic-Credential-Id=cred_pets ...",
 					"provisioning_url": "https://console.example/connect/acme",
 					"candidates": ["cred_pets", "cred_pets_admin"],
-					"retry_after_seconds": 30
+					"retry_after_seconds": 30,
+					"connect": {"vendor_key": "acme", "registration_id": "oar_acme"},
+					"suggested_rules": [{"effect": "allow", "methods": ["GET"], "path": "/v1/pets", "match_mode": "exact"}]
 				},
 				"human_readable_instruction": "You are not bound for 'acme/pets'. Ask your operator to bind this agent to the credential serving 'acme/pets' (in the dashboard, or via POST /agents/{agent_id}/credentials) — only a human can grant the binding. Once bound, retry this call."
 			}
@@ -112,6 +120,31 @@ func TestGolden_ExecuteContract(t *testing.T) {
 			}
 		}`))
 	}
+	// The off-registry no_credential_binding 403 when the deployment takes API
+	// connect requests: the directive names the API itself as the connect
+	// target (suggested_command + the structured parameters.connect.api).
+	brokerDenial403ConnectAPI := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header()["Date"] = nil
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.Header().Set("Jentic-Error-Origin", "broker")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{
+			"type": "no_credential_binding",
+			"title": "No credential binding for this API",
+			"status": 403,
+			"error_origin": "broker",
+			"agent_directive": {
+				"strategy": "prompt_human",
+				"parameters": {
+					"api": {"vendor": "acme", "name": "pets", "version": "v1"},
+					"api_served": false,
+					"suggested_command": "jentic connect --api acme/pets/v1",
+					"connect": {"api": {"vendor": "acme", "name": "pets", "version": "v1"}}
+				},
+				"human_readable_instruction": "No credential is provisioned for 'acme/pets' yet. Start the request yourself: run ` + "`jentic connect --api acme/pets/v1 --reason \\\"…\\\"`" + ` (or call the request_connection tool with api {\"vendor\": \"acme\", \"name\": \"pets\", \"version\": \"v1\"} and a reason), and relay the approval_url it returns to your operator — a human enters the credential in the browser, which can take a while, so end your turn and retry this call later. Only a human can approve."
+			}
+		}`))
+	}
 	// A broker denial with NO agent_directive (e.g. action_denied): exit 2 with
 	// the synthesized status-keyed recovery, never a dead end.
 	brokerDenial424NoDirective := func(w http.ResponseWriter, _ *http.Request) {
@@ -127,12 +160,78 @@ func TestGolden_ExecuteContract(t *testing.T) {
 		}`))
 	}
 
+	// A call a require-approval rule held: the 202 held envelope (held
+	// execution, review link, directive, links) instead of a run.
+	brokerHeld := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header()["Date"] = nil
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Preference-Applied", "respond-async")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"status":"held","held_execution_id":"held_held1",` +
+			`"review_url":"https://console.example/app/agents/approvals/held_held1",` +
+			`"expires_at":"2026-10-10T12:00:00Z","agent_directive":"This call needs human approval.",` +
+			`"_links":{"self":"https://console.example/executions/holds/held_held1",` +
+			`"result":"https://console.example/executions/holds/held_held1/result",` +
+			`"withdraw":"https://console.example/executions/holds/held_held1:withdraw"}}`))
+	}
+	// The held execution's control-plane routes once a reviewer denied it:
+	// the call failed and its result is the approval_denied problem.
+	holdsDenied := func(w http.ResponseWriter, r *http.Request) {
+		w.Header()["Date"] = nil
+		if r.URL.Path == "/executions/holds/held_held1/result" {
+			w.Header().Set("Content-Type", "application/problem+json")
+			_, _ = w.Write([]byte(`{"type":"approval_denied","title":"Execution approval denied","status":403,` +
+				`"detail":"A reviewer denied this held execution: not today","error_origin":"broker",` +
+				`"held_execution":{"id":"held_held1","state":"denied"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"held_held1","state":"denied","execution_status":"failed",` +
+			`"agent_id":"agt_1","api_vendor":"example.com","api_name":"orders","api_version":"1",` +
+			`"credential_id":"cred_1","method":"POST","path":"/v1/orders","execution_id":"exec_held1",` +
+			`"expires_at":"2026-10-10T12:00:00Z","created_at":"2026-10-09T12:00:00Z",` +
+			`"_links":{"self":"/executions/holds/held_held1","result":"/executions/holds/held_held1/result"}}`))
+	}
+	// A broker-origin 503 (CircuitOpenError) with Retry-After: the broker
+	// fast-failed before reaching the upstream, so it is a retryable
+	// TRANSPORT_ERROR (exit 1) carrying the relayed Retry-After (#1531).
+	brokerCircuitOpen503 := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header()["Date"] = nil
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.Header().Set("Jentic-Error-Origin", "broker")
+		w.Header().Set("Retry-After", "12")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"type":"circuit_open","title":"Upstream circuit open; the broker is fast-failing to let it recover.","status":503,"detail":"Upstream circuit open; the broker is fast-failing to let it recover.","error_origin":"broker"}`))
+	}
+	// A broker-origin 504 (UpstreamTimeoutError) in the exact shape the broker
+	// renders it since #1675: stamped broker and typed upstream_timeout, so a
+	// read is a retryable TRANSPORT_ERROR (exit 1) instead of an exit-0 result.
+	brokerUpstreamTimeout504 := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header()["Date"] = nil
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.Header().Set("Jentic-Error-Origin", "broker")
+		w.WriteHeader(http.StatusGatewayTimeout)
+		_, _ = w.Write([]byte(`{"type":"upstream_timeout","title":"The upstream did not respond within the deadline.","status":504,"detail":"The upstream did not respond within the deadline.","error_origin":"broker"}`))
+	}
+	// The same status mirrored from the vendor (origin UPSTREAM): the caller's
+	// data, exit 0 — the header decides, not the status.
+	brokerUpstream503 := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header()["Date"] = nil
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Jentic-Error-Origin", "upstream")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"vendor maintenance"}`))
+	}
+
 	cases := []struct {
 		name    string
 		target  string
 		flags   []string // appended after the broker flags
 		inspect http.HandlerFunc
 		broker  http.HandlerFunc
+		// holds plays the control plane's /executions/holds routes (--wait on
+		// a held call).
+		holds http.HandlerFunc
 		// fixedBroker overrides the mock's address with a static broker target
 		// (the SEC-1 transport case must not depend on an ephemeral port).
 		fixedBroker []string
@@ -166,9 +265,29 @@ func TestGolden_ExecuteContract(t *testing.T) {
 			broker: brokerDenial403CredentialBinding,
 		},
 		{
+			name:   "execute_broker_denial_connect_api_json",
+			target: "GET:/v1/pets",
+			broker: brokerDenial403ConnectAPI,
+		},
+		{
 			name:   "execute_broker_denial_no_directive_json",
 			target: "GET:/v1/pets",
 			broker: brokerDenial424NoDirective,
+		},
+		{
+			name:   "execute_broker_transport_circuit_open_json",
+			target: "GET:/v1/pets",
+			broker: brokerCircuitOpen503,
+		},
+		{
+			name:   "execute_broker_transport_upstream_timeout_json",
+			target: "GET:/v1/pets",
+			broker: brokerUpstreamTimeout504,
+		},
+		{
+			name:   "execute_upstream_5xx_passthrough_json",
+			target: "GET:/v1/pets",
+			broker: brokerUpstream503,
 		},
 		{
 			name:   "execute_transport_insecure_broker",
@@ -176,6 +295,18 @@ func TestGolden_ExecuteContract(t *testing.T) {
 			// Plaintext http to a non-loopback broker → SEC-1 refusal before
 			// any dial (deterministic TRANSPORT_ERROR, exit 1).
 			fixedBroker: []string{"--broker-scheme", "http", "--broker-host", "203.0.113.9:8100"},
+		},
+		{
+			name:   "execute_held_json",
+			target: "POST:/v1/orders",
+			broker: brokerHeld,
+		},
+		{
+			name:   "execute_held_wait_denied_json",
+			target: "POST:/v1/orders",
+			flags:  []string{"--wait"},
+			broker: brokerHeld,
+			holds:  holdsDenied,
 		},
 		{
 			name:    "execute_resolve_not_found_json",
@@ -199,6 +330,15 @@ func TestGolden_ExecuteContract(t *testing.T) {
 						return
 					}
 					tc.inspect(w, r)
+					return
+				}
+				if strings.HasPrefix(r.URL.Path, "/executions/holds/") {
+					if tc.holds == nil {
+						t.Errorf("unexpected %s call in case %s", r.URL.Path, tc.name)
+						w.WriteHeader(http.StatusNotFound)
+						return
+					}
+					tc.holds(w, r)
 					return
 				}
 				if tc.broker == nil {

@@ -10,15 +10,21 @@ from jentic_one.registry.core.server_hosts import (
     hosts_from_spec,
     needs_review,
 )
-from jentic_one.registry.ingest.exc import DuplicateRevisionError
+from jentic_one.registry.ingest.exc import (
+    CatalogIdentityConflictError,
+    DuplicateRevisionError,
+)
 from jentic_one.registry.ingest.pipeline.ctx import PipelineContext
 from jentic_one.registry.ingest.stages.base import BasePipelineStage
 from jentic_one.registry.repos import (
     ApiRepository,
     ApiRevisionRepository,
+    CatalogApiIdConflictError,
     OverlayRepository,
     ServerRepository,
 )
+from jentic_one.registry.repos.revision_repo import is_duplicate_revision_conflict
+from jentic_one.shared.db.errors import DatabaseIntegrityError
 from jentic_one.shared.models import ORIGIN_OVERLAY, ApiRevisionSourceType
 
 
@@ -30,14 +36,30 @@ class ResolveApiStage(BasePipelineStage):
     _produces: ClassVar[dict[str, type]] = {"api_id": uuid.UUID}
 
     async def _run(self, ctx: PipelineContext) -> None:
-        api = await ApiRepository.upsert(
-            ctx.session,
-            vendor=ctx.specification.api_identifier.vendor,
-            name=ctx.specification.api_identifier.name,
-            version=ctx.specification.api_identifier.version,
-            created_by=ctx.created_by,
-            catalog_api_id=ctx.specification.catalog_api_id,
-        )
+        identifier = ctx.specification.api_identifier
+        incoming_catalog_api_id = ctx.specification.catalog_api_id
+        try:
+            # The upsert refuses a catalog import whose identity already belongs
+            # to a different catalog entry (distinct entries can collapse onto one
+            # identity because vendor extraction reduces hosts to eTLD+1), under a
+            # row lock so concurrent colliding imports can't both pass.
+            api = await ApiRepository.upsert(
+                ctx.session,
+                vendor=identifier.vendor,
+                name=identifier.name,
+                version=identifier.version,
+                created_by=ctx.created_by,
+                catalog_api_id=incoming_catalog_api_id,
+            )
+        except CatalogApiIdConflictError as exc:
+            assert incoming_catalog_api_id is not None
+            raise CatalogIdentityConflictError(
+                vendor=identifier.vendor,
+                name=identifier.name,
+                version=identifier.version,
+                stored_id=exc.stored_id,
+                incoming_id=incoming_catalog_api_id,
+            ) from exc
         ctx.produce("api_id", api.id, uuid.UUID)
 
 
@@ -54,6 +76,19 @@ class CreateRevisionStage(BasePipelineStage):
     _produces: ClassVar[dict[str, type]] = {"revision_id": uuid.UUID}
 
     async def _run(self, ctx: PipelineContext) -> None:
+        try:
+            await self._create_revision(ctx)
+        except DatabaseIntegrityError as exc:
+            # A concurrent import of the same API can pass the digest pre-check
+            # below and still lose the insert race on a duplicate-revision
+            # constraint; that is the same "already exists" outcome, so it must
+            # surface as DuplicateRevisionError rather than as an unexpected
+            # stage failure (the /mcp import tools key on its message).
+            if is_duplicate_revision_conflict(exc):
+                raise DuplicateRevisionError() from exc
+            raise
+
+    async def _create_revision(self, ctx: PipelineContext) -> None:
         api_id = ctx.require("api_id", uuid.UUID)
         spec = ctx.specification
         # Domain invariant: every production IngestSpecification comes through

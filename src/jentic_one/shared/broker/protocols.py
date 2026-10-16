@@ -9,6 +9,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.models.credentials import CredentialType
+from jentic_one.shared.permissions.evaluation import PathDivergence
 from jentic_one.shared.schemas import APIReference, OperationInfo
 
 
@@ -54,10 +55,16 @@ class RevisionPinOutcome(StrEnum):
     FORBIDDEN = "forbidden"
     """The revision is an unpublished ``draft`` the caller does not own (→ 403)."""
 
+    HOST_CHANGE_HELD = "host_change_held"
+    """The caller's own ``draft`` serves different server hosts than the API's live
+    revision, the API has bound credentials, and the caller lacks
+    ``credentials:write`` (→ 403 ``host_change_requires_operator``).
+    ``revision_id`` is set so the broker can tell whether the draft serves the URL."""
+
 
 @dataclass(frozen=True, slots=True)
 class RevisionPinResult:
-    """The resolved ``revision_id`` (when ``RESOLVED``) plus the classifying outcome."""
+    """The resolved ``revision_id`` (``RESOLVED``, ``HOST_CHANGE_HELD``) plus the outcome."""
 
     outcome: RevisionPinOutcome
     revision_id: uuid.UUID | None = None
@@ -90,7 +97,7 @@ class RegistryResolverProtocol(Protocol):
         Performs the in-process lookup + access-rule check and returns a neutral
         :class:`RevisionPinResult`; it never raises a registry-specific exception
         across the boundary. The broker maps the outcome to its domain taxonomy
-        (``UNKNOWN``/``ARCHIVED`` → 422, ``FORBIDDEN`` → 403).
+        (``UNKNOWN``/``ARCHIVED`` → 422, ``FORBIDDEN``/``HOST_CHANGE_HELD`` → 403).
         """
         ...
 
@@ -102,20 +109,55 @@ class TokenResolverProtocol(Protocol):
     async def resolve_access_token(self, token: str) -> Identity | None: ...
 
 
-@dataclass(frozen=True, slots=True)
-class RuleEvaluation:
-    """Outcome of a permission-rule evaluation with just enough context to explain a deny.
+class RuleVerdict(StrEnum):
+    """Tri-state outcome of a permission-rule evaluation.
 
-    ``rules_loaded`` distinguishes two very different deny paths (#578): a
-    zero-length pool (nothing matched
-    because there was nothing to match — wrong vendor, unbound credential,
-    empty binding, misconfigured store) vs a non-empty pool where no rule
-    happened to match. The router turns this into a two-variant detail
-    sentence — no rule contents, no internal ids, redaction-safe.
+    ALLOW and DENY are the two historic outcomes. REQUIRE_APPROVAL means the
+    matching rule carries ``effect="require-approval"``: the execution is held
+    pending a human decision.
+
+    The ``allowed`` property on :class:`RuleEvaluation` maps ALLOW to True and
+    DENY or REQUIRE_APPROVAL to False so existing callers that need only the
+    binary answer continue to work without change. The hold path reads
+    ``verdict`` directly to distinguish REQUIRE_APPROVAL from DENY.
     """
 
-    allowed: bool
+    ALLOW = "allow"
+    DENY = "deny"
+    REQUIRE_APPROVAL = "require-approval"
+
+
+@dataclass(frozen=True, slots=True)
+class RuleEvaluation:
+    """Outcome of a permission-rule evaluation.
+
+    ``verdict`` is the tri-state result. ``allowed`` is a backward-compatible
+    property that returns True only for ALLOW; callers that inspect the binary
+    outcome continue to work without change.
+
+    ``rules_loaded`` distinguishes two deny paths (#578): a zero-length pool
+    (nothing matched because there was nothing to match — wrong vendor, unbound
+    credential, empty binding, misconfigured store) vs a non-empty pool where no
+    rule happened to match. The router turns this into a two-variant detail
+    sentence — no rule contents, no internal ids, redaction-safe.
+
+    ``matched_rule_id`` is the primary key of the first rule that fired, or
+    None when no rule matched (the deny is the implicit default). The hold path
+    records this on the ``held_executions`` row.
+    """
+
+    verdict: RuleVerdict
     rules_loaded: int
+    matched_rule_id: str | None = None
+    # Set when ``evaluate`` was given an ``upstream_path`` and a rule written
+    # against the full upstream path (server base included) changes the
+    # verdict versus the spec-relative path (#1424 upgrade diagnostics).
+    divergence: PathDivergence | None = None
+
+    @property
+    def allowed(self) -> bool:
+        """True when the verdict is ALLOW; False for DENY or REQUIRE_APPROVAL."""
+        return self.verdict == RuleVerdict.ALLOW
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +229,31 @@ class CredentialDeriverProtocol(Protocol):
     ) -> CredentialDerivation: ...
 
 
+@dataclass(frozen=True, slots=True)
+class ConnectableRegistration:
+    """An active shared OAuth-app registration an agent can connect through.
+
+    ``api_vendor`` is the connect key ``POST /integrations:connect`` resolves
+    the registration under; ``catalog_api_id`` is the catalog API the
+    registration's credentials are scoped to.
+    """
+
+    id: str
+    api_vendor: str
+    catalog_api_id: str
+
+
+@runtime_checkable
+class ConnectableRegistrationSourceProtocol(Protocol):
+    """Lists the active shared OAuth-app registrations (denial guidance only).
+
+    The broker reads these to tell an unprovisioned agent which connect key
+    serves the API it was denied; it never decides authorization.
+    """
+
+    async def list_active(self) -> tuple[ConnectableRegistration, ...]: ...
+
+
 @runtime_checkable
 class AgentRuleEvaluatorProtocol(Protocol):
     """Evaluates direct-binding permission rules against an inbound request.
@@ -207,6 +274,7 @@ class AgentRuleEvaluatorProtocol(Protocol):
         method: str,
         path: str,
         operation_id: str | None,
+        upstream_path: str | None = None,
     ) -> RuleEvaluation: ...
 
 

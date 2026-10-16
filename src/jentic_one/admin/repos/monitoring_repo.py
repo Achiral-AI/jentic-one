@@ -6,12 +6,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Select, Text, case, cast, func, literal, select
+from sqlalchemy import Select, Text, case, cast, false, func, literal, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.expression import ColumnElement, SQLColumnExpression
 
 from jentic_one.admin.core.schema.execution_records import ExecutionRecord
-from jentic_one.shared.models import ExecutionStatus
+from jentic_one.admin.core.schema.jobs import Job
+from jentic_one.shared.models import ExecutionStatus, JobKind, JobStatus
 
 
 def _is_postgres(session: AsyncSession) -> bool:
@@ -48,6 +49,36 @@ def _slash_join(*parts: Any) -> SQLColumnExpression[Any]:
     return expr
 
 
+def _group_key(
+    group_by: str,
+) -> tuple[SQLColumnExpression[Any], list[SQLColumnExpression[Any]]]:
+    """The grouping key expression and its ``GROUP BY`` columns for a dimension.
+
+    The single definition of the grouped-usage key shapes (``vendor/name``,
+    ``{actor_type}/{actor_id}``, …) shared by ``grouped_top`` and
+    ``grouped_trend``, so the trend series always lines up with the top rows.
+    Unknown dimensions fall back to the actor grouping.
+    """
+    if group_by == "api":
+        key_expr = _slash_join(
+            func.coalesce(ExecutionRecord.api_vendor, "unknown"),
+            literal("/"),
+            func.coalesce(ExecutionRecord.api_name, "unknown"),
+        )
+        return key_expr, [ExecutionRecord.api_vendor, ExecutionRecord.api_name]
+    if group_by == "credential":
+        # credential_id is the direct-binding attribution axis (theme-5
+        # Phase 2); rows without one (legacy toolkit-path executions,
+        # credential-less calls) pool under "unknown" like the api branch
+        # does for missing identity axes.
+        return (
+            func.coalesce(ExecutionRecord.credential_id, "unknown"),
+            [ExecutionRecord.credential_id],
+        )
+    key_expr = _slash_join(ExecutionRecord.actor_type, literal("/"), ExecutionRecord.actor_id)
+    return key_expr, [ExecutionRecord.actor_type, ExecutionRecord.actor_id]
+
+
 @dataclass(slots=True, frozen=True)
 class UsageQueryFilters:
     toolkit_id: str | None = None
@@ -68,6 +99,30 @@ class UsageQueryFilters:
             clauses.append(ExecutionRecord.actor_id == self.actor_id)
         if self.status is not None:
             clauses.append(ExecutionRecord.status == self.status)
+        return clauses
+
+    def to_job_clauses(self) -> list[ColumnElement[bool]]:
+        """The same filters applied to execution jobs.
+
+        An execution job carries its attribution in its payload and its actor
+        on ``created_by``. Two filters can never match an unfinished job, so
+        each excludes every job:
+
+        - ``toolkit_id`` is legacy. Toolkits were removed (#1498) and no
+          execution job is attributed to one since, so the filter only
+          narrows historical ``execution_records``.
+        - ``status`` names a terminal execution status, which an unfinished
+          job never has.
+        """
+        clauses: list[ColumnElement[bool]] = []
+        if self.toolkit_id is not None or self.status is not None:
+            clauses.append(false())
+        if self.api_vendor is not None:
+            clauses.append(Job.payload["api_vendor"].as_string() == self.api_vendor)
+        if self.api_name is not None:
+            clauses.append(Job.payload["api_name"].as_string() == self.api_name)
+        if self.actor_id is not None:
+            clauses.append(Job.created_by == self.actor_id)
         return clauses
 
 
@@ -96,6 +151,8 @@ class OverallStatsRow:
     avg_ms: float
     p50_ms: float | None
     p95_ms: float | None
+    pending: int
+    active_now: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -215,6 +272,34 @@ class MonitoringRepository:
                 .within_group(ExecutionRecord.duration_ms)
                 .label("p95_ms"),
             ]
+        # Executions are recorded only once they finish, so the unfinished ones
+        # come from the execution jobs (async runs; a synchronous run has no row
+        # until it returns). `pending` is every unfinished job queued in the
+        # window; `active_now` is only the jobs a worker is running right now.
+        # Scalar subqueries keep everything in one round trip.
+        execution_job = [
+            Job.kind == JobKind.EXECUTION,
+            *(filters.to_job_clauses() if filters else []),
+        ]
+        pending_col = (
+            select(func.count())
+            .select_from(Job)
+            .where(
+                *execution_job,
+                Job.status.in_((JobStatus.QUEUED, JobStatus.RUNNING)),
+                Job.created_at >= cutoff,
+                Job.created_at < until,
+            )
+            .scalar_subquery()
+            .label("pending")
+        )
+        active_now_col = (
+            select(func.count())
+            .select_from(Job)
+            .where(*execution_job, Job.status == JobStatus.RUNNING)
+            .scalar_subquery()
+            .label("active_now")
+        )
         stmt = select(
             func.count().label("total"),
             func.count()
@@ -222,6 +307,8 @@ class MonitoringRepository:
             .label("success"),
             func.count().filter(ExecutionRecord.status == ExecutionStatus.FAILED).label("failed"),
             func.coalesce(func.avg(ExecutionRecord.duration_ms), 0).label("avg_ms"),
+            pending_col,
+            active_now_col,
             *percentile_cols,
         ).where(ExecutionRecord.started_at >= cutoff, ExecutionRecord.started_at < until)
         if filters:
@@ -236,6 +323,8 @@ class MonitoringRepository:
             avg_ms=float(row.avg_ms),
             p50_ms=float(p50) if p50 is not None else None,
             p95_ms=float(p95) if p95 is not None else None,
+            pending=row.pending,
+            active_now=row.active_now,
         )
 
     @staticmethod
@@ -297,49 +386,18 @@ class MonitoringRepository:
         limit: int,
         filters: UsageQueryFilters | None = None,
     ) -> list[GroupedTopRow]:
-        key_expr: SQLColumnExpression[Any]
-        label_expr: SQLColumnExpression[Any]
-        group_cols: list[SQLColumnExpression[Any]]
-        if group_by == "api":
-            key_expr = _slash_join(
-                func.coalesce(ExecutionRecord.api_vendor, "unknown"),
-                literal("/"),
-                func.coalesce(ExecutionRecord.api_name, "unknown"),
-            )
-            label_expr = _slash_join(
-                func.coalesce(ExecutionRecord.api_vendor, "unknown"),
-                literal("/"),
-                func.coalesce(ExecutionRecord.api_name, "unknown"),
-            )
-            group_cols = [ExecutionRecord.api_vendor, ExecutionRecord.api_name]
-        elif group_by == "toolkit":
-            # toolkit_id is nullable-legacy (theme-5 Phase 2): direct-binding
-            # executions have none, so pool them under "unknown" like the api
-            # branch does for missing identity axes.
-            key_expr = func.coalesce(ExecutionRecord.toolkit_id, "unknown")
-            label_expr = func.coalesce(ExecutionRecord.toolkit_id, "unknown")
-            group_cols = [ExecutionRecord.toolkit_id]
-        elif group_by == "credential":
-            # credential_id is the direct-binding attribution axis (theme-5
-            # Phase 2); rows without one (legacy toolkit-path executions,
-            # credential-less calls) pool under "unknown" like the toolkit
-            # branch above.
-            key_expr = func.coalesce(ExecutionRecord.credential_id, "unknown")
-            label_expr = func.coalesce(ExecutionRecord.credential_id, "unknown")
-            group_cols = [ExecutionRecord.credential_id]
-        else:
-            key_expr = _slash_join(
-                ExecutionRecord.actor_type, literal("/"), ExecutionRecord.actor_id
-            )
-            label_expr = _slash_join(
-                ExecutionRecord.actor_type, literal("/"), ExecutionRecord.actor_id
-            )
-            group_cols = [ExecutionRecord.actor_type, ExecutionRecord.actor_id]
+        """Per-key totals for the ``limit`` busiest keys of a dimension.
+
+        One grouped aggregate over the window, ordered by volume. This is the
+        whole of ``MonitoringService.get_grouped_totals`` and the top-N half of
+        ``get_usage_stats`` (which adds buckets and per-key trends on top).
+        """
+        key_expr, group_cols = _group_key(group_by)
 
         stmt: Select[Any] = (
             select(
                 key_expr.label("key"),
-                label_expr.label("label"),
+                key_expr.label("label"),
                 func.count().label("total"),
                 func.count()
                 .filter(ExecutionRecord.status == ExecutionStatus.COMPLETED)
@@ -386,21 +444,7 @@ class MonitoringRepository:
         until_epoch = until.timestamp()
         segment_seconds = (until_epoch - cutoff_epoch) / num_points
 
-        key_expr: SQLColumnExpression[Any]
-        if group_by == "api":
-            key_expr = _slash_join(
-                func.coalesce(ExecutionRecord.api_vendor, "unknown"),
-                literal("/"),
-                func.coalesce(ExecutionRecord.api_name, "unknown"),
-            )
-        elif group_by == "toolkit":
-            key_expr = func.coalesce(ExecutionRecord.toolkit_id, "unknown")
-        elif group_by == "credential":
-            key_expr = func.coalesce(ExecutionRecord.credential_id, "unknown")
-        else:
-            key_expr = _slash_join(
-                ExecutionRecord.actor_type, literal("/"), ExecutionRecord.actor_id
-            )
+        key_expr, _ = _group_key(group_by)
 
         epoch_expr = _epoch_seconds(session)
         segment_idx = cast(

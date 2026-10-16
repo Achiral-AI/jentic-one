@@ -5,10 +5,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
+from jentic_one.admin.core.schema.held_executions import HeldExecution
 from jentic_one.admin.core.schema.jobs import Job
 from jentic_one.admin.services.errors import JobNotFoundError
 from jentic_one.shared.models import JobKind, JobStatus
@@ -124,13 +125,17 @@ class JobRepository:
         *,
         filters: Sequence[ColumnElement[bool]] | None = None,
     ) -> Job | None:
-        """Cancel a job if active (queued or running).
+        """Cancel a job if active (queued, running or held).
 
-        Returns None if already terminal or not matched by ``filters``.
+        Returns None if already terminal or not matched by ``filters``. Callers
+        refuse held executions (which await approval) before calling this.
         """
         stmt = (
             update(Job)
-            .where(Job.id == job_id, Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]))
+            .where(
+                Job.id == job_id,
+                Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.HELD]),
+            )
             .values(status=JobStatus.CANCELLED)
             .returning(Job)
         )
@@ -142,6 +147,69 @@ class JobRepository:
         if row is not None:
             await session.flush()
         return row
+
+    @staticmethod
+    async def transition(
+        session: AsyncSession,
+        job_id: str,
+        *,
+        from_status: JobStatus,
+        to_status: JobStatus,
+    ) -> bool:
+        """Move a job ``from_status`` → ``to_status``; False when it is in another status."""
+        stmt = (
+            update(Job)
+            .where(Job.id == job_id, Job.status == from_status)
+            .values(status=to_status, visible_at=None)
+            .returning(Job.id)
+        )
+        result = await session.execute(stmt)
+        return result.scalar_one_or_none() is not None
+
+    @staticmethod
+    def _held_execution_filter() -> ColumnElement[bool]:
+        """The one predicate the holds surface reads jobs through.
+
+        A job matches only if it is an execution job that a require-approval
+        hold filed: an approval row names it, filed by the agent that created
+        the job. The holds routes need no ``jobs:*`` permission, so this keeps
+        them to the held execution behind each hold and never any other job.
+        """
+        return and_(
+            Job.kind == JobKind.EXECUTION.value,
+            exists().where(
+                HeldExecution.job_id == Job.id,
+                HeldExecution.agent_id == Job.created_by,
+            ),
+        )
+
+    @staticmethod
+    async def get_held_execution(
+        session: AsyncSession,
+        job_id: str,
+        *,
+        filters: Sequence[ColumnElement[bool]],
+    ) -> Job | None:
+        """The held execution job ``job_id``, or ``None`` if it is not one or not visible."""
+        stmt = select(Job).where(Job.id == job_id, JobRepository._held_execution_filter(), *filters)
+        result = await session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def held_execution_statuses(
+        session: AsyncSession,
+        job_ids: Sequence[str],
+        *,
+        filters: Sequence[ColumnElement[bool]],
+    ) -> dict[str, str]:
+        """Each visible held execution job's status, keyed by job id; others are absent."""
+        if not job_ids:
+            return {}
+        stmt = select(Job.id, Job.status).where(
+            Job.id.in_(job_ids), JobRepository._held_execution_filter(), *filters
+        )
+        result = await session.execute(stmt)
+        return {job_id: str(status) for job_id, status in result.all()}
 
     @staticmethod
     async def get_child_job_ids(session: AsyncSession, parent_job_id: str) -> list[str]:
@@ -160,3 +228,56 @@ class JobRepository:
             .group_by(Job.status)
         )
         return {JobStatus(row[0]): row[1] for row in result.all()}
+
+    @staticmethod
+    async def cancel_active_for_actor(session: AsyncSession, actor_id: str) -> int:
+        """Cancel every queued or running job the actor enqueued; returns the row count.
+
+        The agent-purge sweep. Matches on ``created_by`` alone: the id prefix
+        names the actor, and legacy agent jobs carry ``actor_type='user'``. A
+        cancelled job is never claimed again, and the worker skips the
+        completion and requeue writes for one it holds. The rows stay as history.
+        """
+        stmt = (
+            update(Job)
+            .where(
+                Job.created_by == actor_id,
+                Job.status.in_([JobStatus.QUEUED.value, JobStatus.RUNNING.value]),
+            )
+            .values(status=JobStatus.CANCELLED.value, visible_at=None)
+        )
+        result = await session.execute(stmt)
+        await session.flush()
+        return int(result.rowcount)  # type: ignore[attr-defined]
+
+    @staticmethod
+    async def cancel_queued_executions_for_actor(session: AsyncSession, actor_id: str) -> list[str]:
+        """Cancel the actor's *queued* execution jobs; returns the cancelled ids, sorted.
+
+        The disable/archive sweep (#1674). Narrower than
+        :meth:`cancel_active_for_actor`: only ``kind = execution`` and
+        ``status = queued`` rows created by ``actor_id`` match. A running
+        execution is left alone, as cancelling it would discard a result whose
+        upstream call has already happened; the worker's execution-time actor
+        check refuses it instead. Import and other job kinds are untouched.
+
+        A queued row includes one requeued after a failed attempt (it carries a
+        future ``visible_at``), so ``visible_at`` is cleared on cancel, as on
+        every other terminal transition. The single conditional ``UPDATE``
+        races safely with the worker's claim: a row the worker has already
+        flipped to ``running`` no longer matches the ``status`` predicate.
+        """
+        stmt = (
+            update(Job)
+            .where(
+                Job.created_by == actor_id,
+                Job.kind == JobKind.EXECUTION.value,
+                Job.status == JobStatus.QUEUED.value,
+            )
+            .values(status=JobStatus.CANCELLED.value, visible_at=None)
+            .returning(Job.id)
+        )
+        result = await session.execute(stmt)
+        job_ids = sorted(str(job_id) for job_id in result.scalars().all())
+        await session.flush()
+        return job_ids

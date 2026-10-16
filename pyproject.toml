@@ -1,6 +1,6 @@
 [project]
 name = "jentic-one"
-version = "0.41.0"
+version = "0.43.0"
 description = "Jentic One"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -35,6 +35,11 @@ dependencies = [
     "python-multipart>=0.0.32",
     "mcp>=2.1.1",
     "publicsuffixlist>=1.0.2",
+    # Not imported by jentic_one: httpcore's current_async_library() does
+    # `try: import sniffio` on every lock/event/shield it constructs (several
+    # per outbound request). anyio>=4 no longer pulls sniffio in, and a failed
+    # import is not cached, so without it each call stats every sys.path entry.
+    "sniffio>=1.3.1",
 ]
 
 [project.optional-dependencies]
@@ -90,6 +95,8 @@ dev = [
     # the dev env always installs it so the state-backend unit tests (which build
     # the redis backend) run without needing the extra enabled explicitly.
     "redis>=8.0.0",
+    "jsonschema>=4.26.0",
+    "types-jsonschema>=4.26.0.20261006",
 ]
 
 # Conventional-commit enforcement (pure Python — no Node needed). Fires for

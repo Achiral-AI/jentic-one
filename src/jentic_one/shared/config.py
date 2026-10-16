@@ -942,6 +942,8 @@ class DirectOAuth2ProviderConfig(BaseModel):
     # can't see, and only if it differs from ``server.public_base_url``.
     redirect_uri: str | None = None
     default_scopes: list[str] = Field(default_factory=list)
+    # How long before an access token's true expiry the broker refreshes it.
+    # Applied once, at comparison time; stored ``expires_at`` is never skewed.
     expiry_skew_seconds: int = 60
     # Extra query params appended to every authorize URL.
     #
@@ -984,6 +986,8 @@ class PipedreamProviderConfig(BaseModel):
     client_id: str
     client_secret: SecretStr
     connect_base_url: str = "https://api.pipedream.com/v1"
+    # How long before an access token's true expiry the broker refreshes it.
+    # Applied once, at comparison time; stored ``expires_at`` is never skewed.
     expiry_skew_seconds: int = 60
 
 
@@ -1105,7 +1109,11 @@ class VendorAuthConfig(BaseModel):
     display_name: str
     flows: list[VendorFlowConfig]
     scopes: list[VendorScopeConfig] = Field(default_factory=list)
-    identity_probe: VendorIdentityProbeConfig
+    # Optional: platform-shipped vendors always define one; admin-registered
+    # OAuth apps that don't have a matching config entry connect without one
+    # (the credential is still valid — the ``connected_as`` UX label is just
+    # absent). Callers must guard on ``None``.
+    identity_probe: VendorIdentityProbeConfig | None = None
 
     @field_validator("vendor")
     @classmethod
@@ -1132,14 +1140,68 @@ class VendorRegistryConfig(BaseModel):
     entries: dict[str, VendorAuthConfig] = Field(default_factory=dict)
 
 
+class ControlConnectConfig(BaseModel):
+    """Agent connect-session settings on the control surface."""
+
+    manual_flows_enabled: bool = Field(
+        default=True,
+        description=(
+            "Allow connect sessions that target a registry API (rather than a "
+            "vendor-registry key), where a human enters the credential, or "
+            "brings an OAuth app, when approving them in the dashboard. On by "
+            "default; while off, `:connect` refuses API targets with "
+            "`manual_flows_disabled`."
+        ),
+    )
+    manual_flows_ttl_hours: int = Field(
+        default=72,
+        ge=1,
+        description=(
+            "Hours an API-target connect session (a human-entered credential, or "
+            "an OAuth API waiting for an app) stays open before it expires. "
+            "Vendor OAuth sessions keep their fixed 30-minute lifetime."
+        ),
+    )
+    max_open_sessions_per_agent: int = Field(
+        default=10,
+        ge=1,
+        description=(
+            "Most open connect sessions one agent may hold at once while "
+            "`manual_flows_enabled` is on; one more `:connect` gets 429 "
+            "`too_many_open_sessions`."
+        ),
+    )
+    max_open_sessions_per_owner: int = Field(
+        default=50,
+        ge=1,
+        description=(
+            "Most open connect sessions across one user and the agents they own "
+            "while `manual_flows_enabled` is on; one more `:connect` gets 429 "
+            "`too_many_open_sessions`."
+        ),
+    )
+    rejection_cooldown_hours: int = Field(
+        default=24,
+        ge=0,
+        description=(
+            "Hours after a human rejects an agent's connect request during which "
+            "the agent's repeat `:connect` for the same target gets 429 "
+            "`recently_rejected`. 0 turns the cooldown off."
+        ),
+    )
+
+
 class ControlSurfaceConfig(BaseModel):
     """Control surface configuration.
 
-    Empty since theme 7 removed the access-request subsystem (its
-    ``access_requests.ttl_days``/``canonical_base_url`` knobs). The section
-    stays so a ``control:`` key in existing YAML keeps validating and future
-    control-surface knobs have a home; unknown subkeys are ignored.
+    Unknown subkeys are ignored, so a ``control:`` section written for another
+    release keeps validating.
     """
+
+    connect: ControlConnectConfig = Field(
+        default_factory=ControlConnectConfig,
+        description="Agent connect-session settings.",
+    )
 
 
 class UpstreamClientConfig(BaseModel):
@@ -1528,19 +1590,11 @@ class BrokerConfig(BaseModel):
     # + clock-skew, strict asymmetric alg allowlist. When trusted_issuers is set
     # it supersedes the HS256 jwt_secret path for self-contained JWTs.
     jwt_verification: JwtVerificationConfig = Field(default_factory=JwtVerificationConfig)
-    # Public base URL of the account-linking/provisioning UI. When set, a 424
-    # (credential not provisioned) carries a `prompt_human` directive with a
-    # `provisioning_url` the agent can relay to the user. None keeps the
-    # directive but omits the URL. The URL is non-secret (where to *go* to
-    # provision, never the credential itself).
-    account_linking_base_url: str | None = None
     resilience: BrokerResilienceConfig = Field(default_factory=BrokerResilienceConfig)
     idempotency: IdempotencyConfig = Field(default_factory=IdempotencyConfig)
     egress: EgressConfig = Field(default_factory=EgressConfig)
 
-    _normalize_public_urls = field_validator("jobs_api_base_url", "account_linking_base_url")(
-        _normalize_optional_base_url
-    )
+    _normalize_public_urls = field_validator("jobs_api_base_url")(_normalize_optional_base_url)
 
     @model_validator(mode="before")
     @classmethod
@@ -1569,6 +1623,21 @@ class BrokerConfig(BaseModel):
             data = {k: v for k, v in data.items() if k != "direct_bindings_enabled"}
         return data
 
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_retired_account_linking_base_url(cls, data: Any) -> Any:
+        """Ignore ``broker.account_linking_base_url`` with a one-time warning.
+
+        Denial directives link to the agent's open connect session on the
+        deployment's own UI (``connect_approval_url``), so there is no
+        separate account-linking origin to configure. A leftover value is
+        harmless and never fails boot.
+        """
+        if isinstance(data, dict) and _RETIRED_ACCOUNT_LINKING_KEY in data:
+            _warn_retired_account_linking_base_url_once()
+            data = {k: v for k, v in data.items() if k != _RETIRED_ACCOUNT_LINKING_KEY}
+        return data
+
 
 _retired_direct_bindings_flag_warned = threading.Event()
 
@@ -1592,6 +1661,34 @@ def _warn_retired_direct_bindings_flag_once() -> None:
         actionable_step=(
             "Remove broker.direct_bindings_enabled from the config file or "
             "JENTIC__BROKER__DIRECT_BINDINGS_ENABLED from the environment."
+        ),
+    )
+
+
+_RETIRED_ACCOUNT_LINKING_KEY = "account_linking_base_url"
+_retired_account_linking_warned = threading.Event()
+
+
+def _warn_retired_account_linking_base_url_once() -> None:
+    """One WARNING per process for the leftover setting (it is ignored).
+
+    Latched like :func:`_warn_retired_direct_bindings_flag_once`: config is
+    validated more than once per process.
+    """
+    if _retired_account_linking_warned.is_set():
+        return
+    _retired_account_linking_warned.set()
+    _logger.warning(
+        "config_retired_setting_ignored",
+        setting=f"broker.{_RETIRED_ACCOUNT_LINKING_KEY}",
+        detail=(
+            "denial directives carry a provisioning_url only when the agent has an "
+            "open connect session, linking to it on this deployment's UI; the value "
+            "is ignored"
+        ),
+        actionable_step=(
+            f"Remove broker.{_RETIRED_ACCOUNT_LINKING_KEY} from the config file or "
+            "JENTIC__BROKER__ACCOUNT_LINKING_BASE_URL from the environment."
         ),
     )
 
@@ -1741,12 +1838,11 @@ class ServerConfig(BaseModel):
     Every absolute URL the app builds for external consumption on the
     control/auth surfaces — the OAuth connect ``redirect_uri``, the OIDC issuer
     / JWT-Bearer audience, the DCR ``registration_client_uri``, the SPA login
-    callback, and access-request approval links — falls back to this when its
+    callback, and connect-session approval links — falls back to this when its
     own more specific knob is unset. Explicit per-field values still win
     (needed behind a reverse proxy that fronts multiple surfaces on distinct
-    origins). The broker's ``jobs_api_base_url`` / ``account_linking_base_url``
-    are deliberately independent: they name other services' origins, not this
-    one. Left unset, request-scoped consumers derive
+    origins). The broker's ``jobs_api_base_url`` is deliberately independent:
+    it names another service's origin, not this one. Left unset, request-scoped consumers derive
     from the incoming request's origin and request-less ones from the serving
     bind (``http://{host}:{port}``), so zero-config local dev on any port just
     works — set this only when clients reach the app on an origin it can't
@@ -1888,6 +1984,43 @@ class EntitlementConfig(BaseModel):
         return self
 
 
+class HeldExecutionsConfig(BaseModel):
+    """Require-approval holds: held execution jobs awaiting a human reviewer.
+
+    An execute call matching a permission rule with ``effect="require-approval"``
+    is enqueued as a ``held`` job with a ``pending`` approval; a reviewer (the
+    agent's owner or an ``org:admin``) approves or denies it, or it expires.
+    """
+
+    ttl_seconds: int = Field(
+        default=86_400,
+        gt=0,
+        description=(
+            "Seconds a pending approval lives before the expiry sweep marks it "
+            "``expired`` and fails its held job with a permission-denied result. "
+            "Defaults to 24 hours."
+        ),
+    )
+    max_pending_per_agent: int = Field(
+        default=10,
+        ge=1,
+        description=(
+            "Maximum pending approvals per agent. An execute call that would file "
+            "another hold beyond this is denied with the "
+            "``approval_pending_limit_reached`` problem type."
+        ),
+    )
+    result_retention_seconds: int = Field(
+        default=86_400,
+        gt=0,
+        description=(
+            "Seconds the result of an approved execution stays readable via "
+            "``GET /jobs/{id}/result`` before the result sweep removes it. "
+            "Defaults to 24 hours."
+        ),
+    )
+
+
 class AppConfig(BaseModel):
     """Top-level application configuration."""
 
@@ -1917,6 +2050,7 @@ class AppConfig(BaseModel):
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     release_check: ReleaseCheckConfig = Field(default_factory=ReleaseCheckConfig)
     entitlement: EntitlementConfig = Field(default_factory=EntitlementConfig)
+    held_executions: HeldExecutionsConfig = Field(default_factory=HeldExecutionsConfig)
     apps: list[str] = Field(default_factory=lambda: ["registry", "admin", "control", "auth"])
 
     # Validated extension sub-configs, keyed by their registered section name.
@@ -1978,6 +2112,22 @@ def has_spa_platform_client(config: AppConfig) -> bool:
     return any(pc.client_id == _SPA_CLIENT_ID for pc in config.auth.platform_clients)
 
 
+def broker_links_root_on_broker(config: AppConfig) -> bool:
+    """Whether a standalone broker would root its admin-side links on itself.
+
+    ``True`` when this process serves the broker without the admin app and
+    ``broker.jobs_api_base_url`` is unset: a held call's ``review_url`` and the
+    ``_links`` of held and async executions then fall back to the broker's own
+    request origin, where the review page, ``/jobs`` and
+    ``/executions/holds`` are not served.
+    """
+    return (
+        "broker" in config.apps
+        and "admin" not in config.apps
+        and not config.broker.jobs_api_base_url
+    )
+
+
 def bind_origin(config: AppConfig) -> str:
     """The origin this process serves on, as a client on the same host reaches it.
 
@@ -2016,6 +2166,20 @@ def resolved_auth_base_url(config: AppConfig) -> str:
     return effective_auth_base_url(config) or bind_origin(config)
 
 
+def connect_approval_url(config: AppConfig, session_id: str) -> str:
+    """The owner-facing deep link to an agent's connect session (token-less).
+
+    Lands on the Agents page with the session id as the ``approve`` query
+    param, where the target agent's owner or ``org:admin`` reviews it without
+    the ``poll_token``. Absolute even with no public URL configured (it is
+    relayed out-of-band by agents), via :func:`resolved_auth_base_url`. Shared
+    by the connect session's ``approval_url`` and the broker denials'
+    ``provisioning_url`` so both always name the same address.
+    """
+    base = resolved_auth_base_url(config).rstrip("/")
+    return f"{base}/app/agents?approve={session_id}"
+
+
 @dataclass(frozen=True, slots=True)
 class PublicUrlMismatch:
     """One explicitly-configured public URL whose origin doesn't match serving."""
@@ -2038,8 +2202,8 @@ def check_public_url_consistency(config: AppConfig) -> list[PublicUrlMismatch]:
        When it is unset, the bind is the only known origin only on a loopback
        bind; on an all-interfaces bind the public origin is unknowable (proxy,
        ingress, port mapping), so the check is skipped rather than flag every
-       correctly-proxied override. The broker's ``jobs_api_base_url`` /
-       ``account_linking_base_url`` name other services and are not compared.
+       correctly-proxied override. The broker's ``jobs_api_base_url`` names
+       another service and is not compared.
     2. When the server binds a **loopback** host, it can only be reached from
        the same machine on exactly that port — no port mapping or gateway can
        sit in front of it. A loopback ``server.public_base_url`` or provider
@@ -2182,13 +2346,21 @@ def _env_overrides() -> dict[str, Any]:
 # Alembic env loads it per database). The first read is cached so later loads
 # see the same document. Regular files keep re-reading from disk.
 #
-# The cache key is the source's fstat identity (device, inode) plus the path
-# string, never the path alone: fd numbers are recycled by the kernel, so two
-# different files can appear as the same ``/dev/fd/N`` within one process, and
-# a path-string key would silently serve the first file's contents for the
+# The cache key is the source's stat identity (device, inode, ctime) plus the
+# path string, never the path alone: fd numbers are recycled by the kernel, so
+# two different files can appear as the same ``/dev/fd/N`` within one process,
+# and a path-string key would silently serve the first file's contents for the
 # second. Keying on identity also keeps ``/dev/fd/N`` of a *regular* file
 # re-readable (rotation-safe) and covers ``/proc/self/fd/N`` spellings.
-_ONESHOT_CONFIG_CACHE: dict[tuple[int, int, str], str] = {}
+#
+# (device, inode) alone is not a stable identity: macOS reports pipes with
+# st_dev 0 and recycles a freed pipe's st_ino for the next pipe, and a deleted
+# and recreated named FIFO can land on a reused inode. The ctime (set at
+# creation, bumped by every write, frozen once the writer closes) separates
+# those. Linux pipe ctimes are tick-granular and can coincide across pipes, but
+# Linux pipe inodes are not recycled, so the tuple stays distinct on both.
+# (#1499)
+_ONESHOT_CONFIG_CACHE: dict[tuple[int, int, int, str], str] = {}
 _ONESHOT_CACHE_LOCK = threading.Lock()
 
 # A forked child never received the one-shot document itself; drop the parent's
@@ -2206,13 +2378,17 @@ def oneshot_config_source_active() -> bool:
     return bool(_ONESHOT_CONFIG_CACHE)
 
 
+def _oneshot_cache_key(st: os.stat_result, path: Path) -> tuple[int, int, int, str]:
+    return (st.st_dev, st.st_ino, st.st_ctime_ns, str(path))
+
+
 def _read_config_text(path: Path) -> str:
     """Read the config document, caching one-shot sources (pipes, /dev/fd)."""
     # Cache lookup by stat identity happens before open(): opening a named FIFO
     # whose writer has gone blocks forever, and a cache hit must not reopen it.
     st = os.stat(path)
     if stat.S_ISFIFO(st.st_mode) or stat.S_ISSOCK(st.st_mode):
-        key = (st.st_dev, st.st_ino, str(path))
+        key = _oneshot_cache_key(st, path)
         with _ONESHOT_CACHE_LOCK:
             if key in _ONESHOT_CONFIG_CACHE:
                 # "Why didn't my config change take effect" needs a trail: a
@@ -2229,10 +2405,13 @@ def _read_config_text(path: Path) -> str:
             # semantics), so rewind before reading.
             f.seek(0)
             return f.read()
-        key = (fst.st_dev, fst.st_ino, str(path))
         # The drain-and-cache is a single critical section: a concurrent loader
         # must wait and take the cached document, never race the pipe read.
         with _ONESHOT_CACHE_LOCK:
+            # Stat inside the lock: a loader that waited here while another
+            # drained a still-streaming source must see the post-drain ctime
+            # the drainer stored, not the one from before the lock.
+            key = _oneshot_cache_key(os.fstat(f.fileno()), path)
             if key in _ONESHOT_CONFIG_CACHE:
                 _logger.info("oneshot_config_cache_reused", source=str(path))
                 return _ONESHOT_CONFIG_CACHE[key]
@@ -2246,6 +2425,10 @@ def _read_config_text(path: Path) -> str:
                     "already drained by another reader, or the supervisor closed it "
                     "without writing"
                 )
+            # Every write bumps the ctime, so the stored key is taken after the
+            # drain, once the writer has closed: later loads see the same
+            # frozen identity.
+            key = _oneshot_cache_key(os.fstat(f.fileno()), path)
             return _ONESHOT_CONFIG_CACHE.setdefault(key, text)
 
 

@@ -33,12 +33,12 @@ from jentic_one.shared.auth.api_key_resolver import (
     is_retired_service_account_key,
 )
 from jentic_one.shared.auth.identity import Identity
+from jentic_one.shared.auth.permission_catalog import OIDC_PASSTHROUGH_SCOPES
 from jentic_one.shared.auth.verify import resolve_permissions_for_actor, verify_token
 from jentic_one.shared.context import Context
 from jentic_one.shared.db.errors import DatabaseUnavailableError
 from jentic_one.shared.models import ActorType
 from jentic_one.shared.pagination import InvalidCursorError
-from jentic_one.shared.scopes import OIDC_PASSTHROUGH_SCOPES
 from jentic_one.shared.state import build_state_backend
 from jentic_one.shared.state.factory import BackendKind
 from jentic_one.shared.web.app_factory import create_surface_app
@@ -53,7 +53,7 @@ def get_routers() -> list[tuple[APIRouter, str, list[str]]]:
     # Tags are assigned centrally by the OpenAPI tag resolver (see
     # shared/web/openapi_meta.resolve_tag), so no coarse include-level tags here.
     return [
-        (make_health_router("auth"), "/auth", []),
+        (make_health_router("auth", include_in_schema=False), "/auth", []),
         (discovery.router, "", []),
         # /mcp-scoped OAuth discovery: RFC 8414 + RFC 9728 docs,
         # the root protected-resource alias, and the /mcp 401 challenge. All
@@ -157,7 +157,7 @@ def _make_auth_verifier(ctx: Context) -> Any:
             )
             if resolved.actor_type == ActorType.AGENT:
                 # The access-token row carries the scopes minted from the agent's
-                # live actor_scope_grants (TokenService.issue_pair via the
+                # live actor_permission_grants (TokenService.issue_pair via the
                 # jwt-bearer exchange). Trust those as the agent's permissions:
                 # the AGENT branch of resolve_permissions_for_actor is an
                 # unimplemented stub that returns [], which silently drops every

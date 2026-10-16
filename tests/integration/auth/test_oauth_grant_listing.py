@@ -32,7 +32,9 @@ from jentic_one.auth.services.errors import (
 )
 from jentic_one.auth.services.oauth_grant_service import OAuthGrantService
 from jentic_one.shared.auth.identity import Identity
+from jentic_one.shared.auth.permission_catalog import OWNER_AGENTS_READ
 from jentic_one.shared.context import Context
+from jentic_one.shared.models import ActorType
 from tests.integration.auth import seeds
 
 pytestmark = pytest.mark.integration
@@ -68,8 +70,11 @@ async def _force_created_at(ctx: Context, grant_ids: list[str], created_at: date
 async def test_list_grants_for_agent_owner_or_admin_matrix(
     integration_context: Context, clean_grants: None
 ) -> None:
-    """Owner OK; stranger 403-mapped; each admin read permission OK; unknown
-    agent 404-mapped — mirroring the ``:revoke`` semantics on the read side."""
+    """Owner OK; org:admin OK; a stranger who cannot see the agent (even one
+    holding an oauth-clients permission) and an unknown agent both 404-mapped;
+    a caller who can see the agent without owning it (the agent itself, a
+    delegated sibling agent) 403-mapped — mirroring the ``:revoke`` semantics
+    on the read side."""
     owner_id = await _seed_user(integration_context, "usr_l_owner")
     stranger_id = await _seed_user(integration_context, "usr_l_stranger")
     admin_id = await _seed_user(integration_context, "usr_l_admin")
@@ -86,24 +91,49 @@ async def test_list_grants_for_agent_owner_or_admin_matrix(
             "agt_missing", identity=Identity(sub=owner_id, email="")
         )
 
-    with pytest.raises(OAuthGrantAccessDeniedError):
-        await grant_svc.list_grants_for_agent(
-            agent_id, identity=Identity(sub=stranger_id, email="")
-        )
+    # A stranger, even one holding agents:read, cannot see the agent: the
+    # same not-found as a missing agent.
+    for permissions in ([], ["agents:read"]):
+        with pytest.raises(ActorNotFoundError):
+            await grant_svc.list_grants_for_agent(
+                agent_id, identity=Identity(sub=stranger_id, email="", permissions=permissions)
+            )
+
+    # Visible but not owned: the agent itself, and a sibling agent reading
+    # through owner delegation.
+    sibling_id = await _seed_agent(integration_context, owner_id=owner_id, scopes=[])
+    visible_non_owners = [
+        Identity(sub=agent_id, email="", actor_type=ActorType.AGENT, parent_actor_id=owner_id),
+        Identity(
+            sub=sibling_id,
+            email="",
+            permissions=[OWNER_AGENTS_READ],
+            actor_type=ActorType.AGENT,
+            parent_actor_id=owner_id,
+        ),
+    ]
+    for identity in visible_non_owners:
+        with pytest.raises(OAuthGrantAccessDeniedError):
+            await grant_svc.list_grants_for_agent(agent_id, identity=identity)
 
     page = await grant_svc.list_grants_for_agent(
         agent_id, identity=Identity(sub=owner_id, email="")
     )
     assert [g.id for g in page.data] == [grant_id]
 
-    # Each admin permission unlocks the read: the write pair from :revoke plus
-    # the read half that gates the admin cross-view.
-    for permission in ("org:admin", "oauth-clients:write", "oauth-clients:read"):
-        page = await grant_svc.list_grants_for_agent(
-            agent_id,
-            identity=Identity(sub=admin_id, email="", permissions=[permission]),
-        )
-        assert [g.id for g in page.data] == [grant_id]
+    # Only org:admin reads any agent's grants. The oauth-clients permissions
+    # gate the cross-view route but do not lift caller scoping: a holder who
+    # cannot see the agent gets the same not-found as a stranger.
+    page = await grant_svc.list_grants_for_agent(
+        agent_id, identity=Identity(sub=admin_id, email="", permissions=["org:admin"])
+    )
+    assert [g.id for g in page.data] == [grant_id]
+    for permission in ("oauth-clients:write", "oauth-clients:read"):
+        with pytest.raises(ActorNotFoundError):
+            await grant_svc.list_grants_for_agent(
+                agent_id,
+                identity=Identity(sub=admin_id, email="", permissions=[permission]),
+            )
 
 
 async def test_list_grants_for_agent_enrichment_and_status_filter(
@@ -334,7 +364,7 @@ async def test_can_revoke_matrix_consenter_transfer_and_admin_arms(
 ) -> None:
     """``can_revoke`` mirrors the ``:revoke`` predicate per item — including
     the two G10 divergence arms: the agent's post-transfer owner can LIST but
-    not revoke, and a read-only admin can LIST but not revoke."""
+    not revoke, and a read-only admin neither lists nor revokes."""
     consenter_id = await _seed_user(integration_context, "usr_l_consenter")
     new_owner_id = await _seed_user(integration_context, "usr_l_new_owner")
     ro_admin_id = await _seed_user(integration_context, "usr_l_ro_admin")
@@ -365,24 +395,25 @@ async def test_can_revoke_matrix_consenter_transfer_and_admin_arms(
     with pytest.raises(OAuthGrantAccessDeniedError):
         await grant_svc.revoke_grant(grant_id, identity=new_owner)
 
-    # Read-only-admin arm: `oauth-clients:read` unlocks the LIST but is not in
-    # the revoke write set — can_revoke False, and the revoke verb agrees.
+    # Read-only-admin arm: `oauth-clients:read` alone neither lifts list
+    # scoping (the grant is outside its rows) nor grants the revoke.
     ro_admin = Identity(sub=ro_admin_id, email="", permissions=["oauth-clients:read"])
-    page = await grant_svc.list_grants_for_agent(agent_id, identity=ro_admin)
-    assert [(g.id, g.can_revoke) for g in page.data] == [(grant_id, False)]
+    cross = await OAuthGrantAdminService(integration_context).list_grants(identity=ro_admin)
+    assert cross.data == []
     with pytest.raises(OAuthGrantAccessDeniedError):
         await grant_svc.revoke_grant(grant_id, identity=ro_admin)
 
-    # The write-set admins CAN revoke — capability True on both surfaces.
-    for permission in ("org:admin", "oauth-clients:write"):
-        admin = Identity(sub=ro_admin_id, email="", permissions=[permission])
-        page = await grant_svc.list_grants_for_agent(agent_id, identity=admin)
-        assert [(g.id, g.can_revoke) for g in page.data] == [(grant_id, True)]
-        cross = await OAuthGrantAdminService(integration_context).list_grants(identity=admin)
-        assert [(g.id, g.can_revoke) for g in cross.data] == [(grant_id, True)]
+    # org:admin sees and CAN revoke — capability True on both surfaces.
+    admin = Identity(sub=ro_admin_id, email="", permissions=["org:admin"])
+    page = await grant_svc.list_grants_for_agent(agent_id, identity=admin)
+    assert [(g.id, g.can_revoke) for g in page.data] == [(grant_id, True)]
+    cross = await OAuthGrantAdminService(integration_context).list_grants(identity=admin)
+    assert [(g.id, g.can_revoke) for g in cross.data] == [(grant_id, True)]
 
-    # The consenting user still holds the revoke on the admin cross-view shape
-    # too (were they ever granted the read permission to reach it).
+    # The cross-view is caller-scoped: the new owner sees the grant through
+    # their agent (no revoke), the consenting user through the consent (revoke).
+    cross = await OAuthGrantAdminService(integration_context).list_grants(identity=new_owner)
+    assert [(g.id, g.can_revoke) for g in cross.data] == [(grant_id, False)]
     cross = await OAuthGrantAdminService(integration_context).list_grants(identity=consenter)
     assert [(g.id, g.can_revoke) for g in cross.data] == [(grant_id, True)]
 

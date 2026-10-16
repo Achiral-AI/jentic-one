@@ -1,8 +1,8 @@
 /**
- * AgentKeysPanel — the detail page's Keys tab: current API-key metadata,
- * generate/regenerate/revoke actions, and the rotation history. Relocated
- * from the identity header + flat card stack so the credential story lives
- * in one place. Plaintext is still shown exactly once, via ApiKeyDialog.
+ * AgentKeysPanel — the body of the dock's API key sheet: current API-key
+ * metadata, generate/regenerate/revoke actions, and the rotation history, so
+ * the key's story lives in one place. Plaintext is shown exactly once, via
+ * ApiKeyDialog.
  *
  * Generation is only offered for `active` agents (the backend rejects keys
  * for other statuses); metadata for an already-issued key stays visible in
@@ -17,9 +17,18 @@
  */
 import { useState } from 'react';
 import { Ban, History, KeyRound } from 'lucide-react';
-import { ActorLabel, Badge, Button, DetailSection, LoadingState } from '@/shared/ui';
+import {
+	ActorLabel,
+	Badge,
+	Button,
+	DetailSection,
+	LoadingState,
+	ConfirmDialog,
+	Tooltip,
+} from '@/shared/ui';
 import { formatTimestamp, timeAgo } from '@/shared/lib/utils';
 import { MIGRATED_SERVICE_ACCOUNT_KEY_WARNING, holdsMigratedServiceAccountKey } from '@/shared/lib';
+import { AGENTS_WRITE, useCanAccess } from '@/shared/auth';
 import {
 	useAgentApiKeyInfo,
 	useAgentApiKeyHistory,
@@ -27,8 +36,8 @@ import {
 	useRevokeAgentApiKey,
 	type AgentEntity,
 } from '@/modules/agents/api';
+import { AgentNameText } from '@/modules/agents/components/AgentNameText';
 import { ApiKeyDialog } from '@/modules/agents/components/ApiKeyDialog';
-import { ConfirmDialog } from '@/modules/agents/components/confirm/ConfirmDialog';
 import { MetaItem } from '@/modules/agents/components/detail/shared';
 
 export function AgentKeysPanel({ agent }: { agent: AgentEntity }) {
@@ -39,6 +48,8 @@ export function AgentKeysPanel({ agent }: { agent: AgentEntity }) {
 
 	const [apiKey, setApiKey] = useState<string | null>(null);
 	const [confirmRevoke, setConfirmRevoke] = useState(false);
+	// Issuing and revoking keys need `agents:write` (or `org:admin`).
+	const canManage = useCanAccess(AGENTS_WRITE);
 	const [confirmRegenerate, setConfirmRegenerate] = useState(false);
 
 	if (apiKeyInfo.isPending) {
@@ -108,7 +119,11 @@ export function AgentKeysPanel({ agent }: { agent: AgentEntity }) {
 					</p>
 				)}
 
-				{agent.status === 'active' ? (
+				{!canManage ? (
+					<p className="text-muted-foreground text-xs" data-testid="keys-need-permission">
+						Issuing or revoking keys needs permission to manage agents.
+					</p>
+				) : agent.status === 'active' ? (
 					<div className="flex flex-wrap justify-end gap-2">
 						{agent.hasApiKey && (
 							<Button
@@ -154,7 +169,7 @@ export function AgentKeysPanel({ agent }: { agent: AgentEntity }) {
 					{history.map((entry) => (
 						<div
 							key={entry.id}
-							className="border-border/60 flex items-center justify-between rounded-lg border px-3 py-2"
+							className="bg-surface-field flex items-center justify-between rounded-md px-3 py-2"
 						>
 							<div className="flex items-center gap-2">
 								<Badge
@@ -170,12 +185,14 @@ export function AgentKeysPanel({ agent }: { agent: AgentEntity }) {
 									</span>
 								)}
 							</div>
-							<span
-								className="text-muted-foreground/70 shrink-0 text-[11px]"
-								title={formatTimestamp(entry.occurredAt)}
+							<Tooltip
+								content={formatTimestamp(entry.occurredAt)}
+								className="shrink-0"
 							>
-								{timeAgo(entry.occurredAt)}
-							</span>
+								<span className="text-muted-foreground text-[11px]">
+									{timeAgo(entry.occurredAt)}
+								</span>
+							</Tooltip>
 						</div>
 					))}
 				</DetailSection>
@@ -183,7 +200,12 @@ export function AgentKeysPanel({ agent }: { agent: AgentEntity }) {
 
 			<ConfirmDialog
 				open={confirmRegenerate}
-				title={`Regenerate API key for ${agent.name}`}
+				title={
+					<>
+						Regenerate API key for{' '}
+						<AgentNameText name={agent.name} className="max-w-[32ch]" />
+					</>
+				}
 				body={
 					<>
 						<p>
@@ -202,7 +224,12 @@ export function AgentKeysPanel({ agent }: { agent: AgentEntity }) {
 
 			<ConfirmDialog
 				open={confirmRevoke}
-				title={`Revoke API key for ${agent.name}`}
+				title={
+					<>
+						Revoke API key for{' '}
+						<AgentNameText name={agent.name} className="max-w-[32ch]" />
+					</>
+				}
 				body={
 					<>
 						<p>

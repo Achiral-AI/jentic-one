@@ -34,7 +34,7 @@ An authenticated MCP connection. The credential (an OAuth grant your
 operator authorized when connecting the client, or a bearer token/API key
 the client presents at the transport) is attached by the MCP client on every
 request — you never run setup, never handle token refresh, and never see the
-raw credential. On the HTTP mount your scopes and bindings are resolved live
+raw credential. On the HTTP mount your permissions and bindings are resolved live
 per request, so an approved grant works on the very next tool call with no
 re-mint step (one exception: the session's OAuth consent ceiling — see the
 access step).
@@ -42,7 +42,7 @@ access step).
 ## Step 1 — identity
 
 Call `whoami` — it answers with your identity as the control plane sees it:
-id, **status**, scopes, and credential bindings.
+id, **status**, permissions, and credential bindings.
 
 ```
 whoami {}
@@ -60,27 +60,40 @@ invent it.
 
 The decide-first doctrine (see `SKILL.md` step 2) is driven by `whoami`:
 read your bindings and the APIs they serve, and decide up front whether the
-job is coverable. When a credential is missing for a vendor in the
-deployment's connect registry, **start the connection yourself** with
-`request_connection`:
+job is coverable. When a credential is missing, **start the connection
+yourself** with `request_connection` — by vendor key for a registry vendor,
+by API identity (the `api.vendor/name/version` from `inspect_operation`)
+for anything else:
 
 ```
 request_connection {"vendor": "github", "reason": "read open PRs to summarise them"}
+request_connection {"api": {"vendor": "stripe-com", "name": "stripe-com-api", "version": "2024-06-20"}, "reason": "list this month's charges"}
 ```
 
 It returns `{session_id, approval_url, resolved_flow}` — relay the
-`approval_url` to your human operator, who opens it in their browser and
-approves the connection and its scopes (you cannot open or approve it, and
-the tool never polls). Once they confirm, call `whoami` to see the new
-binding, then retry the blocked call. Optionally shape the ask with
-`requested_scopes` (vendor scope names; write scopes are flagged for the
-approver) and a `reason` the approver sees.
+`approval_url` to your human operator, who approves in their browser (and
+enters the key, for an `api` connect); you cannot open or approve it, and
+the tool never polls. Pass `auth_type` when the spec declares several
+schemes (the error lists them), `requested_scopes` for vendor scopes,
+`requested_permission_rules` for the binding rules you need (e.g.
+`[{"effect": "allow", "methods": ["GET"], "path": "/repos/.*"}]` — the
+approver reviews them), and a `reason` the approver sees. When
+`resolved_flow` is `manual_*` or `awaiting_app` (the result then points
+`next_tool` at `execute`), a human enters the credential, which can take
+hours: relay the URL, **end your turn**, and retry the blocked call later.
+Otherwise, once they confirm, call `whoami` to see the new binding and
+retry. A rejected request means stop: tell your user, don't ask again. If
+several shared OAuth apps serve the vendor, the error lists them in
+`details.candidates` (name and `registration_id`). Choosing the app is your
+user's decision, not yours: show them the list, ask which one to use, then
+call `request_connection` again with `oauth_app_registration_id` set to
+their pick.
 
-For everything else, **report the gap to your human operator in one
-complete summary** — the API (vendor/name), the auth type the spec
-declares, the operations you intend to call, your proposed permission
-rules, and why. Approval is always a human action, and so are binding an
-existing credential and scope grants: the operator acts in the Jentic One
+Where `api` connects aren't available (the error says so), **report the
+gap to your human operator in one complete summary** — the API
+(vendor/name), the auth type the spec declares, the operations you intend
+to call, your proposed permission rules, and why. Approval is always a human action, and so are binding an
+existing credential and permission grants: the operator acts in the Jentic One
 dashboard; your job is to relay the gap, not to grant it.
 
 Bindings resolve live per request on the HTTP mount, so once your operator
@@ -157,17 +170,30 @@ execute {"operation_id": "POST:https://api.example.com/v1/things", "inputs": {"l
 execute_read {"operation_id": "GET:https://sheets.googleapis.com/v4/spreadsheets/{id}/values/{range}", "inputs": {"id": "ABC", "range": "A1:Z10"}}
 ```
 
-**The job-poll idiom.** A held or async execution does not answer inline: a
-202 HELD response (human approval required) or a tracked import returns a
-**job envelope** (`{job_id, status, …}`). Poll it with the job id until the
-status is terminal (`completed`, `failed`, `cancelled`, `dead_letter`):
+**The poll idiom.** A held or async execution does not answer inline. A
+202 HELD response (human approval required) returns a `held_execution_id`;
+an async execution or a tracked import returns a **job envelope**
+(`{job_id, status, …}`). For a held call, the most important step is to
+**show the user its `review_url`** — a reviewer signs in there to approve or
+deny it — and end your turn so the user sees the link. **Do not call
+`get_execution_result` until the user replies**; then call it **once** with
+the `held_execution_id`; it waits up to 30 seconds (`timeout`, in seconds,
+at most 30) and returns early once the call has finished (`completed`,
+`failed`, `cancelled`). If it is still held, the answer repeats the
+`review_url`: show the user the link again and end your turn again. A
+`failed` held call carries the permission-denied problem (denied or expired)
+as its result. A tracked import is polled the same way with its `job_id`:
 
 ```
-get_execution_result {"job_id": "<id from the held response>"}
+get_execution_result {"held_execution_id": "<id from the held response>"}
+get_execution_result {"job_id": "<id from an async or import response>"}
 ```
 
-**Never re-send the original call while a job is pending** — approval
-happens out-of-band, and re-sending duplicates the side effect.
+**Never re-send the original call while it is pending** — approval
+happens out-of-band, and re-sending duplicates the side effect. A client
+that supports URL-mode elicitation may instead be asked to open the review
+page for the user; its accept only means the link was opened — the
+reviewer still decides on that page.
 
 **The recovery mapping.** What the CLI lane surfaces as a stderr
 `agent_directive` + exit codes arrives on MCP as a **coded error envelope**:
@@ -185,10 +211,17 @@ happens out-of-band, and re-sending duplicates the side effect.
 And know the recovery split: a `credential_not_provisioned` (424) or an
 unserved `no_credential_binding` (403) denial is **provisioning-shaped** —
 its envelope points `next_tool` at `request_connection`. When the directive
-carries a `suggested_command` naming the registry key, start the fix
-yourself (`request_connection` with that key) and relay the `approval_url`;
-a denial whose recovery carries only a `provisioning_url` is for your
-operator — relay it so they can connect the account. The denial taxonomy
+names a connect target — `parameters.connect.vendor_key` (pass it as
+`vendor`), `parameters.connect.api` (pass it as `api`), or a
+`suggested_command` naming the registry key — start the fix yourself (the
+envelope's `next_tool_arguments` — `{"vendor": …}`, plus
+`oauth_app_registration_id` when the directive pins the one shared app that
+covers the API, or `{"api": …}` — are the `request_connection` arguments; add
+the directive's `suggested_rules` as `requested_permission_rules`) and relay
+the `approval_url`;
+a denial carrying a `provisioning_url` means a connect request you opened
+is still waiting — relay that link to your operator rather than calling
+`request_connection` again. The denial taxonomy
 (`no_credential_binding`, `credential_undecryptable`,
 `credential_identity_mismatch`,
 `ambiguous_credential_binding` — the per-code meanings are surface-independent
@@ -197,12 +230,12 @@ delivered in the envelope instead of stderr.
 
 ## The 9 mount tools (each maps onto the loop)
 
-- `whoami` — your identity, status, scopes, and credential bindings with the
+- `whoami` — your identity, status, permissions, and credential bindings with the
   APIs each one serves; start here and decide access from it.
-- `request_connection` — start a connect session for a registry vendor when
-  no binding serves the API you need; relay the returned `approval_url` to
-  your operator (they approve — you never poll or approve), then confirm
-  with `whoami` and retry.
+- `request_connection` — start a connect session (registry vendor or any
+  registry API) when no binding serves the API you need; relay the returned
+  `approval_url` to your operator (they approve — you never poll or
+  approve), then confirm with `whoami` and retry.
 - `search_apis` — search the imported registry for operations by
   natural-language query; each hit carries the `target` to pass to
   `inspect_operation`/`execute`.

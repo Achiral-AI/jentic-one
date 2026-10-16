@@ -19,8 +19,8 @@ from fastapi.testclient import TestClient
 from jentic_one.auth.web import app as auth_app
 from jentic_one.auth.web.routers import discovery
 from jentic_one.mcp.installer import install_mcp_challenge_placeholder
+from jentic_one.shared.auth.permission_catalog import MCP_TOOL_SCOPES
 from jentic_one.shared.config import AuthConfig, ServerConfig
-from jentic_one.shared.scopes import MCP_TOOL_SCOPES
 
 _BASE = "https://auth.example.com"
 
@@ -339,13 +339,14 @@ def test_mcp_probe_method_answer_is_uniform_in_the_disabled_arm() -> None:
 
 
 @pytest.mark.parametrize("oauth_enabled", [True, False])
-def test_doc_paths_listed_in_live_openapi_in_both_arms(oauth_enabled: bool) -> None:
-    """The live /openapi.json lists the three doc paths (build-level, like the
-    root discovery doc) in both arms; the /mcp placeholder stays schema-hidden."""
+def test_doc_paths_hidden_from_live_openapi_in_both_arms(oauth_enabled: bool) -> None:
+    """The three doc paths are RFC 8414/9728 well-known documents clients find by
+    URL, not via OpenAPI, so they stay schema-hidden in both arms (as does the
+    /mcp placeholder) while still being served."""
     client = _make_client(oauth_enabled=oauth_enabled)
     paths = client.get("/openapi.json").json()["paths"]
     for path in _MCP_DOC_PATHS:
-        assert path in paths
+        assert path not in paths
     assert "/mcp" not in paths
 
 

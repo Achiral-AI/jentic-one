@@ -29,6 +29,9 @@ export class UsersService {
     public static login({
         requestBody,
     }: {
+        /**
+         * Credentials for login.
+         */
         requestBody: LoginRequest,
     }): CancelablePromise<LoginResponse> {
         return __request(OpenAPI, {
@@ -73,7 +76,9 @@ export class UsersService {
     }
     /**
      * List Users
-     * List all users with cursor-based pagination.
+     * List users with cursor-based pagination.
+     *
+     * Scoped to the caller: org admins see every user; anyone else sees only themselves.
      * @returns UserListResponse Successful Response
      * @throws ApiError
      */
@@ -82,8 +87,17 @@ export class UsersService {
         limit = 50,
         inviteState,
     }: {
+        /**
+         * Opaque cursor from a previous page's `next_cursor`; omit for the first page.
+         */
         cursor?: (string | null),
+        /**
+         * Maximum number of users to return (1-200, default 50).
+         */
         limit?: number,
+        /**
+         * Only return users in this invite state. `expired` matches pending users whose invite has lapsed; `pending` matches only those with a live invite.
+         */
         inviteState?: (InviteState | null),
     }): CancelablePromise<UserListResponse> {
         return __request(OpenAPI, {
@@ -113,6 +127,9 @@ export class UsersService {
     public static createUser({
         requestBody,
     }: {
+        /**
+         * Request body for creating a new user.
+         */
         requestBody: UserCreateRequest,
     }): CancelablePromise<UserCreatedResponse> {
         return __request(OpenAPI, {
@@ -163,6 +180,9 @@ export class UsersService {
     public static changePassword({
         requestBody,
     }: {
+        /**
+         * Payload for changing own password.
+         */
         requestBody: ChangePasswordRequest,
     }): CancelablePromise<LoginResponse> {
         return __request(OpenAPI, {
@@ -194,6 +214,9 @@ export class UsersService {
     public static deleteUser({
         userId,
     }: {
+        /**
+         * ID of the user.
+         */
         userId: string,
     }): CancelablePromise<void> {
         return __request(OpenAPI, {
@@ -217,12 +240,18 @@ export class UsersService {
     /**
      * Get User
      * Get a user by ID.
+     *
+     * Scoped to the caller: org admins can read any user; anyone else only themselves.
+     * Any other user answers 404.
      * @returns UserResponse Successful Response
      * @throws ApiError
      */
     public static getUser({
         userId,
     }: {
+        /**
+         * ID of the user.
+         */
         userId: string,
     }): CancelablePromise<UserResponse> {
         return __request(OpenAPI, {
@@ -235,6 +264,7 @@ export class UsersService {
                 400: `Bad Request`,
                 401: `Unauthorized`,
                 403: `Forbidden`,
+                404: `Not Found`,
                 422: `Unprocessable Entity`,
                 500: `Internal Server Error`,
                 503: `Service Unavailable`,
@@ -244,6 +274,9 @@ export class UsersService {
     /**
      * Update User
      * Update a user's profile fields.
+     *
+     * Scoped like `GET /users/{user_id}`: org admins can update any user; anyone
+     * else only themselves. Any other user answers 404.
      * @returns UserResponse Successful Response
      * @throws ApiError
      */
@@ -251,7 +284,13 @@ export class UsersService {
         userId,
         requestBody,
     }: {
+        /**
+         * ID of the user.
+         */
         userId: string,
+        /**
+         * Request body for updating a user.
+         */
         requestBody: UserUpdateRequest,
     }): CancelablePromise<UserResponse> {
         return __request(OpenAPI, {
@@ -266,6 +305,8 @@ export class UsersService {
                 400: `Bad Request`,
                 401: `Unauthorized`,
                 403: `Forbidden`,
+                404: `Not Found`,
+                409: `The email is already in use`,
                 422: `Unprocessable Entity`,
                 500: `Internal Server Error`,
                 503: `Service Unavailable`,
@@ -282,7 +323,13 @@ export class UsersService {
         userId,
         requestBody,
     }: {
+        /**
+         * ID of the user.
+         */
         userId: string,
+        /**
+         * Request body for setting user permissions.
+         */
         requestBody: SetPermissionsRequest,
     }): CancelablePromise<UserResponse> {
         return __request(OpenAPI, {
@@ -314,6 +361,9 @@ export class UsersService {
     public static disableUser({
         userId,
     }: {
+        /**
+         * ID of the user.
+         */
         userId: string,
     }): CancelablePromise<void> {
         return __request(OpenAPI, {
@@ -343,6 +393,9 @@ export class UsersService {
     public static enableUser({
         userId,
     }: {
+        /**
+         * ID of the user.
+         */
         userId: string,
     }): CancelablePromise<void> {
         return __request(OpenAPI, {
@@ -370,6 +423,9 @@ export class UsersService {
     public static reissueInvite({
         userId,
     }: {
+        /**
+         * ID of the user.
+         */
         userId: string,
     }): CancelablePromise<InviteIssuedResponse> {
         return __request(OpenAPI, {
@@ -401,6 +457,9 @@ export class UsersService {
     public static createAdmin({
         requestBody,
     }: {
+        /**
+         * Payload for first-run admin creation (one-time setup).
+         */
         requestBody: CreateAdminRequest,
     }): CancelablePromise<LoginResponse> {
         return __request(OpenAPI, {
@@ -426,6 +485,9 @@ export class UsersService {
     public static redeemInvite({
         requestBody,
     }: {
+        /**
+         * Payload for redeeming an invite token.
+         */
         requestBody: RedeemInviteRequest,
     }): CancelablePromise<LoginResponse> {
         return __request(OpenAPI, {

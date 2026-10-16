@@ -41,7 +41,7 @@ in [`tests/arch/`](tests/arch/) and the scoped rules under
 | `test-arch`         | Run architecture enforcement tests                |
 | `test-smoke`        | Run smoke tests (requires running services)       |
 | `cov`               | Run tests with coverage report                    |
-| `score`             | Validate OpenAPI specs with scorecard (80+ req)   |
+| `score`             | Score OpenAPI specs (opt-in: `JENTIC_SCORE_API_KEY`) |
 | `check`             | Run lint, score, secrets audit, unit + arch tests |
 | `hooks`             | Install lefthook git hooks (pre-commit + commit-msg) |
 | `clean`             | Remove caches and build artifacts                 |
@@ -97,11 +97,10 @@ src/jentic_one/
     ├── tracing.py    # Tracing facade
     ├── redaction.py  # Secret/PII redaction helpers
     ├── pagination.py # Shared pagination primitives
-    ├── scopes.py     # Scope/permission constants
     ├── url.py        # URL utilities (server-variable substitution)
     ├── url_validation.py # Upstream URL validation (SSRF guard)
     ├── audit/        # Audit-log helpers
-    ├── auth/         # Shared auth primitives (JWKS, tokens)
+    ├── auth/         # Shared auth primitives (JWKS, tokens, permission catalogue)
     ├── broker/       # Shared broker protocols
     ├── crypto/       # Encryption facade
     ├── events/       # Event/SSE plumbing

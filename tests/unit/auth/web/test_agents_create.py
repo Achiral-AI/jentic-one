@@ -146,3 +146,11 @@ def test_agent_created_by_a_user_has_no_parent_agent(
     kwargs = mock_agent_svc.create.await_args.kwargs
     assert kwargs["owner_id"] == "usr_admin"
     assert kwargs["parent_agent_id"] is None
+
+
+def test_create_agent_rejects_unknown_field(client: TestClient, mock_agent_svc: MagicMock) -> None:
+    """A body naming its grants ``scopes`` (the pre-rename shape) is a 422, not
+    an ignored key that falls through to the default permission baseline."""
+    resp = client.post("/agents", json={"name": "my-bot", "scopes": ["capabilities:read"]})
+    assert resp.status_code == 422
+    mock_agent_svc.create.assert_not_called()

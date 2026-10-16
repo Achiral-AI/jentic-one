@@ -17,6 +17,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -195,6 +197,22 @@ func TestMCPExecute_DenialNextToolKeysOnProblemType(t *testing.T) {
 			`{"type":"credential_not_provisioned","detail":"denied","agent_directive":{"strategy":"prompt_human","parameters":{"suggested_command":"jentic connect acme"},"human_readable_instruction":"Run jentic connect acme (or request_connection)."}}`, "request_connection",
 		},
 		{
+			// A shared OAuth app covers the API: the structured connect target
+			// alone is enough to point at request_connection.
+			"credential_not_provisioned_shared_app", http.StatusFailedDependency,
+			`{"type":"credential_not_provisioned","detail":"denied","agent_directive":{"strategy":"prompt_human","parameters":{"connect":{"vendor_key":"google","registration_id":"oar_1"}},"human_readable_instruction":"Run jentic connect google (or request_connection)."}}`, "request_connection",
+		},
+		{
+			// A connect target never turns a rule denial into a connect pointer.
+			"action_denied_with_connect", http.StatusForbidden,
+			`{"type":"action_denied","detail":"denied","agent_directive":{"strategy":"prompt_human","parameters":{"connect":{"vendor_key":"google"}},"human_readable_instruction":"Ask your operator."}}`, "whoami",
+		},
+		{
+			// API connect requests enabled: the directive names the API itself.
+			"no_credential_binding_api_target", http.StatusForbidden,
+			`{"type":"no_credential_binding","detail":"denied","agent_directive":{"strategy":"prompt_human","parameters":{"suggested_command":"jentic connect --api acme/pets/v1","connect":{"api":{"vendor":"acme","name":"pets","version":"v1"}}},"human_readable_instruction":"Run jentic connect --api acme/pets/v1 (or request_connection with api) and relay the approval_url."}}`, "request_connection",
+		},
+		{
 			"action_denied", http.StatusForbidden,
 			`{"type":"action_denied","detail":"a permission rule forbids this operation"}`, "whoami",
 		},
@@ -240,6 +258,77 @@ func TestMCPExecute_DenialNextToolKeysOnProblemType(t *testing.T) {
 			}
 			if tc.wantTool == "request_connection" && !strings.Contains(step, "request_connection") {
 				t.Errorf("actionable_step %q must teach the connect leg on a registry-vendor denial", step)
+			}
+		})
+	}
+}
+
+// TestMCPExecute_DenialFillsRequestConnectionArguments pins the
+// next_tool_arguments a provisioning denial carries: the vendor from the
+// directive's parameters.connect.vendor_key, with oauth_app_registration_id
+// when it pins a registration_id (else the api identity from
+// parameters.connect.api), and nothing when the directive
+// names only the CLI suggested_command (an older broker) or when next_tool is
+// not request_connection. Python twin:
+// tests/unit/mcp/test_execute_golden.py.
+func TestMCPExecute_DenialFillsRequestConnectionArguments(t *testing.T) {
+	cases := []struct {
+		name     string
+		body     string
+		wantArgs map[string]any
+	}{
+		{
+			"structured_connect",
+			`{"type":"no_credential_binding","agent_directive":{"strategy":"prompt_human","parameters":{"suggested_command":"jentic connect google","connect":{"vendor_key":"google","registration_id":"oar_1"},"suggested_rules":[{"effect":"allow","methods":["GET"],"path":"/v1/pets","match_mode":"exact"}]},"human_readable_instruction":"Run jentic connect google (or request_connection)."}}`,
+			map[string]any{"vendor": "google", "oauth_app_registration_id": "oar_1"},
+		},
+		{
+			"structured_connect_unpinned",
+			`{"type":"no_credential_binding","agent_directive":{"strategy":"prompt_human","parameters":{"suggested_command":"jentic connect google","connect":{"vendor_key":"google"}},"human_readable_instruction":"Run jentic connect google (or request_connection)."}}`,
+			map[string]any{"vendor": "google"},
+		},
+		{
+			"suggested_command_only",
+			`{"type":"no_credential_binding","agent_directive":{"strategy":"prompt_human","parameters":{"suggested_command":"jentic connect acme"},"human_readable_instruction":"Run jentic connect acme (or request_connection)."}}`,
+			nil,
+		},
+		{
+			"api_target",
+			`{"type":"no_credential_binding","agent_directive":{"strategy":"prompt_human","parameters":{"suggested_command":"jentic connect --api acme/pets/v1","connect":{"api":{"vendor":"acme","name":"pets","version":"v1"}}},"human_readable_instruction":"Run jentic connect --api acme/pets/v1 (or request_connection with api)."}}`,
+			map[string]any{"api": map[string]any{"vendor": "acme", "name": "pets", "version": "v1"}},
+		},
+		{
+			"rule_denial",
+			`{"type":"action_denied","agent_directive":{"strategy":"prompt_human","parameters":{"connect":{"vendor_key":"google"}},"human_readable_instruction":"Ask your operator."}}`,
+			nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/problem+json")
+				w.Header().Set("Jentic-Error-Origin", "broker")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer broker.Close()
+
+			s := stampedTestMCPServer(t)
+			res, err := s.handleExecute(activeCtxWithBroker("http://127.0.0.1:8000", broker.URL),
+				callToolRequest("execute", `{"operation_id":"GET:/v1/pets"}`))
+			if err != nil {
+				t.Fatalf("a broker denial must be a soft error: %v", err)
+			}
+			payload := decodeToolJSON(t, res)
+			got, present := payload["next_tool_arguments"]
+			if tc.wantArgs == nil {
+				if present {
+					t.Errorf("next_tool_arguments = %v, want absent", got)
+				}
+				return
+			}
+			if !reflect.DeepEqual(got, tc.wantArgs) {
+				t.Errorf("next_tool_arguments = %v, want %v", got, tc.wantArgs)
 			}
 		})
 	}
@@ -328,41 +417,6 @@ func TestMCPExecute_UpstreamErrorIsNormalResult(t *testing.T) {
 	payload := decodeToolJSON(t, res)
 	if payload["status"] != float64(http.StatusForbidden) {
 		t.Errorf("status = %v, want the upstream 403 relayed", payload["status"])
-	}
-}
-
-func TestMCPExecute_HeldEnvelopePassesThrough(t *testing.T) {
-	// The ask-tier 202-held broker behavior has not shipped; this mocks its
-	// envelope (§3.4) and pins the passthrough: NOT an error, directive and
-	// job pointer intact, so the model can poll with get_execution_result.
-	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Jentic-Execution-Id", "exec_held")
-		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte(`{"job_id":"job_9","status":"held","agent_directive":{"strategy":"wait","parameters":{"job_id":"job_9","retry_after_seconds":30},"human_readable_instruction":"This call is held for human approval; poll the job for the outcome."}}`))
-	}))
-	defer broker.Close()
-
-	s := stampedTestMCPServer(t)
-	res, err := s.handleExecute(activeCtxWithBroker("http://127.0.0.1:8000", broker.URL),
-		callToolRequest("execute", `{"operation_id":"POST:/v1/pets"}`))
-	if err != nil {
-		t.Fatalf("handleExecute: %v", err)
-	}
-	if res.IsError {
-		t.Fatalf("a held (202) envelope is a normal result, got soft error: %s", toolResultText(res))
-	}
-	payload := decodeToolJSON(t, res)
-	if payload["status"] != float64(http.StatusAccepted) || payload["execution_id"] != "exec_held" {
-		t.Fatalf("envelope = %v, want the 202 + execution id relayed", payload)
-	}
-	body, _ := payload["body"].(map[string]any)
-	if body["job_id"] != "job_9" {
-		t.Errorf("body = %v, want the job pointer intact", payload["body"])
-	}
-	directive, _ := body["agent_directive"].(map[string]any)
-	if directive["strategy"] != "wait" {
-		t.Errorf("held directive = %v, want the wait strategy passed through", body["agent_directive"])
 	}
 }
 
@@ -466,6 +520,25 @@ func TestMCPExecute_MidflightFailureWithIdempotencyKeyIsRetryable(t *testing.T) 
 	payload := decodeToolJSON(t, res)
 	if payload["error_code"] != ux.CodeTransportError || payload["retryable"] != true {
 		t.Errorf("payload = {error_code: %v, retryable: %v}, want a retryable TRANSPORT_ERROR (keyed POST is de-duplicated)",
+			payload["error_code"], payload["retryable"])
+	}
+}
+
+// TestMCPExecute_MidflightFailureWithHeaderIdempotencyKeyIsRetryable: an
+// Idempotency-Key passed via `headers` rides the wire just like
+// `idempotency_key`, so the network-failure path honours it too (parity with
+// the 5xx path and with the Python mount).
+func TestMCPExecute_MidflightFailureWithHeaderIdempotencyKeyIsRetryable(t *testing.T) {
+	broker := midflightBroker(t)
+	s := stampedTestMCPServer(t)
+	res, err := s.handleExecute(activeCtxWithBroker("http://127.0.0.1:8000", broker.URL),
+		callToolRequest("execute", `{"operation_id":"POST:/v1/pets","body":{"name":"Bob"},"headers":{"Idempotency-Key":"key-1"}}`))
+	if err != nil {
+		t.Fatalf("handleExecute: %v", err)
+	}
+	payload := decodeToolJSON(t, res)
+	if payload["error_code"] != ux.CodeTransportError || payload["retryable"] != true {
+		t.Errorf("payload = {error_code: %v, retryable: %v}, want a retryable TRANSPORT_ERROR (header-keyed POST is de-duplicated)",
 			payload["error_code"], payload["retryable"])
 	}
 }
@@ -980,7 +1053,7 @@ func TestMCPGetExecutionResult_PendingJobHasNoResult(t *testing.T) {
 	defer srv.Close()
 
 	s := stampedTestMCPServer(t)
-	res, err := s.handleGetExecutionResult(activeCtx(srv.URL), callToolRequest("get_execution_result", `{"job_id":"job_9"}`))
+	res, err := s.handleGetExecutionResult(activeCtx(srv.URL), callToolRequest("get_execution_result", `{"job_id":"job_9","timeout":0}`))
 	if err != nil {
 		t.Fatalf("handleGetExecutionResult: %v", err)
 	}
@@ -1138,4 +1211,196 @@ func problemTypeOf(body string) string {
 	}
 	_ = json.Unmarshal([]byte(body), &env)
 	return env.Type
+}
+
+// TestMCPExecute_BrokerResolveFailureIsError pins #1429 on the MCP twin: a
+// broker-origin 4xx that is not a denial is an isError RESOLVE_FAILED result,
+// non-retryable, pointing at the tool that can fix it.
+func TestMCPExecute_BrokerResolveFailureIsError(t *testing.T) {
+	cases := []struct {
+		name, body, wantNext string
+		status               int
+	}{
+		{"unknown credential id", `{"type":"credential_id_not_found","title":"Credential id cred_nope is not among your credentials","status":400}`, "whoami", http.StatusBadRequest},
+		{"unregistered upstream", `{"type":"operation_not_found","title":"Operation not found — unregistered upstream URL.","status":404}`, "search_apis", http.StatusNotFound},
+		{"contract error points at inspect", `{"type":"payload_too_large","title":"Request body exceeds the 1024-byte cap.","status":413}`, "inspect_operation", http.StatusRequestEntityTooLarge},
+		{"credential-ish type is not substring-matched", `{"type":"credential_header_malformed","title":"bad header","status":400}`, "inspect_operation", http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/problem+json")
+				w.Header().Set("Jentic-Error-Origin", "broker")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer broker.Close()
+
+			s := stampedTestMCPServer(t)
+			res, err := s.handleExecute(activeCtxWithBroker("http://127.0.0.1:8000", broker.URL),
+				callToolRequest("execute", `{"operation_id":"GET:/v1/pets"}`))
+			if err != nil {
+				t.Fatalf("a broker resolve failure must be a soft error, not a protocol error: %v", err)
+			}
+			if !res.IsError {
+				t.Fatalf("want IsError result for a broker resolve failure")
+			}
+			payload := decodeToolJSON(t, res)
+			if payload["error_code"] != ux.CodeResolveFailed {
+				t.Errorf("error_code = %v, want %q", payload["error_code"], ux.CodeResolveFailed)
+			}
+			if payload["retryable"] != false {
+				t.Errorf("retryable = %v, want false", payload["retryable"])
+			}
+			if payload["next_tool"] != tc.wantNext {
+				t.Errorf("next_tool = %v, want %q", payload["next_tool"], tc.wantNext)
+			}
+		})
+	}
+}
+
+// TestMCPExecute_BrokerRateLimitIsNotAResolveFailure pins that a broker 429 is
+// not a RESOLVE_FAILED: it is retryable after Retry-After, so it must not carry
+// retryable=false / "do not retry" advice.
+func TestMCPExecute_BrokerRateLimitIsNotAResolveFailure(t *testing.T) {
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.Header().Set("Jentic-Error-Origin", "broker")
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"type":"rate_limit_exceeded","title":"Rate limit exceeded; slow down and retry after the indicated delay.","status":429}`))
+	}))
+	defer broker.Close()
+
+	s := stampedTestMCPServer(t)
+	res, err := s.handleExecute(activeCtxWithBroker("http://127.0.0.1:8000", broker.URL),
+		callToolRequest("execute", `{"operation_id":"GET:/v1/pets"}`))
+	if err != nil {
+		t.Fatalf("handleExecute: %v", err)
+	}
+	payload := decodeToolJSON(t, res)
+	if payload["error_code"] == ux.CodeResolveFailed {
+		t.Fatalf("a broker 429 must not be classified RESOLVE_FAILED: %v", payload)
+	}
+}
+
+// TestMCPExecute_BrokerTransportErrorIsError pins #1531: a 5xx/429 the broker
+// itself emitted is a soft TRANSPORT_ERROR with a retryable hint keyed on the
+// problem type and the broker's Retry-After relayed as retry_after_s, never a
+// normal result. POST keeps the SDK transport from retrying the 5xx; the 429's
+// Retry-After exceeds the transport's inline wait budget.
+func TestMCPExecute_BrokerTransportErrorIsError(t *testing.T) {
+	cases := []struct {
+		name, problemType, retryAfter, target, args, wantNext string
+		status                                                int
+		wantRetryable                                         bool
+	}{
+		{"circuit open", "circuit_open", "12", "POST:/v1/pets", "", "get_started", 503, true},
+		{"runner unavailable", "runner_unavailable", "", "POST:/v1/pets", "", "get_started", 503, true},
+		{"too many candidates", "too_many_candidates", "", "POST:/v1/pets", "", "get_started", 503, true},
+		{"refresh transient", "refresh_transient_error", "", "POST:/v1/pets", "", "get_started", 502, true},
+		{"connect failed on an unkeyed POST", "upstream_connect_failed", "", "POST:/v1/pets", "", "get_started", 504, true},
+		{"timeout on an unkeyed POST", "deadline_exceeded", "", "POST:/v1/pets", "", "get_started", 504, false},
+		{"timeout on a keyed POST", "deadline_exceeded", "", "POST:/v1/pets", `,"idempotency_key":"idem-1"`, "get_started", 504, true},
+		{"timeout on a POST keyed via headers", "deadline_exceeded", "", "POST:/v1/pets", `,"headers":{"Idempotency-Key":"idem-1"}`, "get_started", 504, true},
+		{"timeout on a POST with a blank key", "deadline_exceeded", "", "POST:/v1/pets", `,"idempotency_key":"   "`, "get_started", 504, false},
+		{"upstream timeout on a read", "upstream_timeout", "", "GET:/v1/pets", "", "get_started", 504, true},
+		{"response too large", "upstream_response_too_large", "", "GET:/v1/pets", "", "get_started", 502, false},
+		{"scheme unsupported", "runner_scheme_unsupported", "", "POST:/v1/pets", "", "search_apis", 501, false},
+		{"unknown type", "streaming_unsupported", "", "POST:/v1/pets", "", "get_started", 500, false},
+		{"rate limited", "rate_limit_exceeded", "60", "GET:/v1/pets", "", "get_started", 429, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/problem+json")
+				w.Header().Set("Jentic-Error-Origin", "broker")
+				if tc.retryAfter != "" {
+					w.Header().Set("Retry-After", tc.retryAfter)
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(`{"type":"` + tc.problemType + `","title":"broker said ` + tc.problemType + `"}`))
+			}))
+			defer broker.Close()
+
+			s := stampedTestMCPServer(t)
+			res, err := s.handleExecute(activeCtxWithBroker("http://127.0.0.1:8000", broker.URL),
+				callToolRequest("execute", `{"operation_id":"`+tc.target+`"`+tc.args+`}`))
+			if err != nil {
+				t.Fatalf("a broker transport failure must be a soft error, not a protocol error: %v", err)
+			}
+			if !res.IsError {
+				t.Fatalf("want IsError result for a broker-origin %d", tc.status)
+			}
+			payload := decodeToolJSON(t, res)
+			if payload["error_code"] != ux.CodeTransportError {
+				t.Errorf("error_code = %v, want %q", payload["error_code"], ux.CodeTransportError)
+			}
+			if payload["retryable"] != tc.wantRetryable {
+				t.Errorf("retryable = %v, want %v", payload["retryable"], tc.wantRetryable)
+			}
+			if payload["next_tool"] != tc.wantNext {
+				t.Errorf("next_tool = %v, want %q", payload["next_tool"], tc.wantNext)
+			}
+			details, _ := payload["details"].(map[string]any)
+			if details["problem_type"] != tc.problemType || details["http_status"] != float64(tc.status) ||
+				details["origin"] != "broker" {
+				t.Errorf("details = %v", details)
+			}
+			if tc.retryAfter != "" {
+				want, _ := strconv.ParseFloat(tc.retryAfter, 64)
+				if payload["retry_after_s"] != want {
+					t.Errorf("retry_after_s = %v, want %v", payload["retry_after_s"], want)
+				}
+			} else if _, has := payload["retry_after_s"]; has {
+				t.Errorf("retry_after_s relayed without a Retry-After header: %v", payload)
+			}
+			if !strings.Contains(payload["error"].(string), "broker said "+tc.problemType) {
+				t.Errorf("error %q should carry the broker's reason", payload["error"])
+			}
+			if hint, _ := payload["actionable_step"].(string); hint == "" || strings.Contains(hint, "jentic ") {
+				t.Errorf("actionable_step must be MCP-flavored (no CLI commands), got %q", hint)
+			}
+		})
+	}
+}
+
+// TestMCPExecute_UpstreamOrigin5xxPassesThrough pins the other side of #1531: a
+// 5xx/429 the broker mirrored from the vendor, or one with no origin header, is
+// a normal result carrying the vendor's status.
+func TestMCPExecute_UpstreamOrigin5xxPassesThrough(t *testing.T) {
+	for _, tc := range []struct {
+		name, origin string
+		status       int
+	}{
+		{"upstream 503", "upstream", 503},
+		{"upstream 429", "upstream", 429},
+		{"missing origin 502", "", 502},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if tc.origin != "" {
+					w.Header().Set("Jentic-Error-Origin", tc.origin)
+				}
+				w.Header().Set("Retry-After", "60")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(`{"type":"circuit_open","error":"vendor down"}`))
+			}))
+			defer broker.Close()
+
+			s := stampedTestMCPServer(t)
+			res, err := s.handleExecute(activeCtxWithBroker("http://127.0.0.1:8000", broker.URL),
+				callToolRequest("execute", `{"operation_id":"POST:/v1/pets"}`))
+			if err != nil {
+				t.Fatalf("handleExecute: %v", err)
+			}
+			if res.IsError {
+				t.Fatalf("a non-broker %d must be a normal result: %v", tc.status, decodeToolJSON(t, res))
+			}
+			if payload := decodeToolJSON(t, res); payload["status"] != float64(tc.status) {
+				t.Errorf("status = %v, want %d", payload["status"], tc.status)
+			}
+		})
+	}
 }

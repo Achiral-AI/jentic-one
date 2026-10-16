@@ -84,7 +84,7 @@ describe('AgentDock — fixed bottom action dock', () => {
 		// The dock is agent-scoped only — the org-wide Credentials verb lives on
 		// the page header instead.
 		expect(dock.queryByRole('button', { name: 'Credentials' })).not.toBeInTheDocument();
-		// Settings is a sheet verb, never a link out to the console.
+		// Settings is a sheet verb, never a link out of the page.
 		expect(dock.queryByRole('link', { name: /Settings/ })).not.toBeInTheDocument();
 		expect(dock.getByRole('button', { name: /Archive support-agent/ })).toBeEnabled();
 	});
@@ -107,6 +107,12 @@ describe('AgentDock — fixed bottom action dock', () => {
 		const dock = await findDock();
 
 		expect(dock.queryByTestId('dock-serving-toggle')).not.toBeInTheDocument();
+		// Approve says what it grants, as every approval surface does.
+		await waitFor(() =>
+			expect(dock.getByTestId('dock-approve')).toHaveAccessibleDescription(
+				/^Approving grants /,
+			),
+		);
 		await user.click(dock.getByTestId('dock-approve'));
 
 		// Approval lands: the dock re-renders with the live serving toggle.
@@ -361,12 +367,13 @@ describe('AgentDock — fixed bottom action dock', () => {
 	it('surface with the dock mounted passes axe', async () => {
 		renderPage('/?agent=agnt_active_1');
 		await findDock();
-		// The panel fades in (180ms); axe must not sample contrast mid-animation or
-		// muted copy reads as low-contrast against the blended background.
+		// The card's content and the list fade in (180ms); axe must not sample
+		// contrast mid-animation or muted copy reads as low-contrast against the
+		// blended background.
 		await waitFor(() => {
-			const section = document.querySelector('section[aria-label="APIs for support-agent"]');
-			expect(section).not.toBeNull();
-			expect(getComputedStyle(section as Element).opacity).toBe('1');
+			for (const id of ['agent-card-content', 'can-call']) {
+				expect(getComputedStyle(screen.getByTestId(id)).opacity).toBe('1');
+			}
 		});
 		await checkA11y(document.body);
 	});

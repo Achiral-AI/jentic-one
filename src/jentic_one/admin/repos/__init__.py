@@ -2,7 +2,7 @@
 
 from jentic_one.admin.repos.access_token_repo import AccessTokenRepository
 from jentic_one.admin.repos.actor_directory_repo import ActorDirectoryRepository
-from jentic_one.admin.repos.actor_scope_grant_repo import ActorScopeGrantRepository
+from jentic_one.admin.repos.actor_permission_grant_repo import ActorPermissionGrantRepository
 from jentic_one.admin.repos.agent_credential_binding_repo import AgentCredentialBindingRepository
 from jentic_one.admin.repos.agent_credential_repo import AgentCredentialRepository
 from jentic_one.admin.repos.agent_repo import AgentRepository
@@ -11,6 +11,7 @@ from jentic_one.admin.repos.authorization_code_repo import AuthorizationCodeRepo
 from jentic_one.admin.repos.event_repo import EventRepository
 from jentic_one.admin.repos.execution_record_repo import ExecutionRecordRepository
 from jentic_one.admin.repos.external_identity_repo import ExternalIdentityRepository
+from jentic_one.admin.repos.held_execution_repo import HeldExecutionRepository
 from jentic_one.admin.repos.invite_token_repo import InviteTokenRepository
 from jentic_one.admin.repos.job_repo import JobRepository
 from jentic_one.admin.repos.job_result_repo import JobResultRepository
@@ -26,7 +27,7 @@ from jentic_one.admin.repos.user_secret_repo import UserSecretRepository
 __all__ = [
     "AccessTokenRepository",
     "ActorDirectoryRepository",
-    "ActorScopeGrantRepository",
+    "ActorPermissionGrantRepository",
     "AgentCredentialBindingRepository",
     "AgentCredentialRepository",
     "AgentRepository",
@@ -35,6 +36,7 @@ __all__ = [
     "EventRepository",
     "ExecutionRecordRepository",
     "ExternalIdentityRepository",
+    "HeldExecutionRepository",
     "InviteTokenRepository",
     "JobRepository",
     "JobResultRepository",

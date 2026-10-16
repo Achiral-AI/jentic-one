@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from jentic_one.admin.core.schema.access_tokens import AccessToken
-from jentic_one.admin.core.schema.actor_scope_grants import ActorScopeGrant
+from jentic_one.admin.core.schema.actor_permission_grants import ActorPermissionGrant
 from jentic_one.admin.core.schema.agent_credential_bindings import AgentCredentialBinding
 from jentic_one.admin.core.schema.agent_credentials import AgentCredential
 from jentic_one.admin.core.schema.agents import Agent
@@ -12,6 +12,7 @@ from jentic_one.admin.core.schema.authorization_codes import AuthorizationCode
 from jentic_one.admin.core.schema.events import Event
 from jentic_one.admin.core.schema.execution_records import ExecutionRecord
 from jentic_one.admin.core.schema.external_identities import ExternalIdentity
+from jentic_one.admin.core.schema.held_executions import HeldExecution
 from jentic_one.admin.core.schema.instance_identity import InstanceIdentity
 from jentic_one.admin.core.schema.invite_tokens import InviteToken
 from jentic_one.admin.core.schema.job_results import JobResult
@@ -28,7 +29,7 @@ from jentic_one.shared.db.base import AdminBase
 
 __all__ = [
     "AccessToken",
-    "ActorScopeGrant",
+    "ActorPermissionGrant",
     "AdminBase",
     "Agent",
     "AgentCredential",
@@ -38,6 +39,7 @@ __all__ = [
     "Event",
     "ExecutionRecord",
     "ExternalIdentity",
+    "HeldExecution",
     "InstanceIdentity",
     "InviteToken",
     "Job",

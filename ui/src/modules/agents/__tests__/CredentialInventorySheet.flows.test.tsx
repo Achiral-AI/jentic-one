@@ -6,6 +6,7 @@
  * sheet on the Agents page.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { http, HttpResponse } from 'msw';
 import { useLocation } from 'react-router';
 import { page, userEvent as browserUser } from 'vitest/browser';
 import { worker } from '@/mocks/browser';
@@ -212,6 +213,45 @@ describe('CredentialInventorySheet — credential flows', () => {
 			.getAllByTestId('toast')
 			.find((t) => t.textContent?.includes('Credential created'))!;
 		expect(toast).toHaveTextContent('CI token');
+	});
+
+	it('downgrades the create toast to a warning when the API scope matches no imported API', async () => {
+		const warning =
+			"API scope 'acme/*/*' matches no imported API — executions using this credential will fail.";
+		worker.use(
+			http.post('/credentials', () =>
+				HttpResponse.json(
+					{
+						credential: makeMockCredential({
+							credential_id: 'c_warn',
+							name: 'CI token',
+						}),
+						secret: { token: 'x' },
+						warnings: [warning],
+					},
+					{ status: 201 },
+				),
+			),
+		);
+		renderInventory();
+		const user = userEvent.setup();
+		await openCreateWizard(user);
+
+		await user.click(await screen.findByRole('button', { name: /Enter manually/i }));
+		await user.type(screen.getByPlaceholderText('Production API key'), 'CI token');
+		await user.type(screen.getByPlaceholderText('acme'), 'acme');
+		await user.type(screen.getByPlaceholderText('sk_live_…'), 'super-secret-value');
+		await user.click(screen.getByRole('button', { name: 'Create credential' }));
+
+		await waitFor(() => {
+			const toasts = screen.queryAllByTestId('toast');
+			expect(toasts.some((t) => t.textContent?.includes('check its API scope'))).toBe(true);
+		});
+		const toast = screen
+			.getAllByTestId('toast')
+			.find((t) => t.textContent?.includes('check its API scope'))!;
+		expect(toast).toHaveTextContent('matches no imported API');
+		expect(toast).not.toHaveTextContent('ready to use');
 	});
 
 	it('creates a credential via the guided flow: pick local API → auto-shape to API_KEY', async () => {
@@ -463,12 +503,24 @@ describe('CredentialInventorySheet — credential flows', () => {
 	});
 
 	describe("an agent's approval link", () => {
-		it('opens the wizard in approve mode, and closing it drops the link params', async () => {
-			renderInventory('/?agent=agnt_active_1&approve=sess_1&poll_token=tok_1');
+		it('opens the wizard in approve mode and strips the link params on load', async () => {
+			renderInventory('/?agent=agnt_active_1&approve=sess_1');
 
 			expect(
 				await screen.findByRole('dialog', { name: /^Approve integration$/ }),
 			).toBeVisible();
+			// Only the approval: the inventory does not open underneath it.
+			expect(screen.queryByRole('heading', { name: 'Credentials' })).not.toBeInTheDocument();
+			// Stripped while the wizard is still open: history, bookmarks and a
+			// shared screen never keep the session id. The selection survives.
+			await waitFor(() => {
+				const params = new URLSearchParams(
+					screen.getByTestId('location-search').textContent ?? '',
+				);
+				expect(params.has('approve')).toBe(false);
+				expect(params.get('agent')).toBe('agnt_active_1');
+			});
+			expect(screen.getByRole('dialog', { name: /^Approve integration$/ })).toBeVisible();
 
 			await browserUser.keyboard('{Escape}');
 			await waitFor(() =>
@@ -476,30 +528,40 @@ describe('CredentialInventorySheet — credential flows', () => {
 					screen.queryByRole('dialog', { name: /^Approve integration$/ }),
 				).not.toBeInTheDocument(),
 			);
-			// Spent, so a reload doesn't reopen a stale prompt; the selection survives.
-			// Wait on the params themselves: `?agent=` is in the URL before the clear too.
+			// The approval opened on its own: backing out lands on the Agents page,
+			// with no credential inventory left open behind it.
+			expect(screen.queryByRole('heading', { name: 'Credentials' })).not.toBeInTheDocument();
+		});
+
+		it('opens from the link exactly as the backend mints it (session id only)', async () => {
+			renderInventory('/?approve=sess_1');
+			expect(
+				await screen.findByRole('dialog', { name: /^Approve integration$/ }),
+			).toBeVisible();
+		});
+
+		it('still opens an older link that carries a poll token, and strips both params', async () => {
+			renderInventory('/?approve=sess_1&poll_token=tok_1');
+			expect(
+				await screen.findByRole('dialog', { name: /^Approve integration$/ }),
+			).toBeVisible();
 			await waitFor(() => {
 				const params = new URLSearchParams(
 					screen.getByTestId('location-search').textContent ?? '',
 				);
 				expect(params.has('approve')).toBe(false);
 				expect(params.has('poll_token')).toBe(false);
-				expect(params.get('agent')).toBe('agnt_active_1');
 			});
-			// Backing out of the approval leaves the operator in the inventory.
-			expect(screen.getByRole('heading', { name: 'Credentials' })).toBeInTheDocument();
 		});
 
-		it('opens from the link exactly as the backend mints it (no agent selected)', async () => {
-			renderInventory('/?approve=sess_1&poll_token=tok_1');
-			expect(
-				await screen.findByRole('dialog', { name: /^Approve integration$/ }),
-			).toBeVisible();
-		});
-
-		it('ignores a link missing its poll token', async () => {
-			renderInventory('/?approve=sess_1');
+		it('drops a stray poll token with no session id and opens nothing', async () => {
+			renderInventory('/?poll_token=tok_1');
 			await screen.findByRole('button', { name: 'Credentials' });
+			await waitFor(() =>
+				expect(screen.getByTestId('location-search').textContent).not.toContain(
+					'poll_token',
+				),
+			);
 			expect(
 				screen.queryByRole('dialog', { name: /^Approve integration$/ }),
 			).not.toBeInTheDocument();

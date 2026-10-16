@@ -13,8 +13,12 @@ worker records it on the job result (see :mod:`.queued_authorization`).
 
 from __future__ import annotations
 
+import time
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any, NoReturn
+from urllib.parse import urlparse
 
 import structlog
 
@@ -26,21 +30,28 @@ from jentic_one.broker.core.exceptions import (
     direct_action_denied_directive,
     direct_credential_identity_mismatch_directive,
     no_credential_binding_directive,
+    suggested_permission_rules,
 )
+from jentic_one.broker.services.credentials.connect_target import resolve_connect_target
 from jentic_one.broker.services.credentials.orchestrator import CredentialService
+from jentic_one.broker.services.credentials.provisioning import open_session_provisioning_url
 from jentic_one.broker.services.credentials.resolver import ResolvedCredential
-from jentic_one.shared.access_guidance import connect_vendor_key
+from jentic_one.shared.access_guidance import ConnectTarget
 from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.broker.protocols import (
     AgentRuleEvaluatorProtocol,
+    ConnectableRegistrationSourceProtocol,
     CredentialDerivation,
     CredentialDeriverProtocol,
+    RuleVerdict,
 )
 from jentic_one.shared.context import Context
 from jentic_one.shared.events import emit_event_best_effort
 from jentic_one.shared.metrics import get_meter
 from jentic_one.shared.models.events import EventSeverity, EventType
+from jentic_one.shared.permissions.evaluation import PathDivergence
 from jentic_one.shared.schemas import APIReference
+from jentic_one.shared.url_path import has_ambiguous_traversal, normalize_path
 
 logger = structlog.get_logger(__name__)
 
@@ -56,19 +67,14 @@ _authz_denied = _meter.create_counter(
 )
 
 
-def _connect_vendor_for(ctx: Context, api: APIReference) -> str | None:
-    """Resolve the vendor-registry key covering ``api``, if any (Phase 1b).
+def _api_connect_enabled(ctx: Context) -> bool:
+    """Whether connect sessions may target any registry API on this deployment.
 
-    Gates the missing-binding directives' ``suggested_command`` (``jentic
-    connect <vendor>``) on the registry: the connect surface takes the
-    registry key, not the API identity, and suggesting a connect for an
-    off-registry API would send the agent into a guaranteed
-    ``unknown vendor`` error. The broker call-path owns ``AppConfig`` via
-    ``ctx``, so the reverse map is a pure config scan — no I/O.
+    Mirrors the control-plane gate (``control.connect.manual_flows_enabled``)
+    so a directive only suggests ``jentic connect --api`` where ``:connect``
+    accepts it; off, the off-registry ask stays with the operator.
     """
-    return connect_vendor_key(
-        ctx.config.vendors, vendor=api.vendor, name=api.name, version=api.version
-    )
+    return ctx.config.control.connect.manual_flows_enabled
 
 
 def _empty_credential_derivation_denial(
@@ -76,7 +82,10 @@ def _empty_credential_derivation_denial(
     api: APIReference,
     *,
     instance: str,
-    connect_vendor: str | None = None,
+    connect: ConnectTarget | None = None,
+    suggested_rules: list[dict[str, Any]] | None = None,
+    provisioning_url: str | None = None,
+    connect_api: bool = False,
 ) -> BrokerError:
     """Pick the right denial for an empty credential derivation (direct path).
 
@@ -123,7 +132,10 @@ def _empty_credential_derivation_denial(
             name=api.name,
             version=api.version,
             api_served=d.api_served,
-            connect_vendor=connect_vendor,
+            connect=connect,
+            suggested_rules=suggested_rules,
+            provisioning_url=provisioning_url,
+            connect_api=connect_api,
         ),
     )
 
@@ -174,6 +186,9 @@ async def derive_credential_bindings(
     api: APIReference,
     instance: str,
     ctx: Context,
+    method: str = "",
+    path: str = "",
+    connect_registrations: ConnectableRegistrationSourceProtocol | None = None,
 ) -> CredentialDerivation:
     """Derive the caller's credential-binding candidates for this execution.
 
@@ -187,6 +202,11 @@ async def derive_credential_bindings(
     Non-agent actors (users) follow the **same** derivation rule — no
     implicit bypass. Retired toolkit keys resolve as their successor agents
     and derive here like any other caller.
+
+    ``method`` / ``path`` are the denied request's, for the directive's
+    ``suggested_rules``. The connect target is resolved (``config`` entries,
+    then active shared OAuth-app registrations via ``connect_registrations``)
+    only on the denial path, before the denial is built.
     """
     assert api.vendor and api.name and api.version, (
         "derive_credential_bindings requires a concrete discovered API identity"
@@ -202,7 +222,10 @@ async def derive_credential_bindings(
             derivation,
             api,
             instance=instance,
-            connect_vendor=_connect_vendor_for(ctx, api),
+            connect=await resolve_connect_target(ctx, api, registrations=connect_registrations),
+            suggested_rules=suggested_permission_rules(method=method, path=path),
+            provisioning_url=await open_session_provisioning_url(ctx, identity=identity, api=api),
+            connect_api=_api_connect_enabled(ctx),
         )
         # The operator-visible pre-binding signal fires only for the plain
         # no-binding + nothing-serves case — an identity mismatch already has
@@ -215,16 +238,132 @@ async def derive_credential_bindings(
 
 @dataclass(frozen=True, slots=True)
 class ExecutionAuthorization:
-    """An allowed execution's authorization outcome.
+    """An allowed-or-held execution's authorization outcome.
 
     ``allowed_credential_ids`` is the injection boundary (the caller's bound
     credentials for the API) — only these ids may resolve at injection, and an
     empty list resolves nothing. ``selected_credential`` is the credential
     already selected among them.
+
+    ``verdict`` is the tri-state rule result. ALLOW proceeds to execution;
+    REQUIRE_APPROVAL routes to the hold path; DENY never reaches here (it
+    raises ``ActionDeniedError`` inside ``authorize_execution``).
+
+    ``matched_rule_id`` carries the primary key of the rule that fired when the
+    verdict is REQUIRE_APPROVAL — recorded on the ``held_executions`` row.
     """
 
     allowed_credential_ids: list[str]
     selected_credential: ResolvedCredential
+    verdict: RuleVerdict = RuleVerdict.ALLOW
+    matched_rule_id: str | None = None
+
+
+#: One divergence warning per (binding, rule, kind) per window — an agent
+#: retrying a denied call must not flood the logs. The counter still counts
+#: every occurrence.
+_DIVERGENCE_LOG_WINDOW_SECONDS = 300.0
+_DIVERGENCE_LOG_MAX_KEYS = 4096
+_divergence_last_logged: OrderedDict[tuple[str, str | None, str, int, str], float] = OrderedDict()
+
+_base_path_divergence = _meter.create_counter(
+    "broker.authorization.base_path_divergence",
+    description=(
+        "Requests whose verdict differs from pre-#1424 full-upstream-path matching "
+        "because of a rule written with the server base path, by kind"
+    ),
+)
+
+
+def _should_log_divergence(key: tuple[str, str | None, str, int, str]) -> bool:
+    now = time.monotonic()
+    last = _divergence_last_logged.get(key)
+    if last is not None and now - last < _DIVERGENCE_LOG_WINDOW_SECONDS:
+        return False
+    _divergence_last_logged[key] = now
+    _divergence_last_logged.move_to_end(key)
+    while len(_divergence_last_logged) > _DIVERGENCE_LOG_MAX_KEYS:
+        _divergence_last_logged.popitem(last=False)
+    return True
+
+
+def _report_base_path_divergence(
+    divergence: PathDivergence,
+    *,
+    agent_id: str,
+    credential_id: str,
+    rule_set_id: str | None,
+    api: APIReference,
+    method: str,
+    operation_id: str | None,
+) -> None:
+    """Name a rule still written with the server base path (#1424 upgrade).
+
+    Diagnostic only — the verdict is already decided. Logs identifiers and
+    the offending rule's own (operator-authored) pattern, never the concrete
+    request path, which can carry user data.
+    """
+    _base_path_divergence.add(1, {"kind": divergence.kind.value, "vendor": api.vendor})
+    if not _should_log_divergence(
+        (agent_id, rule_set_id, credential_id, divergence.rule_index, divergence.kind.value)
+    ):
+        return
+    logger.warning(
+        "rule_written_with_server_base_path",
+        kind=divergence.kind.value,
+        agent_id=agent_id,
+        credential_id=credential_id,
+        rule_set_id=rule_set_id,
+        rule_position=divergence.rule_index + 1,
+        rule_path=divergence.rule_path,
+        vendor=api.vendor,
+        api_name=api.name,
+        api_version=api.version,
+        method=method,
+        operation_id=operation_id,
+        actionable_step=(
+            "This rule matches the full upstream path (server base path included) "
+            "but rules are evaluated on the spec-relative path. Run "
+            "'jentic_one rewrite-rule-base-paths --diff-only' and fix the rule."
+        ),
+    )
+
+
+async def _deny(
+    ctx: Context,
+    *,
+    identity: Identity,
+    api: APIReference,
+    instance: str,
+    reason: DenialReason,
+    summary: str,
+    detail: str,
+) -> NoReturn:
+    """Count, record (``PBAC_DENIED``) and raise a rule-level ``action_denied``."""
+    _authz_denied.add(
+        1,
+        {"reason": reason.value, "mode": "direct", "vendor": api.vendor},
+    )
+    try:
+        async with ctx.admin_db.transaction() as session:
+            await emit_event_best_effort(
+                session,
+                type=EventType.PBAC_DENIED,
+                severity=EventSeverity.WARNING,
+                summary=summary,
+                created_by=identity.sub,
+                actor_id=identity.sub,
+                actor_type=identity.actor_type.value,
+                data={"reason": reason.value, "mode": "direct"},
+            )
+    except Exception:
+        logger.warning("telemetry_emit_failed", event_type=EventType.PBAC_DENIED, exc_info=True)
+    raise ActionDeniedError(
+        detail=detail,
+        type="action_denied",
+        instance=instance,
+        directive=direct_action_denied_directive(),
+    )
 
 
 async def authorize_execution(
@@ -242,6 +381,7 @@ async def authorize_execution(
     credential_id: str | None = None,
     request_server_variables: Mapping[str, str] | None = None,
     server_variables_unresolved: bool = False,
+    upstream_url: str | None = None,
 ) -> ExecutionAuthorization:
     """Authorize one execution for ``identity`` against the discovered ``api``.
 
@@ -249,9 +389,17 @@ async def authorize_execution(
     inputs (``Jentic-Credential-Name`` / ``Jentic-Credential-Id`` on the sync
     path; the enqueue-time selection on the worker). ``request_server_variables``
     are the request URL's concrete server-variable values; credential selection
-    skips credentials scoped to other values. ``path`` is the upstream URL path
-    the rules match against and ``instance`` the RFC 9457 ``instance`` a denial
-    carries.
+    skips credentials scoped to other values. ``path`` is the server-relative
+    request path the rules match against (``OperationInfo.relative_path``, see
+    ``shared.permissions.evaluation.rule_request_path``) and ``instance`` the
+    RFC 9457 ``instance`` a denial
+    carries. ``upstream_url`` is the raw URL the broker will forward: a path
+    that spells a dot segment with escapes or a backslash is denied (its
+    meaning depends on
+    the upstream stack — see ``shared.url_path.has_ambiguous_traversal``), and
+    its normalized full path lets the rules flag one still written with the
+    server base path (see :func:`_report_base_path_divergence`; never changes
+    the verdict).
 
     Raises a :class:`BrokerError` (``ActionDeniedError`` /
     ``CredentialIdentityMismatchError`` → 403, ``AmbiguousMatchError`` → 409,
@@ -268,6 +416,8 @@ async def authorize_execution(
         api=api,
         instance=instance,
         ctx=ctx,
+        method=method,
+        path=path,
     )
     allowed_credential_ids = [bc.credential_id for bc in derivation.credentials]
     rule_set_ids = {bc.credential_id: bc.rule_set_id for bc in derivation.credentials}
@@ -281,59 +431,87 @@ async def authorize_execution(
         allowed_credential_ids=allowed_credential_ids,
         request_server_variables=request_server_variables,
         server_variables_unresolved=server_variables_unresolved,
+        method=method,
+        path=path,
     )
     assert selected_credential is not None  # api.vendor is concrete (asserted above)
+    rule_set_id = rule_set_ids.get(selected_credential.credential_id)
+    raw_upstream_path = urlparse(upstream_url).path if upstream_url is not None else None
+    if has_ambiguous_traversal(path) or (
+        raw_upstream_path is not None and has_ambiguous_traversal(raw_upstream_path)
+    ):
+        await _deny(
+            ctx,
+            identity=identity,
+            api=api,
+            instance=instance,
+            reason=DenialReason.AMBIGUOUS_PATH,
+            summary="Operation denied: the request path spells a dot segment ambiguously",
+            detail=(
+                "The request path contains an encoded path separator, a backslash or an "
+                "encoded dot segment (e.g. '%2F..%2F', '..\\', '%2e%2e') whose meaning "
+                "depends on the upstream server, so binding rules cannot be enforced on "
+                "it. Send the path without encoded or backslash traversal."
+            ),
+        )
+    upstream_path = (
+        normalize_path(raw_upstream_path or "/") if raw_upstream_path is not None else None
+    )
     evaluation = await agent_rule_evaluator.evaluate(
         agent_id=identity.sub,
         credential_id=selected_credential.credential_id,
-        rule_set_id=rule_set_ids.get(selected_credential.credential_id),
+        rule_set_id=rule_set_id,
         method=method,
         path=path,
         operation_id=operation_id,
+        upstream_path=upstream_path if upstream_path != path else None,
     )
+    if evaluation.divergence is not None:
+        _report_base_path_divergence(
+            evaluation.divergence,
+            agent_id=identity.sub,
+            credential_id=selected_credential.credential_id,
+            rule_set_id=rule_set_id,
+            api=api,
+            method=method,
+            operation_id=operation_id,
+        )
+    if evaluation.verdict == RuleVerdict.REQUIRE_APPROVAL:
+        # The matching rule requests a hold rather than an outright deny.
+        # Return to the caller so it can enter the hold path — no exception.
+        return ExecutionAuthorization(
+            allowed_credential_ids=allowed_credential_ids,
+            selected_credential=selected_credential,
+            verdict=RuleVerdict.REQUIRE_APPROVAL,
+            matched_rule_id=evaluation.matched_rule_id,
+        )
+
     if not evaluation.allowed:
         # Two-variant deny split (#578): an empty rule list (nothing
         # configured for this binding) vs loaded rules where none allowed the
         # request.
         no_rules = evaluation.rules_loaded == 0
         reason = DenialReason.NO_RULES_LOADED if no_rules else DenialReason.NO_RULE_MATCHED
-        _authz_denied.add(
-            1,
-            {"reason": reason.value, "mode": "direct", "vendor": api.vendor},
-        )
-        summary = (
-            "Operation denied by credential-binding permission rules (no rules "
-            "configured for this binding)"
-            if no_rules
-            else "Operation denied by credential-binding permission rules (no rule matched)"
-        )
-        detail = (
-            "The requested operation is denied — this credential binding has no "
-            "permission rules configured. Attach rules under "
-            "PUT /credentials/{credential_id}/agents/{agent_id}/permissions "
-            "or attach a rule set."
-            if no_rules
-            else "The requested operation is denied by a credential-binding permission rule."
-        )
-        try:
-            async with ctx.admin_db.transaction() as session:
-                await emit_event_best_effort(
-                    session,
-                    type=EventType.PBAC_DENIED,
-                    severity=EventSeverity.WARNING,
-                    summary=summary,
-                    created_by=identity.sub,
-                    actor_id=identity.sub,
-                    actor_type=identity.actor_type.value,
-                    data={"reason": reason.value, "mode": "direct"},
-                )
-        except Exception:
-            logger.warning("telemetry_emit_failed", event_type=EventType.PBAC_DENIED, exc_info=True)
-        raise ActionDeniedError(
-            detail=detail,
-            type="action_denied",
+        await _deny(
+            ctx,
+            identity=identity,
+            api=api,
             instance=instance,
-            directive=direct_action_denied_directive(),
+            reason=reason,
+            summary=(
+                "Operation denied by credential-binding permission rules (no rules "
+                "configured for this binding)"
+                if no_rules
+                else "Operation denied by credential-binding permission rules (no rule matched)"
+            ),
+            detail=(
+                "The requested operation is denied — this credential binding has no "
+                "permission rules configured. Attach rules under "
+                "PUT /credentials/{credential_id}/agents/{agent_id}/permissions "
+                "or attach a rule set."
+                if no_rules
+                else "The requested operation is denied by a credential-binding permission rule."
+            ),
         )
 
     return ExecutionAuthorization(

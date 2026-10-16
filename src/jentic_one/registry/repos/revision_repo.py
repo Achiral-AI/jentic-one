@@ -9,12 +9,47 @@ from typing import Any, cast
 
 from sqlalchemy import and_, case, delete, or_, select, update
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from jentic_one.registry.core.schema.api_revisions import ApiRevision
 from jentic_one.registry.core.schema.apis import Api
+from jentic_one.shared.db.errors import DatabaseIntegrityError
 from jentic_one.shared.models import ApiRevisionSourceType, ApiRevisionState
+
+# The unique constraints whose violation means "this revision already exists".
+#   - uq_api_revisions_api_id_spec_digest: identical content re-imported.
+#   - ix_api_revisions_one_active: a concurrent import raced to become the single
+#     active (published/imported) revision for the API and lost — the digest guard
+#     can't catch this (it's keyed on api_id alone, independent of spec_digest).
+# Postgres names the violated constraint; SQLite reports only its column list
+# (``UNIQUE constraint failed: api_revisions.api_id[, api_revisions.spec_digest]``),
+# and these are the only unique constraints on ``api_revisions`` keyed on api_id.
+_DUPLICATE_REVISION_CONSTRAINTS = (
+    "uq_api_revisions_api_id_spec_digest",
+    "ix_api_revisions_one_active",
+    "UNIQUE constraint failed: api_revisions.api_id",
+)
+
+
+def is_duplicate_revision_conflict(exc: DatabaseIntegrityError) -> bool:
+    """True when ``exc`` is a violation of one of the "revision already exists" constraints."""
+    return any(name in exc.detail for name in _DUPLICATE_REVISION_CONSTRAINTS)
+
+
+async def _flush_new_revision(session: AsyncSession) -> None:
+    """Flush a freshly added revision, surfacing constraint violations as a domain error.
+
+    The insert is where a concurrent import loses a uniqueness race, and callers
+    sit outside the repository layer (no SQLAlchemy imports), so the raw
+    ``IntegrityError`` is mapped to ``DatabaseIntegrityError`` here — the same
+    type ``DatabaseSession.transaction`` raises for a commit-time violation.
+    """
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        raise DatabaseIntegrityError(str(exc)) from exc
 
 
 @dataclass(frozen=True)
@@ -69,7 +104,7 @@ class ApiRevisionRepository:
             created_by=created_by,
         )
         session.add(revision)
-        await session.flush()
+        await _flush_new_revision(session)
         return revision
 
     @staticmethod
@@ -102,7 +137,7 @@ class ApiRevisionRepository:
             created_by=created_by,
         )
         session.add(revision)
-        await session.flush()
+        await _flush_new_revision(session)
         return revision
 
     @staticmethod
@@ -268,25 +303,28 @@ class ApiRevisionRepository:
         return (row[0], row[1])
 
     @staticmethod
-    async def registered_vendor_for_source_url(
+    async def registered_identity_for_source_url(
         session: AsyncSession, source_url: str
-    ) -> str | None:
-        """The stored ``vendor`` of the local API already registered from ``source_url``.
+    ) -> tuple[str, str] | None:
+        """The stored ``(vendor, name)`` of the local API already registered from ``source_url``.
 
-        Uses the same coverage key as ``CatalogRepository.registered_spec_urls``: any
-        non-archived revision whose ``source_url`` matches, not just the current one.
-        When several APIs match, the oldest wins so the answer is deterministic.
-        Returns ``None`` when nothing is registered from that URL.
+        Both axes come from the same row so a re-import can never pair one API's
+        vendor with another's name. Uses the same coverage key as
+        ``CatalogRepository.registered_spec_urls``: any non-archived revision whose
+        ``source_url`` matches, not just the current one. When several APIs match,
+        the oldest wins so the answer is deterministic. Returns ``None`` when
+        nothing is registered from that URL.
         """
         result = await session.execute(
-            select(Api.vendor)
+            select(Api.vendor, Api.name)
             .join(ApiRevision, ApiRevision.api_id == Api.id)
             .where(ApiRevision.source_url == source_url)
             .where(ApiRevision.state != ApiRevisionState.ARCHIVED)
             .order_by(Api.created_at, Api.id)
             .limit(1)
         )
-        return result.scalar_one_or_none()
+        row = result.first()
+        return (row.vendor, row.name) if row is not None else None
 
     @staticmethod
     async def origin_of(session: AsyncSession, revision_id: uuid.UUID) -> str | None:

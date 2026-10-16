@@ -1,5 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { http, HttpResponse } from 'msw';
+import { QueryClient } from '@tanstack/react-query';
 import { worker } from '@/mocks/browser';
 import {
 	checkA11y,
@@ -18,7 +19,9 @@ import {
 	getMockConnectSessions,
 	resetConnectSessionsStore,
 	resetCredentialsStore,
+	seedMockAgentConnectSession,
 } from '@/shared/credentials/mocks/handlers';
+import { getToken, setToken } from '@/shared/api';
 import type {
 	ConfirmRequest,
 	PermissionRule,
@@ -35,7 +38,8 @@ import type {
  *     polling reports a terminal state.
  *   * ``approve`` — an agent already started the session and passed its
  *     owner an approval URL; the human lands here with just the session id
- *     + poll token and reviews what the agent asked for before confirming.
+ *     (plus a poll token only from an older link) and reviews what the agent
+ *     asked for before confirming.
  *
  * These tests focus on the load-bearing bits: the configure step in ``self``
  * mode surfaces the vendor catalog + agent picker; a start-and-confirm
@@ -45,9 +49,13 @@ import type {
  */
 
 const vendor = {
+	entry_id: 'github',
+	registration_id: null,
 	key: 'github',
 	vendor: 'github.com',
 	display_name: 'GitHub',
+	name: 'GitHub',
+	source: 'config' as const,
 	flow_kinds: ['device_authorization'],
 };
 
@@ -125,7 +133,11 @@ describe('VendorConnectFlow — self mode', () => {
 		);
 		// Vendor header comes from the ``vendor`` prop, so it's up
 		// immediately; scope data hydrates from the capabilities query.
-		expect(await screen.findByText('GitHub')).toBeInTheDocument();
+		// The vendor name renders as an editable input pre-filled with the
+		// display name.
+		expect((await screen.findByLabelText(/credential name/i)) as HTMLInputElement).toHaveValue(
+			'GitHub',
+		);
 		expect(await screen.findByText('repo')).toBeInTheDocument();
 		expect(await screen.findByText('read:user')).toBeInTheDocument();
 		// Agent picker IS rendered — theme-5 landed on main and
@@ -256,6 +268,8 @@ describe('VendorConnectFlow — self mode', () => {
 					scopes: [],
 					requested_permission_rules: [],
 					api_reference: { vendor: 'github-com', name: 'github-com', version: null },
+					digest: 'dig_test',
+					can_confirm: true,
 				}),
 			),
 			http.post('/connect-sessions/sess_1\\:confirm', () =>
@@ -304,6 +318,258 @@ describe('VendorConnectFlow — self mode', () => {
 		// regression here breaks the whole device-code UX.
 		expect(await screen.findByText('ABCD-1234')).toBeInTheDocument();
 	});
+
+	it('reports the created credential once and refreshes the agent bindings', async () => {
+		// ``:connect`` fires on Continue off the configure page and ``:confirm``
+		// on Continue off the rules page.
+		const invalidate = vi.spyOn(QueryClient.prototype, 'invalidateQueries');
+		worker.use(
+			http.post('/integrations:connect', () =>
+				HttpResponse.json(
+					{
+						session_id: 'sess_1',
+						approval_url:
+							'https://example.com/app/agents?approve=sess_1&poll_token=tok',
+						poll_token: 'tok',
+						resolved_flow: 'device_authorization',
+					},
+					{ status: 201 },
+				),
+			),
+			// ``:connect`` returning triggers a ``GET /connect-sessions/{id}``
+			// (useConnectSession) so the rules page can read ``api_reference``.
+			http.get('/connect-sessions/sess_1', () =>
+				HttpResponse.json({
+					session_id: 'sess_1',
+					state: 'created',
+					vendor_key: 'github',
+					vendor_display_name: 'GitHub',
+					resolved_flow: 'device_authorization',
+					reason: null,
+					requested_by_actor_id: 'usr_alice',
+					scopes: [],
+					requested_permission_rules: [],
+					api_reference: { vendor: 'github-com', name: 'github-com', version: null },
+				}),
+			),
+			http.post('/connect-sessions/sess_1\\:confirm', () =>
+				HttpResponse.json({
+					kind: 'device_authorization',
+					user_code: 'ABCD-1234',
+					verification_uri: 'https://github.com/login/device',
+					verification_uri_complete: null,
+					poll_interval_seconds: 5,
+				}),
+			),
+			http.get('/connect-sessions/:id/status', () =>
+				HttpResponse.json({
+					status: 'connected',
+					connected_as: 'octocat',
+					credential_id: 'cred_new',
+					bound_scopes: null,
+					error_code: null,
+				}),
+			),
+		);
+
+		const onConnected = vi.fn();
+		renderWithProviders(
+			<VendorConnectFlow
+				mode="self"
+				vendor={vendor}
+				onConnected={onConnected}
+				onBack={vi.fn()}
+				onDone={vi.fn()}
+			/>,
+		);
+		const user = userEvent.setup();
+
+		// Wait for both capabilities + session-id + agent choice (Continue
+		// is gated on all three). ``read:user`` proves the scope catalog
+		// hydrated; picking Scout satisfies the agent gate; the button
+		// un-disables when ``:connect`` also returns.
+		await screen.findByText('read:user');
+		const picker = await screen.findByRole('radiogroup', { name: /which agent uses this/i });
+		await user.click(within(picker).getByRole('radio', { name: 'Scout' }));
+		await waitFor(() =>
+			expect(screen.getByRole('button', { name: /^continue$/i })).not.toBeDisabled(),
+		);
+		await user.click(screen.getByRole('button', { name: /^continue$/i }));
+		expect(await screen.findByText(/permission rules/i)).toBeInTheDocument();
+		await user.click(
+			await screen.findByRole('button', { name: /(skip.*continue|^continue$)/i }),
+		);
+
+		await waitFor(() =>
+			expect(onConnected).toHaveBeenCalledWith({
+				credentialId: 'cred_new',
+				name: vendor.display_name,
+			}),
+		);
+		expect(onConnected).toHaveBeenCalledTimes(1);
+		// The connect bound the credential to Scout, so Scout's binding list
+		// (agent page, Add APIs tray) is refetched.
+		expect(invalidate).toHaveBeenCalledWith({
+			queryKey: ['agents', 'credential-bindings', 'agnt_1'],
+		});
+	});
+
+	it('threads a user-typed credential name through the :connect payload', async () => {
+		stubCapabilities();
+		let capturedBody: unknown = null;
+		worker.use(
+			http.post('/integrations:connect', async ({ request }) => {
+				capturedBody = await request.json();
+				return HttpResponse.json({
+					session_id: 'sess_named',
+					approval_url: '/x',
+					poll_token: 'tok_named',
+					resolved_flow: 'device_authorization',
+				});
+			}),
+		);
+		renderWithProviders(
+			<VendorConnectFlow mode="self" vendor={vendor} onBack={vi.fn()} onDone={vi.fn()} />,
+		);
+		const user = userEvent.setup();
+		const nameInput = await screen.findByLabelText(/credential name/i);
+		await user.clear(nameInput);
+		await user.type(nameInput, 'GitHub (personal)');
+		await waitFor(() =>
+			expect(screen.getByRole('button', { name: /^continue$/i })).not.toBeDisabled(),
+		);
+		await user.click(screen.getByRole('button', { name: /^continue$/i }));
+		await waitFor(() => expect(capturedBody).not.toBeNull());
+		expect(capturedBody).toMatchObject({ vendor: 'github', name: 'GitHub (personal)' });
+	});
+
+	it('sends the vendor display name as `name` when the field is left untouched', async () => {
+		stubCapabilities();
+		let capturedBody: Record<string, unknown> | null = null;
+		worker.use(
+			http.post('/integrations:connect', async ({ request }) => {
+				capturedBody = (await request.json()) as Record<string, unknown>;
+				return HttpResponse.json({
+					session_id: 'sess_blank',
+					approval_url: '/x',
+					poll_token: 'tok_blank',
+					resolved_flow: 'device_authorization',
+				});
+			}),
+		);
+		renderWithProviders(
+			<VendorConnectFlow mode="self" vendor={vendor} onBack={vi.fn()} onDone={vi.fn()} />,
+		);
+		const user = userEvent.setup();
+		await waitFor(() =>
+			expect(screen.getByRole('button', { name: /^continue$/i })).not.toBeDisabled(),
+		);
+		await user.click(screen.getByRole('button', { name: /^continue$/i }));
+		await waitFor(() => expect(capturedBody).not.toBeNull());
+		// The input is pre-filled with the vendor display name so the
+		// payload always carries a ``name``. Sending the same string
+		// server-side is functionally equivalent to omitting it.
+		expect(capturedBody).toMatchObject({ vendor: 'github', name: 'GitHub' });
+	});
+
+	it('threads oauth_app_registration_id when the vendor prop carries one', async () => {
+		stubCapabilities();
+		let capturedBody: Record<string, unknown> | null = null;
+		worker.use(
+			http.post('/integrations:connect', async ({ request }) => {
+				capturedBody = (await request.json()) as Record<string, unknown>;
+				return HttpResponse.json({
+					session_id: 'sess_pinned',
+					approval_url: '/x',
+					poll_token: 'tok_pinned',
+					resolved_flow: 'device_authorization',
+				});
+			}),
+		);
+		const vendorPinned = {
+			...vendor,
+			entry_id: 'oar_prod',
+			registration_id: 'oar_prod',
+			name: 'MyOrg Prod GitHub',
+			source: 'db' as const,
+		};
+		renderWithProviders(
+			<VendorConnectFlow
+				mode="self"
+				vendor={vendorPinned}
+				onBack={vi.fn()}
+				onDone={vi.fn()}
+			/>,
+		);
+		const user = userEvent.setup();
+		await waitFor(() =>
+			expect(screen.getByRole('button', { name: /^continue$/i })).not.toBeDisabled(),
+		);
+		await user.click(screen.getByRole('button', { name: /^continue$/i }));
+		await waitFor(() => expect(capturedBody).not.toBeNull());
+		expect(capturedBody).toMatchObject({
+			vendor: 'github',
+			oauth_app_registration_id: 'oar_prod',
+		});
+	});
+
+	it('names the shared app on the configure step for admin-registered vendors', async () => {
+		stubCapabilities();
+		const vendorPinned = {
+			...vendor,
+			entry_id: 'oar_prod',
+			registration_id: 'oar_prod',
+			name: 'MyOrg Prod GitHub',
+			source: 'db' as const,
+		};
+		renderWithProviders(
+			<VendorConnectFlow
+				mode="self"
+				vendor={vendorPinned}
+				onBack={vi.fn()}
+				onDone={vi.fn()}
+			/>,
+		);
+		expect(await screen.findByText('Shared app')).toBeInTheDocument();
+		expect(screen.getByText('via MyOrg Prod GitHub')).toBeInTheDocument();
+	});
+
+	it('shows no shared-app line for platform vendors', async () => {
+		stubCapabilities();
+		renderWithProviders(
+			<VendorConnectFlow mode="self" vendor={vendor} onBack={vi.fn()} onDone={vi.fn()} />,
+		);
+		await waitFor(() =>
+			expect(screen.getByRole('button', { name: /^continue$/i })).not.toBeDisabled(),
+		);
+		expect(screen.queryByText('Shared app')).not.toBeInTheDocument();
+	});
+
+	it('omits oauth_app_registration_id when the vendor prop has no registration', async () => {
+		stubCapabilities();
+		let capturedBody: Record<string, unknown> | null = null;
+		worker.use(
+			http.post('/integrations:connect', async ({ request }) => {
+				capturedBody = (await request.json()) as Record<string, unknown>;
+				return HttpResponse.json({
+					session_id: 'sess_cfg',
+					approval_url: '/x',
+					poll_token: 'tok_cfg',
+					resolved_flow: 'device_authorization',
+				});
+			}),
+		);
+		renderWithProviders(
+			<VendorConnectFlow mode="self" vendor={vendor} onBack={vi.fn()} onDone={vi.fn()} />,
+		);
+		const user = userEvent.setup();
+		await waitFor(() =>
+			expect(screen.getByRole('button', { name: /^continue$/i })).not.toBeDisabled(),
+		);
+		await user.click(screen.getByRole('button', { name: /^continue$/i }));
+		await waitFor(() => expect(capturedBody).not.toBeNull());
+		expect(capturedBody).not.toHaveProperty('oauth_app_registration_id');
+	});
 });
 
 describe('VendorConnectFlow — approve mode', () => {
@@ -334,6 +600,8 @@ describe('VendorConnectFlow — approve mode', () => {
 			reason: 'Need repo push access to open a follow-up PR on issue #42.',
 			requested_permission_rules: [],
 			api_reference: { vendor: 'github-com', name: 'github-com', version: null },
+			digest: 'dig_test',
+			can_confirm: true,
 		};
 		worker.use(
 			http.get('/connect-sessions/sess_9', () => HttpResponse.json(session)),
@@ -368,11 +636,11 @@ describe('VendorConnectFlow — approve mode', () => {
 		await waitFor(() =>
 			expect(screen.getByText(/an agent is asking to connect/i)).toBeInTheDocument(),
 		);
-		// The agent-requested scope MUST be surfaced with the "requested"
+		// The agent-requested scope MUST be surfaced with the "requested by agent"
 		// tag so the human notices what the agent added on top of the
 		// vendor defaults.
 		expect(await screen.findByText('repo')).toBeInTheDocument();
-		expect(await screen.findByText('requested')).toBeInTheDocument();
+		expect(await screen.findByText('requested by agent')).toBeInTheDocument();
 		// The agent-supplied ``reason`` is the review page's single piece
 		// of "why" context — a regression that dropped it would strip the
 		// approver of the justification the whole review UX exists for.
@@ -407,6 +675,8 @@ describe('VendorConnectFlow — approve mode', () => {
 				{ effect: 'allow', methods: ['GET'], path: '/repos', match_mode: 'prefix' },
 			],
 			api_reference: { vendor: 'github-com', name: 'github-com', version: null },
+			digest: 'dig_test',
+			can_confirm: true,
 		};
 		worker.use(
 			http.get('/connect-sessions/sess_rules', () => HttpResponse.json(session)),
@@ -461,6 +731,8 @@ describe('VendorConnectFlow — approve mode', () => {
 			reason: null,
 			requested_permission_rules: [],
 			api_reference: { vendor: 'github-com', name: 'github-com', version: null },
+			digest: 'dig_test',
+			can_confirm: true,
 		};
 		worker.use(
 			http.get('/connect-sessions/sess_edit', () => HttpResponse.json(session)),
@@ -492,7 +764,7 @@ describe('VendorConnectFlow — approve mode', () => {
 			await screen.findByText(/must constrain at least one of methods or path/i),
 		).toBeInTheDocument();
 		// Constrain the rule with a path — Save succeeds and the row appears.
-		const pathInput = screen.getByPlaceholderText('/repos');
+		const pathInput = screen.getByLabelText('Path pattern');
 		await user.type(pathInput, '/issues');
 		await user.click(screen.getByRole('button', { name: /^add$/i }));
 		// The rendered row prints ``<path> (<match_mode>)`` — match on the
@@ -528,6 +800,8 @@ describe('VendorConnectFlow — approve mode', () => {
 				{ effect: 'allow', methods: ['GET'], path: '/repos', match_mode: 'prefix' },
 			],
 			api_reference: { vendor: 'github-com', name: 'github-com', version: null },
+			digest: 'dig_test',
+			can_confirm: true,
 		};
 		worker.use(
 			http.get('/connect-sessions/sess_ed', () => HttpResponse.json(session)),
@@ -602,6 +876,8 @@ describe('VendorConnectFlow — approve mode', () => {
 				},
 			],
 			api_reference: { vendor: 'github-com', name: 'github-com', version: '1.0.0' },
+			digest: 'dig_test',
+			can_confirm: true,
 		};
 		worker.use(
 			http.get('/connect-sessions/sess_partial', () => HttpResponse.json(session)),
@@ -643,7 +919,7 @@ describe('VendorConnectFlow — approve mode', () => {
 		await user.click(groupHeader);
 		// The leaf op is present with the ``partial`` pill.
 		const opText = await screen.findByText('/repos/{owner}/{repo}/commits');
-		const opRow = opText.closest('div.bg-muted\\/20') as HTMLElement;
+		const opRow = opText.closest('[data-testid="op-impact-row"]') as HTMLElement;
 		expect(opRow).not.toBeNull();
 		expect(within(opRow).getByText(/^partial$/i)).toBeInTheDocument();
 		// Sample lines are hidden by default — the row is collapsed.
@@ -691,6 +967,8 @@ describe('VendorConnectFlow — approve mode', () => {
 				},
 			],
 			api_reference: { vendor: 'github-com', name: 'github-com', version: '1.0.0' },
+			digest: 'dig_test',
+			can_confirm: true,
 		};
 		worker.use(
 			http.get('/connect-sessions/sess_noops', () => HttpResponse.json(session)),
@@ -755,6 +1033,8 @@ describe('VendorConnectFlow — approve mode', () => {
 			reason: null,
 			requested_permission_rules: [],
 			api_reference: { vendor: 'github-com', name: 'github-com', version: '1.0.0' },
+			digest: 'dig_test',
+			can_confirm: true,
 		};
 		worker.use(
 			http.get('/connect-sessions/sess_ac', () => HttpResponse.json(session)),
@@ -789,7 +1069,7 @@ describe('VendorConnectFlow — approve mode', () => {
 		await user.click(screen.getByRole('button', { name: /^continue$/i }));
 		// Open the Add-rule form.
 		await user.click(await screen.findByRole('button', { name: /add rule/i }));
-		const pathInput = screen.getByPlaceholderText('/repos') as HTMLInputElement;
+		const pathInput = screen.getByLabelText('Path pattern') as HTMLInputElement;
 		// Focus opens the dropdown; type ``/r`` to start filtering (the
 		// mocked op list gives suggestions starting with ``/repos``).
 		await user.click(pathInput);
@@ -931,6 +1211,8 @@ describe('VendorConnectFlow — connect-wizard regressions', () => {
 					scopes: [],
 					requested_permission_rules: [],
 					api_reference: { vendor: 'github-com', name: 'github-com', version: null },
+					digest: 'dig_test',
+					can_confirm: true,
 				}),
 			),
 			http.post('/connect-sessions/:id\\:confirm', () =>
@@ -972,14 +1254,16 @@ describe('VendorConnectFlow — connect-wizard regressions', () => {
 		expect(connectCalls).toBe(1);
 		await user.click(screen.getByRole('button', { name: /try again/i }));
 
-		// Back on the configure step, and a SECOND :connect fired — the old
-		// behaviour left Continue permanently disabled because the mount
-		// effect never re-ran and session stayed null.
+		// Back on the configure step, Continue re-enabled. Under the current
+		// design ``:connect`` fires from Continue-click (not on mount), so
+		// a fresh click on Continue after Try Again produces a SECOND
+		// ``:connect`` call — asserted below.
 		expect(await screen.findByText('read:user')).toBeInTheDocument();
-		await waitFor(() => expect(connectCalls).toBe(2));
 		await waitFor(() =>
 			expect(screen.getByRole('button', { name: /^continue$/i })).not.toBeDisabled(),
 		);
+		await user.click(screen.getByRole('button', { name: /^continue$/i }));
+		await waitFor(() => expect(connectCalls).toBe(2));
 	});
 
 	it('the no-agents empty state links to the Agents page and does not block Continue (M2)', async () => {
@@ -1039,6 +1323,8 @@ describe('VendorConnectFlow — connect-wizard regressions', () => {
 			reason: null,
 			requested_permission_rules: [requestedRule],
 			api_reference: { vendor: 'github-com', name: 'github-com', version: null },
+			digest: 'dig_test',
+			can_confirm: true,
 		};
 		let confirmBody: ConfirmRequest | null = null;
 		let confirmToken: string | null = null;
@@ -1130,6 +1416,8 @@ describe('VendorConnectFlow — connect-wizard regressions', () => {
 			reason: null,
 			requested_permission_rules: [],
 			api_reference: { vendor: 'github-com', name: 'github-com', version: null },
+			digest: 'dig_test',
+			can_confirm: true,
 		};
 		worker.use(
 			http.get('/connect-sessions/sess_noscopes', () => HttpResponse.json(session)),
@@ -1152,5 +1440,167 @@ describe('VendorConnectFlow — connect-wizard regressions', () => {
 		expect(cont).not.toBeDisabled();
 		await user.click(cont);
 		expect(await screen.findByText('Permission rules')).toBeInTheDocument();
+	});
+});
+
+/**
+ * Token-less approve mode: the approval URL carries only the session id, and
+ * the backend authorises the target agent's owner (or an org admin) without
+ * the poll token. Every session-scoped call — review, confirm, status, the
+ * unmount cancel and the tab-close cancel — must go out without one. Driven
+ * through the credentials module's own MSW handlers, whose gate admits a
+ * token-less caller only on the owner path (`ownerCanAct`).
+ */
+describe('VendorConnectFlow — token-less approve (owner / org admin)', () => {
+	let sessionRequests: Request[] = [];
+	const record = ({ request }: { request: Request }): void => {
+		if (new URL(request.url).pathname.startsWith('/connect-sessions/')) {
+			sessionRequests.push(request);
+		}
+	};
+
+	beforeEach(() => {
+		resetConnectSessionsStore();
+		resetCredentialsStore();
+		stubAgents();
+		vi.spyOn(window, 'open').mockReturnValue(null);
+		sessionRequests = [];
+		worker.events.on('request:start', record);
+	});
+
+	afterEach(() => {
+		worker.events.removeListener('request:start', record);
+		vi.restoreAllMocks();
+		resetConnectSessionsStore();
+		resetCredentialsStore();
+	});
+
+	async function driveToAwaiting(
+		sessionId: string,
+	): Promise<ReturnType<typeof renderWithProviders>> {
+		const view = renderWithProviders(
+			<VendorConnectFlow
+				mode="approve"
+				sessionId={sessionId}
+				onBack={vi.fn()}
+				onDone={vi.fn()}
+			/>,
+		);
+		const user = userEvent.setup();
+		await screen.findByText(/an agent is asking to connect/i);
+		await waitFor(() =>
+			expect(screen.getByRole('button', { name: /^continue$/i })).not.toBeDisabled(),
+		);
+		await user.click(screen.getByRole('button', { name: /^continue$/i }));
+		await user.click(await screen.findByRole('button', { name: /skip.*continue/i }));
+		expect(await screen.findByText('MOCK-1234')).toBeInTheDocument();
+		return view;
+	}
+
+	function expectNoPollToken(): void {
+		expect(sessionRequests.length).toBeGreaterThan(0);
+		for (const request of sessionRequests) {
+			expect(new URL(request.url).searchParams.has('poll_token')).toBe(false);
+		}
+	}
+
+	it('reviews and confirms with no poll token on any request', async () => {
+		const seeded = seedMockAgentConnectSession({ agent_id: 'agnt_1', vendor_key: 'github' });
+		await driveToAwaiting(seeded.session_id);
+
+		expect(getMockConnectSessions()[0].confirmBodies).toHaveLength(1);
+		expect(screen.queryByText(/isn't yours to approve/i)).not.toBeInTheDocument();
+		await waitFor(() =>
+			expect(sessionRequests.some((r) => new URL(r.url).pathname.endsWith('/status'))).toBe(
+				true,
+			),
+		);
+		expectNoPollToken();
+	});
+
+	it('cancels token-less when unmounted mid-sign-in', async () => {
+		const seeded = seedMockAgentConnectSession({ agent_id: 'agnt_1', vendor_key: 'github' });
+		const view = await driveToAwaiting(seeded.session_id);
+
+		view.unmount();
+		// The mock :cancel cascades the session away, which it only does once
+		// the token-less request passed the owner gate.
+		await waitFor(() => expect(getMockConnectSessions()).toHaveLength(0));
+		expectNoPollToken();
+	});
+
+	it('cancels on tab close with an authenticated keepalive request and no token', async () => {
+		const previousToken = getToken();
+		setToken('bearer-for-unload');
+		onTestFinished(() => setToken(previousToken));
+		// Capture the flow's own unload handler rather than dispatching a real
+		// `beforeunload`: MSW's worker treats that event as the page closing
+		// and stops intercepting for every later test.
+		const unloadHandlers: EventListener[] = [];
+		const addListener = window.addEventListener.bind(window);
+		vi.spyOn(window, 'addEventListener').mockImplementation(((
+			type: string,
+			listener: EventListenerOrEventListenerObject,
+			options?: boolean | AddEventListenerOptions,
+		) => {
+			if (type === 'beforeunload' && typeof listener === 'function') {
+				unloadHandlers.push(listener);
+			}
+			addListener(type, listener, options);
+		}) as typeof window.addEventListener);
+		const seeded = seedMockAgentConnectSession({ agent_id: 'agnt_1', vendor_key: 'github' });
+		await driveToAwaiting(seeded.session_id);
+
+		expect(unloadHandlers.length).toBeGreaterThan(0);
+		for (const handler of unloadHandlers) handler(new Event('beforeunload'));
+		await waitFor(() => expect(getMockConnectSessions()).toHaveLength(0));
+		const cancel = sessionRequests.find((r) => new URL(r.url).pathname.endsWith(':cancel'));
+		expect(cancel).toBeDefined();
+		expect(cancel!.keepalive).toBe(true);
+		expect(cancel!.headers.get('Authorization')).toBe('Bearer bearer-for-unload');
+		expectNoPollToken();
+	});
+
+	it("tells a caller who is neither the agent's owner nor an admin that it isn't theirs", async () => {
+		const seeded = seedMockAgentConnectSession({
+			agent_id: 'agnt_1',
+			vendor_key: 'github',
+			ownerCanAct: false,
+		});
+		renderWithProviders(
+			<VendorConnectFlow
+				mode="approve"
+				sessionId={seeded.session_id}
+				onBack={vi.fn()}
+				onDone={vi.fn()}
+			/>,
+		);
+		expect(
+			await screen.findByText(
+				"This request is no longer open, or it isn't yours to approve.",
+			),
+		).toBeInTheDocument();
+		expectNoPollToken();
+	});
+
+	it('still honours a poll token from an older link', async () => {
+		const seeded = seedMockAgentConnectSession({
+			agent_id: 'agnt_1',
+			vendor_key: 'github',
+			ownerCanAct: false,
+		});
+		renderWithProviders(
+			<VendorConnectFlow
+				mode="approve"
+				sessionId={seeded.session_id}
+				pollToken={seeded.poll_token}
+				onBack={vi.fn()}
+				onDone={vi.fn()}
+			/>,
+		);
+		expect(await screen.findByText(/an agent is asking to connect/i)).toBeInTheDocument();
+		expect(new URL(sessionRequests[0].url).searchParams.get('poll_token')).toBe(
+			seeded.poll_token,
+		);
 	});
 });

@@ -17,7 +17,7 @@
     {
       "name": "whoami",
       "title": "Show agent identity",
-      "description": "Show the calling agent's identity as the Jentic control plane sees it: id, status, scopes, and credential bindings with the APIs each one serves. Call after get_started reports ready, and before requesting access or executing operations — never execute an operation just to probe whether you have access. On an auth error, call get_started for the fix.",
+      "description": "Show the calling agent's identity as the Jentic control plane sees it: id, status, permissions, and credential bindings with the APIs each one serves. Call after get_started reports ready, and before requesting access or executing operations — never execute an operation just to probe whether you have access. On an auth error, call get_started for the fix.",
       "input_schema": {
         "properties": {},
         "type": "object"
@@ -27,7 +27,7 @@
       },
       "lane_overrides": {
         "http": {
-          "description": "Show the calling agent's identity as the Jentic control plane sees it: id, status, scopes, and credential bindings with the APIs each one serves. Call before requesting access or executing operations — never execute an operation just to probe whether you have access. On an auth error, relay it to your human operator: this connection's credentials and the agent's status are managed in the Jentic One dashboard."
+          "description": "Show the calling agent's identity as the Jentic control plane sees it: id, status, permissions, and credential bindings with the APIs each one serves. Call before requesting access or executing operations — never execute an operation just to probe whether you have access. On an auth error, relay it to your human operator: this connection's credentials and the agent's status are managed in the Jentic One dashboard."
         }
       }
     },
@@ -90,7 +90,7 @@
     {
       "name": "execute",
       "title": "Execute an API operation",
-      "description": "Execute an operation through the Jentic broker: the broker authenticates this agent and injects the stored upstream credential server-side — credentials never pass through this session. This is the final step of the flow (whoami → search_apis → inspect_operation → execute): always inspect the contract first, and never execute just to probe whether you have access (call whoami). Example: {\"operation_id\": \"POST:https://api.example.com/v1/pets\", \"inputs\": {\"petId\": \"42\", \"limit\": 10}, \"body\": {\"name\": \"Bob\"}}. Returns {status, headers, body, execution_id}: any HTTP status, including upstream 4xx/5xx, is the upstream's answer — a denial by the broker itself comes back as an error result with recovery directions instead. A 202 response with a directive means the call is HELD for human approval: poll it with get_execution_result using the job id it carries — never re-send the execute. Large bodies are truncated ({truncated: true, total_bytes}); narrow the call (query parameters, pagination) to see the rest. Prefer execute_read for pure reads — it is approved more readily.",
+      "description": "Execute an operation through the Jentic broker: the broker authenticates this agent and injects the stored upstream credential server-side — credentials never pass through this session. This is the final step of the flow (whoami → search_apis → inspect_operation → execute): always inspect the contract first, and never execute just to probe whether you have access (call whoami). Example: {\"operation_id\": \"POST:https://api.example.com/v1/pets\", \"inputs\": {\"petId\": \"42\", \"limit\": 10}, \"body\": {\"name\": \"Bob\"}}. Returns {status, headers, body, execution_id}: any HTTP status, including upstream 4xx/5xx, is the upstream's answer — a denial by the broker itself comes back as an error result with recovery directions instead. A 202 response with status \"held\" means the call is HELD for human approval: above all, show the user its review_url (a reviewer signs in there to approve or deny it) and end your turn so they see it; once the user replies, call get_execution_result once with the held_execution_id it carries (it waits up to 30 seconds by default) — never re-send the execute. Large bodies are truncated ({truncated: true, total_bytes}); narrow the call (query parameters, pagination) to see the rest. Prefer execute_read for pure reads — it is approved more readily.",
       "input_schema": {
         "properties": {
           "body": {
@@ -157,12 +157,23 @@
     {
       "name": "get_execution_result",
       "title": "Poll a held or asynchronous execution",
-      "description": "Poll a job by id: returns {job_id, kind, status, ...} and, once status is \"completed\", the result document. Use it when execute returns a 202 HELD response (human approval required): poll with the job id it carries until the status is terminal (completed, failed, cancelled, dead_letter) — NEVER re-send the execute while a job is pending; approval happens out-of-band and re-sending duplicates the call. Example: {\"job_id\": \"job_abc123\"}. While pending/running, wait briefly and poll again.",
+      "description": "Poll a held or asynchronous execution, waiting up to timeout seconds (default and max 30; 0 answers at once) and returning as soon as the call has finished. Pass held_execution_id for a 202 HELD response (human approval required): returns {held_execution_id, state, status, review_url, expires_at, ...} — state is the decision (pending, approved, denied, expired, withdrawn), status where the call stands (held, queued, running, completed, failed, cancelled) — and, once the call has finished, the result: the upstream response, or the problem explaining why it never ran (denied or expired). While the call has not finished the payload carries an agent_directive: show the user the review_url again and end your turn. Above all, show the user the review_url from the held response and end your turn so they see it; only after the user replies, call this once with the held_execution_id. Pass job_id instead for an asynchronous 202 that is not held: returns {job_id, kind, status, ...} and, once \"completed\", the result document. NEVER re-send the execute while a call is pending; approval happens out-of-band and re-sending duplicates the call. Example: {\"held_execution_id\": \"held_abc123\"}.",
       "input_schema": {
         "properties": {
-          "job_id": {
-            "description": "The job to poll (required; \"id\" and \"job\" are accepted aliases), from a held (202) execute response.",
+          "held_execution_id": {
+            "description": "The held execution to poll (\"held_execution\" is an accepted alias): the held_execution_id of a held (202) execute response. Pass exactly one of held_execution_id and job_id.",
             "type": "string"
+          },
+          "job_id": {
+            "description": "The job to poll (\"id\" and \"job\" are accepted aliases): the job_id of an asynchronous (202) execute response that is not held. Pass exactly one of held_execution_id and job_id.",
+            "type": "string"
+          },
+          "timeout": {
+            "default": 30,
+            "description": "Optional. Wait up to this many seconds (default and max 30; larger values are capped at 30) for the call to finish, re-polling and returning as soon as it has. 0 returns the current status at once.",
+            "maximum": 30,
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "type": "object"
@@ -199,7 +210,7 @@
     {
       "name": "import_api",
       "title": "Import a catalog API into the registry",
-      "description": "Import a catalog API into this instance's registry so its operations become searchable and executable. Example: {\"api_id\": \"googleapis.com/sheets\"} with an api_id from a search_catalog hit. The import runs as a job: this call tracks it briefly and, on completion, promotes the imported revisions live, returning {job_id, status, revisions, promoted}. If it returns a non-terminal status, call import_api again with the same api_id — re-importing converges (idempotent) and finishes the promotion. Requires the catalog:import scope (agents hold it by default); on a denial, ask your operator to grant it — do not guess other scopes. Importing makes an API discoverable but does NOT grant access to call it: check whoami for a credential binding serving it — never execute just to probe — and ask your operator to connect a credential and bind you if nothing serves it.",
+      "description": "Import a catalog API into this instance's registry so its operations become searchable and executable. Example: {\"api_id\": \"googleapis.com/sheets\"} with an api_id from a search_catalog hit. The import runs as a job: this call tracks it briefly and, on completion, promotes the imported revisions live, returning {job_id, status, revisions, promoted}. If it returns a non-terminal status, call import_api again with the same api_id — re-importing converges (idempotent) and finishes the promotion. Requires the catalog:import permission (agents hold it by default); on a denial, ask your operator to grant it — do not guess other permissions. Importing makes an API discoverable but does NOT grant access to call it: check whoami for a credential binding serving it — never execute just to probe — and ask your operator to connect a credential and bind you if nothing serves it.",
       "input_schema": {
         "properties": {
           "api_id": {
@@ -219,12 +230,82 @@
     {
       "name": "request_connection",
       "title": "Start connecting a vendor credential",
-      "description": "Start a connect session for a verified vendor when whoami shows no credential binding serving the API you need — the self-service leg of credential provisioning. Example: {\"vendor\": \"github\", \"reason\": \"read open PRs to summarise them\"}. Returns {session_id, approval_url, resolved_flow}: relay the approval_url to your human operator — they approve the connection in their browser and confirm the scopes; you cannot open the URL or approve it yourself. Once they confirm, call whoami to see the new credential binding, then retry the blocked call. This tool only STARTS the flow and never polls it. Optionally pass requested_scopes (vendor scope names; write scopes are flagged for the approver) and a reason the approver will see. Only vendors in the deployment's connect registry work; for any other API, ask your operator to connect a credential in the dashboard. Binding an EXISTING credential and scope grants stay operator actions.",
+      "description": "Start a connect session when whoami shows no credential binding serving the API you need — the self-service leg of credential provisioning. Name a verified vendor ({\"vendor\": \"github\", \"reason\": \"read open PRs to summarise them\"}) or, for any other registry API, the API itself ({\"api\": {\"vendor\": …, \"name\": …, \"version\": …}}, from inspect_operation or a denial's parameters.connect.api). Returns {session_id, approval_url, resolved_flow}: relay the approval_url to your human operator — they approve the connection (or enter the API key) in their browser; you cannot open the URL or approve it yourself. This tool only STARTS the flow and never polls it. When a human must enter the credential (resolved_flow manual_* or awaiting_app) it can take hours: end your turn and retry execute later. Otherwise, once they confirm, call whoami to see the new credential binding, then retry the blocked call. Optionally pass auth_type (with api, when the spec declares several schemes), requested_scopes (vendor scope names; write scopes are flagged for the approver), requested_permission_rules (the binding rules you need; the approver reviews them) and a reason the approver will see. If several shared OAuth apps serve the vendor, the error lists them: ask your human user which one to use (choosing it is their call, not yours) and retry with its oauth_app_registration_id. If the deployment does not take API connect requests, the error says so: report the gap to your operator once. After a rejection, do not ask again — tell your user. Binding an EXISTING credential and scope grants stay operator actions.",
       "input_schema": {
         "properties": {
+          "api": {
+            "description": "Registry API to connect a credential for, as the api.vendor/name/version inspect_operation reports (a \"vendor/name/version\" string also works) — for any API, not just registry vendors. A denial's agent_directive.parameters.connect.api fits as-is. Its spec decides the credential; a human enters it.",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "vendor": {
+                "type": "string"
+              },
+              "version": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "vendor",
+              "name",
+              "version"
+            ],
+            "type": "object"
+          },
+          "auth_type": {
+            "description": "With api only: the declared scheme name or kind to use (api_key, bearer, basic, oauth2). Needed only when the spec declares several — the error then lists them.",
+            "type": "string"
+          },
+          "oauth_app_registration_id": {
+            "description": "registration_id of the shared OAuth app to connect through (optional; \"registration_id\" is an accepted alias). Only needed when several shared apps serve the vendor: the error then lists them, and your human user picks one — never choose it yourself.",
+            "type": "string"
+          },
           "reason": {
             "description": "Why you need this connection (optional, max 1024 chars). Shown to the approver — a clear one-liner gets you approved faster.",
             "type": "string"
+          },
+          "requested_permission_rules": {
+            "description": "Permission rules you are asking for on the new binding (optional, max 100; \"permission_rules\" is an accepted alias), e.g. [{\"effect\": \"allow\", \"methods\": [\"GET\"], \"path\": \"/repos/.*\"}]. The approver reviews and edits them before anything is granted; an allow rule must constrain methods, path, or operations.",
+            "items": {
+              "properties": {
+                "effect": {
+                  "enum": [
+                    "allow",
+                    "deny"
+                  ],
+                  "type": "string"
+                },
+                "match_mode": {
+                  "enum": [
+                    "regex",
+                    "prefix",
+                    "exact"
+                  ],
+                  "type": "string"
+                },
+                "methods": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "operations": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "effect"
+              ],
+              "type": "object"
+            },
+            "type": "array"
           },
           "requested_scopes": {
             "description": "Vendor scope names to request (optional; \"scopes\" is an accepted alias). The human approver confirms the final set — write scopes are flagged for their attention.",
@@ -234,13 +315,10 @@
             "type": "array"
           },
           "vendor": {
-            "description": "Vendor registry key, e.g. \"github\" (required). Only vendors in this deployment's connect registry work.",
+            "description": "Vendor registry key, e.g. \"github\". Only vendors in this deployment's connect registry work. Pass exactly one of vendor or api.",
             "type": "string"
           }
         },
-        "required": [
-          "vendor"
-        ],
         "type": "object"
       },
       "annotations": {}

@@ -36,20 +36,43 @@ class OAuthClientOptions(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    # RFC 6749 §2.3.1: the secret in the body, or HTTP Basic.
-    token_auth_method: Literal["client_secret_post", "client_secret_basic"] = "client_secret_post"
-    token_request_encoding: Literal["form", "json"] = "form"
-    # RFC 7636 with S256.
-    pkce: bool = False
-    # The callback registered with the vendor, when it is not this
-    # deployment's own (for example an app that relays the callback here).
-    redirect_uri: str | None = None
-    # Non-secret token-response fields to keep as server variables:
-    # dotted response path -> server variable name.
-    keep_token_fields: dict[str, str] = Field(default_factory=dict)
-    # Extra authorize-URL parameters for this vendor (Atlassian's
-    # ``audience``); they win over the provider's authorize_extra_params.
-    authorize_params: dict[str, str] = Field(default_factory=dict)
+    token_auth_method: Literal["client_secret_post", "client_secret_basic"] = Field(
+        default="client_secret_post",
+        description="RFC 6749 §2.3.1 client authentication: the secret in the body, or HTTP Basic.",
+        examples=["client_secret_basic"],
+    )
+    token_request_encoding: Literal["form", "json"] = Field(
+        default="form",
+        description="Encoding of the token request body.",
+        examples=["json"],
+    )
+    pkce: bool = Field(
+        default=False, description="Send an RFC 7636 S256 PKCE challenge.", examples=[True]
+    )
+    redirect_uri: str | None = Field(
+        default=None,
+        description=(
+            "The callback registered with the vendor, when it is not this deployment's own "
+            "(for example an app that relays the callback here)."
+        ),
+        examples=["https://app.example.com/oauth/callback"],
+    )
+    keep_token_fields: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Non-secret token-response fields to keep as server variables: dotted response "
+            "path to server variable name (at most 20)."
+        ),
+        examples=[{"instance_url": "instance_url"}],
+    )
+    authorize_params: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Extra authorize-URL parameters for this vendor; they win over the provider's "
+            "authorize_extra_params and may not set protocol parameters."
+        ),
+        examples=[{"audience": "api.atlassian.com"}],
+    )
 
     @field_validator("redirect_uri")
     @classmethod

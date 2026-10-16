@@ -278,7 +278,11 @@ async def test_handler_passes_the_enqueue_selection_to_the_authorizer() -> None:
     await handler.execute(
         "job_req",
         _FakeSession(),
-        payload=_payload(operation_id="listThings", credential_id="cred_a", toolkit_id=None),
+        payload=_payload(
+            operation={"id": "listThings", "path": "/v1/things", "method": "GET"},
+            credential_id="cred_a",
+            toolkit_id=None,
+        ),
         created_by="agt_abc123",
         actor_type="agent",
     )
@@ -293,6 +297,7 @@ async def test_handler_passes_the_enqueue_selection_to_the_authorizer() -> None:
         api_version="1.0.0",
         operation_id="listThings",
         credential_id="cred_a",
+        job_id="job_req",
     )
 
 
@@ -378,7 +383,7 @@ async def test_handler_denied_job_keys_repeated_failure_on_the_folded_operation(
         await handler.execute(
             "job_denied_op",
             _FakeSession(),
-            payload=_payload(operation=operation, operation_id="op_x", credential_id="cred_a"),
+            payload=_payload(operation=operation, credential_id="cred_a"),
             created_by="agt_abc123",
             actor_type="agent",
         )
@@ -388,8 +393,7 @@ async def test_handler_denied_job_keys_repeated_failure_on_the_folded_operation(
 
 @pytest.mark.asyncio
 async def test_handler_reauthorizes_on_the_operation_dict_id() -> None:
-    """The run-time re-check reads the id off the folded ``operation`` dict, so a
-    payload carrying only the dict (no flat key) is still authorized on its id."""
+    """The run-time re-check reads the id off the folded ``operation`` dict."""
     authorizer = _FakeAuthorizer()
     handler = ExecutionHandler(
         executor=_RecordingExecutor(
@@ -409,6 +413,40 @@ async def test_handler_reauthorizes_on_the_operation_dict_id() -> None:
 
     assert authorizer.last_request is not None
     assert authorizer.last_request.operation_id == "op_dict"
+    assert authorizer.last_request.relative_path is None
+
+
+@pytest.mark.asyncio
+async def test_handler_reauthorizes_on_the_operation_relative_path() -> None:
+    """Pins #1424: the run-time rule re-check is handed the enqueue-time
+    server-relative path, so a base-path API's rules are judged on the same
+    path at run time as at the sync edge."""
+    authorizer = _FakeAuthorizer()
+    handler = ExecutionHandler(
+        executor=_RecordingExecutor(
+            UpstreamExecResult(status_code=200, body=b"", content_type=None, duration_ms=1)
+        ),
+        credential_injector=_FakeInjector(InjectedAuth(headers={}, query_params={}, cookies={})),
+        execution_authorizer=authorizer,
+    )
+
+    await handler.execute(
+        "job_relative",
+        _FakeSession(),
+        payload=_payload(
+            operation={
+                "id": "op_w",
+                "path": "/widgets/{id}",
+                "method": "GET",
+                "relative_path": "/widgets/42",
+            }
+        ),
+        created_by="agt_abc123",
+        actor_type="agent",
+    )
+
+    assert authorizer.last_request is not None
+    assert authorizer.last_request.relative_path == "/widgets/42"
 
 
 def test_handler_refuses_an_injector_without_an_authorizer() -> None:
@@ -617,8 +655,8 @@ async def test_handler_missing_origin_emits_untagged_event() -> None:
 async def test_handler_forwards_operation_dict_in_metadata() -> None:
     """The payload's ``operation`` dict (id + path template + method) reaches
     the executor metadata — validated once here (the handler folds it for the
-    repeated-failure detector) — alongside the dual-written flat
-    ``operation_id``."""
+    repeated-failure detector) — and no flat ``operation_id`` key rides
+    alongside (#1382)."""
     executor = _RecordingExecutor(
         UpstreamExecResult(status_code=200, body=b"", content_type=None, duration_ms=1)
     )
@@ -628,41 +666,14 @@ async def test_handler_forwards_operation_dict_in_metadata() -> None:
     await handler.execute(
         "job_op",
         _FakeSession(),
-        payload=_payload(operation=operation, operation_id="op_x"),
+        payload=_payload(operation=operation),
         created_by="agt_abc123",
         actor_type="agent",
     )
 
     assert executor.last_request is not None
-    assert executor.last_request.metadata["operation"] == operation
-    assert executor.last_request.metadata["operation_id"] == "op_x"
-
-
-@pytest.mark.asyncio
-async def test_handler_forwards_legacy_flat_operation_id() -> None:
-    """A job enqueued before the ``operation`` dict existed carries only the
-    flat ``operation_id`` — the handler folds it into an id-only operation, so
-    the executor metadata keeps the id on the record either way."""
-    executor = _RecordingExecutor(
-        UpstreamExecResult(status_code=200, body=b"", content_type=None, duration_ms=1)
-    )
-    handler = ExecutionHandler(executor=executor)
-
-    await handler.execute(
-        "job_legacy_op",
-        _FakeSession(),
-        payload=_payload(operation_id="op_legacy"),
-        created_by="agt_abc123",
-        actor_type="agent",
-    )
-
-    assert executor.last_request is not None
-    assert executor.last_request.metadata["operation"] == {
-        "id": "op_legacy",
-        "path": None,
-        "method": None,
-    }
-    assert executor.last_request.metadata["operation_id"] == "op_legacy"
+    assert executor.last_request.metadata["operation"] == OperationInfo(**operation).model_dump()
+    assert "operation_id" not in executor.last_request.metadata
 
 
 @pytest.mark.asyncio
@@ -749,3 +760,43 @@ async def test_handler_substitutes_server_variable_defaults() -> None:
     req = executor.last_request
     assert req is not None
     assert req.url == "https://api.example.com/us/things"
+
+
+@pytest.mark.asyncio
+async def test_handler_replays_payload_headers_under_injected_credentials() -> None:
+    """The broker-kept request headers reach the upstream; injected auth wins a clash."""
+    executor = _RecordingExecutor(
+        UpstreamExecResult(status_code=200, body=b"", content_type=None, duration_ms=1)
+    )
+    injector = _FakeInjector(
+        InjectedAuth(headers={"Authorization": "Bearer tok"}, query_params={}, cookies={})
+    )
+    handler = ExecutionHandler(
+        executor=executor,
+        credential_injector=injector,  # pragma: allowlist secret
+        execution_authorizer=_FakeAuthorizer(),
+    )
+
+    await handler.execute(
+        "job_hdr",
+        _FakeSession(),
+        payload=_payload(
+            method="POST",
+            body_b64="eyJhIjoxfQ==",
+            headers={
+                "content-type": "application/json",
+                "stripe-version": "2024-06-20",
+                "authorization": "Bearer agent",
+            },
+        ),
+        created_by="usr_test",
+        actor_type="user",
+    )
+
+    req = executor.last_request
+    assert req is not None
+    assert req.headers["content-type"] == "application/json"
+    assert req.headers["stripe-version"] == "2024-06-20"
+    assert req.body == b'{"a":1}'
+    assert req.headers["Authorization"] == "Bearer tok"
+    assert "authorization" not in req.headers

@@ -1,8 +1,7 @@
 /**
  * CredentialOptions — which credential an API should use, as radio cards: every
  * credential that covers it, then "Add a new credential". The Add APIs setup queue
- * and both access-request dialogs render it, so the choice reads the
- * same wherever it is made.
+ * renders it for each API it works through.
  *
  * Sibling credentials often share the API's own name, so each card carries the
  * type, date and id tail that tell them apart, and reuse is never the only
@@ -113,9 +112,10 @@ function OptionCard({
 	return (
 		<label
 			className={cn(
-				'border-border/60 hover:border-border bg-card flex cursor-pointer items-center gap-2.5 rounded-lg border px-3 py-2 transition-colors',
+				'bg-field hover:bg-tint-2 flex cursor-pointer items-center gap-2.5 rounded-lg px-3 py-2 transition-colors',
+				'has-[:focus-visible]:ring-ring has-[:focus-visible]:ring-2',
 				'has-[:disabled]:cursor-not-allowed has-[:disabled]:opacity-60',
-				checked && 'border-primary/60 bg-primary/5',
+				checked && 'bg-surface-selected shadow-[0_0_0_1.5px_hsl(var(--primary)/0.45)]',
 			)}
 		>
 			<input
@@ -126,11 +126,11 @@ function OptionCard({
 				onChange={onSelect}
 			/>
 			<span className="min-w-0 flex-1">
-				<span className="text-foreground flex items-center gap-1.5 text-sm">
+				<span className="text-foreground-name flex items-center gap-1.5 text-sm font-semibold">
 					{icon}
 					<span className="truncate">{title}</span>
 				</span>
-				<span className="text-muted-foreground block truncate text-[11px]">{detail}</span>
+				<span className="text-foreground-sub block truncate text-[11px]">{detail}</span>
 			</span>
 			{badges && <span className="flex shrink-0 items-center gap-1.5">{badges}</span>}
 		</label>

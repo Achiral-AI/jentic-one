@@ -37,6 +37,15 @@ def test_combined_app_mounts_all_surfaces(ctx: Context) -> None:
         assert data["surface"] == surface
 
 
+def test_combined_app_root_health_body_is_exact(ctx: Context) -> None:
+    """The typed root probe must not leak null optional members onto the wire."""
+    app = create_combined_app(ctx, ["registry", "admin", "control"])
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "version": __version__}
+
+
 def test_combined_app_subset_only_mounts_requested(ctx: Context) -> None:
     app = create_combined_app(ctx, ["control"])
     client = TestClient(app, raise_server_exceptions=False)
@@ -80,9 +89,13 @@ def test_combined_app_unified_openapi_spec(ctx: Context) -> None:
     app = create_combined_app(ctx, ["registry", "admin", "control"])
     spec = app.openapi()
     paths = spec["paths"]
-    assert "/registry/health" in paths
+    # The root probe and the admin probe (the SPA's setup gate reads its
+    # response model) are documented; the other per-surface probes are served
+    # but schema-hidden so the spec has one canonical liveness check.
+    assert "/health" in paths
     assert "/admin/health" in paths
-    assert "/control/health" in paths
+    assert "/registry/health" not in paths
+    assert "/control/health" not in paths
 
 
 def test_auth_surface_in_surface_modules() -> None:
@@ -147,19 +160,19 @@ def test_registry_surface_gets_admin_and_control_db_access(app_config: AppConfig
     _ = ctx.control_db
 
 
-def test_reference_endpoint_serves_scope_join(ctx: Context) -> None:
-    """GET /reference/endpoints.json serves the canonical scope reference."""
+def test_reference_endpoint_serves_permission_join(ctx: Context) -> None:
+    """GET /reference/endpoints.json serves the canonical permission reference."""
     app = create_combined_app(ctx, ["registry", "admin", "control", "auth"])
     client = TestClient(app, raise_server_exceptions=False)
     resp = client.get("/reference/endpoints.json")
     assert resp.status_code == 200
     payload = resp.json()
-    assert payload["schema"] == "jentic.endpoint-scope-tree/v1"
+    assert payload["schema"] == "jentic.endpoint-permission-tree/v1"
     assert payload["total"] == len(payload["endpoints"])
     assert payload["total"] > 10
     # Every row carries the fields the CLI / docs SPA need.
     for ep in payload["endpoints"]:
-        assert {"method", "path", "public", "required_scopes", "group"} <= ep.keys()
+        assert {"method", "path", "public", "required_permissions", "group"} <= ep.keys()
 
 
 def test_reference_endpoint_hidden_from_schema(ctx: Context) -> None:

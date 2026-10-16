@@ -1,44 +1,58 @@
 import { renderWithProviders, checkA11y } from '@/__tests__/test-utils';
 import { VendorIcon } from '@/shared/ui/VendorIcon';
 
+/** The initials a tile paints (generated content, not DOM text). */
+const initialsOf = (root: Element | null) => root?.getAttribute('data-initials');
+
 describe('VendorIcon', () => {
-	it('renders two-letter initials from the name in the gradient fallback', () => {
+	it('renders two-letter initials from the name in the pastel tile', () => {
 		const { container } = renderWithProviders(<VendorIcon name="Stripe" />);
-		expect(container.firstElementChild).toHaveTextContent('ST');
+		const tile = container.firstElementChild!;
+		expect(initialsOf(tile)).toBe('ST');
+		// Painted via ::before, so the glyph never joins a parent control's
+		// visible label text.
+		expect(tile).toHaveTextContent('');
+		expect(getComputedStyle(tile, '::before').content).toBe('"ST"');
 	});
 
 	it('strips non-alphanumerics before taking initials', () => {
 		const { container } = renderWithProviders(<VendorIcon name="big-api" />);
 		// Hyphen is dropped, so the first two *alphanumeric* chars are "BI".
-		expect(container.firstElementChild).toHaveTextContent('BI');
+		expect(initialsOf(container.firstElementChild)).toBe('BI');
 	});
 
 	it('falls back to "??" when the name has no alphanumerics', () => {
 		const { container } = renderWithProviders(<VendorIcon name="---" />);
-		expect(container.firstElementChild).toHaveTextContent('??');
+		expect(initialsOf(container.firstElementChild)).toBe('??');
 	});
 
-	it('is deterministic — the same seed always picks the same gradient', () => {
+	const toneOf = (root: Element | null) => root?.getAttribute('data-tone');
+
+	it('is deterministic — the same seed always picks the same tone', () => {
 		const { container: a } = renderWithProviders(<VendorIcon name="alpha" vendor="acme" />);
 		const { container: b } = renderWithProviders(<VendorIcon name="beta" vendor="acme" />);
-		const gradientOf = (root: Element | null) =>
-			(root?.className ?? '').split(' ').find((c) => c.startsWith('from-'));
-		// Same vendor seed → same gradient even though the names differ.
-		expect(gradientOf(a.firstElementChild)).toBe(gradientOf(b.firstElementChild));
+		// Same vendor seed → same tone even though the names differ.
+		expect(toneOf(a.firstElementChild)).toBe(toneOf(b.firstElementChild));
 	});
 
-	it('seeds the gradient from `vendor` in preference to `name`', () => {
-		const gradientOf = (root: Element | null) =>
-			(root?.className ?? '').split(' ').find((c) => c.startsWith('from-'));
+	it('is a flat pastel tile with dark initials — no gradient, no white text', () => {
+		const { container } = renderWithProviders(<VendorIcon name="Stripe" vendor="stripe.com" />);
+		const el = container.firstElementChild as HTMLElement;
+		expect(el.className).not.toContain('bg-gradient');
+		expect(el.className).not.toContain('text-white');
+		expect(el.className).toContain('font-heading');
+		expect(el.style.backgroundColor).toMatch(/--avatar-\d-bg/);
+		expect(el.style.color).toMatch(/--avatar-\d-fg/);
+	});
+
+	it('seeds the tone from `vendor` in preference to `name`', () => {
 		// vendor present → name is ignored for the seed.
 		const { container: withVendor } = renderWithProviders(
 			<VendorIcon name="zzz" vendor="acme" />,
 		);
 		const { container: nameSeed } = renderWithProviders(<VendorIcon name="acme" />);
-		// vendor "acme" and name "acme" hash to the same gradient; "zzz" alone would not.
-		expect(gradientOf(withVendor.firstElementChild)).toBe(
-			gradientOf(nameSeed.firstElementChild),
-		);
+		// vendor "acme" and name "acme" hash to the same tone.
+		expect(toneOf(withVendor.firstElementChild)).toBe(toneOf(nameSeed.firstElementChild));
 	});
 
 	it('renders the real logo (decorative img) when an iconUrl is provided', () => {
@@ -56,8 +70,9 @@ describe('VendorIcon', () => {
 
 	it('applies size-specific box classes', () => {
 		const { container } = renderWithProviders(<VendorIcon name="Stripe" size="lg" />);
-		expect(container.firstElementChild?.className).toContain('h-12');
-		expect(container.firstElementChild?.className).toContain('w-12');
+		// lg = 44px (sheet / hub headers).
+		expect(container.firstElementChild?.className).toContain('h-11');
+		expect(container.firstElementChild?.className).toContain('w-11');
 	});
 
 	it('merges a caller-supplied className', () => {

@@ -2,9 +2,15 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-import type { ConfirmSessionRequest } from '../models/ConfirmSessionRequest';
+import type { ApiKeyConfirmSessionRequest } from '../models/ApiKeyConfirmSessionRequest';
+import type { BasicConfirmSessionRequest } from '../models/BasicConfirmSessionRequest';
+import type { BearerConfirmSessionRequest } from '../models/BearerConfirmSessionRequest';
 import type { ConnectSessionListResponse } from '../models/ConnectSessionListResponse';
+import type { ExistingCredentialConfirmSessionRequest } from '../models/ExistingCredentialConfirmSessionRequest';
 import type { IntegrationsConnectRequest } from '../models/IntegrationsConnectRequest';
+import type { OAuthConfirmSessionRequest } from '../models/OAuthConfirmSessionRequest';
+import type { OwnOAuthClientConfirmSessionRequest } from '../models/OwnOAuthClientConfirmSessionRequest';
+import type { ReauthorizeConfirmSessionRequest } from '../models/ReauthorizeConfirmSessionRequest';
 import type { CancelablePromise } from '../core/CancelablePromise';
 import { OpenAPI } from '../core/OpenAPI';
 import { request as __request } from '../core/request';
@@ -29,12 +35,18 @@ export class IntegrationsService {
         /**
          * Filter by session state
          */
-        state?: ('created' | 'polling' | 'connected' | null),
+        state?: ('created' | 'awaiting_app' | 'polling' | 'connected' | null),
         /**
          * Filter by vendor registry key
          */
         vendor?: (string | null),
+        /**
+         * Opaque cursor from a previous page's next_cursor; omit for the first page.
+         */
         cursor?: (string | null),
+        /**
+         * Maximum number of sessions to return (1-200, default 50).
+         */
         limit?: number,
     }): CancelablePromise<ConnectSessionListResponse> {
         return __request(OpenAPI, {
@@ -62,9 +74,10 @@ export class IntegrationsService {
      * scope catalog flagged with default/requested, current state, reason.
      *
      * Gated by the session's ``poll_token`` capability (rides the approval
-     * URL / the ``:connect`` response) — ``credentials:write`` alone must
-     * not read arbitrary sessions' review data. Missing session and token
-     * mismatch both surface as 403, matching ``/status`` (no session-id
+     * URL / the ``:connect`` response), or by being the target agent's owner
+     * or ``org:admin`` — ``credentials:write`` alone must not read arbitrary
+     * sessions' review data. Missing session, token mismatch and a caller who
+     * is neither all surface as 403, matching ``/status`` (no session-id
      * enumeration oracle).
      * @returns any Successful Response
      * @throws ApiError
@@ -73,11 +86,14 @@ export class IntegrationsService {
         sessionId,
         pollToken,
     }: {
+        /**
+         * ID of the connect session.
+         */
         sessionId: string,
         /**
-         * Opaque poll capability
+         * Opaque poll capability returned by :connect. Optional for the target agent's owner (with credentials:write and agents:write) and org:admin. Deliberately a query parameter: it rides the approval URL a human opens in a browser, where a header cannot be set. It is a short-lived, single-session capability, not a reusable credential, and it only scopes reads/actions on that one connect session.
          */
-        pollToken: string,
+        pollToken?: (string | null),
     }): CancelablePromise<any> {
         return __request(OpenAPI, {
             method: 'GET',
@@ -92,6 +108,7 @@ export class IntegrationsService {
                 400: `Bad Request`,
                 401: `Unauthorized`,
                 403: `Forbidden`,
+                409: `The session's OAuth app changed; start a new session`,
                 422: `Unprocessable Entity`,
                 500: `Internal Server Error`,
                 503: `Service Unavailable`,
@@ -100,6 +117,20 @@ export class IntegrationsService {
     }
     /**
      * Poll a connect session's status
+     * Poll the lifecycle status of a connect session.
+     *
+     * Returns the session's current ``status`` and, once it has connected, the
+     * resulting ``credential_id``, the account it ``connected_as``, and the
+     * ``bound_scopes``; a failed session carries an ``error_code``. Agents and the
+     * SPA poll this after ``:connect`` until the status is terminal.
+     *
+     * Auth is intentionally lightweight: the caller must be authenticated with
+     * ``credentials:connect`` or ``credentials:write``, but the real capability
+     * that scopes the response is the session's ``poll_token`` (or being the
+     * target agent's owner / ``org:admin``). An agent handed the token by
+     * ``:connect`` can poll without full session-read rights. A missing session,
+     * a ``poll_token`` mismatch, and a caller who is neither all answer a uniform
+     * 403, so the endpoint is not a session-id enumeration oracle.
      * @returns any Successful Response
      * @throws ApiError
      */
@@ -107,11 +138,14 @@ export class IntegrationsService {
         sessionId,
         pollToken,
     }: {
+        /**
+         * ID of the connect session.
+         */
         sessionId: string,
         /**
-         * Opaque poll capability
+         * Opaque poll capability returned by :connect. Optional for the target agent's owner (with credentials:write and agents:write) and org:admin. Deliberately a query parameter: it rides the approval URL a human opens in a browser, where a header cannot be set. It is a short-lived, single-session capability, not a reusable credential, and it only scopes reads/actions on that one connect session.
          */
-        pollToken: string,
+        pollToken?: (string | null),
     }): CancelablePromise<any> {
         return __request(OpenAPI, {
             method: 'GET',
@@ -136,9 +170,8 @@ export class IntegrationsService {
      * Cancel an in-flight connect session
      * Terminate a still-active session at the user's request.
      *
-     * Gated by the same ``poll_token`` capability as ``/status`` — the
-     * SPA already holds it, so we don't force the caller to bring a
-     * heavier scope than the poller endpoint they're already using.
+     * Gated like ``/status`` — the ``poll_token`` the SPA already holds, or
+     * the target agent's owner / ``org:admin`` without it.
      *
      * A still-existing but already-terminal session is a 204 no-op — a
      * "Cancel" click racing the poll scanner doesn't error. A session
@@ -155,11 +188,14 @@ export class IntegrationsService {
         sessionId,
         pollToken,
     }: {
+        /**
+         * ID of the connect session.
+         */
         sessionId: string,
         /**
-         * Opaque poll capability
+         * Opaque poll capability returned by :connect. Optional for the target agent's owner (with credentials:write and agents:write) and org:admin. Deliberately a query parameter: it rides the approval URL a human opens in a browser, where a header cannot be set. It is a short-lived, single-session capability, not a reusable credential, and it only scopes reads/actions on that one connect session.
          */
-        pollToken: string,
+        pollToken?: (string | null),
     }): CancelablePromise<void> {
         return __request(OpenAPI, {
             method: 'POST',
@@ -181,28 +217,41 @@ export class IntegrationsService {
         });
     }
     /**
-     * Confirm scopes + permissions and kick off the vendor flow
+     * Confirm a connect session
      * Called by the review page after the human confirms selections.
+     *
+     * The body's ``kind`` picks the variant (no ``kind`` is the OAuth
+     * variant): OAuth scopes, a secret for a ``manual_*`` session
+     * (``api_key`` / ``bearer`` / ``basic``), the approver's own OAuth client
+     * for an ``awaiting_app`` session, or a credential the approver already
+     * holds (``existing_credential``, ``reauthorize``). Secrets are write-only:
+     * they never appear in a response, audit entry or log.
      *
      * Shares the ``:connect`` per-actor rate bucket — this is the endpoint
      * that actually fires the vendor's device-authorization call, and a
      * failed ``begin`` leaves the session retryable, so it must not be
-     * free to hammer during a vendor incident. Gated by ``poll_token``
-     * like the review read (403 on mismatch or missing session).
+     * free to hammer during a vendor incident. Gated like the review read
+     * (``poll_token`` or owner / ``org:admin``; 403 otherwise).
      * @returns any Successful Response
      * @throws ApiError
      */
     public static confirmConnectSession({
         sessionId,
-        pollToken,
         requestBody,
+        pollToken,
     }: {
+        /**
+         * ID of the connect session.
+         */
         sessionId: string,
         /**
-         * Opaque poll capability
+         * How to complete the session, selected by `kind`. A body without `kind` is the `oauth` variant.
          */
-        pollToken: string,
-        requestBody: ConfirmSessionRequest,
+        requestBody: (OAuthConfirmSessionRequest | ApiKeyConfirmSessionRequest | BearerConfirmSessionRequest | BasicConfirmSessionRequest | OwnOAuthClientConfirmSessionRequest | ExistingCredentialConfirmSessionRequest | ReauthorizeConfirmSessionRequest),
+        /**
+         * Opaque poll capability returned by :connect. Optional for the target agent's owner (with credentials:write and agents:write) and org:admin. Deliberately a query parameter: it rides the approval URL a human opens in a browser, where a header cannot be set. It is a short-lived, single-session capability, not a reusable credential, and it only scopes reads/actions on that one connect session.
+         */
+        pollToken?: (string | null),
     }): CancelablePromise<any> {
         return __request(OpenAPI, {
             method: 'POST',
@@ -215,6 +264,46 @@ export class IntegrationsService {
             },
             body: requestBody,
             mediaType: 'application/json',
+            errors: {
+                400: `Bad Request`,
+                401: `Unauthorized`,
+                403: `Forbidden`,
+                404: `Not Found`,
+                409: `Session not awaiting confirmation, its OAuth app, scheme or hosts changed, or the review is stale`,
+                422: `Unprocessable Entity`,
+                500: `Internal Server Error`,
+                503: `Service Unavailable`,
+            },
+        });
+    }
+    /**
+     * Reject an agent's connect request
+     * End the session as rejected — the approve dialog's explicit Reject.
+     *
+     * Only the target agent's owner (holding ``credentials:write`` and
+     * ``agents:write``) or ``org:admin``; there is no poll-token path and an
+     * agent can never reject. Everyone else gets the uniform 403. The agent's
+     * ``/status`` then reports ``failed`` with ``error_code: rejected``, and
+     * its repeat ``:connect`` for the same target answers 429
+     * ``recently_rejected`` for the rejection cooldown. Closing the dialog
+     * without rejecting makes no call; an unmount cancel stays ``cancelled``.
+     * @returns void
+     * @throws ApiError
+     */
+    public static rejectConnectSession({
+        sessionId,
+    }: {
+        /**
+         * ID of the connect session.
+         */
+        sessionId: string,
+    }): CancelablePromise<void> {
+        return __request(OpenAPI, {
+            method: 'POST',
+            url: '/connect-sessions/{session_id}:reject',
+            path: {
+                'session_id': sessionId,
+            },
             errors: {
                 400: `Bad Request`,
                 401: `Unauthorized`,
@@ -232,16 +321,24 @@ export class IntegrationsService {
      * Agent callers: `agent_id` in the payload is refused (the caller *is*
      * the agent — spoofing another agent's id is a permission-boundary
      * violation). The caller's own identity is injected instead. UI / user
-     * callers: `agent_id` is optional — when named, confirm creates the
-     * direct agent-credential binding + permission rules; when omitted, the
-     * credential connects unbound and an agent can be bound later through
-     * the credentials API.
+     * callers: `agent_id` is optional and must name an agent the caller owns
+     * (`org:admin` may name any agent); any other id is refused with 400
+     * `connect_session_agent_not_found`, the same as an unknown agent. Naming
+     * an owned agent also takes `agents:write`, which confirming for it needs
+     * (403 `connect_session_confirmation_forbidden` otherwise), and an active
+     * agent (409 `connect_session_agent_inactive` otherwise). When
+     * named, confirm creates the direct agent-credential binding + permission
+     * rules; when omitted, the credential connects unbound and an agent can
+     * be bound later through the credentials API.
      * @returns any Successful Response
      * @throws ApiError
      */
     public static integrationsConnect({
         requestBody,
     }: {
+        /**
+         * Start connecting a credential for a vendor or a registry API.
+         */
         requestBody: IntegrationsConnectRequest,
     }): CancelablePromise<any> {
         return __request(OpenAPI, {
@@ -253,7 +350,10 @@ export class IntegrationsService {
                 400: `Bad Request`,
                 401: `Unauthorized`,
                 403: `Forbidden`,
+                404: `Unknown vendor or API, or API targets are not enabled`,
+                409: `The API declares no supported scheme, or its hosts cannot be pinned`,
                 422: `Unprocessable Entity`,
+                429: `Rate limit, open-session cap, or a recent rejection`,
                 500: `Internal Server Error`,
                 503: `Service Unavailable`,
             },

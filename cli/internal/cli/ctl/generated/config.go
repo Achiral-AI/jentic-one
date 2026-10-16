@@ -3,6 +3,7 @@
 package generated
 
 import "encoding/json"
+import "errors"
 import "fmt"
 import "reflect"
 import "regexp"
@@ -216,10 +217,6 @@ type BaseModel map[string]interface{}
 
 // Broker surface configuration.
 type BrokerConfig struct {
-	// AccountLinkingBaseUrl corresponds to the JSON schema field
-	// "account_linking_base_url".
-	AccountLinkingBaseUrl interface{} `json:"account_linking_base_url,omitempty,omitzero" yaml:"account_linking_base_url,omitempty" mapstructure:"account_linking_base_url,omitempty"`
-
 	// Egress corresponds to the JSON schema field "egress".
 	Egress *EgressConfig `json:"egress,omitempty,omitzero" yaml:"egress,omitempty" mapstructure:"egress,omitempty"`
 
@@ -258,8 +255,6 @@ type BrokerConfig struct {
 	// envelope.
 	UpstreamTimeoutS float64 `json:"upstream_timeout_s,omitempty,omitzero" yaml:"upstream_timeout_s,omitempty" mapstructure:"upstream_timeout_s,omitempty"`
 }
-
-type BrokerConfigAccountLinkingBaseUrl_0 *string
 
 type BrokerConfigJobsApiBaseUrl_0 *string
 
@@ -546,7 +541,7 @@ type ConfigSchemaJson struct {
 	Catalog *CatalogConfig `json:"catalog,omitempty,omitzero" yaml:"catalog,omitempty" mapstructure:"catalog,omitempty"`
 
 	// Control corresponds to the JSON schema field "control".
-	Control ControlSurfaceConfig `json:"control,omitempty,omitzero" yaml:"control,omitempty" mapstructure:"control,omitempty"`
+	Control *ControlSurfaceConfig `json:"control,omitempty,omitzero" yaml:"control,omitempty" mapstructure:"control,omitempty"`
 
 	// Credentials corresponds to the JSON schema field "credentials".
 	Credentials *CredentialsConfig `json:"credentials,omitempty,omitzero" yaml:"credentials,omitempty" mapstructure:"credentials,omitempty"`
@@ -556,6 +551,9 @@ type ConfigSchemaJson struct {
 
 	// Entitlement corresponds to the JSON schema field "entitlement".
 	Entitlement *EntitlementConfig `json:"entitlement,omitempty,omitzero" yaml:"entitlement,omitempty" mapstructure:"entitlement,omitempty"`
+
+	// HeldExecutions corresponds to the JSON schema field "held_executions".
+	HeldExecutions *HeldExecutionsConfig `json:"held_executions,omitempty,omitzero" yaml:"held_executions,omitempty" mapstructure:"held_executions,omitempty"`
 
 	// Ingest corresponds to the JSON schema field "ingest".
 	Ingest *IngestConfig `json:"ingest,omitempty,omitzero" yaml:"ingest,omitempty" mapstructure:"ingest,omitempty"`
@@ -642,13 +640,85 @@ func (j *ConnectConfig) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// Agent connect-session settings on the control surface.
+type ControlConnectConfig struct {
+	// Allow connect sessions that target a registry API (rather than a
+	// vendor-registry key), where a human enters the credential, or brings an OAuth
+	// app, when approving them in the dashboard. On by default; while off, `:connect`
+	// refuses API targets with `manual_flows_disabled`.
+	ManualFlowsEnabled bool `json:"manual_flows_enabled,omitempty,omitzero" yaml:"manual_flows_enabled,omitempty" mapstructure:"manual_flows_enabled,omitempty"`
+
+	// Hours an API-target connect session (a human-entered credential, or an OAuth
+	// API waiting for an app) stays open before it expires. Vendor OAuth sessions
+	// keep their fixed 30-minute lifetime.
+	ManualFlowsTtlHours int `json:"manual_flows_ttl_hours,omitempty,omitzero" yaml:"manual_flows_ttl_hours,omitempty" mapstructure:"manual_flows_ttl_hours,omitempty"`
+
+	// Most open connect sessions one agent may hold at once while
+	// `manual_flows_enabled` is on; one more `:connect` gets 429
+	// `too_many_open_sessions`.
+	MaxOpenSessionsPerAgent int `json:"max_open_sessions_per_agent,omitempty,omitzero" yaml:"max_open_sessions_per_agent,omitempty" mapstructure:"max_open_sessions_per_agent,omitempty"`
+
+	// Most open connect sessions across one user and the agents they own while
+	// `manual_flows_enabled` is on; one more `:connect` gets 429
+	// `too_many_open_sessions`.
+	MaxOpenSessionsPerOwner int `json:"max_open_sessions_per_owner,omitempty,omitzero" yaml:"max_open_sessions_per_owner,omitempty" mapstructure:"max_open_sessions_per_owner,omitempty"`
+
+	// Hours after a human rejects an agent's connect request during which the agent's
+	// repeat `:connect` for the same target gets 429 `recently_rejected`. 0 turns the
+	// cooldown off.
+	RejectionCooldownHours int `json:"rejection_cooldown_hours,omitempty,omitzero" yaml:"rejection_cooldown_hours,omitempty" mapstructure:"rejection_cooldown_hours,omitempty"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ControlConnectConfig) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	type Plain ControlConnectConfig
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if v, ok := raw["manual_flows_enabled"]; !ok || v == nil {
+		plain.ManualFlowsEnabled = true
+	}
+	if v, ok := raw["manual_flows_ttl_hours"]; !ok || v == nil {
+		plain.ManualFlowsTtlHours = 72
+	}
+	if 1 > plain.ManualFlowsTtlHours {
+		return fmt.Errorf("field %s: must be >= %v", "manual_flows_ttl_hours", 1)
+	}
+	if v, ok := raw["max_open_sessions_per_agent"]; !ok || v == nil {
+		plain.MaxOpenSessionsPerAgent = 10
+	}
+	if 1 > plain.MaxOpenSessionsPerAgent {
+		return fmt.Errorf("field %s: must be >= %v", "max_open_sessions_per_agent", 1)
+	}
+	if v, ok := raw["max_open_sessions_per_owner"]; !ok || v == nil {
+		plain.MaxOpenSessionsPerOwner = 50
+	}
+	if 1 > plain.MaxOpenSessionsPerOwner {
+		return fmt.Errorf("field %s: must be >= %v", "max_open_sessions_per_owner", 1)
+	}
+	if v, ok := raw["rejection_cooldown_hours"]; !ok || v == nil {
+		plain.RejectionCooldownHours = 24
+	}
+	if 0 > plain.RejectionCooldownHours {
+		return fmt.Errorf("field %s: must be >= %v", "rejection_cooldown_hours", 0)
+	}
+	*j = ControlConnectConfig(plain)
+	return nil
+}
+
 // Control surface configuration.
 //
-// Empty since theme 7 removed the access-request subsystem (its
-// “access_requests.ttl_days“/“canonical_base_url“ knobs). The section
-// stays so a “control:“ key in existing YAML keeps validating and future
-// control-surface knobs have a home; unknown subkeys are ignored.
-type ControlSurfaceConfig map[string]interface{}
+// Unknown subkeys are ignored, so a “control:“ section written for another
+// release keeps validating.
+type ControlSurfaceConfig struct {
+	// Agent connect-session settings.
+	Connect *ControlConnectConfig `json:"connect,omitempty,omitzero" yaml:"connect,omitempty" mapstructure:"connect,omitempty"`
+}
 
 // Credentials subsystem configuration.
 type CredentialsConfig struct {
@@ -1110,6 +1180,59 @@ func (j *EntitlementConfig) UnmarshalJSON(value []byte) error {
 		plain.Region = "us-east-1"
 	}
 	*j = EntitlementConfig(plain)
+	return nil
+}
+
+// Require-approval holds: held execution jobs awaiting a human reviewer.
+//
+// An execute call matching a permission rule with “effect="require-approval"“
+// is enqueued as a “held“ job with a “pending“ approval; a reviewer (the
+// agent's owner or an “org:admin“) approves or denies it, or it expires.
+type HeldExecutionsConfig struct {
+	// Maximum pending approvals per agent. An execute call that would file another
+	// hold beyond this is denied with the ``approval_pending_limit_reached`` problem
+	// type.
+	MaxPendingPerAgent int `json:"max_pending_per_agent,omitempty,omitzero" yaml:"max_pending_per_agent,omitempty" mapstructure:"max_pending_per_agent,omitempty"`
+
+	// Seconds the result of an approved execution stays readable via ``GET
+	// /jobs/{id}/result`` before the result sweep removes it. Defaults to 24 hours.
+	ResultRetentionSeconds int `json:"result_retention_seconds,omitempty,omitzero" yaml:"result_retention_seconds,omitempty" mapstructure:"result_retention_seconds,omitempty"`
+
+	// Seconds a pending approval lives before the expiry sweep marks it ``expired``
+	// and fails its held job with a permission-denied result. Defaults to 24 hours.
+	TtlSeconds int `json:"ttl_seconds,omitempty,omitzero" yaml:"ttl_seconds,omitempty" mapstructure:"ttl_seconds,omitempty"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *HeldExecutionsConfig) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	type Plain HeldExecutionsConfig
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if v, ok := raw["max_pending_per_agent"]; !ok || v == nil {
+		plain.MaxPendingPerAgent = 10
+	}
+	if 1 > plain.MaxPendingPerAgent {
+		return fmt.Errorf("field %s: must be >= %v", "max_pending_per_agent", 1)
+	}
+	if v, ok := raw["result_retention_seconds"]; !ok || v == nil {
+		plain.ResultRetentionSeconds = 86400
+	}
+	if 0 >= plain.ResultRetentionSeconds {
+		return fmt.Errorf("field %s: must be > %v", "result_retention_seconds", 0)
+	}
+	if v, ok := raw["ttl_seconds"]; !ok || v == nil {
+		plain.TtlSeconds = 86400
+	}
+	if 0 >= plain.TtlSeconds {
+		return fmt.Errorf("field %s: must be > %v", "ttl_seconds", 0)
+	}
+	*j = HeldExecutionsConfig(plain)
 	return nil
 }
 
@@ -2543,13 +2666,57 @@ type VendorAuthConfig struct {
 	Flows []interface{} `json:"flows" yaml:"flows" mapstructure:"flows"`
 
 	// IdentityProbe corresponds to the JSON schema field "identity_probe".
-	IdentityProbe VendorIdentityProbeConfig `json:"identity_probe" yaml:"identity_probe" mapstructure:"identity_probe"`
+	IdentityProbe *VendorAuthConfigIdentityProbe `json:"identity_probe,omitempty,omitzero" yaml:"identity_probe,omitempty" mapstructure:"identity_probe,omitempty"`
 
 	// Scopes corresponds to the JSON schema field "scopes".
 	Scopes []VendorScopeConfig `json:"scopes,omitempty,omitzero" yaml:"scopes,omitempty" mapstructure:"scopes,omitempty"`
 
 	// Vendor corresponds to the JSON schema field "vendor".
 	Vendor string `json:"vendor" yaml:"vendor" mapstructure:"vendor"`
+}
+
+// Generic identity-echo protocol config for a vendor.
+//
+// After the connect flow completes, the platform calls
+// `{method} {endpoint}` with the freshly minted access token, extracts
+// `identity_field` (dotted JSON path) from the response body, and formats it
+// into `display_template` (Python str.format). The result is stored as
+// `connected_as` and returned to the caller.
+type VendorAuthConfigIdentityProbe struct {
+	// DisplayTemplate corresponds to the JSON schema field "display_template".
+	DisplayTemplate string `json:"display_template" yaml:"display_template" mapstructure:"display_template"`
+
+	// Endpoint corresponds to the JSON schema field "endpoint".
+	Endpoint string `json:"endpoint" yaml:"endpoint" mapstructure:"endpoint"`
+
+	// IdentityField corresponds to the JSON schema field "identity_field".
+	IdentityField string `json:"identity_field" yaml:"identity_field" mapstructure:"identity_field"`
+
+	// Method corresponds to the JSON schema field "method".
+	Method VendorIdentityProbeConfigMethod `json:"method,omitempty,omitzero" yaml:"method,omitempty" mapstructure:"method,omitempty"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *VendorAuthConfigIdentityProbe) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	var vendorAuthConfigIdentityProbe_0 VendorAuthConfigIdentityProbe_0
+	var errs []error
+	if err := vendorAuthConfigIdentityProbe_0.UnmarshalJSON(value); err != nil {
+		errs = append(errs, err)
+	}
+	if len(errs) == 1 {
+		return fmt.Errorf("all validators failed: %s", errors.Join(errs...))
+	}
+	type Plain VendorAuthConfigIdentityProbe
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = VendorAuthConfigIdentityProbe(plain)
+	return nil
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -2563,9 +2730,6 @@ func (j *VendorAuthConfig) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["flows"]; raw != nil && !ok {
 		return fmt.Errorf("field flows in VendorAuthConfig: required")
-	}
-	if _, ok := raw["identity_probe"]; raw != nil && !ok {
-		return fmt.Errorf("field identity_probe in VendorAuthConfig: required")
 	}
 	if _, ok := raw["vendor"]; raw != nil && !ok {
 		return fmt.Errorf("field vendor in VendorAuthConfig: required")
@@ -2903,3 +3067,5 @@ func (j *WorkerConfig) UnmarshalJSON(value []byte) error {
 	*j = WorkerConfig(plain)
 	return nil
 }
+
+type VendorAuthConfigIdentityProbe_0 = VendorIdentityProbeConfig

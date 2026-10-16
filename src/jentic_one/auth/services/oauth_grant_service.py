@@ -11,13 +11,14 @@ from __future__ import annotations
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from jentic_one.admin.core.schema.agents import Agent
 from jentic_one.admin.core.schema.oauth_client_grants import OAuthClientGrant
 from jentic_one.admin.repos import (
     AgentRepository,
     OAuthClientGrantRepository,
 )
+from jentic_one.admin.scoping.filters import build_access_filters
 from jentic_one.admin.services.oauth_grant_admin_service import (
-    GRANT_REVOKE_ADMIN_PERMISSIONS,
     OAuthGrantAdminService,
     viewer_can_revoke,
 )
@@ -30,9 +31,9 @@ from jentic_one.auth.services.errors import (
 )
 from jentic_one.shared.audit import AuditAction, AuditTargetType, record_audit
 from jentic_one.shared.auth.identity import Identity
-from jentic_one.shared.auth.permission_catalog import OAUTH_CLIENTS_READ
+from jentic_one.shared.auth.permission_catalog import ORG_ADMIN
 from jentic_one.shared.context import Context
-from jentic_one.shared.events import emit_event_best_effort
+from jentic_one.shared.events import emit_event_best_effort, summary_label
 from jentic_one.shared.models import ActorStatus, ActorType
 from jentic_one.shared.models.events import EventSeverity, EventType
 
@@ -45,14 +46,6 @@ from jentic_one.shared.oauth_grant_revocation import (
 from jentic_one.shared.pagination import Page
 
 logger = structlog.get_logger(__name__)
-
-#: Read-side admin set (grant listings): the ``:revoke`` write pair
-#: (:data:`GRANT_REVOKE_ADMIN_PERMISSIONS` — the single revoke-predicate
-#: definition, shared with ``viewer_can_revoke``) plus the read-only half of
-#: the client-lifecycle permission pair — the same permission that gates
-#: ``GET /admin/oauth-clients`` and the ``/admin/oauth-grants`` cross-view,
-#: so a caller who can see grants there can see them per-agent.
-_ADMIN_READ_PERMISSIONS: frozenset[str] = GRANT_REVOKE_ADMIN_PERMISSIONS | {OAUTH_CLIENTS_READ}
 
 #: The revocation cause stamped (audit ``reason`` + event ``data.reason``) on
 #: grants swept by an agent ownership transfer (G10, #1222) — distinguishes a
@@ -68,6 +61,11 @@ AGENT_TRANSFER_REVOCATION_REASON = "agent_ownership_transferred"
 #: transfer reason above.
 AGENT_ARCHIVE_REVOCATION_REASON = "agent_archived"
 
+#: The revocation cause stamped on grants swept by an agent hard delete
+#: (``DELETE /agents/{id}?purge=true``) of an agent that was not yet archived.
+#: Same cause-in-data pattern as the archive and transfer reasons above.
+AGENT_DELETE_REVOCATION_REASON = "agent_deleted"
+
 
 async def revoke_active_grants_for_agent(
     session: AsyncSession,
@@ -78,6 +76,7 @@ async def revoke_active_grants_for_agent(
     event_reason: str = AGENT_TRANSFER_REVOCATION_REASON,
     summary_cause: str = "changed owner",
     log_event: str = "oauth_grants_revoked_on_agent_transfer",
+    agent_name: str | None = None,
 ) -> int:
     """Revoke EVERY active grant bound to ``agent_id`` — the per-agent sweep.
 
@@ -108,10 +107,7 @@ async def revoke_active_grants_for_agent(
             actor_id=identity.sub,
             origin=identity.origin.value,
             audit_reason=audit_reason,
-            summary=(
-                f"OAuth grant {grant.id} for client '{grant.oauth_client_id}' was "
-                f"revoked because agent {agent_id} {summary_cause}"
-            ),
+            revocation_cause=f"agent {summary_label(agent_name, agent_id)} {summary_cause}",
             event_reason=event_reason,
         )
     if grants:
@@ -206,8 +202,8 @@ class OAuthGrantService:
                 type=EventType.OAUTH_GRANT_CREATED,
                 severity=EventSeverity.INFO,
                 summary=(
-                    f"OAuth client '{client_name or oauth_client_id}' was granted "
-                    f"access through agent {agent_id}"
+                    f"OAuth client {summary_label(client_name, oauth_client_id)} was granted "
+                    f"access through agent {summary_label(agent.name, agent_id)}"
                 ),
                 # Consent WAS the decision — user-visible notification, not an
                 # inbox item awaiting action.
@@ -249,9 +245,6 @@ class OAuthGrantService:
                 actor_id=identity.sub,
                 origin=identity.origin.value,
                 audit_reason="oauth grant revoked",
-                summary=(
-                    f"OAuth grant {grant_id} for client '{grant.oauth_client_id}' was revoked"
-                ),
             )
 
         revoked = await self._ctx.admin_db.run_in_transaction(_write)
@@ -271,26 +264,34 @@ class OAuthGrantService:
 
         Owner-or-admin, mirroring ``revoke_grant``'s semantics on the read
         side: the agent's owner sees their agent's grants; anyone else needs
-        an admin permission (403, not 404 — agent ids are ksuids, not
-        secrets). Items carry the display fields (client name,
-        redirect-URI origin, scopes, created, last-used, status) plus the
-        consenting ``user_id`` and the viewer's per-item ``can_revoke``
-        capability. The two predicates still differ (list keys on the agent's
-        current owner, revoke on the grant's consenting user), but a LIVE
-        grant's consenter is always the current owner — an invariant that
-        holds BECAUSE G10 (#1222) makes an ownership transfer revoke all
-        active grants in the transfer transaction AND ``create_grant`` locks
-        the agent row and re-checks ownership inside the mint transaction
-        (closing the consent-vs-transfer race). The divergence only shows on
-        revoked history rows.
+        ``org:admin`` (the only unrestricted reader of the grant registry —
+        the shared listing read is caller-scoped for everyone else). A caller
+        who is not ``org:admin`` and cannot
+        see the agent (the same visibility as ``GET /agents/{id}``) gets
+        ``ActorNotFoundError``, exactly like a missing agent, matching every
+        other ``/agents/{id}`` route. A caller who can see the agent but does
+        not own it (the agent itself, or a delegated sibling agent) gets
+        ``OAuthGrantAccessDeniedError``.
+
+        Items carry the display fields (client name, redirect-URI origin,
+        scopes, created, last-used, status) plus the consenting ``user_id``
+        and the viewer's per-item ``can_revoke`` capability. The two
+        predicates still differ (list keys on the agent's current owner,
+        revoke on the grant's consenting user), but a LIVE grant's consenter
+        is always the current owner — an invariant that holds BECAUSE G10
+        (#1222) makes an ownership transfer revoke all active grants in the
+        transfer transaction AND ``create_grant`` locks the agent row and
+        re-checks ownership inside the mint transaction (closing the
+        consent-vs-transfer race). The divergence only shows on revoked
+        history rows.
         """
+        is_admin_reader = ORG_ADMIN in identity.permissions
+        access_filters = None if is_admin_reader else build_access_filters(identity, Agent)
         async with self._ctx.admin_db.session() as session:
-            agent = await AgentRepository.get_by_id(session, agent_id)
+            agent = await AgentRepository.get_by_id(session, agent_id, filters=access_filters)
         if agent is None:
             raise ActorNotFoundError(agent_id)
-        if agent.owner_id != identity.sub and not (
-            _ADMIN_READ_PERMISSIONS & set(identity.permissions)
-        ):
+        if not is_admin_reader and agent.owner_id != identity.sub:
             raise OAuthGrantAccessDeniedError(
                 agent_id,
                 message=f"Not permitted to list OAuth grants for agent '{agent_id}'",

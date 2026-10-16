@@ -100,7 +100,9 @@ from jentic_one.shared.context import Context
 from jentic_one.shared.models import ActorType
 from jentic_one.shared.resilience import RateLimiter
 from jentic_one.shared.web import get_current_identity
+from jentic_one.shared.web import openapi_examples as ex
 from jentic_one.shared.web.deps import get_ctx
+from jentic_one.shared.web.openapi_responses import problem, route_not_found
 from jentic_one.shared.web.sensitive import SENSITIVE
 
 logger = structlog.get_logger(__name__)
@@ -153,12 +155,12 @@ class _LocalLoginRoute(APIRoute):
 router = APIRouter(route_class=_LocalLoginRoute)
 
 _GATED_404_RESPONSE: dict[int | str, dict[str, Any]] = {
-    404: {
-        "description": "Local-account login is unavailable (`auth.local_login.enabled=false`, "
+    404: route_not_found(
+        "Local-account login is unavailable (`auth.local_login.enabled=false`, "
         "or an external IdP is configured — `auth.idp.enabled=true` — which always wins): "
         "the route answers the framework's plain route-not-found 404, so the gate state "
         "is unobservable."
-    }
+    )
 }
 
 # Static page structure only — every dynamic value is HTML-escaped before it
@@ -389,6 +391,7 @@ def _render_login_page(
 
 @router.get(
     "/login",
+    include_in_schema=False,
     operation_id="loginPage",
     summary="Local-account login form (authorization flow)",
     response_class=HTMLResponse,
@@ -398,7 +401,11 @@ def _render_login_page(
 )
 async def login_page(
     request: Request,
-    ls: str = Query(..., description="Signed authorization-flow state (carry-through token)"),
+    ls: str = Query(
+        ...,
+        description="Signed authorization-flow state (carry-through token)",
+        openapi_examples=ex.example(ex.SIGNED_FLOW_STATE),
+    ),
     ctx: Context = Depends(get_ctx),
 ) -> HTMLResponse | RedirectResponse:
     """Render the local-account login form for an in-flight ``/authorize`` request.
@@ -441,6 +448,7 @@ async def login_page(
 
 @router.post(
     "/login",
+    include_in_schema=False,
     operation_id="loginSubmit",
     summary="Local-account login submit (authorization flow)",
     response_model=None,
@@ -449,10 +457,26 @@ async def login_page(
 )
 async def login_submit(
     request: Request,
-    email: str = Form(...),
-    password: str = Form(..., json_schema_extra=SENSITIVE),
-    ls: str = Form(...),
-    csrf: str = Form(..., json_schema_extra=SENSITIVE),
+    email: str = Form(
+        ..., description="Email address of the local account.", examples=["ada@example.com"]
+    ),
+    password: str = Form(
+        ...,
+        json_schema_extra=SENSITIVE,
+        description="Password of the local account.",
+        examples=["example-secret"],  # pragma: allowlist secret
+    ),
+    ls: str = Form(
+        ...,
+        description="Signed authorization-flow state (carry-through token) from the login form.",
+        examples=[ex.SIGNED_FLOW_STATE],
+    ),
+    csrf: str = Form(
+        ...,
+        json_schema_extra=SENSITIVE,
+        description="Single-use CSRF token embedded in the login form.",
+        examples=[ex.OPAQUE_TOKEN],
+    ),
     ctx: Context = Depends(get_ctx),
     authorize_svc: AuthorizeService = Depends(get_authorize_service),
 ) -> HTMLResponse | RedirectResponse:
@@ -626,14 +650,15 @@ async def check_session_continue_rate_limit(
 
 @router.post(
     "/oauth/session/continue",
+    include_in_schema=False,
     operation_id="sessionContinueEndpoint",
     summary="Exchange a live platform session for an authorize continuation",
     responses={
         **_GATED_404_RESPONSE,
-        400: {
-            "description": "Malformed, tampered, expired, or otherwise unusable "
+        400: problem(
+            "Malformed, tampered, expired, or otherwise unusable "
             "authorize state — one generic rejection, never a reason."
-        },
+        ),
     },
     dependencies=[Depends(check_session_continue_rate_limit)],
 )

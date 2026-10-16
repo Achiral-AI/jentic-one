@@ -13,10 +13,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	sdkclient "github.com/jentic/jentic-one/cli/client"
 	"github.com/jentic/jentic-one/cli/internal/agentops"
 	"github.com/jentic/jentic-one/cli/internal/cli/clictx"
+	"github.com/jentic/jentic-one/cli/internal/cli/cmdcore"
 	"github.com/jentic/jentic-one/cli/internal/cli/ux"
 	"github.com/jentic/jentic-one/cli/internal/config"
 	"github.com/spf13/cobra"
@@ -48,6 +50,15 @@ type executeOptions struct {
 	brokerHost     string
 	revision       string
 	idempotencyKey string
+	wait           bool
+	timeout        time.Duration
+	// heldExecutionID names the held execution whose finished outcome
+	// executeOutput renders; empty for a call that ran at once.
+	heldExecutionID string
+	// retrySafe reports whether re-sending the call is safe (an idempotent
+	// method, or an Idempotency-Key); it keys the retry hint on a broker
+	// transport failure. False for a held execution polled by id.
+	retrySafe bool
 }
 
 func newExecuteCmd(app *app) *cobra.Command {
@@ -78,11 +89,23 @@ func newExecuteCmd(app *app) *cobra.Command {
 			"for the API, or no credential is provisioned), it returns an\n" +
 			"agent_directive describing how to recover. execute surfaces that\n" +
 			"directive on stderr and exits 2 so a script can branch on the denial.\n\n" +
+			"When a permission rule requires approval, the broker holds the call\n" +
+			"for a human instead of running it and answers 202 with the held\n" +
+			"execution and a review_url. execute prints that envelope, shows the\n" +
+			"review link on stderr, and exits 3 (TIMEOUT_PENDING). Show the user the\n" +
+			"link, then collect the outcome with `jentic executions poll\n" +
+			"<held_execution_id>` — never re-send the call. With --wait, execute\n" +
+			"follows the held call itself (up to --timeout: default 30s, max 5m)\n" +
+			"and then prints the result exactly as if the call had run at once, or\n" +
+			"the denial/expiry (exit 2). Every held outcome names the\n" +
+			"held_execution_id.\n\n" +
 			"Exit codes:\n" +
 			"  0 — broker returned a non-denial HTTP response (incl. 2xx and upstream errors)\n" +
 			"  1 — local/transport failure (DNS, TLS, timeout, connection refused)\n" +
 			"  2 — denied by the broker (carries an agent_directive) or resolve failure\n" +
-			"      (inspect error, e.g. an unknown operation)\n\n" +
+			"      (inspect error, e.g. an unknown operation); also a held call a\n" +
+			"      reviewer denied or that expired undecided\n" +
+			"  3 — held for human approval and not yet decided (TIMEOUT_PENDING)\n\n" +
 			"Broker target: resolved as built-in default (https://127.0.0.1:8100) <\n" +
 			"the active environment's broker_url < --broker-scheme/--broker-host. A\n" +
 			"local install serves the broker over plain HTTP, so `jentic register`\n" +
@@ -97,12 +120,14 @@ func newExecuteCmd(app *app) *cobra.Command {
 			"  jentic execute GET:https://api.example.com/v1/pets --query limit=10 --json\n" +
 			"  jentic execute GET:/v1/pets/{petId} --path petId=123 --raw\n" +
 			"  echo '{\"name\":\"Bob\"}' | jentic execute POST:/v1/users --json\n" +
+			"  # A call a rule holds for approval: follow it for up to 2 minutes:\n" +
+			"  jentic execute POST:https://api.example.com/v1/orders -d '{\"n\":1}' --wait --timeout 2m --json\n" +
 			"  jentic execute POST:https://api.example.com/v1/pics --form demo=true --form-file images=@face.jpg --json\n" +
 			"  # Local broker over http, one-off (usually unnecessary — register seeds broker_url):\n" +
 			"  jentic execute GET:https://api.example.com/v1/pets --broker-scheme http --broker-host 127.0.0.1:8100",
 		Args: exactNamedArgs("<METHOD:url | METHOD:/path>", "target"),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return app.executeE(cmd, opts, args[0])
+			return cmdcore.WithStoppedInstanceHint(cmd, app.Err, app.executeE(cmd, opts, args[0]))
 		},
 	}
 
@@ -119,6 +144,8 @@ func newExecuteCmd(app *app) *cobra.Command {
 	cmd.Flags().StringVar(&opts.brokerHost, "broker-host", config.DefaultBrokerHost, "broker target host as host[:port] (no scheme; use --broker-scheme)")
 	cmd.Flags().StringVar(&opts.revision, "revision", "", "pin to a specific revision ID for inspect")
 	cmd.Flags().StringVar(&opts.idempotencyKey, "idempotency-key", "", "caller-supplied Idempotency-Key so a retried POST/PUT is de-duplicated by the broker")
+	cmd.Flags().BoolVar(&opts.wait, "wait", false, "when the call is held for human approval, wait for the decision and print the result")
+	addHeldTimeoutFlag(cmd, &opts.timeout, "how long --wait follows a held call before exiting 3 (TIMEOUT_PENDING): a duration (30s, 1m) or seconds (30); max 5m, 0 checks once")
 	planFlags(cmd)
 
 	return cmd
@@ -303,6 +330,10 @@ func (a *app) executeE(cmd *cobra.Command, opts *executeOptions, target string) 
 		return err
 	}
 
+	opts.retrySafe = agentops.RetrySafe(req.Method, req.Header.Get("Idempotency-Key"))
+	if held, ok := agentops.ParseHeld(result); ok {
+		return a.executeHeld(cmd, opts, result, held)
+	}
 	return a.executeOutput(cmd, opts, result)
 }
 

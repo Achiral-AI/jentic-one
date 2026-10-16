@@ -120,10 +120,8 @@ def _payload() -> dict[str, Any]:
         "api_vendor": "example",
         "api_name": "api",
         "api_version": "1.0.0",
-        # The resolved operation rides the payload as one dict (plus the
-        # dual-written flat id for pre-dict workers).
+        # The resolved operation rides the payload as one dict.
         "operation": {"id": "op_widgets", "path": "/v1/widgets", "method": "GET"},
-        "operation_id": "op_widgets",
     }
 
 
@@ -167,6 +165,7 @@ async def test_async_job_dispatches_through_executor(
         "id": "op_widgets",
         "path": "/v1/widgets",
         "method": "GET",
+        "relative_path": None,
     }
 
     # The job completed and the upstream body was persisted as the job result.

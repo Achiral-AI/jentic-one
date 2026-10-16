@@ -37,7 +37,7 @@ async function login(page: Page) {
  * Agents auto-selects an agent at xl, which points the lens at it.
  */
 async function gotoRailPage(page: Page) {
-	await page.goto('/app/workspace');
+	await page.goto('/app/library');
 	await expect(page.getByRole('navigation', { name: 'Primary' })).toBeVisible();
 }
 
@@ -111,7 +111,7 @@ test.describe('Activity rail — shell-mounted live event feed', () => {
 		await page.setViewportSize({ width: 1440, height: 900 });
 		await login(page);
 		await gotoRailPage(page);
-		await page.getByRole('button', { name: /^Notifications \(\d+ needs? you\)/ }).click();
+		await page.getByRole('button', { name: /^Notifications, \d+ unread/ }).click();
 		const panel = page.getByRole('dialog', { name: /^Notifications/ });
 		await expect(panel.getByRole('region', { name: 'Approvals' })).toBeVisible();
 		await panel.getByRole('button', { name: 'Notification settings' }).click();

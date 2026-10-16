@@ -18,18 +18,20 @@ vendored fallback under [`vendored/`](vendored/) guarded by
 - [`test_agent_docs_refs.py`](test_agent_docs_refs.py) — `llms.txt` / `AGENTS.md` links and counts stay true
 - [`test_config_reference_conformance.py`](test_config_reference_conformance.py) — `docs/reference/config.md` is byte-equal to its generator's output
 - [`test_config_schema_conformance.py`](test_config_schema_conformance.py) — the config JSON Schema (and the CLI's vendored copy) hasn't drifted
-- [`test_endpoint_tree.py`](test_endpoint_tree.py) — the endpoint/scope reference matches the live route table
+- [`test_endpoint_tree.py`](test_endpoint_tree.py) — the endpoint/permission reference matches the live route table
 - [`test_openapi_conformance.py`](test_openapi_conformance.py) — OpenAPI specs are well-formed and (control) not drifted
 - [`test_install_docs_conformance.py`](test_install_docs_conformance.py) — documented `brew`/`winget`/`scoop` install commands match `cli/.goreleaser.yaml`
 - [`test_cosign_identity_pins.py`](test_cosign_identity_pins.py) — every `--certificate-identity` (docs, `install.sh`, the Go updater) names a workflow that exists
 - [`test_skill_drift.py`](test_skill_drift.py) — the served skill set stays in lockstep across its copies
-- [`test_scope_catalog.py`](test_scope_catalog.py) — the conceptual scope catalogue covers every scope in use
+- [`test_permission_catalog.py`](test_permission_catalog.py) — the conceptual permission catalogue covers every permission in use
 - [`test_revision_pin_regex_matches_spec.py`](test_revision_pin_regex_matches_spec.py) — the broker revision-pin regex matches the OpenAPI spec
+- [`test_gateway_routes.py`](test_gateway_routes.py) — the split-deploy gateway (Docker + Helm) routes every backend path to a backend that serves it, carries no dead locations, and both configs share one map
 
 ## Module boundaries and layering
 
 - [`test_module_boundaries.py`](test_module_boundaries.py) — surfaces never import each other; `shared/` imports no surface
 - [`test_web_layer.py`](test_web_layer.py) — web layer rules (`web → services → repos → core`)
+- [`test_route_auth_gate.py`](test_route_auth_gate.py) — every route on every built app shape (including `shared/web/` and container-installed routes) carries an auth dependency or a justified, non-stale public declaration (`PUBLIC_OPERATION_IDS`); classified from dependency trees, not source text
 - [`test_web_links_absolute.py`](test_web_links_absolute.py) — routers build links through `build_link`, never by hand
 - [`test_broker_runner_seam.py`](test_broker_runner_seam.py) — the broker execution path stays runner-shaped, not inlined
 - [`test_worker_no_inline_dispatch.py`](test_worker_no_inline_dispatch.py) — the async worker holds no inline upstream dispatch
@@ -55,6 +57,8 @@ vendored fallback under [`vendored/`](vendored/) guarded by
 - [`test_migration_single_head.py`](test_migration_single_head.py) — exactly one alembic head per migration tree
 - [`test_no_db_mocking.py`](test_no_db_mocking.py) — tests never mock database internals
 - [`test_scoping_boundary.py`](test_scoping_boundary.py), [`test_scoping_coverage.py`](test_scoping_coverage.py) — repos stay auth-agnostic, every scoped model is registered, identity is mandatory in scoped surfaces
+- [`test_scoped_list_reads.py`](test_scoped_list_reads.py) — every admin/auth/control service list read takes and uses `identity`, or is allowlisted with a reason
+- [`test_route_identity_scoping.py`](test_route_identity_scoping.py) — every admin/auth/control/registry authenticated route passes the caller's identity to a service call (not just a helper), or is allowlisted with a reason
 
 ## Security, secrets, and audit
 

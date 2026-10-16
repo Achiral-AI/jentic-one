@@ -1,33 +1,34 @@
 <!--
 GENERATED FILE — DO NOT EDIT.
 
-This endpoint + scope reference is generated from code by `make endpoints`
+This endpoint + permission reference is generated from code by `make endpoints`
 (tools/endpoint_tree.py). Editing it by hand will be overwritten and will fail
 the drift-guard test.
 
 How to update (humans & agents)
 -------------------------------
-- The scope of a route is read from its `get_current_identity(required_permissions=[...])`
-  dependency. To make a route's scope appear here, add that argument upstream.
-- For routes whose scope is enforced in the service layer, edit the curated map
-  `PATH_SCOPE_OVERRIDES` / `ACTOR_TYPE_OVERRIDES` in
-  `src/jentic_one/shared/web/endpoint_scopes.py`.
+- The permission of a route is read from its
+  `get_current_identity(required_permissions=[...])` dependency. To make a route's
+  permission appear here, add that argument upstream.
+- For routes whose permission is enforced in the service layer, edit the curated
+  map `PATH_PERMISSION_OVERRIDES` / `ACTOR_TYPE_OVERRIDES` in
+  `src/jentic_one/shared/web/endpoint_permissions.py`.
 - Then run `make endpoints` (regenerates this file + endpoints.json) and
   `make openapi` (regenerates the specs), and commit code + artifacts together.
 
-Agents: treat `src/jentic_one/shared/web/endpoint_scopes.py` as the editable
+Agents: treat `src/jentic_one/shared/web/endpoint_permissions.py` as the editable
 source of truth, never this file.
 -->
 
-# Endpoint & scope reference
+# Endpoint & permission reference
 
-> **Generated file — do not edit by hand.** Produced by `make endpoints` from code. To correct an entry, edit `src/jentic_one/shared/web/endpoint_scopes.py` and regenerate (see [docs/reference/README.md](README.md)).
+> **Generated file — do not edit by hand.** Produced by `make endpoints` from code. To correct an entry, edit `src/jentic_one/shared/web/endpoint_permissions.py` and regenerate (see [docs/reference/README.md](README.md)).
 
-Every API endpoint grouped by its **typical caller**, then by surface, annotated with the **scope(s)** it requires.
+Every API endpoint grouped by its **typical caller**, then by surface, annotated with the **permission(s)** it requires.
 
-> The grouping and the _Typical caller_ column are an **advisory hint** at who usually calls a route, inferred from the scope family. They are **not** an enforced restriction: access is gated by the **scope**, not the actor kind, so any actor holding the required scope can call the endpoint.
+> The grouping and the _Typical caller_ column are an **advisory hint** at who usually calls a route, inferred from the permission family. They are **not** an enforced restriction: access is gated by the **permission**, not the actor kind, so any actor holding the required permission can call the endpoint.
 
-_Total endpoints: **174**._
+_Total endpoints: **170**._
 
 
 ## Agent-facing (typically an agent) (32)
@@ -35,23 +36,23 @@ _Total endpoints: **174**._
 
 ### `apis`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/apis` | `apis:read` | agent | List Apis |
 | GET | `/apis/{vendor}/{name}/{version}` | `apis:read` | agent | Get Api |
 | GET | `/apis/{vendor}/{name}/{version}/openapi` | `apis:read` | agent | Get Api Spec |
-| GET | `/apis/{vendor}/{name}/{version}/operations` | `apis:read` | agent | List Api Operations |
-| GET | `/apis/{vendor}/{name}/{version}/overlays` | `apis:read` | agent | List Overlays |
+| GET | `/apis/{vendor}/{name}/{version}/operations` | `apis:read` | agent | List the operations an API currently serves |
+| GET | `/apis/{vendor}/{name}/{version}/overlays` | `apis:read` | agent | List an API's overlays |
 | GET | `/apis/{vendor}/{name}/{version}/overlays/{overlay_id}` | `apis:read` | agent | Get Overlay |
-| GET | `/apis/{vendor}/{name}/{version}/revisions` | `apis:read` | agent | List Api Revisions |
-| GET | `/apis/{vendor}/{name}/{version}/revisions/{revision_id}` | `apis:read` | agent | Get Api Revision |
-| GET | `/apis/{vendor}/{name}/{version}/revisions/{revision_id}/openapi` | `apis:read` | agent | Get Api Revision Spec |
-| GET | `/apis/{vendor}/{name}/{version}/revisions/{revision_id}/operations` | `apis:read` | agent | List Api Revision Operations |
+| GET | `/apis/{vendor}/{name}/{version}/revisions` | `apis:read` | agent | List an API's revisions |
+| GET | `/apis/{vendor}/{name}/{version}/revisions/{revision_id}` | `apis:read` | agent | Get an API revision |
+| GET | `/apis/{vendor}/{name}/{version}/revisions/{revision_id}/openapi` | `apis:read` | agent | Download an API revision's OpenAPI document |
+| GET | `/apis/{vendor}/{name}/{version}/revisions/{revision_id}/operations` | `apis:read` | agent | List the operations in an API revision |
 | GET | `/apis/{vendor}/{name}/{version}/security-schemes` | `apis:read` | agent | List security schemes for an API |
 
 ### `broker`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | DELETE | `/{upstream_url}` | `capabilities:execute` | agent | Execute an upstream API operation |
 | GET | `/{upstream_url}` | `capabilities:execute` | agent | Execute an upstream API operation |
@@ -61,7 +62,7 @@ _Total endpoints: **174**._
 
 ### `catalog`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/catalog` | `capabilities:read` | agent | List Catalog |
 | GET | `/catalog/{api_id}` | `capabilities:read` | agent | Get Catalog Entry |
@@ -70,7 +71,7 @@ _Total endpoints: **174**._
 
 ### `events`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/events` | `events:read` | agent | List Events |
 | GET | `/events/stream` | `events:read` | agent | Stream Events |
@@ -78,20 +79,20 @@ _Total endpoints: **174**._
 
 ### `executions`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/executions` | `executions:read` | agent | List Executions |
 | GET | `/executions/{execution_id}` | `executions:read` | agent | Get Execution |
 
 ### `inspect`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/inspect` | `apis:read` | agent | Inspect operation |
 
 ### `jobs`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/jobs` | `jobs:read` | agent | List Jobs |
 | GET | `/jobs/{job_id}` | `jobs:read` | agent | Get Job |
@@ -99,42 +100,42 @@ _Total endpoints: **174**._
 
 ### `search`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | POST | `/search` | `apis:read` | agent | Search operations |
 
 ### `vendors`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/vendors` | `capabilities:read` | agent | List verified vendors |
-| GET | `/vendors/{vendor_key}/auth-capabilities` | `capabilities:read` | agent | Get a vendor's SSO capabilities |
+| GET | `/vendors/{vendor_key}/auth-capabilities` | `capabilities:read` | agent | Get a vendor's OAuth flows and scopes |
 
-## Operator-facing (typically a human operator / admin) (41)
+## Operator-facing (typically a human operator / admin) (45)
 
 
 ### `actors`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
-| GET | `/actors` | `users:read` | operator | List Actors |
+| GET | `/actors` | `users:read` | operator | List users and agents |
 
 ### `agents`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
-| GET | `/agents` | `agents:read` | operator | List Agents |
-| POST | `/agents` | `agents:write` | operator | Create Agent |
+| GET | `/agents` | `agents:read` | operator | List visible agents |
+| POST | `/agents` | `agents:write` | operator | Create an agent |
 | DELETE | `/agents/{agent_id}` | `agents:write` | operator | Archive Agent |
-| PATCH | `/agents/{agent_id}` | `agents:write` | operator | Update Agent |
-| GET | `/agents/{agent_id}/api-key` | `agents:read` | operator | Get Agent Api Key Info |
-| GET | `/agents/{agent_id}/api-key/history` | `agents:read` | operator | Get Agent Api Key History |
-| POST | `/agents/{agent_id}/credentials` | `agents:write` | operator | Bind Credential |
-| DELETE | `/agents/{agent_id}/credentials/{credential_id}` | `agents:write` | operator | Unbind Credential |
-| POST | `/agents/{agent_id}/credentials/{credential_id}:resume` | `agents:write` | operator | Resume Credential Binding |
+| PATCH | `/agents/{agent_id}` | `agents:write` | operator | Update an agent |
+| GET | `/agents/{agent_id}/api-key` | `agents:read` | operator | Get an agent's API key metadata |
+| GET | `/agents/{agent_id}/api-key/history` | `agents:read` | operator | Get an agent's API key history |
+| POST | `/agents/{agent_id}/credentials` | `agents:write` | operator | Bind a credential to an agent |
+| DELETE | `/agents/{agent_id}/credentials/{credential_id}` | `agents:write` | operator | Suspend or remove a credential binding |
+| POST | `/agents/{agent_id}/credentials/{credential_id}:resume` | `agents:write` | operator | Resume a suspended credential binding |
 | PUT | `/agents/{agent_id}/jwks` | `agents:write` | operator | Update Agent Jwks |
-| GET | `/agents/{agent_id}/scopes` | `agents:read` | operator | Get Agent Scopes |
-| PUT | `/agents/{agent_id}/scopes` | `agents:write` | operator | Replace Agent Scopes |
+| GET | `/agents/{agent_id}/permissions` | `agents:read` | operator | Get Agent Permissions |
+| PUT | `/agents/{agent_id}/permissions` | `agents:write` | operator | Replace Agent Permissions |
 | POST | `/agents/{agent_id}:approve` | `agents:write` | operator | Approve Agent |
 | POST | `/agents/{agent_id}:claim` | _any authenticated_ | operator | Claim Agent |
 | POST | `/agents/{agent_id}:deny` | `agents:write` | operator | Deny Agent |
@@ -145,59 +146,58 @@ _Total endpoints: **174**._
 
 ### `apis`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
-| POST | `/apis/{vendor}/{name}/{version}/overlays/{overlay_id}:confirm` | `overlays:confirm` | operator | Confirm Overlay |
-| POST | `/apis/{vendor}/{name}/{version}/overlays/{overlay_id}:rollback` | `overlays:confirm` | operator | Rollback Overlay |
+| POST | `/apis/{vendor}/{name}/{version}/overlays/{overlay_id}:confirm` | `overlays:confirm` | operator | Confirm an overlay and apply it to the served spec |
+| POST | `/apis/{vendor}/{name}/{version}/overlays/{overlay_id}:rollback` | `overlays:confirm` | operator | Roll back a confirmed overlay |
 
 ### `audit`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/audit` | `audit:read` | operator | List Audit Entries |
 | GET | `/audit/{audit_id}` | `audit:read` | operator | Get Audit Entry |
 
 ### `auth`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | POST | `/auth/refresh` | _any authenticated_ | operator | Refresh session token |
 
 ### `catalog`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | POST | `/catalog/{api_id}:snooze` | `events:write` | operator | Snooze Catalog Entry |
 | POST | `/catalog/{api_id}:unsnooze` | `events:write` | operator | Unsnooze Catalog Entry |
 
 ### `catalog:refresh`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | POST | `/catalog:refresh` | `org:admin` | operator | Refresh Catalog |
 
-### `events`
-
-| Method | Path | Scope(s) | Typical caller | Summary |
-|---|---|---|---|---|
-| PATCH | `/events/{event_id}` | `events:write` | operator | Acknowledge Event |
-
 ### `monitoring`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/monitoring/executions` | `org:admin` | operator | Get Execution Stats |
 | GET | `/monitoring/usage` | `org:admin` | operator | Get Usage Stats |
 
-### `oauth`
+### `oauth-app-registrations`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
-| POST | `/oauth/session/continue` | _any authenticated_ | operator | Exchange a live platform session for an authorize continuation |
+| GET | `/oauth-app-registrations` | `org:admin` | operator | List OAuth app registrations |
+| POST | `/oauth-app-registrations` | `org:admin` | operator | Register a shared OAuth application |
+| DELETE | `/oauth-app-registrations/{id}` | `org:admin` | operator | Delete an OAuth app registration |
+| GET | `/oauth-app-registrations/{id}` | `org:admin` | operator | Get an OAuth app registration |
+| PATCH | `/oauth-app-registrations/{id}` | `org:admin` | operator | Update an OAuth app registration |
+| POST | `/oauth-app-registrations/{id}:rotate-secret` | `org:admin` | operator | Rotate the client secret |
 
 ### `users`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/users` | `users:read` | operator | List Users |
 | POST | `/users` | `users:write` | operator | Create User |
@@ -209,12 +209,18 @@ _Total endpoints: **174**._
 | POST | `/users/{user_id}:enable` | `users:write` | operator | Enable User |
 | POST | `/users/{user_id}:reissue-invite` | `users:write` | operator | Reissue Invite |
 
-## Any authenticated actor (71)
+## Any authenticated actor (78)
 
+
+### `actors`
+
+| Method | Path | Permission(s) | Typical caller | Summary |
+|---|---|---|---|---|
+| GET | `/actors/lookup` | _any authenticated_ | any | Resolve actor names by id |
 
 ### `admin`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/admin/config/providers` | `config:read` | any | List credential provider configs |
 | GET | `/admin/config/providers/{name}` | `config:read` | any | Get a credential provider config |
@@ -232,39 +238,40 @@ _Total endpoints: **174**._
 
 ### `agents`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
-| GET | `/agents/{agent_id}` | _any authenticated_ | any | Get Agent |
-| GET | `/agents/{agent_id}/credentials` | _any authenticated_ | any | List Credentials |
-| GET | `/agents/{agent_id}/oauth-grants` | _any authenticated_ | any | List agent OAuth grants |
+| GET | `/agents/{agent_id}` | _any authenticated_ | any | Get an agent |
+| GET | `/agents/{agent_id}/credentials` | _any authenticated_ | any | List an agent's credential bindings |
+| GET | `/agents/{agent_id}/oauth-grants` | _any authenticated_ | any | List an agent's connected OAuth clients |
 
 ### `apis`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | POST | `/apis` | `apis:write` | any | Import Apis |
 | DELETE | `/apis/{vendor}/{name}/{version}` | `apis:write` | any | Delete Api |
 | PATCH | `/apis/{vendor}/{name}/{version}` | `apis:write` | any | Update Api |
-| POST | `/apis/{vendor}/{name}/{version}/overlays` | `apis:write` | any | Submit Overlay |
-| DELETE | `/apis/{vendor}/{name}/{version}/overlays/{overlay_id}` | `apis:write` | any | Deprecate Overlay |
-| PATCH | `/apis/{vendor}/{name}/{version}/overlays/{overlay_id}` | `apis:write` | any | Update Overlay |
-| DELETE | `/apis/{vendor}/{name}/{version}/revisions/{revision_id}` | `apis:write` | any | Delete Revision |
-| POST | `/apis/{vendor}/{name}/{version}/revisions/{revision_id}:archive` | `apis:write` | any | Archive Revision |
+| POST | `/apis/{vendor}/{name}/{version}/overlays` | `apis:write` | any | Submit an OpenAPI overlay |
+| DELETE | `/apis/{vendor}/{name}/{version}/overlays/{overlay_id}` | `apis:write` | any | Deprecate an overlay |
+| PATCH | `/apis/{vendor}/{name}/{version}/overlays/{overlay_id}` | `apis:write` | any | Edit an overlay |
+| DELETE | `/apis/{vendor}/{name}/{version}/revisions/{revision_id}` | `apis:write` | any | Delete an archived API revision |
+| POST | `/apis/{vendor}/{name}/{version}/revisions/{revision_id}:archive` | `apis:write` | any | Archive an API revision |
 | POST | `/apis/{vendor}/{name}/{version}/revisions/{revision_id}:promote` | `apis:write` | any | Promote Revision |
 
 ### `connect-sessions`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/connect-sessions` | `credentials:read`, `owner:credentials:read` | any | List connect sessions |
 | GET | `/connect-sessions/{session_id}` | `credentials:write` | any | Get review data for a connect session |
 | GET | `/connect-sessions/{session_id}/status` | `credentials:connect`, `credentials:write` | any | Poll a connect session's status |
 | POST | `/connect-sessions/{session_id}:cancel` | `credentials:connect`, `credentials:write` | any | Cancel an in-flight connect session |
-| POST | `/connect-sessions/{session_id}:confirm` | `credentials:write` | any | Confirm scopes + permissions and kick off the vendor flow |
+| POST | `/connect-sessions/{session_id}:confirm` | `credentials:write` | any | Confirm a connect session |
+| POST | `/connect-sessions/{session_id}:reject` | `credentials:write` | any | Reject an agent's connect request |
 
 ### `credentials`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/credentials` | `credentials:read`, `owner:credentials:read` | any | List credentials |
 | POST | `/credentials` | `credentials:write` | any | Create credential |
@@ -281,39 +288,49 @@ _Total endpoints: **174**._
 | PUT | `/credentials/{credential_id}/agents/{agent_id}/rule-set` | `credentials:write` | any | Attach rule set to binding |
 | POST | `/credentials/{credential_id}/connect` | `credentials:write` | any | Begin OAuth connect flow |
 
+### `executions`
+
+| Method | Path | Permission(s) | Typical caller | Summary |
+|---|---|---|---|---|
+| GET | `/executions/holds` | _any authenticated_ | any | List held executions |
+| GET | `/executions/holds/{held_execution_id}` | _any authenticated_ | any | Get a held execution |
+| GET | `/executions/holds/{held_execution_id}/result` | _any authenticated_ | any | Get a held execution's result |
+| POST | `/executions/holds/{held_execution_id}:decide` | _any authenticated_ | any | Approve or deny a held execution |
+| POST | `/executions/holds/{held_execution_id}:withdraw` | _any authenticated_ | any | Withdraw a held execution |
+
 ### `governed-hosts`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/governed-hosts` | `credentials:read`, `owner:credentials:read` | any | Get Governed Hosts |
 
 ### `integrations:connect`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | POST | `/integrations:connect` | `credentials:connect`, `credentials:write` | any | Start an integration connect session |
 
 ### `jobs`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | POST | `/jobs/{job_id}:cancel` | `jobs:write` | any | Cancel Job |
 
 ### `mcp`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | POST | `/mcp/config-registrations` | _any authenticated_ | any | Report MCP config registration |
 
 ### `me`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/me` | _any authenticated_ | any | Get Me |
 
 ### `notes`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/notes` | _any authenticated_ | any | List Notes |
 | POST | `/notes` | _any authenticated_ | any | Create Note |
@@ -323,7 +340,7 @@ _Total endpoints: **174**._
 
 ### `oauth`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | POST | `/oauth/approval/decision` | `oauth-clients:write` | any | Approve or deny a pending client inline (approval-pending page) |
 | POST | `/oauth/introspect` | _any authenticated_ | any | Introspect Endpoint |
@@ -331,30 +348,30 @@ _Total endpoints: **174**._
 
 ### `oauth-grants`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | POST | `/oauth-grants/{grant_id}:revoke` | _any authenticated_ | any | Revoke OAuth grant |
 
 ### `permission-rule-sets`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/permission-rule-sets` | `credentials:read`, `owner:credentials:read` | any | List permission rule sets |
 | POST | `/permission-rule-sets` | `credentials:write` | any | Create permission rule set |
 | DELETE | `/permission-rule-sets/{rule_set_id}` | `credentials:write` | any | Delete permission rule set |
 | GET | `/permission-rule-sets/{rule_set_id}` | `credentials:read`, `owner:credentials:read` | any | Get permission rule set |
-| PATCH | `/permission-rule-sets/{rule_set_id}` | `credentials:write` | any | Update permission rule set |
-| PUT | `/permission-rule-sets/{rule_set_id}/rules` | `credentials:write` | any | Replace rule set rules |
+| PATCH | `/permission-rule-sets/{rule_set_id}` | `credentials:write` | any | Rename or re-describe a permission rule set |
+| PUT | `/permission-rule-sets/{rule_set_id}/rules` | `credentials:write` | any | Replace all rules in a permission rule set |
 
 ### `permissions`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
-| GET | `/permissions` | _any authenticated_ | any | List Permissions |
+| GET | `/permissions` | _any authenticated_ | any | List the permission catalogue |
 
 ### `register`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | DELETE | `/register/{agent_id}` | _any authenticated_ | any | Delete Registration Endpoint |
 | GET | `/register/{agent_id}` | _any authenticated_ | any | Poll Status Endpoint _(Authenticated with the Registration-Access-Token issued at registration (RFC 7592), not a platform bearer token.)_ |
@@ -362,131 +379,86 @@ _Total endpoints: **174**._
 
 ### `system`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/system/version` | _any authenticated_ | any | Running and latest-available app version |
 
 ### `users`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/users/me` | _any authenticated_ | any | Get current user |
 | POST | `/users/me:change-password` | _any authenticated_ | any | Change own password |
 
-## Public (unauthenticated) (30)
+## Public (unauthenticated) (15)
 
-
-### `.well-known`
-
-| Method | Path | Scope(s) | Typical caller | Summary |
-|---|---|---|---|---|
-| GET | `/.well-known/jwks.json` | _public — no auth_ | — | JSON Web Key Set |
-| GET | `/.well-known/oauth-authorization-server` | _public — no auth_ | — | OAuth authorization server metadata |
-| GET | `/.well-known/oauth-authorization-server/mcp` | _public — no auth_ | — | OAuth authorization server metadata for the MCP resource |
-| GET | `/.well-known/oauth-protected-resource` | _public — no auth_ | — | OAuth protected resource metadata (root alias for the MCP resource) |
-| GET | `/.well-known/oauth-protected-resource/mcp` | _public — no auth_ | — | OAuth protected resource metadata for the MCP resource |
 
 ### `admin`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/admin/health` | _public — no auth_ | — | Health |
 
 ### `auth`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
-| GET | `/auth/health` | _public — no auth_ | — | Auth health |
 | GET | `/auth/idp` | _public — no auth_ | — | External IdP login descriptor |
 | POST | `/auth/login` | _public — no auth_ | — | Log in |
 
-### `authorize`
-
-| Method | Path | Scope(s) | Typical caller | Summary |
-|---|---|---|---|---|
-| GET | `/authorize` | _public — no auth_ | — | Authorize Endpoint |
-
-### `control`
-
-| Method | Path | Scope(s) | Typical caller | Summary |
-|---|---|---|---|---|
-| GET | `/control/health` | _public — no auth_ | — | Control health |
-
-### `credentials`
-
-| Method | Path | Scope(s) | Typical caller | Summary |
-|---|---|---|---|---|
-| GET | `/credentials/oauth/callback` | _public — no auth_ | — | OAuth connect callback |
-
 ### `error`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/error` | _public — no auth_ | — | Error Page |
 
 ### `health`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/health` | _public — no auth_ | — | Health |
 
 ### `instance`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/instance` | _public — no auth_ | — | Backend identity |
 
-### `login`
-
-| Method | Path | Scope(s) | Typical caller | Summary |
-|---|---|---|---|---|
-| GET | `/login` | _public — no auth_ | — | Local-account login form (authorization flow) |
-| POST | `/login` | _public — no auth_ | — | Local-account login submit (authorization flow) |
-
 ### `oauth`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/oauth/approval/status` | _public — no auth_ | — | Poll client approval status (approval-pending page) |
-| GET | `/oauth/callback` | _public — no auth_ | — | Authorize Oauth Callback |
-| GET | `/oauth/consent` | _public — no auth_ | — | Consent Page |
-| POST | `/oauth/consent` | _public — no auth_ | — | Consent Submit |
 | POST | `/oauth/consent/agent` | _public — no auth_ | — | Create the consenting user's first agent inline (consent page) |
 | GET | `/oauth/consent/agent/status` | _public — no auth_ | — | Poll pending-agent approval status (consent awaiting page) |
 | POST | `/oauth/token` | _public — no auth_ | — | Token Endpoint |
 
 ### `oauth-clients`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | POST | `/oauth-clients` | _public — no auth_ | — | Register OAuth client (anonymous DCR) |
 
 ### `ready`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | GET | `/ready` | _public — no auth_ | — | Broker readiness (saturation-aware) |
 
 ### `register`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | POST | `/register` | _public — no auth_ | — | Register Endpoint |
 
-### `registry`
-
-| Method | Path | Scope(s) | Typical caller | Summary |
-|---|---|---|---|---|
-| GET | `/registry/health` | _public — no auth_ | — | Registry health |
-
 ### `users:create-admin`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | POST | `/users:create-admin` | _public — no auth_ | — | Create first admin (one-time setup) |
 
 ### `users:redeem-invite`
 
-| Method | Path | Scope(s) | Typical caller | Summary |
+| Method | Path | Permission(s) | Typical caller | Summary |
 |---|---|---|---|---|
 | POST | `/users:redeem-invite` | _public — no auth_ | — | Redeem invite |

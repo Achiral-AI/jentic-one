@@ -1,4 +1,4 @@
-"""Repository for cross-database effect operations.
+"""Repository for the connect-session flow's cross-database operations.
 
 Uses raw SQL for admin-DB reads/writes to avoid importing admin ORM models —
 the control module must not import from the admin module. Uses ON CONFLICT DO
@@ -7,187 +7,50 @@ NOTHING for idempotent inserts without requiring rollback.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from jentic_one.shared.db.ids import generate_ksuid
-from jentic_one.shared.models.api_identity import credential_coverage_where, slugify_api_field
+
+
+class AgentOwnerRow(NamedTuple):
+    """Owner and lifecycle status of an agent, read from the admin DB."""
+
+    owner_id: str | None
+    status: str
+    name: str | None = None
 
 
 class EffectsRepository:
-    """Read/write operations for approval effects, using raw SQL for cross-DB tables."""
+    """Cross-DB reads/writes for the connect-session flow, using raw SQL for admin-DB tables."""
 
     @staticmethod
-    def _in_clause(
-        values: list[str] | None,
-        params: dict[str, object],
-        *,
-        prefix: str,
-    ) -> str | None:
-        """Build a parameterized ``<p>_0, <p>_1, …`` placeholder list.
+    async def get_agent_owner(session: AsyncSession, agent_id: str) -> AgentOwnerRow | None:
+        """Return the agent's owner, status and name via raw SQL (admin DB), ``None`` if missing.
 
-        Mutates ``params`` in place and returns the comma-joined placeholder
-        fragment. Returns:
-
-        - ``""`` when ``values is None`` (no restriction — caller omits the
-          clause entirely),
-        - ``None`` when ``values`` is an empty list (sentinel: caller must
-          short-circuit to "no rows" without running the query).
-        """
-        if values is None:
-            return ""
-        if not values:
-            return None
-        placeholders = ", ".join(f":{prefix}_{i}" for i in range(len(values)))
-        for i, val in enumerate(values):
-            params[f"{prefix}_{i}"] = val
-        return placeholders
-
-    @staticmethod
-    async def resolve_credentials_for_api(
-        session: AsyncSession,
-        *,
-        vendor: str,
-        name: str | None,
-        version: str | None,
-        owner_ids: list[str] | None = None,
-        bound_credential_ids: list[str] | None = None,
-    ) -> list[str]:
-        """Return credential IDs covering the given API identity, decider-visible.
-
-        Theme-5 Phase 3 successor of the toolkit-era ``resolve_toolkits_for_api``
-        — the join through ``toolkit_credential_bindings`` is gone; the
-        candidate axis is the credential itself. An empty ``name``/``version``
-        reference axis means "any"; a NULL ``api_name``/``api_version`` on the
-        credential means it covers all names/versions for the vendor.
-
-        **Owner axis (hard problem 8):** the toolkit era scoped candidates by
-        the *toolkit's* owner (``tk.created_by``). Dropping the join must not
-        silently narrow resolution to "credentials I own" — a decider may
-        legitimately govern another owner's credential through an agent they
-        own that is already bound to it (the binding-widened visibility of
-        ``scoping/filters._binding_visibility_clause``). A credential is a
-        candidate when the decider **owns it** (``created_by IN owner_ids``)
-        **or** it appears in ``bound_credential_ids`` — the ids of credentials
-        bound to agents the decider owns, resolved by the caller from the
-        admin DB (`list_bound_credential_ids_for_owned_agents`) and pushed
-        down here as a plain id list (the cross-DB seam of hard problem 9; no
-        admin table is referenced in this query).
-
-        ``owner_ids`` is ``None`` only for an ``org:admin`` decider, who may
-        resolve across all owners (``bound_credential_ids`` is then irrelevant).
-        Passing an empty list for both returns no candidates.
-
-        To avoid widening a name-specific reference into a vendor-wide
-        (``api_name IS NULL``) credential, an **exact** name/version match is
-        preferred: NULL-wildcard credentials only contribute when no exact
-        match exists for the requested name (#775).
-
-        The ``vendor``/``name`` reference axes are canonicalized (slugified)
-        here before binding, because stored rows are canonical (the credential
-        service slugifies on write and the backfill migration re-slugs legacy
-        rows) — a raw reference like ``GitHub.com`` must be slugified to
-        ``github-com`` or it would match nothing (#656). ``version`` is trimmed
-        but never slugified, matching ``canonical_credential_scope``.
-        """
-        params: dict[str, object] = {"vendor": slugify_api_field(vendor)}
-        if name:
-            params["name"] = slugify_api_field(name)
-        if version:
-            params["version"] = version.strip()
-        name_scoped = bool(name)
-        version_scoped = bool(version)
-
-        visibility = ""
-        if owner_ids is not None:
-            owners = EffectsRepository._in_clause(owner_ids, params, prefix="owner")
-            bound = EffectsRepository._in_clause(
-                bound_credential_ids if bound_credential_ids is not None else [],
-                params,
-                prefix="bound",
-            )
-            clauses: list[str] = []
-            if owners is not None:
-                clauses.append(f"c.created_by IN ({owners})")
-            if bound is not None:
-                clauses.append(f"c.id IN ({bound})")
-            if not clauses:
-                return []
-            visibility = f" AND ({' OR '.join(clauses)}) "
-
-        # Shared coverage rule (see shared/models/api_identity.credential_coverage_where):
-        # a wildcard *reference* axis (empty name/version at bind time) omits that
-        # axis so it matches anything; a scoped axis matches NULL-wildcard or exact.
-        coverage = credential_coverage_where(name_scoped=name_scoped, version_scoped=version_scoped)
-        # Prefer an exact name match only when the reference names one — otherwise
-        # there is no exactness to rank on.
-        name_exact = "(CASE WHEN c.api_name = :name THEN 1 ELSE 0 END)" if name_scoped else "0"
-        base_query = (
-            f"SELECT DISTINCT c.id, {name_exact} AS name_exact "
-            "FROM credentials c "
-            f"WHERE {coverage} "
-            f"{visibility}"
-        )
-        result = await session.execute(text(base_query), params)
-        rows = result.all()
-        # Prefer exact name matches: if any candidate matched the requested name
-        # exactly, drop the NULL-wildcard (vendor-wide) matches so a named
-        # reference never silently binds a broader catch-all credential.
-        if any(row[1] for row in rows):
-            return sorted({row[0] for row in rows if row[1]})
-        return sorted({row[0] for row in rows})
-
-    @staticmethod
-    async def list_bound_credential_ids_for_owned_agents(
-        session: AsyncSession,
-        *,
-        owner_ids: list[str],
-    ) -> list[str]:
-        """Credential ids bound to any agent owned by one of ``owner_ids`` (admin DB).
-
-        The push-down half of the hard-problem-8 owner axis: run on an **admin**
-        session, its result feeds ``resolve_credentials_for_api``'s
-        ``bound_credential_ids`` so the control-DB query never references an
-        admin table (cross-DB seam, hard problem 9; precedent
-        ``PrerequisiteRepository.list_credential_ids_for_agent``). Suspended
-        bindings still count — suspension is a broker-derivation cut-off, not a
-        governance-ownership change; the decider who owns the agent can still
-        see (and re-govern) the credential the binding names.
-        """
-        if not owner_ids:
-            return []
-        params: dict[str, object] = {}
-        owners = EffectsRepository._in_clause(owner_ids, params, prefix="owner")
-        result = await session.execute(
-            text(
-                "SELECT DISTINCT acb.credential_id "
-                "FROM agent_credential_bindings acb "
-                "JOIN agents a ON a.id = acb.agent_id "
-                f"WHERE a.owner_id IN ({owners})"
-            ),
-            params,
-        )
-        return [str(row[0]) for row in result.fetchall()]
-
-    @staticmethod
-    async def get_agent_owner(session: AsyncSession, agent_id: str) -> tuple[bool, str | None]:
-        """Return ``(exists, owner_id)`` for an agent via raw SQL (admin DB).
-
-        Cross-DB seam for the connect flow's agent-binding validation: the
-        control-side ``:confirm`` must verify the target agent exists and is
-        owned by the confirming caller before writing the binding, and the
-        broker/control modules may not import admin ORM models. The two
-        axes are separate because ``agents.owner_id`` is nullable — an
-        existing but ownerless agent is ``(True, None)``, not "missing".
+        Cross-DB seam for the connect flow's agent checks: the control-side
+        session routes verify the target agent is owned by the caller, and
+        ``:confirm`` also refuses an agent that is no longer usable (archived,
+        disabled, rejected) before writing a binding in its name; ``name``
+        labels the ``connect_session.created`` event. The broker
+        and control modules may not import admin ORM models. ``owner_id`` is
+        nullable — an existing but ownerless agent has ``owner_id=None``, not
+        "missing".
         """
         result = await session.execute(
-            text("SELECT owner_id FROM agents WHERE id = :agent_id"),
+            text("SELECT owner_id, status, name FROM agents WHERE id = :agent_id"),
             {"agent_id": agent_id},
         )
         row = result.first()
         if row is None:
-            return False, None
-        return True, (str(row[0]) if row[0] is not None else None)
+            return None
+        return AgentOwnerRow(
+            owner_id=str(row[0]) if row[0] is not None else None,
+            status=str(row[1]),
+            name=str(row[2]) if row[2] is not None else None,
+        )
 
     @staticmethod
     async def bind_agent_to_credential(
@@ -261,41 +124,3 @@ class EffectsRepository:
         )
         await session.flush()
         return bool(getattr(result, "rowcount", 0))
-
-    @staticmethod
-    async def grant_scope_to_actor(
-        session: AsyncSession,
-        *,
-        actor_id: str,
-        actor_type: str,
-        scope: str,
-        granted_by: str,
-        created_by: str,
-    ) -> bool:
-        """Grant a scope to an actor idempotently via raw SQL.
-
-        Returns True if created, False if already existed.
-        """
-        grant_id = generate_ksuid("asg")
-        result = await session.execute(
-            text(
-                "INSERT INTO actor_scope_grants "
-                "(id, actor_id, actor_type, scope, granted_by, created_by) "
-                "VALUES (:id, :actor_id, :actor_type, :scope, :granted_by, :created_by) "
-                "ON CONFLICT (actor_id, scope) DO NOTHING "
-                "RETURNING id"
-            ),
-            {
-                "id": grant_id,
-                "actor_id": actor_id,
-                "actor_type": actor_type,
-                "scope": scope,
-                "granted_by": granted_by,
-                "created_by": created_by,
-            },
-        )
-        inserted_id = result.scalar_one_or_none()
-        if inserted_id is not None:
-            await session.flush()
-            return True
-        return False

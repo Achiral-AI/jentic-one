@@ -11,6 +11,7 @@ from jentic_one.admin.services.event_service import EventService
 from jentic_one.admin.services.event_stream_service import EventStreamService
 from jentic_one.admin.services.execution_service import ExecutionService
 from jentic_one.admin.services.health_service import HealthService
+from jentic_one.admin.services.held_execution_service import HeldExecutionService
 from jentic_one.admin.services.invite_service import InviteService
 from jentic_one.admin.services.job_result_service import JobResultService
 from jentic_one.admin.services.job_service import JobService
@@ -58,6 +59,12 @@ def get_invite_service(ctx: Context = Depends(get_ctx)) -> InviteService:
 
 def get_execution_service(ctx: Context = Depends(get_ctx)) -> ExecutionService:
     return ExecutionService(ctx)
+
+
+def get_held_execution_service(
+    ctx: Context = Depends(get_ctx),
+) -> HeldExecutionService:
+    return HeldExecutionService(ctx)
 
 
 def get_job_service(ctx: Context = Depends(get_ctx)) -> JobService:

@@ -16,16 +16,17 @@ import {
 } from '@tanstack/react-query';
 import { toast } from '@/shared/ui';
 import {
-	acknowledgeEvent,
 	cancelJob,
 	getExecution,
 	getJob,
 	getUsageStats,
+	isMonitorAccessDenied,
 	listActors,
 	listAudit,
 	listEvents,
 	listExecutions,
 	listJobs,
+	MonitorApiError,
 	resolveActor,
 	streamEvents,
 	type ListActorsParams,
@@ -35,8 +36,8 @@ import {
 	type ListJobsParams,
 	type UsageStatsParams,
 } from '@/modules/monitor/api/client';
-import { AuditTargetType, sharedQueryKeys } from '@/shared/api';
-import { useAgentStreamOptional } from '@/shared/lib';
+import { sharedQueryKeys } from '@/shared/api';
+import { useCanListActors } from '@/shared/hooks';
 import { toJobStatus } from '@/modules/monitor/api/types';
 import type {
 	ActorListResponse,
@@ -55,13 +56,14 @@ export const monitorKeys = {
 	executions: (params: ListExecutionsParams) =>
 		[...monitorKeys.all, 'executions', params] as const,
 	execution: (id: string) => [...monitorKeys.all, 'execution', id] as const,
-	jobs: (params: ListJobsParams) => [...monitorKeys.all, 'jobs', params] as const,
-	job: (id: string) => [...monitorKeys.all, 'job', id] as const,
-	// Derives from the shared cross-module root: the agent-stream provider's
-	// `acknowledge` (rail/toast) invalidates that root, so the two prefixes
-	// must be the same list or they'd silently drift apart.
+	// The job slices derive from shared roots so a settled approval (another
+	// module, or the live stream) refreshes a held job in place.
+	jobs: (params: ListJobsParams) => [...sharedQueryKeys.monitorJobsRoot, params] as const,
+	job: (id: string) => [...sharedQueryKeys.monitorJobRoot, id] as const,
+	// Derives from the shared cross-module root, so a cross-module
+	// invalidation of that root reaches every events list here too.
 	events: (params: ListEventsParams) => [...sharedQueryKeys.monitorEventsRoot, params] as const,
-	// Same root, so an acknowledge anywhere also refreshes the Activity feed.
+	// Same root, so that invalidation also refreshes the Activity feed.
 	eventFeed: (params: Omit<ListEventsParams, 'cursor'>) =>
 		[...sharedQueryKeys.monitorEventsRoot, 'feed', params] as const,
 	audit: (params: ListAuditParams) => [...monitorKeys.all, 'audit', params] as const,
@@ -91,11 +93,24 @@ export function useExecutions(
 	});
 }
 
+/**
+ * One execution by id. A 404 is the answer (the record does not exist or is
+ * not visible to the caller), so it is never retried: the detail shows "Call
+ * not found" at once. Any other failure follows the client's default retry.
+ */
 export function useExecution(executionId: string | null) {
+	const defaultRetry = useQueryClient().getDefaultOptions().queries?.retry;
 	return useQuery<ExecutionResponse>({
 		queryKey: monitorKeys.execution(executionId ?? ''),
 		queryFn: () => getExecution(executionId as string),
 		enabled: executionId != null,
+		retry: (failureCount, error) => {
+			if (error instanceof MonitorApiError && error.status === 404) return false;
+			if (typeof defaultRetry === 'function') return defaultRetry(failureCount, error);
+			if (typeof defaultRetry === 'number') return failureCount < defaultRetry;
+			// TanStack's own default when the client sets none: three retries.
+			return defaultRetry ?? failureCount < 3;
+		},
 	});
 }
 
@@ -130,12 +145,17 @@ export function useUsageStats(
 /**
  * `pollWhileActive` (ms) re-polls only while the loaded page still holds a
  * queued/running job, so a settled queue stops hitting the backend.
+ * `enabled: false` (a caller without `jobs:read`) sends nothing.
  */
 export function useJobs(
 	params: ListJobsParams = {},
-	{ pollWhileActive = false }: { pollWhileActive?: number | false } = {},
+	{
+		pollWhileActive = false,
+		enabled = true,
+	}: { pollWhileActive?: number | false; enabled?: boolean } = {},
 ) {
 	return useQuery<JobListResponse>({
+		enabled,
 		queryKey: monitorKeys.jobs(params),
 		queryFn: () => listJobs(params),
 		placeholderData: keepPreviousData,
@@ -198,8 +218,12 @@ const EVENT_FEED_PAGE = 50;
  * cursor ("Load older" appends a page). Live events arrive separately through
  * {@link useEventStream} and are merged on top by the view.
  */
-export function useEventFeed(params: Omit<ListEventsParams, 'cursor' | 'limit'>) {
+export function useEventFeed(
+	params: Omit<ListEventsParams, 'cursor' | 'limit'>,
+	{ enabled = true }: { enabled?: boolean } = {},
+) {
 	return useInfiniteQuery({
+		enabled,
 		queryKey: monitorKeys.eventFeed(params),
 		queryFn: ({ pageParam }) =>
 			listEvents({ ...params, cursor: pageParam, limit: EVENT_FEED_PAGE }),
@@ -209,37 +233,8 @@ export function useEventFeed(params: Omit<ListEventsParams, 'cursor' | 'limit'>)
 	});
 }
 
-/** Acknowledge an event (`PATCH /events/{id}`); invalidates the events feeds. */
-export function useAcknowledgeEvent() {
-	const queryClient = useQueryClient();
-	// Provider-optional: when the app shell's stream is mounted, flip its
-	// in-memory copy too — the SSE watermark poll never re-delivers an old
-	// event on an ack flip, so without this the rail's failure pill keeps
-	// counting an event the operator just acknowledged from the Events tab.
-	const stream = useAgentStreamOptional();
-	return useMutation({
-		mutationFn: (eventId: string) => acknowledgeEvent(eventId),
-		onSuccess: (event) => {
-			toast({
-				title: 'Event acknowledged',
-				description: event.summary,
-				variant: 'success',
-			});
-			queryClient.invalidateQueries({ queryKey: [...monitorKeys.all, 'events'] });
-			stream?.resolveEvent(event.event_id);
-		},
-		onError: (error: unknown) => {
-			toast({
-				title: 'Acknowledge failed',
-				description:
-					error instanceof Error ? error.message : 'Could not acknowledge the event.',
-				variant: 'error',
-			});
-		},
-	});
-}
-
-export type LiveStreamStatus = 'idle' | 'connecting' | 'live' | 'error';
+/** `forbidden`: the server refused the stream (401/403) — nothing reconnects it. */
+export type LiveStreamStatus = 'idle' | 'connecting' | 'live' | 'error' | 'forbidden';
 
 /**
  * Subscribe to the live event SSE while `enabled`. Newest-first buffer, capped
@@ -248,7 +243,9 @@ export type LiveStreamStatus = 'idle' | 'connecting' | 'live' | 'error';
  *
  * Exposes `reconnect()` to force a re-subscribe after a stream error (the EU
  * surfaces this as a "Reconnect" affordance), and `clear()` to empty the
- * buffer. Toasts once when the stream errors so the failure isn't silent.
+ * buffer. Toasts once when the stream errors so the failure isn't silent. A
+ * refusal (401/403) reads `forbidden` instead of `error`, without a toast, so
+ * callers that reconnect on `error` leave it alone.
  */
 export function useEventStream(
 	params: ListEventsParams,
@@ -308,6 +305,10 @@ export function useEventStream(
 				onOpen: () => setStatus('live'),
 				onEvent: (event) => setEvents((prev) => [event, ...prev].slice(0, cap)),
 				onError: (error) => {
+					if (isMonitorAccessDenied(error)) {
+						setStatus('forbidden');
+						return;
+					}
 					setStatus('error');
 					if (!toastOnErrorRef.current) return;
 					toast({
@@ -346,15 +347,15 @@ export function useAudit(
 }
 
 /**
- * Resolve "who did it" for a trace or job.
+ * Resolve "who did it" for a trace.
  *
  * Executions now carry `actor_id`/`actor_type` directly (jentic-one#375), so the
  * trace actor is read straight off the execution record — accurate and available
  * to non-admins. The audit log is kept only as a fallback for older traces whose
  * execution records predate actor attribution.
  *
- * Jobs still have no actor on the wire payload, so they resolve via the audit
- * log filtered server-side by `target_id` (the job id).
+ * (Jobs carry `actor_id`/`actor_type` on the job record too, so the job detail
+ * reads them off `useJob` — no separate lookup.)
  */
 export function useActorForTrace(
 	traceId: string | null,
@@ -381,22 +382,6 @@ export function useActorForTrace(
 	return { ...execQuery, actor: execActor ?? resolveActor(matched) };
 }
 
-export function useActorForJob(
-	jobId: string | null,
-	{ canReadAudit = false }: { canReadAudit?: boolean } = {},
-) {
-	// Filter server-side by target_type+target_id. The backend rejects a
-	// target_id without its matching target_type (400 invalid_input), so both
-	// must be sent together. Audit is org:admin — non-admins skip the lookup.
-	const enabled = jobId != null && canReadAudit;
-	const query = useAudit(jobId ? { targetType: AuditTargetType.JOB, targetId: jobId } : {}, {
-		enabled,
-	});
-	const entries = enabled ? (query.data?.data ?? []) : [];
-	const matched = jobId ? entries.filter((e) => e.job_id === jobId || e.target_id === jobId) : [];
-	return { ...query, actor: resolveActor(matched), canReadAudit };
-}
-
 /* ------------------------------------------------------------------ */
 /* Actor directory (global filter picker)                              */
 /* ------------------------------------------------------------------ */
@@ -404,12 +389,16 @@ export function useActorForJob(
 /**
  * Hydrate the actor directory for the global filter bar's actor picker.
  * Directory data is small and slow-changing, so we cache it aggressively and
- * pull a large page in one shot.
+ * pull a large page in one shot. The listing needs `users:read`; without it the
+ * query stays off (no 403 round trip) and the picker offers "All actors" only,
+ * while row labels still resolve through `<ActorLabel>`'s by-id lookup.
  */
 export function useActors(params: ListActorsParams = {}) {
+	const canList = useCanListActors();
 	return useQuery<ActorListResponse>({
 		queryKey: monitorKeys.actors(),
 		queryFn: () => listActors(params),
+		enabled: canList === true,
 		staleTime: 5 * 60 * 1000,
 	});
 }

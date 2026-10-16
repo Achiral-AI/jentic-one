@@ -45,6 +45,7 @@ import {
 	AgentsApiError,
 	type OAuthGrantEntity,
 } from '@/modules/agents/api';
+import { AgentNameText } from '@/modules/agents/components/AgentNameText';
 
 type StatusFilter = 'active' | 'revoked' | 'all';
 
@@ -125,14 +126,14 @@ export function ConnectedClientsCard({
 					/>
 				) : (
 					<>
-						<ul className="divide-border divide-y">
+						<ul className="divide-hairline-row divide-y">
 							{grants.map((grant) => (
 								<li
 									key={grant.id}
 									className="flex flex-wrap items-start justify-between gap-3 py-3"
 								>
 									<div className="min-w-0 flex-1">
-										<p className="text-foreground flex flex-wrap items-center gap-2 font-medium">
+										<p className="text-foreground-name flex flex-wrap items-center gap-2 font-semibold">
 											<span className="truncate">{clientLabel(grant)}</span>
 											{grant.status === 'revoked' && (
 												<Badge variant="danger">Revoked</Badge>
@@ -154,7 +155,7 @@ export function ConnectedClientsCard({
 										<div className="mt-1.5 flex flex-wrap gap-1">
 											{grant.scopes.length > 0 ? (
 												grant.scopes.map((scope) => (
-													<Badge key={scope} variant="default">
+													<Badge key={scope} variant="default" mono>
 														{scope}
 													</Badge>
 												))
@@ -243,8 +244,9 @@ export function ConnectedClientsCard({
 				>
 					<p className="text-muted-foreground">
 						<strong>{clientLabel(revokeTarget)}</strong> will immediately lose access to{' '}
-						<strong>{agentName}</strong>: every token issued under this grant is
-						revoked. The client must go through consent again to reconnect.
+						<AgentNameText name={agentName} className="font-semibold" />: every token
+						issued under this grant is revoked. The client must go through consent again
+						to reconnect.
 					</p>
 				</Dialog>
 			)}

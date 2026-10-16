@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -30,6 +31,7 @@ from jentic_one.shared.config import (
     EncryptionConfig,
     EncryptionKey,
     EntitlementConfig,
+    HeldExecutionsConfig,
     RuntimeConfig,
     SigningKeyConfig,
     TelemetryConfig,
@@ -37,8 +39,11 @@ from jentic_one.shared.config import (
     _csv_to_list,
     _deep_merge,
     _env_overrides,
+    _oneshot_cache_key,
     bind_origin,
+    broker_links_root_on_broker,
     check_public_url_consistency,
+    connect_approval_url,
     effective_auth_base_url,
     has_spa_platform_client,
     load_config,
@@ -119,6 +124,36 @@ def test_http_wire_trace_defaults_off_and_env_enables(config_file: Path):
     with patch.dict(os.environ, {"JENTIC__LOGGING__HTTP_WIRE_TRACE": "true"}, clear=False):
         config = load_config(config_file)
     assert config.logging.http_wire_trace is True
+
+
+def test_control_connect_manual_flows_default_on_and_env_overrides(
+    config_file: Path, tmp_path: Path, sample_config_dict: dict[str, Any]
+):
+    config = load_config(config_file)
+    assert config.control.connect.manual_flows_enabled is True
+    assert config.control.connect.manual_flows_ttl_hours == 72
+
+    env = {
+        "JENTIC__CONTROL__CONNECT__MANUAL_FLOWS_ENABLED": "false",
+        "JENTIC__CONTROL__CONNECT__MANUAL_FLOWS_TTL_HOURS": "24",
+    }
+    with patch.dict(os.environ, env, clear=False):
+        config = load_config(config_file)
+    assert config.control.connect.manual_flows_enabled is False
+    assert config.control.connect.manual_flows_ttl_hours == 24
+
+    from_yaml = tmp_path / "manual.yaml"
+    from_yaml.write_text(
+        yaml.dump({**sample_config_dict, "control": {"connect": {"manual_flows_ttl_hours": 12}}})
+    )
+    assert load_config(from_yaml).control.connect.manual_flows_ttl_hours == 12
+
+    bad = tmp_path / "bad-ttl.yaml"
+    bad.write_text(
+        yaml.dump({**sample_config_dict, "control": {"connect": {"manual_flows_ttl_hours": 0}}})
+    )
+    with pytest.raises(ConfigError, match="manual_flows_ttl_hours"):
+        load_config(bad)
 
 
 def test_env_coerces_float(config_file: Path):
@@ -304,6 +339,56 @@ def test_non_positive_session_lifetimes_rejected(field: str):
         pytest.raises(ValidationError, match=field),
     ):
         AdminAuthConfig.model_validate({field: 0})
+
+
+def test_held_executions_defaults(tmp_path: Path):
+    """A minimal config gets the 24 h TTL, a pending cap of 10, and 24 h retention."""
+    minimal = {
+        "databases": {
+            "registry": {"name": "reg"},
+            "admin": {"name": "admin"},
+            "control": {"name": "ctrl"},
+        }
+    }
+    path = tmp_path / "minimal.yaml"
+    path.write_text(yaml.dump(minimal))
+    cfg = load_config(path).held_executions
+    assert cfg.ttl_seconds == 86_400
+    assert cfg.max_pending_per_agent == 10
+    assert cfg.result_retention_seconds == 86_400
+
+
+def test_held_executions_yaml_and_env_override(tmp_path: Path):
+    """The section is top-level: YAML sets it and ``JENTIC__HELD_EXECUTIONS__*`` wins."""
+    doc = {
+        "databases": {
+            "registry": {"name": "reg"},
+            "admin": {"name": "admin"},
+            "control": {"name": "ctrl"},
+        },
+        "held_executions": {"ttl_seconds": 600, "max_pending_per_agent": 3},
+    }
+    path = tmp_path / "ea.yaml"
+    path.write_text(yaml.dump(doc))
+    assert load_config(path).held_executions.ttl_seconds == 600
+    env = {
+        "JENTIC__HELD_EXECUTIONS__TTL_SECONDS": "120",
+        "JENTIC__HELD_EXECUTIONS__MAX_PENDING_PER_AGENT": "5",
+        "JENTIC__HELD_EXECUTIONS__RESULT_RETENTION_SECONDS": "3600",
+    }
+    with patch.dict(os.environ, env, clear=False):
+        cfg = load_config(path).held_executions
+    assert cfg.ttl_seconds == 120
+    assert cfg.max_pending_per_agent == 5
+    assert cfg.result_retention_seconds == 3600
+
+
+@pytest.mark.parametrize(
+    "field", ["ttl_seconds", "max_pending_per_agent", "result_retention_seconds"]
+)
+def test_held_executions_non_positive_rejected(field: str):
+    with pytest.raises(ValidationError, match=field):
+        HeldExecutionsConfig.model_validate({field: 0})
 
 
 def test_catalog_jitter_ratio_default():
@@ -1018,6 +1103,77 @@ def test_oneshot_cache_is_keyed_on_source_identity_not_path(
         _ONESHOT_CONFIG_CACHE.clear()
 
 
+def test_oneshot_cache_entry_with_recycled_inode_is_not_served(
+    sample_config_dict: dict[str, Any],
+):
+    """Pins #1499: (device, inode) is not a stable identity — macOS reports
+    pipes with st_dev 0 and hands a freed pipe's inode to the next pipe. An
+    entry cached for an earlier source on the same device, inode, and path
+    (but a different ctime) must never be served for the new source."""
+    sample_config_dict["databases"]["registry"]["name"] = "fresh"
+    doc = yaml.dump(sample_config_dict)
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, doc.encode())
+        os.close(write_fd)
+        pipe_path = Path(f"/dev/fd/{read_fd}")
+        dev, ino, ctime_ns, _ = _oneshot_cache_key(os.fstat(read_fd), pipe_path)
+        _ONESHOT_CONFIG_CACHE[(dev, ino, ctime_ns - 1, str(pipe_path))] = "stale: true"
+        loaded = load_config(pipe_path)
+        assert loaded.databases.registry.name == "fresh"
+    finally:
+        os.close(read_fd)
+        _ONESHOT_CONFIG_CACHE.clear()
+
+
+def test_oneshot_cache_survives_writes_after_open(sample_config_dict: dict[str, Any]):
+    """Every pipe write bumps its ctime, so a supervisor still streaming the
+    document after the loaders opened the fd must not leave any of them keyed
+    on a pre-drain identity: a concurrent loader waiting on the drain, and a
+    repeat load after it, must both take the cached document instead of
+    hitting EOF on the drained pipe."""
+    doc = yaml.dump(sample_config_dict).encode()
+    read_fd, write_fd = os.pipe()
+
+    def stream() -> None:
+        # The first delay lets both loaders open and stat the fd before any
+        # data arrives; each delay outlasts a Linux timestamp tick, so every
+        # write moves the ctime.
+        for chunk in (doc[: len(doc) // 2], doc[len(doc) // 2 :]):
+            time.sleep(0.1)
+            os.write(write_fd, chunk)
+        os.close(write_fd)
+
+    pipe_path = Path(f"/dev/fd/{read_fd}")
+    loaded: list[AppConfig] = []
+    errors: list[BaseException] = []
+
+    def load() -> None:
+        try:
+            loaded.append(load_config(pipe_path))
+        except BaseException as exc:  # surfaced via the assertion below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=stream)] + [threading.Thread(target=load) for _ in range(2)]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert errors == []
+        loaded.append(load_config(pipe_path))
+        assert {c.databases.registry.name for c in loaded} == {
+            sample_config_dict["databases"]["registry"]["name"]
+        }
+        assert len(loaded) == 3
+    finally:
+        for t in threads:
+            if t.is_alive():
+                t.join()
+        os.close(read_fd)
+        _ONESHOT_CONFIG_CACHE.clear()
+
+
 def test_broker_jobs_api_base_url_defaults_to_none(config_file: Path):
     config = load_config(config_file)
     assert config.broker.jobs_api_base_url is None
@@ -1075,6 +1231,47 @@ def test_broker_retired_direct_bindings_flag_true_is_ignored(
     assert len(warnings) == 1, "the deprecation warning is logged once per process"
     assert warnings[0]["log_level"] == "warning"
     assert warnings[0]["setting"] == "broker.direct_bindings_enabled"
+
+
+def test_broker_retired_account_linking_base_url_is_ignored(
+    tmp_path: Path, sample_config_dict: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Denials link to the agent's open connect session; the old base URL is dropped."""
+    sample_config_dict["broker"] = {
+        "account_linking_base_url": "https://console.example.com",
+        "jobs_api_base_url": "https://api.example.com",
+    }
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.dump(sample_config_dict))
+    monkeypatch.setattr(config_module, "_retired_account_linking_warned", threading.Event())
+    with structlog.testing.capture_logs() as logs:
+        config = load_config(path)
+        load_config(path)
+    assert config.broker.jobs_api_base_url == "https://api.example.com"
+    assert not hasattr(config.broker, "account_linking_base_url")
+    warnings = [e for e in logs if e["event"] == "config_retired_setting_ignored"]
+    assert len(warnings) == 1, "the warning is logged once per process"
+    assert warnings[0]["log_level"] == "warning"
+    assert warnings[0]["setting"] == "broker.account_linking_base_url"
+
+
+def test_broker_retired_account_linking_base_url_env_is_ignored(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(config_module, "_retired_account_linking_warned", threading.Event())
+    env = {"JENTIC__BROKER__ACCOUNT_LINKING_BASE_URL": "https://console.example.com"}
+    with patch.dict(os.environ, env, clear=False), structlog.testing.capture_logs() as logs:
+        load_config(config_file)
+    assert [e["setting"] for e in logs if e["event"] == "config_retired_setting_ignored"] == [
+        "broker.account_linking_base_url"
+    ]
+
+
+def test_connect_approval_url_is_token_less_and_absolute(tmp_path: Path) -> None:
+    config = _load(tmp_path, {"server": {"public_base_url": "https://j1.example.com/"}})
+    assert connect_approval_url(config, "cs_1") == "https://j1.example.com/app/agents?approve=cs_1"
+    bare = _load(tmp_path, {"server": {"host": "127.0.0.1", "port": 8123}})
+    assert connect_approval_url(bare, "cs_1") == "http://127.0.0.1:8123/app/agents?approve=cs_1"
 
 
 @pytest.mark.parametrize("value", [24, "0"])
@@ -1288,6 +1485,15 @@ def test_effective_auth_base_url_precedence(tmp_path: Path):
     assert effective_auth_base_url(config) == ""
 
 
+def test_broker_links_root_on_broker_only_for_an_unpinned_standalone_broker(tmp_path: Path):
+    standalone = {"apps": ["broker"]}
+    assert broker_links_root_on_broker(_load(tmp_path, standalone)) is True
+    pinned = {**standalone, "broker": {"jobs_api_base_url": "https://jentic.example.com"}}
+    assert broker_links_root_on_broker(_load(tmp_path, pinned)) is False
+    assert broker_links_root_on_broker(_load(tmp_path, {"apps": ["broker", "admin"]})) is False
+    assert broker_links_root_on_broker(_load(tmp_path, {})) is False
+
+
 def test_check_public_url_consistency(tmp_path: Path):
     # unset fields self-derive → no mismatch
     config = _load(tmp_path, {"server": {"host": "127.0.0.1", "port": 8020}})
@@ -1498,15 +1704,12 @@ def test_check_public_url_consistency_skips_overrides_on_all_interfaces_bind(tmp
 
 
 def test_check_public_url_consistency_ignores_broker_urls(tmp_path: Path):
-    # The broker's jobs/account-linking URLs name other services' origins.
+    # The broker's jobs URL names another service's origin.
     config = _load(
         tmp_path,
         {
             "server": {"host": "127.0.0.1", "port": 8000},
-            "broker": {
-                "jobs_api_base_url": "https://api.example.com",
-                "account_linking_base_url": "https://console.example.com",
-            },
+            "broker": {"jobs_api_base_url": "https://api.example.com"},
         },
     )
     assert check_public_url_consistency(config) == []

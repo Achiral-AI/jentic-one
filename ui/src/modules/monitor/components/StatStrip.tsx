@@ -14,10 +14,10 @@
  * the tier words move under the numbers so nothing crowds a half-width cell. Values count up
  * on arrival and whenever the window changes, so a new slice visibly lands.
  */
-import { useEffect, useId, useRef, type ReactNode } from 'react';
+import { useEffect, useRef, type ReactNode } from 'react';
 import { animate, motion, useReducedMotion } from 'framer-motion';
 import { ArrowUpRight } from 'lucide-react';
-import { AppLink, Skeleton } from '@/shared/ui';
+import { AppLink, AreaSparkline, Skeleton, VendorIcon } from '@/shared/ui';
 import { cn } from '@/shared/lib/utils';
 import {
 	HEALTH_LABEL,
@@ -30,7 +30,7 @@ import {
 } from '@/shared/lib/usageThresholds';
 import type { UsageResponse } from '@/modules/monitor/api';
 import { formatLatency } from '@/modules/monitor/lib/format';
-import { API_PALETTE, getInitials, textColor } from '@/modules/monitor/lib/palette';
+import { entitySeed } from '@/modules/monitor/lib/palette';
 import type { EntityUsageRow, UsageOverview } from '@/modules/monitor/lib/usage';
 
 const SPEED_LABEL: Record<LatencyTier, string> = { fast: 'Fast', normal: 'Normal', slow: 'Slow' };
@@ -106,7 +106,7 @@ export function StatStrip({
 	return (
 		<motion.section
 			aria-label="Usage at a glance"
-			className="border-border bg-card grid grid-cols-2 overflow-hidden rounded-xl border sm:grid-cols-3 lg:grid-cols-5"
+			className="bg-surface-1 grid grid-cols-2 overflow-hidden rounded-lg sm:grid-cols-3 lg:grid-cols-5"
 			initial="hidden"
 			animate="show"
 			variants={{ hidden: {}, show: { transition: { staggerChildren: 0.05 } } }}
@@ -122,7 +122,7 @@ export function StatStrip({
 						value={overview.totalExecutions}
 						className="text-foreground text-2xl font-semibold"
 					/>
-					<AreaSpark
+					<AreaSparkline
 						data={volume}
 						className="text-primary mb-1 h-8 w-32 max-w-[45%] sm:h-7 sm:w-24"
 					/>
@@ -213,13 +213,13 @@ export function StatStripSkeleton() {
 	return (
 		<section
 			aria-hidden="true"
-			className="border-border bg-card grid grid-cols-2 overflow-hidden rounded-xl border sm:grid-cols-3 lg:grid-cols-5"
+			className="bg-surface-1 grid grid-cols-2 overflow-hidden rounded-lg sm:grid-cols-3 lg:grid-cols-5"
 		>
 			{CELL_SPANS.map((span, i) => (
 				<div
 					key={i}
 					className={cn(
-						'border-border -mt-px -ml-px min-w-0 border-t border-l px-3.5 py-3 sm:px-4',
+						'border-hairline -mt-px -ml-px min-w-0 border-t border-l px-3.5 py-3 sm:px-4',
 						span,
 					)}
 				>
@@ -269,7 +269,7 @@ function Cell({
 	// Divided cells: every cell draws its own top/left hairline, so the grid
 	// reads as one card at any column count without doubled borders.
 	const cellClass = cn(
-		'border-border -mt-px -ml-px min-w-0 border-t border-l px-3.5 py-3 sm:px-4',
+		'border-hairline -mt-px -ml-px min-w-0 border-t border-l px-3.5 py-3 sm:px-4',
 		className,
 	);
 	return (
@@ -277,7 +277,7 @@ function Cell({
 			{href ? (
 				<AppLink
 					href={href}
-					className="group hover:bg-muted/40 focus-visible:ring-ring -mx-3.5 -my-3 block px-3.5 py-3 transition-colors focus-visible:ring-2 focus-visible:outline-none focus-visible:ring-inset sm:-mx-4 sm:px-4"
+					className="group hover:bg-tint-2 focus-visible:ring-ring -mx-3.5 -my-3 block px-3.5 py-3 transition-colors focus-visible:ring-2 focus-visible:outline-none focus-visible:ring-inset sm:-mx-4 sm:px-4"
 				>
 					{body}
 				</AppLink>
@@ -375,79 +375,33 @@ function ApiTiles({ apis, extra }: { apis: EntityUsageRow[]; extra: number }) {
 	if (apis.length === 0) return null;
 	return (
 		<span className="mb-1 flex -space-x-1.5" aria-hidden="true">
-			{apis.map((api, i) => {
-				const color = API_PALETTE[i % API_PALETTE.length]!;
-				return (
-					<motion.span
-						key={api.id}
-						title={api.label}
-						initial={{ scale: 0.6, opacity: 0 }}
-						animate={{ scale: 1, opacity: 1 }}
-						transition={{
-							delay: 0.15 + i * 0.05,
-							type: 'spring',
-							stiffness: 420,
-							damping: 22,
-						}}
-						className="ring-card flex h-6 w-6 items-center justify-center rounded-md text-[9px] font-bold ring-2"
-						style={{ backgroundColor: color, color: textColor(color) }}
-					>
-						{getInitials(api.label)}
-					</motion.span>
-				);
-			})}
+			{apis.map((api, i) => (
+				<motion.span
+					key={api.id}
+					title={api.label}
+					initial={{ scale: 0.6, opacity: 0 }}
+					animate={{ scale: 1, opacity: 1 }}
+					transition={{
+						delay: 0.15 + i * 0.05,
+						type: 'spring',
+						stiffness: 420,
+						damping: 22,
+					}}
+					className="ring-surface-1 flex rounded-[7px] ring-2"
+				>
+					{/* The same pastel mark the API wears everywhere else. */}
+					<VendorIcon
+						name={api.label}
+						vendor={entitySeed('apis', api.id) ?? api.label}
+						size="xs"
+					/>
+				</motion.span>
+			))}
 			{extra > 0 && (
-				<span className="bg-muted text-muted-foreground ring-card flex h-6 min-w-6 items-center justify-center rounded-md px-1 text-[9px] font-bold ring-2">
+				<span className="bg-muted text-muted-foreground ring-surface-1 flex h-6 min-w-6 items-center justify-center rounded-md px-1 text-[9px] font-bold ring-2">
 					+{extra}
 				</span>
 			)}
 		</span>
-	);
-}
-
-/** A soft area sparkline that draws itself in. Decorative — the number beside it is the data. */
-function AreaSpark({ data, className }: { data: number[]; className?: string }) {
-	const gradientId = useId();
-	const reduce = useReducedMotion();
-	if (data.length < 2) return null;
-	const w = 96;
-	const h = 28;
-	const max = Math.max(...data, 1);
-	const points = data.map((v, i) => [(i / (data.length - 1)) * w, h - 2 - (v / max) * (h - 4)]);
-	const line = `M ${points.map(([x, y]) => `${x.toFixed(1)},${y!.toFixed(1)}`).join(' L ')}`;
-	const area = `${line} L ${w},${h} L 0,${h} Z`;
-	return (
-		<svg
-			viewBox={`0 0 ${w} ${h}`}
-			className={className}
-			preserveAspectRatio="none"
-			aria-hidden="true"
-		>
-			<defs>
-				<linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
-					<stop offset="0%" stopColor="currentColor" stopOpacity="0.28" />
-					<stop offset="100%" stopColor="currentColor" stopOpacity="0" />
-				</linearGradient>
-			</defs>
-			<motion.path
-				d={area}
-				fill={`url(#${gradientId})`}
-				initial={reduce ? false : { opacity: 0 }}
-				animate={{ opacity: 1 }}
-				transition={{ delay: 0.35, duration: 0.4 }}
-			/>
-			<motion.path
-				d={line}
-				fill="none"
-				stroke="currentColor"
-				strokeWidth={1.5}
-				strokeLinecap="round"
-				strokeLinejoin="round"
-				vectorEffect="non-scaling-stroke"
-				initial={reduce ? false : { pathLength: 0 }}
-				animate={{ pathLength: 1 }}
-				transition={{ duration: 0.8, ease: [0.2, 0.8, 0.2, 1] }}
-			/>
-		</svg>
 	);
 }

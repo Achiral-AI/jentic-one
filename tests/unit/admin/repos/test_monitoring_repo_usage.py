@@ -35,6 +35,8 @@ async def test_overall_stats_returns_correct_aggregates() -> None:
     row.avg_ms = 250.5
     row.p50_ms = 200.0
     row.p95_ms = 500.0
+    row.pending = 4
+    row.active_now = 6
 
     session = _mock_session_with_result(row)
     cutoff = datetime(2026, 6, 1, tzinfo=UTC)
@@ -48,6 +50,8 @@ async def test_overall_stats_returns_correct_aggregates() -> None:
     assert result.avg_ms == 250.5
     assert result.p50_ms == 200.0
     assert result.p95_ms == 500.0
+    assert result.pending == 4
+    assert result.active_now == 6
 
 
 @pytest.mark.asyncio
@@ -59,6 +63,8 @@ async def test_overall_stats_handles_null_percentiles() -> None:
     row.avg_ms = 0
     row.p50_ms = None
     row.p95_ms = None
+    row.pending = 0
+    row.active_now = 0
 
     session = _mock_session_with_result(row)
     cutoff = datetime(2026, 6, 1, tzinfo=UTC)
@@ -126,25 +132,6 @@ async def test_grouped_top_returns_rows_for_api_grouping() -> None:
     assert result[0].key == "stripe/payments"
     assert result[0].total == 50
     assert result[1].key == "twilio/sms"
-
-
-@pytest.mark.asyncio
-async def test_grouped_top_returns_rows_for_toolkit_grouping() -> None:
-    row = MagicMock()
-    row.key = "tk_abc123"
-    row.label = "tk_abc123"
-    row.total = 20
-    row.success = 18
-    row.failed = 2
-    row.avg_ms = 300.0
-
-    session = _mock_session_with_result([row])
-    cutoff = datetime(2026, 6, 1, tzinfo=UTC)
-    until = datetime(2026, 6, 2, tzinfo=UTC)
-
-    result = await MonitoringRepository.grouped_top(session, cutoff, until, "toolkit", 5)
-    assert len(result) == 1
-    assert result[0].key == "tk_abc123"
 
 
 @pytest.mark.asyncio

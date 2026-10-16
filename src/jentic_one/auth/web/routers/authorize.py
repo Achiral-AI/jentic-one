@@ -120,6 +120,7 @@ from jentic_one.shared.auth.permission_catalog import (
     ALL_PERMISSIONS,
     CREDENTIALS_READ,
     CREDENTIALS_WRITE,
+    OIDC_PASSTHROUGH_SCOPES,
     compute_implies_transitive,
 )
 from jentic_one.shared.config import effective_auth_base_url
@@ -127,9 +128,10 @@ from jentic_one.shared.context import Context
 from jentic_one.shared.db import DatabaseIntegrityError
 from jentic_one.shared.models import ActorStatus, ActorType
 from jentic_one.shared.models.oauth_clients import OAuthClientApprovalStatus, OAuthConsentModel
-from jentic_one.shared.scopes import OIDC_PASSTHROUGH_SCOPES
 from jentic_one.shared.web import get_current_identity
+from jentic_one.shared.web import openapi_examples as ex
 from jentic_one.shared.web.deps import derive_origin, get_ctx
+from jentic_one.shared.web.openapi_responses import problem
 from jentic_one.shared.web.sensitive import SENSITIVE
 
 logger = structlog.get_logger(__name__)
@@ -608,9 +610,9 @@ _APPROVAL_PENDING_SCRIPT = """<script>
         fetch(cfg.me_url, { headers: { Authorization: "Bearer " + token } })
             .then(function (resp) { return resp.ok ? resp.json() : null; })
             .then(function (me) {
-                var scopes = (me && me.scopes) || [];
+                var permissions = (me && me.permissions) || [];
                 if (me && (me.admin === true ||
-                        scopes.indexOf("oauth-clients:write") !== -1)) {
+                        permissions.indexOf("oauth-clients:write") !== -1)) {
                     adminPanel.hidden = false;
                     anonPanel.hidden = true;
                 }
@@ -1147,22 +1149,62 @@ def _render_approval_pending_page(
     return HTMLResponse(content=html, headers=CONSENT_SECURITY_HEADERS)
 
 
-@router.get("/authorize", dependencies=[Depends(check_rate_limit)], response_model=None)
+@router.get(
+    "/authorize",
+    dependencies=[Depends(check_rate_limit)],
+    response_model=None,
+    include_in_schema=False,
+)
 async def authorize_endpoint(
     request: Request,
-    response_type: str = Query(...),
-    client_id: str = Query(...),
-    redirect_uri: str = Query(...),
-    code_challenge: str = Query(...),
-    code_challenge_method: str = Query(...),
-    scope: str = Query(default="openid"),
-    state: str | None = Query(default=None),
-    nonce: str | None = Query(default=None),
+    response_type: str = Query(
+        ...,
+        description="OAuth response type; only `code` is supported.",
+        openapi_examples=ex.example("code"),
+    ),
+    client_id: str = Query(
+        ...,
+        description="Client ID of the application requesting authorization.",
+        openapi_examples=ex.example(ex.OAUTH_PUBLIC_CLIENT_ID),
+    ),
+    redirect_uri: str = Query(
+        ...,
+        description="Where to send the result; must be a redirect URI allowed for the client.",
+        openapi_examples=ex.example(ex.REDIRECT_URI),
+    ),
+    code_challenge: str = Query(
+        ...,
+        description="PKCE code challenge derived from the client's code verifier.",
+        openapi_examples=ex.example(ex.PKCE_CODE_CHALLENGE),
+    ),
+    code_challenge_method: str = Query(
+        ...,
+        description="PKCE challenge method; only `S256` is supported.",
+        openapi_examples=ex.example("S256"),
+    ),
+    scope: str = Query(
+        default="openid",
+        description=(
+            "Space-separated scopes requested; must stay within the client's allowed scopes."
+        ),
+        openapi_examples=ex.example("openid"),
+    ),
+    state: str | None = Query(
+        default=None,
+        description="Opaque client value returned unchanged on the redirect back to the client.",
+        openapi_examples=ex.example(ex.OAUTH_STATE),
+    ),
+    nonce: str | None = Query(
+        default=None,
+        description="OpenID Connect nonce to bind the ID token to the client's session.",
+        openapi_examples=ex.example(ex.OIDC_NONCE),
+    ),
     sc: str | None = Query(
         default=None,
         description="Signed session-continuation blob minted by "
         "POST /oauth/session/continue (identity-ladder rung 1). Optional; an "
         "invalid or absent value leaves the flow byte-identical to before.",
+        openapi_examples=ex.example(ex.SIGNED_FLOW_STATE),
     ),
     ctx: Context = Depends(get_ctx),
     authorize_svc: AuthorizeService = Depends(get_authorize_service),
@@ -1394,13 +1436,17 @@ async def _redeem_session_continuation(
     dependencies=[Depends(check_approval_status_rate_limit)],
     summary="Poll client approval status (approval-pending page)",
     responses={
-        400: {"description": "Malformed, tampered, or expired approval-state blob."},
+        400: problem("Malformed, tampered, or expired approval-state blob."),
     },
 )
 async def approval_status_endpoint(
     request: Request,
     response: Response,
-    st: str = Query(..., description="Signed approval-state blob minted by /authorize"),
+    st: str = Query(
+        ...,
+        description="Signed approval-state blob minted by /authorize",
+        openapi_examples=ex.example(ex.SIGNED_FLOW_STATE),
+    ),
     ctx: Context = Depends(get_ctx),
 ) -> OAuthApprovalStatusResponse:
     """Minimal tri-state poll for the approval-pending page.
@@ -1428,7 +1474,7 @@ async def approval_status_endpoint(
     "/oauth/approval/decision",
     summary="Approve or deny a pending client inline (approval-pending page)",
     responses={
-        400: {"description": "Malformed, tampered, or expired approval-state blob."},
+        400: problem("Malformed, tampered, or expired approval-state blob."),
     },
 )
 async def approval_decision_endpoint(
@@ -1476,14 +1522,23 @@ async def approval_decision_endpoint(
 
 @router.get(
     "/oauth/callback",
+    include_in_schema=False,
     operation_id="authorizeOauthCallback",
     name="authorize_oauth_callback",
     dependencies=[Depends(check_rate_limit)],
 )
 async def oauth_callback(
     request: Request,
-    code: str = Query(...),
-    state: str = Query(...),
+    code: str = Query(
+        ...,
+        description="Authorization code issued by the external identity provider.",
+        openapi_examples=ex.example(ex.AUTHORIZATION_CODE),
+    ),
+    state: str = Query(
+        ...,
+        description="Signed authorization-flow state that `/authorize` sent to the provider.",
+        openapi_examples=ex.example(ex.OAUTH_STATE),
+    ),
     ctx: Context = Depends(get_ctx),
     authorize_svc: AuthorizeService = Depends(get_authorize_service),
 ) -> RedirectResponse:
@@ -1580,7 +1635,13 @@ async def oauth_callback(
 
 
 @router.get("/error")
-async def error_page(error: str = Query(default="unknown_error")) -> dict[str, str]:
+async def error_page(
+    error: str = Query(
+        default="unknown_error",
+        description="Error code to display; returned as-is in the response body.",
+        openapi_examples=ex.example("access_denied"),
+    ),
+) -> dict[str, str]:
     """Minimal error endpoint for browser-facing authorization failures."""
     return {"error": error}
 
@@ -1606,6 +1667,13 @@ def _scope_to_permission_description(scope: str) -> str | None:
     Returns None for scopes that should not be displayed (e.g. openid).
     Falls back to the permission catalog description for platform scopes,
     or a generic label for completely unknown scopes.
+
+    A vocabulary crossing point: the argument is a scope off the authorization
+    request, the result describes the permission the user is about to grant. The
+    lookup into :data:`ALL_PERMISSIONS` works because the two formats are the same
+    colon-form strings — see
+    :func:`jentic_one.shared.auth.verify.scopes_to_permissions`, the other place
+    that depends on that identity.
     """
     if scope in _HIDDEN_SCOPES:
         return None
@@ -1657,21 +1725,30 @@ def _claims_from_params(params: dict[str, object]) -> IdpClaims | None:
     claims_data = params.get("claims")
     if not isinstance(claims_data, dict):
         return None
+    # ``hosted_domain`` must survive the round trip: admission-policy hard gates
+    # (e.g. Google Workspace ``hd``) read it, and a handle rebuilt without it
+    # rejects every Workspace user. Handles that predate the field read None.
+    hosted_domain = claims_data.get("hosted_domain")
     return IdpClaims(
         external_subject=str(claims_data.get("external_subject") or ""),
         email=str(claims_data.get("email") or ""),
         email_verified=parse_email_verified(claims_data.get("email_verified")),
         first_name=str(claims_data.get("first_name") or ""),
         last_name=str(claims_data.get("last_name") or ""),
+        hosted_domain=str(hosted_domain) if hosted_domain else None,
     )
 
 
 def _effective_agent_scopes(
     requested: list[str],
     allowlist: frozenset[str] | None,
-    agent_scopes: frozenset[str],
+    agent_permissions: frozenset[str],
 ) -> list[str]:
-    """The D2 grant-scope intersection: requested ∩ client allowlist ∩ agent live scopes.
+    """The D2 grant-scope intersection: requested ∩ client allowlist ∩ the agent's
+    live permissions.
+
+    Named for what it returns — a set of OAuth2 scopes for the grant row — even
+    though the third operand is read from ``actor_permission_grants``.
 
     ``openid``/OIDC passthrough scopes are stripped first (D11): agent-bound
     grants carry no OIDC identity, so they must never enter the granted set.
@@ -1680,7 +1757,7 @@ def _effective_agent_scopes(
     effective = [s for s in requested if s not in OIDC_PASSTHROUGH_SCOPES]
     if allowlist is not None:
         effective = [s for s in effective if s in allowlist]
-    return [s for s in effective if s in agent_scopes]
+    return [s for s in effective if s in agent_permissions]
 
 
 # ---------- inline agent creation on the consent page (P4) ----------
@@ -1920,8 +1997,8 @@ def _render_agent_options(
     """Render the agent picker: one radio per active agent.
 
     Each agent shows the candidate scope set (requested ∩ client allowlist,
-    OIDC stripped) marked granted/lacking against its live scopes — the user
-    sees the ceiling; the submit path recomputes the math server-side.
+    OIDC stripped) marked granted/lacking against the agent's live permissions —
+    the user sees the ceiling; the submit path recomputes the math server-side.
     """
     blocks: list[str] = []
     for idx, agent in enumerate(agents):
@@ -1930,12 +2007,12 @@ def _render_agent_options(
             desc = _scope_to_permission_description(scope_name)
             if desc is None:
                 continue
-            if scope_name in agent.scopes:
+            if scope_name in agent.permissions:
                 items.append(f'<li class="granted">{html_mod.escape(desc)}</li>')
             else:
                 items.append(
                     f'<li class="lacking">{html_mod.escape(desc)}'
-                    " &mdash; not granted (agent lacks this scope)</li>"
+                    " &mdash; not granted (agent lacks this permission)</li>"
                 )
         if not items:
             items.append('<li class="lacking">No requested permissions available</li>')
@@ -1950,10 +2027,17 @@ def _render_agent_options(
     return "\n".join(blocks)
 
 
-@router.get("/oauth/consent", response_class=HTMLResponse, dependencies=[Depends(check_rate_limit)])
+@router.get(
+    "/oauth/consent",
+    response_class=HTMLResponse,
+    dependencies=[Depends(check_rate_limit)],
+    include_in_schema=False,
+)
 async def consent_page(
     request: Request,
-    ch: str = Query(..., description="Opaque consent-flow handle"),
+    ch: str = Query(
+        ..., description="Opaque consent-flow handle", openapi_examples=ex.example(ex.OPAQUE_TOKEN)
+    ),
     ctx: Context = Depends(get_ctx),
     authorize_svc: AuthorizeService = Depends(get_authorize_service),
 ) -> HTMLResponse:
@@ -2138,12 +2222,27 @@ async def _render_agent_consent_page(
     return HTMLResponse(content=html, headers=CONSENT_SECURITY_HEADERS)
 
 
-@router.post("/oauth/consent", dependencies=[Depends(check_rate_limit)])
+@router.post("/oauth/consent", dependencies=[Depends(check_rate_limit)], include_in_schema=False)
 async def consent_submit(
     request: Request,
-    consent_token: str = Form(..., json_schema_extra=SENSITIVE),
-    action: str = Form(...),
-    agent_id: str | None = Form(default=None),
+    consent_token: str = Form(
+        ...,
+        json_schema_extra=SENSITIVE,
+        description="Single-use consent handle embedded in the consent page.",
+        examples=[ex.OPAQUE_TOKEN],
+    ),
+    action: str = Form(
+        ...,
+        description="`approve` or `deny`; any value other than `deny` is treated as approval.",
+        examples=["approve"],
+    ),
+    agent_id: str | None = Form(
+        default=None,
+        description=(
+            "ID of the agent to connect the client to; sent only by the agent-picker consent page."
+        ),
+        examples=[ex.AGENT_ID],
+    ),
     ctx: Context = Depends(get_ctx),
     authorize_svc: AuthorizeService = Depends(get_authorize_service),
     grant_svc: OAuthGrantService = Depends(get_oauth_grant_service),
@@ -2195,7 +2294,7 @@ async def consent_submit(
         logger.info("oauth_consent_denied", client_id=client_id, email=deny_email)
         return _error_redirect(redirect_uri, "access_denied", original_state)
 
-    claims_data = params.get("claims")
+    idp_claims = _claims_from_params(params)
     local_user_id = params.get("local_user_id")
     if local_user_id:
         # Local-login rejoin (#1276): the user authenticated against the
@@ -2203,17 +2302,10 @@ async def consent_submit(
         # nothing to provision and the Deny-leaves-no-residue contract holds
         # trivially (login never creates rows).
         user_id = str(local_user_id)
-    elif not isinstance(claims_data, dict):
+    elif idp_claims is None:
         logger.warning("oauth_consent_missing_claims", client_id=client_id)
         return RedirectResponse(url="/error?error=invalid_consent", status_code=302)
     else:
-        idp_claims = IdpClaims(
-            external_subject=str(claims_data.get("external_subject") or ""),
-            email=str(claims_data.get("email") or ""),
-            email_verified=parse_email_verified(claims_data.get("email_verified")),
-            first_name=str(claims_data.get("first_name") or ""),
-            last_name=str(claims_data.get("last_name") or ""),
-        )
         try:
             user_id = await authorize_svc.provision_from_claims(idp_claims)
         except UserNotAdmittedError:
@@ -2312,7 +2404,7 @@ async def _approve_agent_consent(
     allowlist = (
         frozenset(oauth_client.allowed_scopes) if oauth_client.allowed_scopes is not None else None
     )
-    effective = _effective_agent_scopes(requested, allowlist, selected.scopes)
+    effective = _effective_agent_scopes(requested, allowlist, selected.permissions)
     if not effective:
         logger.warning("oauth_consent_no_grantable_scopes", client_id=client_id, agent_id=agent_id)
         return RedirectResponse(url="/error?error=no_grantable_scopes", status_code=302)
@@ -2346,9 +2438,23 @@ async def _approve_agent_consent(
 )
 async def consent_agent_create(
     request: Request,
-    consent_token: str = Form(..., json_schema_extra=SENSITIVE),
-    create_state: str = Form(..., json_schema_extra=SENSITIVE),
-    agent_name: str = Form(...),
+    consent_token: str = Form(
+        ...,
+        json_schema_extra=SENSITIVE,
+        description="Single-use consent handle embedded in the consent page.",
+        examples=[ex.OPAQUE_TOKEN],
+    ),
+    create_state: str = Form(
+        ...,
+        json_schema_extra=SENSITIVE,
+        description="Signed single-use agent-creation token embedded in the consent page.",
+        examples=[ex.SIGNED_FLOW_STATE],
+    ),
+    agent_name: str = Form(
+        ...,
+        description="Name for the new agent; surrounding whitespace is trimmed.",
+        examples=["invoice-reconciler"],
+    ),
     ctx: Context = Depends(get_ctx),
     authorize_svc: AuthorizeService = Depends(get_authorize_service),
     agent_svc: AgentService = Depends(get_agent_service),
@@ -2498,7 +2604,7 @@ async def consent_agent_create(
         create_status = ActorStatus.ACTIVE if can_create_active else ActorStatus.PENDING
         # Owner is ALWAYS the consenting user resolved from the server-side
         # handle — the form carries no owner input. Scopes=None applies the
-        # platform's DEFAULT_AGENT_SCOPES on the ACTIVE arm, exactly like the
+        # platform's DEFAULT_AGENT_PERMISSIONS on the ACTIVE arm, exactly like the
         # SPA path (the PENDING arm defers scopes to approve(), exactly like
         # /register); the service records the same REGISTER audit +
         # agent.created event either way.
@@ -2510,7 +2616,7 @@ async def consent_agent_create(
         )
         try:
             view = await agent_svc.create(
-                AgentCreatePayload(name=name, description=None, scopes=None),
+                AgentCreatePayload(name=name, description=None, permissions=None),
                 owner_id=user_id,
                 identity=identity,
                 status=create_status,
@@ -2584,13 +2690,15 @@ async def _approval_note_for_params(
     summary="Poll pending-agent approval status (consent awaiting page)",
     dependencies=[Depends(check_approval_status_rate_limit)],
     responses={
-        400: {"description": "Malformed, tampered, or expired agent-status blob."},
+        400: problem("Malformed, tampered, or expired agent-status blob."),
     },
 )
 async def consent_agent_status_endpoint(
     response: Response,
     st: str = Query(
-        ..., description="Signed agent-status blob minted by the consent flow's pending arm"
+        ...,
+        description="Signed agent-status blob minted by the consent flow's pending arm",
+        openapi_examples=ex.example(ex.SIGNED_FLOW_STATE),
     ),
     ctx: Context = Depends(get_ctx),
     authorize_svc: AuthorizeService = Depends(get_authorize_service),

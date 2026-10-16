@@ -61,15 +61,24 @@ export function toExecutionStatus(wire: string): ExecutionStatusUi {
 
 /**
  * Job lifecycle, in UI vocabulary. Mirrors the backend `JobStatus` StrEnum:
- * queued → running → {completed | failed | cancelled | dead_letter}. `unknown`
- * is the safe fallback for any value the server adds later.
+ * queued → running → {completed | failed | cancelled | dead_letter}, plus
+ * `held` (waiting outside the queue; a held execution awaits approval).
+ * `unknown` is the safe fallback for any value the server adds later.
  */
 export type JobStatusUi =
-	'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'dead_letter' | 'unknown';
+	| 'queued'
+	| 'running'
+	| 'held'
+	| 'completed'
+	| 'failed'
+	| 'cancelled'
+	| 'dead_letter'
+	| 'unknown';
 
 const JOB_STATUS_MAP: Record<string, JobStatusUi> = {
 	queued: 'queued',
 	running: 'running',
+	held: 'held',
 	completed: 'completed',
 	failed: 'failed',
 	cancelled: 'cancelled',
@@ -92,12 +101,10 @@ export function isTerminalJobStatus(status: JobStatusUi): boolean {
 }
 
 /**
- * An actor that performed an audited action, resolved from `AuditResponse`.
- * Jobs/executions carry no actor on the wire (STATUS.md decision: actor
- * attribution lives only in the audit log), so trace/job detail views resolve
- * the actor by cross-referencing audit entries on `trace_id` / `job_id`.
+ * Whether the jobs surface can cancel a job: `queued`, `running`, or `held` of
+ * any kind but `execution`. A held execution settles only through its approval.
  */
-export interface AuditActor {
-	actorId: string | null;
-	actorType: string;
+export function isCancellableJob(status: JobStatusUi, kind: string): boolean {
+	if (status === 'held') return kind !== 'execution';
+	return status === 'queued' || status === 'running';
 }
