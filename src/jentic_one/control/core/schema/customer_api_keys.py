@@ -11,7 +11,7 @@ from sqlalchemy.sql import func
 
 from jentic_one.shared.db.base import AuditableMixin, ControlBase
 from jentic_one.shared.db.ids import generate_ksuid
-from jentic_one.shared.db.types import UTCDateTime
+from jentic_one.shared.db.types import UTCDateTime, json_variant
 
 if TYPE_CHECKING:
     from jentic_one.control.core.schema.credentials import Credential
@@ -43,5 +43,10 @@ class CustomerAPIKey(AuditableMixin, ControlBase):
         String(255), nullable=False, default="Authorization", server_default=text("'Authorization'")
     )
     expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    # Secret headers sent alongside the key (Datadog's DD-APPLICATION-KEY):
+    # header name -> encrypted value. Names are not secret; values are.
+    encrypted_additional_headers: Mapped[dict[str, str] | None] = mapped_column(
+        json_variant(), nullable=True, default=None
+    )
 
     credential: Mapped[Credential] = relationship(back_populates="customer_api_key")

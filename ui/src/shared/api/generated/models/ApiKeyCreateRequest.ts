@@ -10,6 +10,10 @@ import type { RuntimeConfig } from './RuntimeConfig';
  */
 export type ApiKeyCreateRequest = {
     /**
+     * Extra secret headers sent alongside the key on upstream calls, as header name to value (at most 5), e.g. Datadog's DD-APPLICATION-KEY. Values are stored encrypted and never returned; responses list the names only (`additional_header_names`).
+     */
+    additional_headers?: (Record<string, string> | null);
+    /**
      * Loose (vendor, name, version) API identity tuple.
      */
     api: APIReferenceRequest;

@@ -98,6 +98,45 @@ def test_inject_api_key_cookie() -> None:
     assert result.cookies == {"session": "cookie-secret"}
 
 
+def test_inject_api_key_with_additional_headers() -> None:
+    resolved = ResolvedCredential(
+        credential_id="cred_dd",
+        name="datadog",
+        wire_type=CredentialType.API_KEY,
+        stored_type=StoredCredentialType.API_KEY,
+        provider="static",
+        encrypted_secret="enc:api-key",
+        location=CredentialLocation.HEADER,
+        field_name="DD-API-KEY",
+        encrypted_additional_headers={"DD-APPLICATION-KEY": "enc:app-key"},
+    )
+    ctx = _make_ctx({"enc:api-key": "api-123", "enc:app-key": "app-456"})
+
+    result = inject_auth(resolved, ctx=ctx)
+
+    assert result.headers == {"DD-API-KEY": "api-123", "DD-APPLICATION-KEY": "app-456"}
+
+
+def test_additional_headers_stay_headers_for_a_query_key() -> None:
+    resolved = ResolvedCredential(
+        credential_id="cred_q",
+        name="query-key",
+        wire_type=CredentialType.API_KEY,
+        stored_type=StoredCredentialType.API_KEY,
+        provider="static",
+        encrypted_secret="enc:api-key",
+        location=CredentialLocation.QUERY,
+        field_name="appid",
+        encrypted_additional_headers={"X-Tenant-Secret": "enc:tenant"},  # pragma: allowlist secret
+    )
+    ctx = _make_ctx({"enc:api-key": "k", "enc:tenant": "t"})
+
+    result = inject_auth(resolved, ctx=ctx)
+
+    assert result.query_params == {"appid": "k"}
+    assert result.headers == {"X-Tenant-Secret": "t"}
+
+
 def test_inject_basic_auth() -> None:
     resolved = ResolvedCredential(
         credential_id="cred_4",

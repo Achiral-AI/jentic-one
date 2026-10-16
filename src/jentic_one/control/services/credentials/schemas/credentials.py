@@ -43,6 +43,7 @@ class CredentialCreate(BaseModel):
     key: str | None = None
     location: str | None = None
     field_name: str | None = None
+    additional_headers: dict[str, str] | None = None
 
     # basic fields
     username: str | None = None
@@ -83,6 +84,8 @@ class CredentialUpdate(BaseModel):
     # ones on every PATCH). See CredentialService.update (#589).
     location: str | None = None
     field_name: str | None = None
+    # Replaces the whole set; {} removes it.
+    additional_headers: dict[str, str] | None = None
 
     # basic rotation/update
     username: str | None = None
@@ -114,6 +117,8 @@ class ApiKeyFull(BaseModel):
     key: str
     location: str
     field_name: str
+    # Names only: the values are never echoed, not even on create.
+    additional_header_names: list[str] | None = None
 
 
 class BasicAuthFull(BaseModel):
@@ -159,6 +164,7 @@ class ApiKeyRedacted(BaseModel):
     key_preview: str | None = None
     location: str | None = None
     field_name: str | None = None
+    additional_header_names: list[str] | None = None
 
 
 class BasicAuthRedacted(BaseModel):

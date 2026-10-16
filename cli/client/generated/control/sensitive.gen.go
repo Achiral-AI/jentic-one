@@ -8,8 +8,8 @@ package control
 // (which carry no custom tags) are redacted from the spec, not by naming luck.
 var SensitiveFields = map[string][]string{
 	"ApiKeyConfirmSessionRequest":                []string{"key"},
-	"ApiKeyCreateRequest":                        []string{"key"},
-	"ApiKeyUpdateRequest":                        []string{"key"},
+	"ApiKeyCreateRequest":                        []string{"additional_headers", "key"},
+	"ApiKeyUpdateRequest":                        []string{"additional_headers", "key"},
 	"AuthorizationCodeRegistrationCreateRequest": []string{"client_secret"},
 	"BasicAuthCreateRequest":                     []string{"password"},
 	"BasicAuthUpdateRequest":                     []string{"password"},

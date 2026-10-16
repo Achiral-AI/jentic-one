@@ -69,11 +69,16 @@ def _inject_api_key(resolved: ResolvedCredential, ctx: Context) -> InjectionResu
     location = resolved.location or CredentialLocation.HEADER
     field_name = resolved.field_name or "Authorization"
 
+    # Extra secret headers are always headers, wherever the key itself goes.
+    headers = {
+        name: ctx.encryption.decrypt(blob)
+        for name, blob in (resolved.encrypted_additional_headers or {}).items()
+    }
     if location == CredentialLocation.QUERY:
-        return InjectionResult(headers={}, query_params={field_name: key}, cookies={})
+        return InjectionResult(headers=headers, query_params={field_name: key}, cookies={})
     if location == CredentialLocation.COOKIE:
-        return InjectionResult(headers={}, query_params={}, cookies={field_name: key})
-    return InjectionResult(headers={field_name: key}, query_params={}, cookies={})
+        return InjectionResult(headers=headers, query_params={}, cookies={field_name: key})
+    return InjectionResult(headers={field_name: key, **headers}, query_params={}, cookies={})
 
 
 def _inject_basic(resolved: ResolvedCredential, ctx: Context) -> InjectionResult:

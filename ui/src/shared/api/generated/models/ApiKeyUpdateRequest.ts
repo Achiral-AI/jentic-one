@@ -13,6 +13,10 @@ export type ApiKeyUpdateRequest = {
      */
     active?: (boolean | null);
     /**
+     * Replacement set of extra secret headers (header name to value, at most 5); `{}` removes them all; omit to leave unchanged.
+     */
+    additional_headers?: (Record<string, string> | null);
+    /**
      * Immutable after create. Accepted for backward compatibility; if provided it must equal the stored value, otherwise the request is rejected. Recreate the credential to change the parameter name.
      */
     field_name?: (string | null);

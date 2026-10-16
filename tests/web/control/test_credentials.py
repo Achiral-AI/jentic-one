@@ -124,6 +124,106 @@ def test_patch_key_rotation_moves_updated_at(cred_writer_client: TestClient) -> 
     assert _parse_ts(resp.json()["updated_at"]) > _parse_ts(before["updated_at"])
 
 
+# --- api_key additional secret headers (Datadog DD-APPLICATION-KEY) ---
+
+
+def _datadog_body(**overrides: object) -> dict[str, object]:
+    body: dict[str, object] = {
+        "type": "api_key",
+        "name": "web-cred-datadog",
+        "api": {"vendor": "datadoghq.com", "name": "datadog", "version": "v2"},
+        "provider": "static",
+        "key": "dd-api-key-value",  # pragma: allowlist secret
+        "location": "header",
+        "field_name": "DD-API-KEY",
+        "additional_headers": {"DD-APPLICATION-KEY": "dd-app-key-value"},
+    }
+    body.update(overrides)
+    return body
+
+
+def test_additional_headers_are_listed_by_name_only(cred_writer_client: TestClient) -> None:
+    resp = cred_writer_client.post("/credentials", json=_datadog_body())
+    assert resp.status_code == 201, resp.text
+    assert "dd-app-key-value" not in resp.text
+    assert resp.json()["secret"]["additional_header_names"] == ["DD-APPLICATION-KEY"]
+
+    cred_id = resp.json()["credential"]["credential_id"]
+    got = cred_writer_client.get(f"/credentials/{cred_id}")
+    assert "dd-app-key-value" not in got.text
+    assert got.json()["details"]["additional_header_names"] == ["DD-APPLICATION-KEY"]
+
+
+def test_api_key_without_additional_headers_lists_none(cred_writer_client: TestClient) -> None:
+    cred_id = _create_api_key(cred_writer_client)
+
+    got = cred_writer_client.get(f"/credentials/{cred_id}").json()
+
+    assert "additional_header_names" not in got["details"]
+
+
+@pytest.mark.parametrize(
+    "additional_headers",
+    [
+        {f"X-Extra-{i}": f"secret-value-{i}" for i in range(6)},
+        {"Bad Header": "secret-value"},
+        {"X-Ok": "line\r\nInjected: yes"},
+        {"dd-api-key": "collides with the key header"},
+        {"X-Empty": ""},
+    ],
+    ids=["too-many", "bad-name", "control-char", "collides-with-key", "empty-value"],
+)
+def test_invalid_additional_headers_are_rejected(
+    cred_writer_client: TestClient, additional_headers: dict[str, str]
+) -> None:
+    resp = cred_writer_client.post(
+        "/credentials", json=_datadog_body(additional_headers=additional_headers)
+    )
+
+    assert resp.status_code == 422, resp.text
+    for value in additional_headers.values():
+        if value:
+            assert value not in resp.text
+
+
+def test_patch_replaces_additional_headers(cred_writer_client: TestClient) -> None:
+    created = cred_writer_client.post("/credentials", json=_datadog_body()).json()
+    cred_id = created["credential"]["credential_id"]
+    before = cred_writer_client.get(f"/credentials/{cred_id}").json()
+
+    resp = cred_writer_client.patch(
+        f"/credentials/{cred_id}",
+        json={"type": "api_key", "additional_headers": {"X-Other-Key": "other-value"}},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert "other-value" not in resp.text
+    assert resp.json()["details"]["additional_header_names"] == ["X-Other-Key"]
+    assert _parse_ts(resp.json()["updated_at"]) > _parse_ts(before["updated_at"])
+
+    cleared = cred_writer_client.patch(
+        f"/credentials/{cred_id}", json={"type": "api_key", "additional_headers": {}}
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert "additional_header_names" not in cleared.json()["details"]
+
+
+def test_patch_additional_headers_cannot_collide_with_the_key_header(
+    cred_writer_client: TestClient,
+) -> None:
+    created = cred_writer_client.post("/credentials", json=_datadog_body()).json()
+    cred_id = created["credential"]["credential_id"]
+
+    resp = cred_writer_client.patch(
+        f"/credentials/{cred_id}",
+        json={"type": "api_key", "additional_headers": {"DD-API-KEY": "x"}},
+    )
+
+    # The stored key header is only known to the service, hence 400 not 422.
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["type"] == "invalid_credential_input"
+
+
 # --- OAuth connect state on the redacted projection (#890) ---
 
 

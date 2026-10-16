@@ -1596,6 +1596,11 @@ type ApiKeyConfirmSessionRequestKind string
 //
 // Examples: {"api":{"name":"stripe","vendor":"stripe.com","version":"2024-04-10"},"field_name":"Authorization","key":"sk_live_…","location":"header","name":"Stripe live key","provider":"static","type":"api_key"}
 type ApiKeyCreateRequest struct {
+	// AdditionalHeaders Extra secret headers sent alongside the key on upstream calls, as header name to value (at most 5), e.g. Datadog's DD-APPLICATION-KEY. Values are stored encrypted and never returned; responses list the names only (`additional_header_names`).
+	//
+	// Examples: {"DD-APPLICATION-KEY":"example-secret"}
+	AdditionalHeaders *map[string]string `json:"additional_headers,omitempty"`
+
 	// Api Loose (vendor, name, version) API identity tuple.
 	//
 	// Examples: {"catalog_api_id":"stripe.com","name":"stripe","vendor":"stripe.com","version":"2024-04-10"}
@@ -1729,12 +1734,17 @@ type ApiKeyResponse struct {
 
 // ApiKeyUpdateRequest Update request for api_key credentials.
 //
-// Examples: {"active":true,"field_name":"Authorization","key":"example-secret","location":"header","name":"Stripe live key","runtime_config":{"headers":{"Stripe-Version":"2024-04-10"},"query_params":{"locale":"en-GB"}},"server_variables":{"region":"eu"},"type":"api_key"}
+// Examples: {"active":true,"additional_headers":{"DD-APPLICATION-KEY":"example-secret"},"field_name":"Authorization","key":"example-secret","location":"header","name":"Stripe live key","runtime_config":{"headers":{"Stripe-Version":"2024-04-10"},"query_params":{"locale":"en-GB"}},"server_variables":{"region":"eu"},"type":"api_key"}
 type ApiKeyUpdateRequest struct {
 	// Active Enable or disable the credential for injection; omit to leave unchanged.
 	//
 	// Examples: true
 	Active *bool `json:"active,omitempty"`
+
+	// AdditionalHeaders Replacement set of extra secret headers (header name to value, at most 5); `{}` removes them all; omit to leave unchanged.
+	//
+	// Examples: {"DD-APPLICATION-KEY":"example-secret"}
+	AdditionalHeaders *map[string]string `json:"additional_headers,omitempty"`
 
 	// FieldName Immutable after create. Accepted for backward compatibility; if provided it must equal the stored value, otherwise the request is rejected. Recreate the credential to change the parameter name.
 	//

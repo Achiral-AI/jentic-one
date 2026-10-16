@@ -57,6 +57,8 @@ class ResolvedCredential(BaseModel):
     # api_key injection params
     location: CredentialLocation | None = None
     field_name: str | None = None
+    # api_key extra secret headers: header name -> encrypted value
+    encrypted_additional_headers: dict[str, str] | None = None
 
     # basic
     username: str | None = None
@@ -277,6 +279,7 @@ class CredentialResolver:
                 encrypted_secret=cak.encrypted_key if cak else None,
                 location=CredentialLocation(cak.location) if cak else CredentialLocation.HEADER,
                 field_name=cak.field_name if cak else "Authorization",
+                encrypted_additional_headers=cak.encrypted_additional_headers if cak else None,
             )
 
         if wire_type == CredentialType.BASIC:

@@ -23,6 +23,7 @@ class CustomerAPIKeyRepository:
         expires_at: datetime | None = None,
         location: str = "header",
         field_name: str = "Authorization",
+        encrypted_additional_headers: dict[str, str] | None = None,
         created_by: str,
     ) -> CustomerAPIKey:
         row = CustomerAPIKey(
@@ -32,6 +33,7 @@ class CustomerAPIKeyRepository:
             expires_at=expires_at,
             location=location,
             field_name=field_name,
+            encrypted_additional_headers=encrypted_additional_headers,
             created_by=created_by,
         )
         session.add(row)
@@ -58,6 +60,20 @@ class CustomerAPIKeyRepository:
             return None
         row.encrypted_key = encrypted_key
         row.key_preview = key_preview
+        await session.flush()
+        return row
+
+    @staticmethod
+    async def update_additional_headers(
+        session: AsyncSession,
+        credential_id: str,
+        *,
+        encrypted_additional_headers: dict[str, str] | None,
+    ) -> CustomerAPIKey | None:
+        row = await CustomerAPIKeyRepository.get_by_credential(session, credential_id)
+        if row is None:
+            return None
+        row.encrypted_additional_headers = encrypted_additional_headers
         await session.flush()
         return row
 

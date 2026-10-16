@@ -59,7 +59,13 @@ async def clean_credentials(control_db: DatabaseSession) -> AsyncGenerator[None,
 
 
 async def _seed_api_key(
-    ctx: Context, *, cred_id: str, location: str, field_name: str, secret: str
+    ctx: Context,
+    *,
+    cred_id: str,
+    location: str,
+    field_name: str,
+    secret: str,
+    additional_headers: dict[str, str] | None = None,
 ) -> None:
     encrypted = ctx.encryption.encrypt(secret)
     async with ctx.control_db.session() as session:
@@ -80,6 +86,11 @@ async def _seed_api_key(
                 encrypted_key=encrypted,
                 location=location,
                 field_name=field_name,
+                encrypted_additional_headers=(
+                    {name: ctx.encryption.encrypt(v) for name, v in additional_headers.items()}
+                    if additional_headers
+                    else None
+                ),
             )
         )
         await session.commit()
@@ -104,6 +115,26 @@ async def test_inject_api_key_header_end_to_end(
     assert result.headers == {"X-Api-Key": "sk-live-123"}
     assert result.query_params == {}
     assert result.cookies == {}
+
+
+async def test_inject_api_key_with_additional_headers_end_to_end(
+    integration_context: Context, clean_credentials: None
+) -> None:
+    """Datadog: the key and the application key both land as headers."""
+    await _seed_api_key(
+        integration_context,
+        cred_id="cred_dd",
+        location="header",
+        field_name="DD-API-KEY",
+        secret="dd-api",  # pragma: allowlist secret
+        additional_headers={"DD-APPLICATION-KEY": "dd-app"},
+    )
+
+    result = await CredentialService(integration_context).inject(
+        api_vendor=_VENDOR, api_name=_API_NAME, api_version=_API_VERSION, identity=_IDENTITY
+    )
+
+    assert result.headers == {"DD-API-KEY": "dd-api", "DD-APPLICATION-KEY": "dd-app"}
 
 
 async def test_inject_api_key_cookie_end_to_end(

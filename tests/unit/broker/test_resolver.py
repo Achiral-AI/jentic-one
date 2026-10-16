@@ -97,6 +97,7 @@ async def test_resolve_api_key() -> None:
     cak.encrypted_key = "enc:key"
     cak.location = "header"
     cak.field_name = "X-Api-Key"
+    cak.encrypted_additional_headers = None
     cred.customer_api_key = cak
 
     session = AsyncMock()

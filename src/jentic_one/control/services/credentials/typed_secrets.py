@@ -65,6 +65,7 @@ async def write_api_key_secret(
     location: str,
     field_name: str,
     created_by: str,
+    additional_headers: dict[str, SecretStr] | None = None,
 ) -> ApiKeyFull:
     """Write the encrypted API key row (with its injection point) for ``credential_id``."""
     plaintext = key.get_secret_value()
@@ -75,9 +76,24 @@ async def write_api_key_secret(
         key_preview=encryption.preview(plaintext),
         location=location,
         field_name=field_name,
+        encrypted_additional_headers=encrypt_additional_headers(encryption, additional_headers),
         created_by=created_by,
     )
-    return ApiKeyFull(key=plaintext, location=location, field_name=field_name)
+    return ApiKeyFull(
+        key=plaintext,
+        location=location,
+        field_name=field_name,
+        additional_header_names=sorted(additional_headers) if additional_headers else None,
+    )
+
+
+def encrypt_additional_headers(
+    encryption: EncryptionService, headers: dict[str, SecretStr] | None
+) -> dict[str, str] | None:
+    """Encrypt each extra header value; an empty set stores NULL."""
+    if not headers:
+        return None
+    return {name: encryption.encrypt(value.get_secret_value()) for name, value in headers.items()}
 
 
 async def write_basic_secret(

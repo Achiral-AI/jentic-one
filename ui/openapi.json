@@ -1138,6 +1138,27 @@
           }
         ],
         "properties": {
+          "additional_headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Extra secret headers sent alongside the key on upstream calls, as header name to value (at most 5), e.g. Datadog's DD-APPLICATION-KEY. Values are stored encrypted and never returned; responses list the names only (`additional_header_names`).",
+            "examples": [
+              {
+                "DD-APPLICATION-KEY": "example-secret"
+              }
+            ],
+            "title": "Additional Headers",
+            "x-sensitive": true
+          },
           "api": {
             "$ref": "#/components/schemas/APIReferenceRequest",
             "description": "Loose (vendor, name, version) API identity tuple.",
@@ -1476,6 +1497,9 @@
         "examples": [
           {
             "active": true,
+            "additional_headers": {
+              "DD-APPLICATION-KEY": "example-secret"
+            },
             "field_name": "Authorization",
             "key": "example-secret",
             "location": "header",
@@ -1509,6 +1533,27 @@
               true
             ],
             "title": "Active"
+          },
+          "additional_headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Replacement set of extra secret headers (header name to value, at most 5); `{}` removes them all; omit to leave unchanged.",
+            "examples": [
+              {
+                "DD-APPLICATION-KEY": "example-secret"
+              }
+            ],
+            "title": "Additional Headers",
+            "x-sensitive": true
           },
           "field_name": {
             "anyOf": [

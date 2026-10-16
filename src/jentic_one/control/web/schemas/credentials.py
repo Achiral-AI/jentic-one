@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from jentic_one.control.services.credentials.schemas.oauth_client_options import (
     OAuthClientOptions,
@@ -73,6 +73,46 @@ def _reject_control_chars(v: str | None, info: ValidationInfo) -> str | None:
     if v is not None and _CONTROL_CHARS.search(v):
         raise ValueError(f"{info.field_name} must not contain control characters")
     return v
+
+
+_MAX_ADDITIONAL_HEADERS = 5
+# RFC 9110 §5.6.2 token.
+_HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,128}$")
+
+
+def _validate_additional_headers(v: dict[str, str] | None) -> dict[str, str] | None:
+    """Check the extra secret headers of an api_key credential.
+
+    Messages name headers, never values: the values are secrets.
+    """
+    if v is None:
+        return None
+    if len(v) > _MAX_ADDITIONAL_HEADERS:
+        raise ValueError(
+            f"additional_headers may contain at most {_MAX_ADDITIONAL_HEADERS} entries"
+        )
+    seen: set[str] = set()
+    for name, value in v.items():
+        if not _HEADER_NAME.match(name):
+            raise ValueError(f"additional_headers name {name!r} is not an HTTP header name")
+        if name.lower() in seen:
+            raise ValueError(f"additional_headers names {name!r} more than once")
+        seen.add(name.lower())
+        if not value:
+            raise ValueError(f"additional_headers value for {name!r} must not be empty")
+        if _CONTROL_CHARS.search(value):
+            raise ValueError(
+                f"additional_headers value for {name!r} must not contain control characters"
+            )
+    return v
+
+
+_ADDITIONAL_HEADERS_DESCRIPTION = (
+    "Extra secret headers sent alongside the key on upstream calls, as header "
+    "name to value (at most 5), e.g. Datadog's DD-APPLICATION-KEY. Values are "
+    "stored encrypted and never returned; responses list the names only "
+    "(`additional_header_names`)."
+)
 
 
 # --- Create request models (per type) ---
@@ -163,9 +203,26 @@ class ApiKeyCreateRequest(BaseModel):
     field_name: str = Field(
         description="Header or query-parameter name carrying the key.", examples=["Authorization"]
     )
+    additional_headers: dict[str, str] | None = Field(
+        default=None,
+        description=_ADDITIONAL_HEADERS_DESCRIPTION,
+        json_schema_extra=SENSITIVE,
+        examples=[{"DD-APPLICATION-KEY": "example-secret"}],  # pragma: allowlist secret
+    )
 
     _check_server_variables = field_validator("server_variables")(_validate_server_variables)
     _check_control_chars = field_validator("key", "field_name")(_reject_control_chars)
+    _check_additional_headers = field_validator("additional_headers")(_validate_additional_headers)
+
+    @model_validator(mode="after")
+    def _additional_headers_differ_from_the_key_header(self) -> ApiKeyCreateRequest:
+        if (
+            self.additional_headers
+            and self.location == CredentialLocation.HEADER
+            and self.field_name.lower() in {name.lower() for name in self.additional_headers}
+        ):
+            raise ValueError("additional_headers must not repeat the key's header (field_name)")
+        return self
 
 
 class BasicAuthCreateRequest(BaseModel):
@@ -464,9 +521,19 @@ class ApiKeyUpdateRequest(BaseModel):
             "rejected. Recreate the credential to change the parameter name."
         ),
     )
+    additional_headers: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "Replacement set of extra secret headers (header name to value, at most 5); "
+            "`{}` removes them all; omit to leave unchanged."
+        ),
+        json_schema_extra=SENSITIVE,
+        examples=[{"DD-APPLICATION-KEY": "example-secret"}],  # pragma: allowlist secret
+    )
 
     _check_server_variables = field_validator("server_variables")(_validate_server_variables)
     _check_control_chars = field_validator("key", "field_name")(_reject_control_chars)
+    _check_additional_headers = field_validator("additional_headers")(_validate_additional_headers)
 
 
 class BasicAuthUpdateRequest(BaseModel):

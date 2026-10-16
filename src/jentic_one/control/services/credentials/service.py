@@ -76,6 +76,7 @@ from jentic_one.control.services.credentials.schemas.credentials import (
 from jentic_one.control.services.credentials.schemas.permission_test import PermissionTestResult
 from jentic_one.control.services.credentials.schemas.provision import APIReference
 from jentic_one.control.services.credentials.typed_secrets import (
+    encrypt_additional_headers,
     write_api_key_secret,
     write_basic_secret,
     write_bearer_token_secret,
@@ -94,7 +95,11 @@ from jentic_one.shared.models.api_identity import (
     credential_covers,
     slugify_api_field,
 )
-from jentic_one.shared.models.credentials import CredentialType, StoredCredentialType
+from jentic_one.shared.models.credentials import (
+    CredentialLocation,
+    CredentialType,
+    StoredCredentialType,
+)
 from jentic_one.shared.models.events import EventSeverity, EventType
 from jentic_one.shared.pagination import decode_cursor_str, encode_cursor
 from jentic_one.shared.permissions.evaluation import (
@@ -274,6 +279,11 @@ class CredentialService:
                     location=payload.location,
                     field_name=payload.field_name,
                     created_by=identity.sub,
+                    additional_headers=(
+                        {name: SecretStr(v) for name, v in payload.additional_headers.items()}
+                        if payload.additional_headers
+                        else None
+                    ),
                 )
 
             elif payload.type == CredentialType.BASIC:
@@ -1240,7 +1250,28 @@ class CredentialService:
                 )
                 changed = True
 
-            elif payload.type == CredentialType.BASIC:
+            if payload.type == CredentialType.API_KEY and payload.additional_headers is not None:
+                cak = await CustomerAPIKeyRepository.get_by_credential(session, credential_id)
+                if (
+                    cak is not None
+                    and cak.location == CredentialLocation.HEADER
+                    and cak.field_name.lower()
+                    in {name.lower() for name in payload.additional_headers}
+                ):
+                    raise InvalidCredentialInputError(
+                        "additional_headers must not repeat the key's header (field_name)"
+                    )
+                await CustomerAPIKeyRepository.update_additional_headers(
+                    session,
+                    credential_id,
+                    encrypted_additional_headers=encrypt_additional_headers(
+                        encryption,
+                        {name: SecretStr(v) for name, v in payload.additional_headers.items()},
+                    ),
+                )
+                changed = True
+
+            if payload.type == CredentialType.BASIC:
                 if payload.username is not None or payload.password is not None:
                     encrypted_pw = (
                         encryption.encrypt(payload.password) if payload.password else None
@@ -1394,6 +1425,11 @@ class CredentialService:
                 key_preview=preview,
                 location=cak.location if cak else None,
                 field_name=cak.field_name if cak else None,
+                additional_header_names=(
+                    sorted(cak.encrypted_additional_headers)
+                    if cak and cak.encrypted_additional_headers
+                    else None
+                ),
             )
 
         elif wire_type == CredentialType.BASIC:
