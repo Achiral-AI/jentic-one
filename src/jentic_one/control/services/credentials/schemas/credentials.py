@@ -57,6 +57,8 @@ class CredentialCreate(BaseModel):
     client_secret: str | None = None
     scopes: list[str] | None = None
     client_options: OAuthClientOptions | None = None
+    # Seeds the refresh_token grant.
+    refresh_token: str | None = None
 
     # sigv4 fields
     access_key_id: str | None = None

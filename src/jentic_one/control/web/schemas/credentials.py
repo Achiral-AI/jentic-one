@@ -290,7 +290,10 @@ class OAuth2CreateRequest(BaseModel):
     grant_type: str = Field(
         default="client_credentials",
         examples=["client_credentials"],
-        description="OAuth2 grant type (e.g. client_credentials, authorization_code, device_code).",
+        description=(
+            "OAuth2 grant type: client_credentials, authorization_code, device_code, or "
+            "refresh_token (the caller's own client with a refresh token it already holds)."
+        ),
     )
     token_url: str | None = Field(
         default=None,
@@ -322,6 +325,16 @@ class OAuth2CreateRequest(BaseModel):
     scopes: list[str] | None = Field(
         default=None, description="OAuth scopes to request.", examples=[["read_write"]]
     )
+    refresh_token: str | None = Field(
+        default=None,
+        description=(
+            "Refresh token for the refresh_token grant (required for it, refused for any "
+            "other). Exchanged at token_url for access tokens; a rotated refresh token "
+            "replaces it. Stored encrypted; never returned."
+        ),
+        json_schema_extra=SENSITIVE,
+        examples=["example-refresh-token"],  # pragma: allowlist secret
+    )
     # Vendor quirks: token auth method and encoding, PKCE, a relayed
     # redirect_uri, token fields kept as server variables.
     client_options: OAuthClientOptions | None = Field(
@@ -334,6 +347,7 @@ class OAuth2CreateRequest(BaseModel):
     )
 
     _check_server_variables = field_validator("server_variables")(_validate_server_variables)
+    _check_control_chars = field_validator("refresh_token")(_reject_control_chars)
 
 
 class NoAuthCreateRequest(BaseModel):

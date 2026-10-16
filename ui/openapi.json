@@ -9881,6 +9881,7 @@
             "grant_type": "client_credentials",
             "name": "Stripe live key",
             "provider": "static",
+            "refresh_token": "example-refresh-token",
             "runtime_config": {
               "headers": {
                 "Stripe-Version": "2024-04-10"
@@ -9984,7 +9985,7 @@
           },
           "grant_type": {
             "default": "client_credentials",
-            "description": "OAuth2 grant type (e.g. client_credentials, authorization_code, device_code).",
+            "description": "OAuth2 grant type: client_credentials, authorization_code, device_code, or refresh_token (the caller's own client with a refresh token it already holds).",
             "examples": [
               "client_credentials"
             ],
@@ -10007,6 +10008,22 @@
             ],
             "title": "Provider",
             "type": "string"
+          },
+          "refresh_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Refresh token for the refresh_token grant (required for it, refused for any other). Exchanged at token_url for access tokens; a rotated refresh token replaces it. Stored encrypted; never returned.",
+            "examples": [
+              "example-refresh-token"
+            ],
+            "title": "Refresh Token",
+            "x-sensitive": true
           },
           "runtime_config": {
             "anyOf": [

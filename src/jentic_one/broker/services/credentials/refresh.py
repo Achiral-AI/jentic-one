@@ -164,9 +164,15 @@ class TokenRefresher:
                 scope=fresh_token.scope,
             )
             if updated is None:
-                logger.error(
-                    "refresh_token_row_missing",
+                # First token for a client_credentials grant: nothing to update yet.
+                await OAuthTokenRepository.create(
+                    session,
                     credential_id=resolved.credential_id,
+                    encrypted_access_token=encrypted_access,
+                    encrypted_refresh_token=encrypted_refresh,
+                    expires_at=fresh_token.expires_at,
+                    scope=fresh_token.scope,
+                    created_by=resolved.created_by,
                 )
 
             return fresh_token.access_token

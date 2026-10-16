@@ -30,7 +30,7 @@ export type OAuth2CreateRequest = {
      */
     client_secret?: (string | null);
     /**
-     * OAuth2 grant type (e.g. client_credentials, authorization_code, device_code).
+     * OAuth2 grant type: client_credentials, authorization_code, device_code, or refresh_token (the caller's own client with a refresh token it already holds).
      */
     grant_type?: string;
     /**
@@ -41,6 +41,10 @@ export type OAuth2CreateRequest = {
      * Credential provider; 'static' for stored secrets.
      */
     provider?: string;
+    /**
+     * Refresh token for the refresh_token grant (required for it, refused for any other). Exchanged at token_url for access tokens; a rotated refresh token replaces it. Stored encrypted; never returned.
+     */
+    refresh_token?: (string | null);
     /**
      * Per-upstream-call overrides; reserved and not currently applied.
      */

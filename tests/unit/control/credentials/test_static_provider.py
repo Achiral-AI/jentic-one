@@ -3,18 +3,19 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from unittest.mock import AsyncMock
 
 import pytest
 
 from jentic_one.control.services.credentials.providers import (
     NotConnectableError,
-    NotRefreshableError,
     StaticProvider,
 )
 from jentic_one.control.services.credentials.schemas import (
     APIReference,
     ConnectRequest,
     OAuthTokenView,
+    RefreshResult,
 )
 from jentic_one.shared.config import AppConfig, DatabaseConfig, DatabasesConfig
 from jentic_one.shared.context import Context
@@ -68,8 +69,12 @@ async def test_begin_connect_raises() -> None:
 
 
 @pytest.mark.asyncio()
-async def test_refresh_raises() -> None:
+async def test_refresh_gets_tokens_like_a_direct_oauth2_client() -> None:
+    # Static oauth2 credentials carry their own client; the integration tests in
+    # tests/integration/broker/test_static_oauth2_grants.py cover the grants.
     provider = StaticProvider()
+    refreshed = RefreshResult(access_token="at", expires_at=None)
+    provider._oauth2.refresh = AsyncMock(return_value=refreshed)  # type: ignore[method-assign]
     ctx = _make_context()
 
     async def _fake_decrypt() -> str:
@@ -81,5 +86,5 @@ async def test_refresh_raises() -> None:
         expires_at=datetime.now(UTC),
         decrypt=_fake_decrypt,
     )
-    with pytest.raises(NotRefreshableError):
-        await provider.refresh(ctx, token=token_view)
+    assert await provider.refresh(ctx, token=token_view) is refreshed
+    provider._oauth2.refresh.assert_awaited_once_with(ctx, token=token_view)

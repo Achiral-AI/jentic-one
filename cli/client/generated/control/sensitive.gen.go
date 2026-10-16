@@ -24,7 +24,7 @@ var SensitiveFields = map[string][]string{
 	"InviteIssuedResponse":                       []string{"token"},
 	"LoginRequest":                               []string{"password"},
 	"LoginResponse":                              []string{"access_token"},
-	"OAuth2CreateRequest":                        []string{"client_secret"},
+	"OAuth2CreateRequest":                        []string{"client_secret", "refresh_token"},
 	"OAuth2UpdateRequest":                        []string{"client_secret"},
 	"OAuthAppRegistrationRotateSecretRequest":    []string{"client_secret"},
 	"OAuthClientCreateResponse":                  []string{"client_secret"},

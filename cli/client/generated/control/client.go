@@ -4630,7 +4630,7 @@ type NoteUpdateRequest struct {
 // For managed providers (e.g. pipedream, direct_oauth2), token_url/client_id/client_secret
 // are optional — the connect flow handles authentication without caller-supplied client details.
 //
-// Examples: {"api":{"catalog_api_id":"stripe.com","name":"stripe","vendor":"stripe.com","version":"2024-04-10"},"authorize_url":"https://connect.stripe.com/oauth/authorize","client_id":"ca_example123","client_options":{"authorize_params":{"audience":"api.atlassian.com"},"keep_token_fields":{"instance_url":"instance_url"},"pkce":true,"redirect_uri":"https://app.example.com/oauth/callback","token_auth_method":"client_secret_basic","token_request_encoding":"json"},"client_secret":"example-secret","grant_type":"client_credentials","name":"Stripe live key","provider":"static","runtime_config":{"headers":{"Stripe-Version":"2024-04-10"},"query_params":{"locale":"en-GB"}},"scopes":["read_write"],"server_variables":{"region":"eu"},"token_url":"https://connect.stripe.com/oauth/token","type":"oauth2"}
+// Examples: {"api":{"catalog_api_id":"stripe.com","name":"stripe","vendor":"stripe.com","version":"2024-04-10"},"authorize_url":"https://connect.stripe.com/oauth/authorize","client_id":"ca_example123","client_options":{"authorize_params":{"audience":"api.atlassian.com"},"keep_token_fields":{"instance_url":"instance_url"},"pkce":true,"redirect_uri":"https://app.example.com/oauth/callback","token_auth_method":"client_secret_basic","token_request_encoding":"json"},"client_secret":"example-secret","grant_type":"client_credentials","name":"Stripe live key","provider":"static","refresh_token":"example-refresh-token","runtime_config":{"headers":{"Stripe-Version":"2024-04-10"},"query_params":{"locale":"en-GB"}},"scopes":["read_write"],"server_variables":{"region":"eu"},"token_url":"https://connect.stripe.com/oauth/token","type":"oauth2"}
 type OAuth2CreateRequest struct {
 	// Api Relaxed variant for request bodies where partial identification is allowed.
 	//
@@ -4657,7 +4657,7 @@ type OAuth2CreateRequest struct {
 	// Examples: example-secret
 	ClientSecret *string `json:"client_secret,omitempty"`
 
-	// GrantType OAuth2 grant type (e.g. client_credentials, authorization_code, device_code).
+	// GrantType OAuth2 grant type: client_credentials, authorization_code, device_code, or refresh_token (the caller's own client with a refresh token it already holds).
 	//
 	// Examples: client_credentials
 	GrantType *string `json:"grant_type,omitempty"`
@@ -4671,6 +4671,11 @@ type OAuth2CreateRequest struct {
 	//
 	// Examples: static
 	Provider *string `json:"provider,omitempty"`
+
+	// RefreshToken Refresh token for the refresh_token grant (required for it, refused for any other). Exchanged at token_url for access tokens; a rotated refresh token replaces it. Stored encrypted; never returned.
+	//
+	// Examples: example-refresh-token
+	RefreshToken *string `json:"refresh_token,omitempty"`
 
 	// RuntimeConfig Per-upstream-call overrides; reserved and not currently applied.
 	//

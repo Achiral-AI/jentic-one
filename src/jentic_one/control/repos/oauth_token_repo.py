@@ -42,7 +42,7 @@ class OAuthTokenRepository:
         app_registration_id: str | None = None,
         platform_application_id: str | None = None,
         issued_to_user: str | None = None,
-        created_by: str,
+        created_by: str | None,
     ) -> OAuthToken:
         row = OAuthToken(
             credential_id=credential_id,

@@ -22,6 +22,8 @@ def to_stored(wire: CredentialType, *, grant_type: str | None = None) -> StoredC
             return StoredCredentialType.OAUTH2_AUTHORIZATION_CODE
         if grant_type == "device_code":
             return StoredCredentialType.OAUTH2_DEVICE_CODE
+        if grant_type == "refresh_token":
+            return StoredCredentialType.OAUTH2_REFRESH_TOKEN
         return StoredCredentialType.OAUTH2_CLIENT_CREDENTIALS
     msg = f"Unsupported wire type: {wire}"
     raise ValueError(msg)
@@ -46,6 +48,7 @@ def to_wire(stored: StoredCredentialType) -> CredentialType:
         StoredCredentialType.OAUTH2_AUTHORIZATION_CODE,
         StoredCredentialType.OAUTH2_DEVICE_CODE,
         StoredCredentialType.OAUTH2_IMPLICIT,
+        StoredCredentialType.OAUTH2_REFRESH_TOKEN,
     ):
         return CredentialType.OAUTH2
     msg = f"Unsupported stored type: {stored}"
@@ -61,4 +64,5 @@ def is_refreshable(stored: StoredCredentialType) -> bool:
         # subsequent refresh grant is standard OAuth2 (public client — no
         # client_secret). See broker refresh path follow-up.
         StoredCredentialType.OAUTH2_DEVICE_CODE,
+        StoredCredentialType.OAUTH2_REFRESH_TOKEN,
     )

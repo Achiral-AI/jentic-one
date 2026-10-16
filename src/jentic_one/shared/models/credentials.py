@@ -15,6 +15,9 @@ class StoredCredentialType(StrEnum):
     # RFC 8628 Device Authorization Grant (public client, no client_secret).
     # Introduced by the agent-driven integration flow.
     OAUTH2_DEVICE_CODE = "OAUTH2_DEVICE_CODE"
+    # The caller's own OAuth client with a refresh token it obtained
+    # elsewhere; Jentic One exchanges and rotates it (no connect flow).
+    OAUTH2_REFRESH_TOKEN = "OAUTH2_REFRESH_TOKEN"
     OAUTH2_IMPLICIT = "OAUTH2_IMPLICIT"
     NO_AUTH = "NO_AUTH"
     AWS_SIGV4 = "AWS_SIGV4"

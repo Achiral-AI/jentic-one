@@ -224,6 +224,59 @@ def test_patch_additional_headers_cannot_collide_with_the_key_header(
     assert resp.json()["type"] == "invalid_credential_input"
 
 
+# --- oauth2 refresh_token grant seeded by the caller (Workday) ---
+
+
+def _workday_body(**overrides: object) -> dict[str, object]:
+    body: dict[str, object] = {
+        "type": "oauth2",
+        "name": "web-cred-workday",
+        "api": {"vendor": "workday.com", "name": "", "version": ""},
+        "provider": "static",
+        "grant_type": "refresh_token",
+        "token_url": "https://wd2-impl-services1.workday.com/ccx/oauth2/acme/token",
+        "client_id": "wd-client",
+        "client_secret": "wd-client-secret",  # pragma: allowlist secret
+        "refresh_token": "wd-refresh-token-value",  # pragma: allowlist secret
+    }
+    body.update(overrides)
+    return body
+
+
+def test_refresh_token_grant_never_returns_the_refresh_token(
+    cred_writer_client: TestClient,
+) -> None:
+    resp = cred_writer_client.post("/credentials", json=_workday_body())
+    assert resp.status_code == 201, resp.text
+    assert "wd-refresh-token-value" not in resp.text
+    assert resp.json()["secret"]["grant_type"] == "refresh_token"
+
+    cred_id = resp.json()["credential"]["credential_id"]
+    got = cred_writer_client.get(f"/credentials/{cred_id}")
+    assert "wd-refresh-token-value" not in got.text
+    assert got.json()["details"]["grant_type"] == "refresh_token"
+    assert got.json()["details"]["connected"] is True
+
+
+def test_refresh_token_grant_requires_a_refresh_token(cred_writer_client: TestClient) -> None:
+    body = _workday_body()
+    del body["refresh_token"]
+
+    resp = cred_writer_client.post("/credentials", json=body)
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["type"] == "invalid_credential_input"
+
+
+def test_refresh_token_needs_the_refresh_token_grant(cred_writer_client: TestClient) -> None:
+    resp = cred_writer_client.post(
+        "/credentials", json=_workday_body(grant_type="client_credentials")
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "wd-refresh-token-value" not in resp.text
+
+
 # --- OAuth connect state on the redacted projection (#890) ---
 
 

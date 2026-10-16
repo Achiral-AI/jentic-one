@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlencode
 
 from jentic_one.control.core.schema.oauth_app_registrations import OAuthAppRegistration
@@ -44,6 +44,8 @@ from jentic_one.control.services.credentials.state import (
 )
 from jentic_one.shared.config import DirectOAuth2ProviderConfig
 from jentic_one.shared.context import Context
+from jentic_one.shared.models.credentials import StoredCredentialType
+from jentic_one.shared.url import apply_server_variables
 
 # Re-exported for existing importers of these error types through
 # ``providers.direct_oauth2`` (they now live on the shared OAuth2 base).
@@ -53,6 +55,15 @@ __all__ = [
     "InvalidGrantError",
     "TokenExchangeError",
 ]
+
+
+class _ClientMaterial(NamedTuple):
+    client_id: str
+    token_url: str
+    client_secret: str
+    options: OAuthClientOptions
+    # Set for client_credentials credentials: the scope to request, "" for none.
+    client_credentials_scope: str | None = None
 
 
 def _true_expiry(token_data: dict[str, Any]) -> datetime | None:
@@ -218,7 +229,7 @@ class DirectOAuth2Provider(OAuth2Provider):
         if not callback.code:
             raise ProviderError("No authorization code in callback")
 
-        client_id, token_url, client_secret, options = await self._resolve_client_material(
+        client_id, token_url, client_secret, options, _ = await self._resolve_client_material(
             ctx, credential_id=state.credential_id
         )
 
@@ -259,17 +270,23 @@ class DirectOAuth2Provider(OAuth2Provider):
         *,
         token: OAuthTokenView,
     ) -> RefreshResult:
-        client_id, token_url, client_secret, options = await self._resolve_client_material(
-            ctx, credential_id=token.credential_id
-        )
-        refresh_token_value = await token.decrypt()
+        material = await self._resolve_client_material(ctx, credential_id=token.credential_id)
+        payload: dict[str, str]
+        if material.client_credentials_scope is not None:
+            # client_credentials has no refresh token (RFC 6749 §4.4.3): a
+            # "refresh" is a new grant with the same client.
+            payload = {"grant_type": "client_credentials"}
+            if material.client_credentials_scope:
+                payload["scope"] = material.client_credentials_scope
+        else:
+            payload = {"grant_type": "refresh_token", "refresh_token": await token.decrypt()}
 
         token_data = await self._post_client_token(
-            token_url,
-            {"grant_type": "refresh_token", "refresh_token": refresh_token_value},
-            client_id,
-            client_secret,
-            options,
+            material.token_url,
+            payload,
+            material.client_id,
+            material.client_secret,
+            material.options,
         )
 
         expires_at = _true_expiry(token_data)
@@ -286,8 +303,8 @@ class DirectOAuth2Provider(OAuth2Provider):
         ctx: Context,
         *,
         credential_id: str,
-    ) -> tuple[str, str, str, OAuthClientOptions]:
-        """Return ``(client_id, token_url, client_secret, options)`` for a credential.
+    ) -> _ClientMaterial:
+        """Return the client and token endpoint material for a credential.
 
         Prefers the shared ``oauth_app_registrations`` row when the credential's
         ``oauth_app_registration_id`` is set (mints for this credential are
@@ -321,17 +338,24 @@ class DirectOAuth2Provider(OAuth2Provider):
                         "authorization_code_details extension"
                     )
                 client_secret = ctx.encryption.decrypt(ac.encrypted_client_secret)
-                return registration.client_id, ac.token_url, client_secret, OAuthClientOptions()
+                return _ClientMaterial(
+                    registration.client_id, ac.token_url, client_secret, OAuthClientOptions()
+                )
 
             occ = await OAuthClientCredentialRepository.get_by_credential(session, credential_id)
             if occ is None:
                 raise ProviderError(f"No oauth_client_credentials for credential {credential_id!r}")
             client_secret = ctx.encryption.decrypt(occ.encrypted_client_secret)
-            return (
+            is_client_credentials = (
+                credential.type == StoredCredentialType.OAUTH2_CLIENT_CREDENTIALS
+            )
+            return _ClientMaterial(
                 occ.client_id,
-                occ.token_url,
+                # A templated host (Marketo's {munchkin}) takes the credential's values.
+                apply_server_variables(occ.token_url, credential.server_variables),
                 client_secret,
                 OAuthClientOptions.from_stored(occ.client_options),
+                (occ.scope or "") if is_client_credentials else None,
             )
 
     async def _post_client_token(

@@ -41,6 +41,7 @@ _MATERIAL_RELATIONSHIP: Mapping[str, str] = {
     StoredCredentialType.OAUTH2_AUTHORIZATION_CODE: "oauth_token",
     StoredCredentialType.OAUTH2_DEVICE_CODE: "oauth_token",
     StoredCredentialType.OAUTH2_IMPLICIT: "oauth_token",
+    StoredCredentialType.OAUTH2_REFRESH_TOKEN: "oauth_token",
     StoredCredentialType.AWS_SIGV4: "sigv4_credential",
 }
 

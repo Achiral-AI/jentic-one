@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from jentic_one.control.services.credentials.providers.base import (
-    NotConnectableError,
-    NotRefreshableError,
-)
+from jentic_one.control.services.credentials.providers.base import NotConnectableError
+from jentic_one.control.services.credentials.providers.direct_oauth2 import DirectOAuth2Provider
 from jentic_one.control.services.credentials.schemas.connect import (
     ConnectCallback,
     ConnectChallenge,
@@ -18,6 +16,7 @@ from jentic_one.control.services.credentials.schemas.provision import (
     ProvisionResult,
     RefreshResult,
 )
+from jentic_one.shared.config import DirectOAuth2ProviderConfig
 from jentic_one.shared.context import Context
 from jentic_one.shared.models.credentials import CredentialType
 
@@ -26,6 +25,13 @@ class StaticProvider:
     """Provider for statically-provisioned credentials (no OAuth flow)."""
 
     name: str = "static"
+
+    def __init__(self) -> None:
+        # Static oauth2 credentials carry their own client and token URL; the
+        # broker gets their tokens (client_credentials, refresh_token) the way
+        # a direct OAuth2 client does.
+        self._oauth2 = DirectOAuth2Provider(DirectOAuth2ProviderConfig())
+        self._expiry_skew_seconds = self._oauth2._expiry_skew_seconds
 
     @property
     def managed(self) -> bool:
@@ -69,4 +75,4 @@ class StaticProvider:
         *,
         token: OAuthTokenView,
     ) -> RefreshResult:
-        raise NotRefreshableError("StaticProvider does not support token refresh")
+        return await self._oauth2.refresh(ctx, token=token)

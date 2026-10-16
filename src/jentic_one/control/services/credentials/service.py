@@ -23,6 +23,7 @@ from jentic_one.control.repos import (
     CustomerAPIKeyRepository,
     OAuthAppRegistrationRepository,
     OAuthClientCredentialRepository,
+    OAuthTokenRepository,
     PermissionRuleSetRepository,
     Sigv4CredentialRepository,
     TokenValueCredentialRepository,
@@ -357,6 +358,19 @@ class CredentialService:
                                 if payload.client_options
                                 else None
                             ),
+                            created_by=identity.sub,
+                        )
+
+                    if payload.refresh_token:
+                        # oauth_tokens needs an access token; an empty one that
+                        # is already expired makes the broker exchange the
+                        # refresh token on first use.
+                        await OAuthTokenRepository.create(
+                            session,
+                            credential_id=credential.id,
+                            encrypted_access_token=encryption.encrypt(""),
+                            encrypted_refresh_token=encryption.encrypt(payload.refresh_token),
+                            expires_at=datetime.now(UTC),
                             created_by=identity.sub,
                         )
 
@@ -1440,6 +1454,7 @@ class CredentialService:
         elif wire_type == CredentialType.OAUTH2:
             is_auth_code = stored_type == StoredCredentialType.OAUTH2_AUTHORIZATION_CODE
             is_device_code = stored_type == StoredCredentialType.OAUTH2_DEVICE_CODE
+            is_refresh_token = stored_type == StoredCredentialType.OAUTH2_REFRESH_TOKEN
             # Device-flow credentials live on ``device_authorization_credentials``;
             # every other OAuth2 variant lives on ``oauth_client_credentials``.
             # Read from the right relation so the redacted view doesn't
@@ -1448,7 +1463,7 @@ class CredentialService:
             dfc = credential.device_authorization_credential if is_device_code else None
             occ = None if is_device_code else credential.oauth_client_credential
             connected: bool | None = None
-            if is_auth_code or is_device_code:
+            if is_auth_code or is_device_code or is_refresh_token:
                 # Managed providers (e.g. Pipedream) complete connect by
                 # stamping `provider_account_ref` without a local token row —
                 # the ref alone means the sign-in finished.
@@ -1472,6 +1487,8 @@ class CredentialService:
                 if is_device_code
                 else "authorization_code"
                 if is_auth_code
+                else "refresh_token"
+                if is_refresh_token
                 else "client_credentials"
             )
             details = OAuth2Redacted(
@@ -1554,6 +1571,15 @@ class CredentialService:
             # Device flow (RFC 8628) is a public-client flow — no secret.
             if payload.grant_type != "device_code" and not payload.client_secret:
                 raise InvalidCredentialInputError("Field 'client_secret' is required for oauth2")
+        if payload.type == CredentialType.OAUTH2:
+            if payload.grant_type == "refresh_token" and not payload.refresh_token:
+                raise InvalidCredentialInputError(
+                    "Field 'refresh_token' is required for the refresh_token grant"
+                )
+            if payload.refresh_token and payload.grant_type != "refresh_token":
+                raise InvalidCredentialInputError(
+                    "Field 'refresh_token' is only accepted with the refresh_token grant"
+                )
         elif payload.type == CredentialType.SIGV4:
             if not payload.access_key_id:
                 raise InvalidCredentialInputError("Field 'access_key_id' is required for sigv4")
