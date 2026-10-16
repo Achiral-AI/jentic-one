@@ -20,7 +20,10 @@ over plaintext to a non-loopback broker).
 from __future__ import annotations
 
 import json
+import math
 import uuid as uuid_mod
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from http import HTTPStatus
 from importlib.metadata import PackageNotFoundError, version
 from ipaddress import ip_address
@@ -302,9 +305,10 @@ def classify_broker_error(status: int, headers: httpx.Headers, body: bytes) -> T
     ``broker`` explicitly: 400/404/422 are what an upstream answers on a call
     that ran, so a missing header keeps the pass-through reading.
 
-    Two broker-origin statuses stay pass-through, because RESOLVE_FAILED means
-    "change the ask, don't retry" and both are retryable as sent: 429
-    (``rate_limit_exceeded``, with Retry-After) and every 5xx (#1531).
+    Two broker-origin statuses are excluded, because RESOLVE_FAILED means
+    "change the ask, don't retry" and both can be retryable as sent: 429
+    (``rate_limit_exceeded``, with Retry-After) and every 5xx.
+    :func:`classify_broker_transport_error` classifies those.
     """
     if not 400 <= status < 500 or status == 429 or status in _DENIAL_STATUSES:
         return None
@@ -338,6 +342,213 @@ def classify_broker_error(status: int, headers: httpx.Headers, body: bytes) -> T
         details=details,
         next_tool=next_tool,
         extra={"retryable": False},
+    )
+
+
+#: Recovery classes for a broker-origin 5xx/429 (Go:
+#: ``agentops.BrokerTransportRecovery``).
+RECOVER_WAIT = "wait"
+RECOVER_TIMEOUT = "timeout"
+RECOVER_SCHEME = "scheme"
+RECOVER_UNKNOWN = "unknown"
+
+#: The wire types the broker emits when it fails a call before the upstream
+#: could act on it, and that a later identical call can succeed on (Go:
+#: ``brokerTransientProblemTypes``): ``circuit_open`` (CircuitOpenError, 503 +
+#: Retry-After), ``runner_unavailable`` (RunnerUnavailableError, 503),
+#: ``server_at_capacity`` (the admission middleware's 503 + Retry-After),
+#: ``too_many_candidates`` (TooManyCandidatesError, 503: operation resolution
+#: overloaded, before dispatch), ``refresh_transient_error``
+#: (CredentialRefreshTransientError, 502: the token refresh failed before
+#: dispatch), ``upstream_connect_failed`` (UpstreamTimeoutError raised in the
+#: connect phase, 504: no request bytes were sent) and ``rate_limit_exceeded``
+#: (RateLimitExceededError, 429 + Retry-After).
+_BROKER_TRANSIENT_PROBLEM_TYPES = frozenset(
+    {
+        "circuit_open",
+        "runner_unavailable",
+        "server_at_capacity",
+        "too_many_candidates",
+        "refresh_transient_error",
+        "upstream_connect_failed",
+        "rate_limit_exceeded",
+    }
+)
+
+#: The wire types for a call the broker ran out of time on after sending it
+#: (Go: ``brokerTimeoutProblemTypes``): ``upstream_timeout``
+#: (UpstreamTimeoutError, 504: one attempt's read timed out) and
+#: ``deadline_exceeded`` (DeadlineExceededError, 504: the overall deadline).
+_BROKER_TIMEOUT_PROBLEM_TYPES = frozenset({"upstream_timeout", "deadline_exceeded"})
+
+
+def broker_transport_recovery(status: int, problem_type: str) -> str:
+    """Route a broker-origin 5xx/429 by status and exact problem type (Go:
+    ``agentops.BrokerTransportRecoveryFor``).
+
+    Any 429 is a wait. The timeout types may have reached the upstream.
+    ``runner_scheme_unsupported`` (RunnerSchemeUnsupportedError, 501) needs a
+    different operation. Everything else is unknown, including
+    ``upstream_response_too_large`` (UpstreamResponseTooLargeError, 502: the
+    upstream answered, so the call ran) and ``upstream_transport_error`` (the
+    connection failed mid-request).
+    """
+    if status == 429 or problem_type in _BROKER_TRANSIENT_PROBLEM_TYPES:
+        return RECOVER_WAIT
+    if problem_type in _BROKER_TIMEOUT_PROBLEM_TYPES:
+        return RECOVER_TIMEOUT
+    if problem_type == "runner_scheme_unsupported":
+        return RECOVER_SCHEME
+    return RECOVER_UNKNOWN
+
+
+def broker_transport_retryable(recovery: str, *, retry_safe: bool) -> bool:
+    """Whether re-sending the same call is safe (Go: ``BrokerTransportRetryable``).
+
+    A wait is always safe (the upstream never saw the call); a timeout only
+    when the call cannot double-execute; a scheme gap or an unknown failure
+    never.
+    """
+    if recovery == RECOVER_WAIT:
+        return True
+    if recovery == RECOVER_TIMEOUT:
+        return retry_safe
+    return False
+
+
+def effective_idempotency_key(headers: list[tuple[str, str]], idempotency_key: str | None) -> str:
+    """The ``Idempotency-Key`` value :func:`send_to_broker` puts on the wire.
+
+    A caller-supplied ``Idempotency-Key`` in ``headers`` wins over the
+    ``idempotency_key`` argument, exactly as :func:`send_to_broker` merges them
+    (Go reads the built request's header for the same reason).
+    """
+    values = [v.strip() for k, v in headers if k.strip().lower() == "idempotency-key"]
+    if values:
+        return values[-1]
+    return idempotency_key or ""
+
+
+def retry_safe(method: str, idempotency_key: str | None) -> bool:
+    """Whether re-sending a call cannot double-execute it (Go: ``agentops.RetrySafe``).
+
+    A GET/HEAD (case-insensitive), or a call carrying a non-blank
+    ``Idempotency-Key`` the broker de-duplicates on. Pass the key that rides the
+    wire (:func:`effective_idempotency_key`).
+    """
+    return bool((idempotency_key or "").strip()) or method.upper() in ("GET", "HEAD")
+
+
+def retry_after_seconds(headers: httpx.Headers) -> float | None:
+    """Parse ``Retry-After`` (Go: ``agentops.RetryAfterSeconds``).
+
+    Delta-seconds, or an HTTP-date converted to the seconds remaining (floored
+    at zero). ``None`` when absent or unparseable, so no made-up delay is relayed.
+    """
+    value = headers.get("Retry-After", "").strip()
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        pass
+    else:
+        if seconds < 0 or not math.isfinite(seconds):
+            return None
+        return int(seconds) if seconds.is_integer() else seconds
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max(0, math.ceil((when - datetime.now(UTC)).total_seconds()))
+
+
+def _broker_transport_actionable(
+    recovery: str, *, retryable: bool, retry_after: float | None
+) -> str:
+    """MCP-lane recovery prose for a broker transport failure (Go:
+    ``brokerTransportToolHint``)."""
+    wait = "Wait briefly" if retry_after is None else f"Wait retry_after_s ({retry_after}s)"
+    if recovery == RECOVER_WAIT:
+        return (
+            f"{wait} and re-send the same call: the broker refused it before it reached the "
+            "upstream API, so a retry cannot double-execute it. If it keeps failing, report it "
+            "to your user: the broker is degraded."
+        )
+    if recovery == RECOVER_TIMEOUT and retryable:
+        return (
+            f"{wait} and re-send the same call (it is a read or carries an idempotency_key, so a "
+            "retry cannot double-execute it)."
+        )
+    if recovery == RECOVER_SCHEME:
+        return (
+            "The broker has no runner for this upstream's URL scheme, so re-sending cannot "
+            "succeed. Call search_apis for an operation served over http(s)."
+        )
+    return (
+        "Do not re-send this call blindly: the broker failed it in a way that may have reached "
+        "the upstream API. Verify the effect with a read (execute_read) first, or re-send with "
+        "an idempotency_key so the broker de-duplicates the retry. If it keeps failing, report "
+        "it to your user."
+    )
+
+
+def classify_broker_transport_error(
+    status: int, headers: httpx.Headers, body: bytes, *, retry_safe: bool
+) -> ToolError | None:
+    """Broker transport-failure classification (Go: ``agentops.BrokerTransportError``
+    + ``executeBrokerTransportError``), #1531.
+
+    A 5xx or 429 the broker itself generated (circuit open, runner degraded,
+    admission shed, rate limit, refresh failure, timeout, deadline, response
+    size cap, scheme unsupported) is not an upstream answer, so it is a
+    TRANSPORT_ERROR, not a normal result. ``retryable`` is
+    earned from the problem type, and the broker's ``Retry-After`` rides as
+    ``retry_after_s`` when present.
+
+    The origin header decides, never the body: it must say ``broker``. A vendor
+    5xx the broker mirrored is stamped ``upstream`` and is the caller's data,
+    and a missing header keeps the same pass-through reading.
+    """
+    if (status < 500 and status != 429) or _error_origin(headers) != "broker":
+        return None
+    problem: dict[str, Any] = {}
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, dict):
+            problem = parsed
+    except ValueError:
+        pass
+    reason = _problem_reason({k: problem.get(k) for k in ("detail", "title")}, status)
+    raw_type = problem.get("type")
+    problem_type = raw_type if isinstance(raw_type, str) else ""
+    recovery = broker_transport_recovery(status, problem_type)
+    retryable = broker_transport_retryable(recovery, retry_safe=retry_safe)
+    retry_after = retry_after_seconds(headers)
+    details: dict[str, Any] = {"http_status": status, "origin": "broker", "retryable": retryable}
+    if problem_type:
+        details["problem_type"] = problem_type
+    extra: dict[str, Any] = {"retryable": retryable}
+    if retry_after is not None:
+        details["retry_after_s"] = retry_after
+        extra["retry_after_s"] = retry_after
+    logger.warning(
+        "mcp_broker_transport_error",
+        status=status,
+        problem_type=problem_type,
+        retryable=retryable,
+    )
+    return ToolError(
+        CODE_TRANSPORT_ERROR,
+        f"the broker could not complete this call (HTTP {status}): {reason}",
+        actionable=_broker_transport_actionable(
+            recovery, retryable=retryable, retry_after=retry_after
+        ),
+        details=details,
+        next_tool="search_apis" if recovery == RECOVER_SCHEME else "get_started",
+        extra=extra,
     )
 
 
