@@ -8,9 +8,10 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from jentic_one.registry.ingest.exc import IngestStageError
+from jentic_one.registry.ingest.errors import IngestStageError, RetryableFetchError
 from jentic_one.registry.ingest.fetch import UrlSource, load_specification
 from jentic_one.shared.config import EgressConfig, IngestConfig
+from tests.harness.http_doubles import CHUNK_SIZE, CountingChunkedStream, chunked_client
 
 _SPEC: dict[str, Any] = {
     "openapi": "3.1.0",
@@ -158,6 +159,29 @@ async def test_valid_redirect_followed_successfully() -> None:
 
 
 @pytest.mark.asyncio
+async def test_redirect_target_is_recorded_as_the_retrieval_url() -> None:
+    """Relative servers resolve against where the document was retrieved (RFC
+    3986 §5.1.3): the end of the redirect chain, here an http→https upgrade on
+    another host. ``source_url`` stays the URL that was asked for."""
+
+    def redirect_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "example.com":
+            return httpx.Response(
+                status_code=301,
+                headers={"location": "https://cdn.example.com/specs/openapi.json"},
+            )
+        return httpx.Response(status_code=200, content=_SPEC_BYTES)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(redirect_handler))
+    with patch("jentic_one.registry.ingest.fetch.httpx.AsyncClient") as mock_cls:
+        mock_cls.return_value = client
+        result = await load_specification(_url_source(url="http://example.com/openapi.json"))
+
+    assert result.source_url == "http://example.com/openapi.json"
+    assert result.retrieval_url == "https://cdn.example.com/specs/openapi.json"
+
+
+@pytest.mark.asyncio
 async def test_relative_redirect_resolved_via_urljoin() -> None:
     call_count = 0
 
@@ -271,3 +295,130 @@ async def test_metadata_ip_rejected_even_with_egress_allowlist() -> None:
         await load_specification(
             _url_source(url="http://169.254.169.254/latest/meta-data/"), config=cfg
         )
+
+
+# ── streamed body cap (chunked upstream, no Content-Length) ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_chunked_body_over_cap_stops_one_chunk_past_limit() -> None:
+    """A chunked spec larger than the cap is refused without being read in full."""
+    stream = CountingChunkedStream(n_chunks=1000)
+    cfg = IngestConfig(max_spec_bytes=4 * CHUNK_SIZE)
+    client = chunked_client(stream)  # built before patching httpx.AsyncClient
+    with patch("jentic_one.registry.ingest.fetch.httpx.AsyncClient") as mock_cls:
+        mock_cls.return_value = client
+        with pytest.raises(IngestStageError, match="size limit"):
+            await load_specification(_url_source(), config=cfg)
+    assert stream.served == 5
+    assert stream.closed
+
+
+@pytest.mark.asyncio
+async def test_chunked_body_under_cap_succeeds() -> None:
+    stream = CountingChunkedStream(n_chunks=1, chunk=_SPEC_BYTES)
+    cfg = IngestConfig(max_spec_bytes=4 * CHUNK_SIZE)
+    client = chunked_client(stream)  # built before patching httpx.AsyncClient
+    with patch("jentic_one.registry.ingest.fetch.httpx.AsyncClient") as mock_cls:
+        mock_cls.return_value = client
+        result = await load_specification(_url_source(), config=cfg)
+    assert result.sha == hashlib.sha256(_SPEC_BYTES).hexdigest()
+    assert result.content == _SPEC
+
+
+@pytest.mark.asyncio
+async def test_content_length_precheck_reads_no_body() -> None:
+    stream = CountingChunkedStream(n_chunks=10)
+    cfg = IngestConfig(max_spec_bytes=4 * CHUNK_SIZE)
+    client = chunked_client(stream, headers={"content-length": str(10 * CHUNK_SIZE)})
+    with patch("jentic_one.registry.ingest.fetch.httpx.AsyncClient") as mock_cls:
+        mock_cls.return_value = client
+        with pytest.raises(IngestStageError, match="size limit"):
+            await load_specification(_url_source(), config=cfg)
+    assert stream.served == 0
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected_type"),
+    [
+        pytest.param(httpx.ConnectError("connection refused"), RetryableFetchError, id="connect"),
+        pytest.param(httpx.ReadTimeout("timed out"), RetryableFetchError, id="timeout"),
+        pytest.param(
+            httpx.RemoteProtocolError("server disconnected"),
+            RetryableFetchError,
+            id="remote-protocol",
+        ),
+        pytest.param(
+            httpx.UnsupportedProtocol("unsupported protocol"),
+            IngestStageError,
+            id="unsupported-protocol",
+        ),
+        pytest.param(
+            httpx.LocalProtocolError("invalid local request"),
+            IngestStageError,
+            id="local-protocol",
+        ),
+        pytest.param(
+            httpx.DecodingError("corrupt response"),
+            IngestStageError,
+            id="decoding",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_http_exception_taxonomy(
+    exc: httpx.HTTPError, expected_type: type[IngestStageError]
+) -> None:
+    """Pins #2029: only transient HTTPX failures consume the import retry budget."""
+
+    def error_handler(request: httpx.Request) -> httpx.Response:
+        raise exc
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(error_handler))
+    with (
+        patch("jentic_one.registry.ingest.fetch.httpx.AsyncClient", return_value=client),
+        pytest.raises(expected_type) as exc_info,
+    ):
+        await load_specification(_url_source())
+
+    assert type(exc_info.value) is expected_type
+    assert exc_info.value.__cause__ is exc
+
+
+@pytest.mark.asyncio
+async def test_undecodable_stream_remains_deterministic() -> None:
+    """A corrupt compressed body is an unusable response, not a transient transport error."""
+    stream = CountingChunkedStream(n_chunks=1, chunk=b"not a gzip stream")
+    client = chunked_client(stream, headers={"content-encoding": "gzip"})
+
+    with (
+        patch("jentic_one.registry.ingest.fetch.httpx.AsyncClient", return_value=client),
+        pytest.raises(IngestStageError) as exc_info,
+    ):
+        await load_specification(_url_source())
+
+    assert type(exc_info.value) is IngestStageError
+    assert "corrupt compressed body" in str(exc_info.value)
+    assert stream.closed
+
+
+@pytest.mark.asyncio
+async def test_unexpected_application_error_is_not_relabelled_as_a_fetch_error() -> None:
+    """Application faults propagate for diagnostic handling instead of becoming fetch failures."""
+
+    class ApplicationError(Exception):
+        pass
+
+    exc = ApplicationError("unexpected application detail")
+
+    def error_handler(request: httpx.Request) -> httpx.Response:
+        raise exc
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(error_handler))
+    with (
+        patch("jentic_one.registry.ingest.fetch.httpx.AsyncClient", return_value=client),
+        pytest.raises(ApplicationError) as exc_info,
+    ):
+        await load_specification(_url_source())
+
+    assert exc_info.value is exc

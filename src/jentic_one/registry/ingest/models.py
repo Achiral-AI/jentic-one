@@ -46,6 +46,10 @@ class IngestSpecification(BaseModel):
     source_id: str | None = None
     source_type: ApiRevisionSourceType | None = None
     source_url: str | None = None
+    #: Where a URL source's redirect chain ended (the document's retrieval URI).
+    #: Relative server URLs resolve against it; ``source_url`` stays the URL the
+    #: caller asked for (provenance, catalog matching). ``None`` for inline sources.
+    retrieval_url: str | None = None
     source_filename: str | None = None
     submitted_by: str | None = None
     origin: str | None = None
@@ -71,13 +75,13 @@ class IngestSpecification(BaseModel):
     #: (which must capture the current revision as the new overlay's superseded target). NULL
     #: for non-overlay ingests. Server-set (never client-controlled), like ``supersede_active``.
     overlay_id: str | None = None
-    #: Operator approval for a server-host change (``credentials:write``), stamped by
+    #: Approval for a server-host change (``org:admin``), stamped by
     #: the scope-checked catalog enqueue path. Server-set, like ``supersede_active``.
     host_change_approved: bool = False
     #: Set by the ``Ingestor`` (never by a source) when this catalog ingest must not
     #: change the API's server hosts on its own: the API has bound credentials and
-    #: the change is not operator-approved. ``CreateRevisionStage`` then keeps a
-    #: host-changing revision as a DRAFT instead of making it current.
+    #: no organisation admin approved the change. ``CreateRevisionStage`` then keeps
+    #: a host-changing revision as a DRAFT instead of making it current.
     guard_host_change: bool = False
 
     def to_log_string(self) -> str:

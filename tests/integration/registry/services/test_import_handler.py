@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import delete, select, update
 
+from jentic_one.admin.core.schema.events import Event
 from jentic_one.registry.core.schema.api_revisions import ApiRevision
 from jentic_one.registry.core.schema.apis import Api
 from jentic_one.registry.core.schema.operation_url_index import OperationURLIndex
@@ -18,8 +20,9 @@ from jentic_one.registry.core.schema.overlays import Overlay
 from jentic_one.registry.core.schema.security_schemes import SecurityScheme, SecuritySchemeFlow
 from jentic_one.registry.core.schema.servers import Server, ServerVariable
 from jentic_one.registry.core.schema.spec_files import SpecFile
-from jentic_one.registry.ingest.exc import IngestJobError
+from jentic_one.registry.ingest.errors import IngestJobError
 from jentic_one.registry.repos.api_repo import ApiRepository
+from jentic_one.registry.repos.revision_repo import ApiRevisionRepository
 from jentic_one.registry.services.catalog.service import CatalogEntryView, CatalogService
 from jentic_one.registry.services.errors import (
     HostOwnedByOtherVendorError,
@@ -30,8 +33,12 @@ from jentic_one.registry.services.overlay_service import OverlayService
 from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.context import Context
 from jentic_one.shared.db.session import DatabaseSession
+from jentic_one.shared.models.events import EventType
+from tests.harness.http_doubles import spec_client
 
 pytestmark = pytest.mark.integration
+
+_IMPORT_SVC = "jentic_one.registry.services.import_overlay"
 
 MINIMAL_OPENAPI = json.dumps(
     {
@@ -99,13 +106,13 @@ async def test_reimport_identical_content_is_idempotent(
     }
 
     first = await handler.execute(
-        job_id=str(uuid.uuid4()), session=None, payload=payload, created_by="usr_test"
+        job_id=str(uuid.uuid4()), db=None, payload=payload, created_by="usr_test"
     )
     first_revision_id = first.body["revisions"][0]["revision_id"]
 
     # Re-import the exact same content — must succeed, not raise.
     second = await handler.execute(
-        job_id=str(uuid.uuid4()), session=None, payload=payload, created_by="usr_test"
+        job_id=str(uuid.uuid4()), db=None, payload=payload, created_by="usr_test"
     )
     second_revision = second.body["revisions"][0]
     assert second_revision["state"] == "draft"
@@ -146,7 +153,7 @@ async def test_reimport_after_sibling_failure_is_idempotent(
 
     await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={"sources": [good_source, bad_source]},
         created_by="usr_test",
     )
@@ -158,7 +165,7 @@ async def test_reimport_after_sibling_failure_is_idempotent(
     # Re-importing the same good content must not collide.
     result = await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={"sources": [good_source]},
         created_by="usr_test",
     )
@@ -195,7 +202,7 @@ async def test_reimport_over_active_revision_surfaces_readable_error(
     }
 
     first = await handler.execute(
-        job_id=str(uuid.uuid4()), session=None, payload=payload, created_by="usr_test"
+        job_id=str(uuid.uuid4()), db=None, payload=payload, created_by="usr_test"
     )
     revision_id = uuid.UUID(first.body["revisions"][0]["revision_id"])
 
@@ -208,7 +215,7 @@ async def test_reimport_over_active_revision_surfaces_readable_error(
 
     with pytest.raises(IngestJobError) as exc_info:
         await handler.execute(
-            job_id=str(uuid.uuid4()), session=None, payload=payload, created_by="usr_test"
+            job_id=str(uuid.uuid4()), db=None, payload=payload, created_by="usr_test"
         )
 
     message = str(exc_info.value)
@@ -226,7 +233,7 @@ async def test_execute_inline_source(
     handler = ImportHandler(integration_context)
     result = await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={
             "sources": [
                 {
@@ -266,7 +273,7 @@ async def test_partial_failure_skips_bad_source(
     handler = ImportHandler(integration_context)
     result = await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={
             "sources": [
                 {
@@ -306,7 +313,7 @@ async def test_all_sources_failing_raises(
     with pytest.raises(IngestJobError, match=r"all .* source.*failed"):
         await handler.execute(
             job_id=str(uuid.uuid4()),
-            session=None,
+            db=None,
             payload={
                 "sources": [
                     {
@@ -356,7 +363,7 @@ async def _import_base(
     """Import a base spec with the given origin (imported + promoted to current)."""
     result = await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={
             "sources": [
                 {
@@ -427,7 +434,7 @@ async def test_overlay_materialization_rewrites_served_spec_and_links_revision(
     )
     result = await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={
             "sources": [
                 {
@@ -513,7 +520,7 @@ async def test_overlay_rollback_restores_superseded_revision(
     # Materialize the overlay (the job the confirm would enqueue).
     result = await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={
             "sources": [
                 {
@@ -622,7 +629,7 @@ async def test_overlay_rollback_restores_published_base_as_published(
 
     await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={
             "sources": [
                 {
@@ -761,7 +768,7 @@ async def test_overlay_rollback_refused_when_another_vendor_now_serves_the_host(
     overlaid["servers"] = [{"url": "https://new.example.com"}]
     result = await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={
             "sources": [
                 {
@@ -839,7 +846,7 @@ async def _rematerialize_via_service(
     assert "overlaid_spec" in captured, "re-materialize did not enqueue a job"
     result = await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={
             "sources": [
                 {
@@ -982,7 +989,7 @@ async def _rematerialize_via_service_first(
     """Run the initial materialize job (confirm path) and flip the overlay to CONFIRMED."""
     result = await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={
             "sources": [
                 {
@@ -1072,7 +1079,7 @@ async def test_stacked_overlay_confirm_captures_prior_overlay_as_superseded(
     async def _materialize(overlay_id: str, url: str) -> uuid.UUID:
         result = await handler.execute(
             job_id=str(uuid.uuid4()),
-            session=None,
+            db=None,
             payload={
                 "sources": [
                     {
@@ -1170,7 +1177,7 @@ async def test_authorized_supersede_reimport_deprecates_overlay(
     # Materialize + confirm the overlay so it is the live served revision.
     result = await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={
             "sources": [
                 {
@@ -1230,7 +1237,7 @@ async def test_authorized_supersede_reimport_deprecates_overlay(
     # The scope-checked enqueue path stamps supersede_active + supersede_overlay_id.
     reimport = await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={
             "sources": [
                 {
@@ -1251,6 +1258,8 @@ async def test_authorized_supersede_reimport_deprecates_overlay(
     )
     new_revision_id = uuid.UUID(reimport.body["revisions"][0]["revision_id"])
     assert new_revision_id != overlay_revision_id
+    # Same API row and the overlay's revision was archived: the #1078 guard lets it through.
+    assert "supersede_skipped" not in reimport.body["revisions"][0]
 
     async with registry_db.session() as session:
         api = (await session.execute(select(Api).where(Api.id == api_id))).scalar_one()
@@ -1288,20 +1297,12 @@ async def test_authorized_supersede_reimport_deprecates_overlay(
     # raises DuplicateRevisionError — the real trigger _recover_supersede handles. This proves
     # _recover_supersede resolves identity by url (current_revision_for_source_url), not by a
     # vendor/name/version triple the real path never carries.
-    mock_response = AsyncMock()
-    mock_response.status_code = 200
-    mock_response.text = fresh_upstream
-    mock_response.content = fresh_upstream.encode()
-    mock_response.headers = {"content-length": str(len(fresh_upstream.encode()))}
-    mock_client = AsyncMock()
-    mock_client.get = AsyncMock(return_value=mock_response)
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client = spec_client(fresh_upstream)
 
     with patch("jentic_one.registry.ingest.fetch.httpx.AsyncClient", return_value=mock_client):
         retry = await handler.execute(
             job_id=str(uuid.uuid4()),
-            session=None,
+            db=None,
             payload={
                 "sources": [
                     {
@@ -1379,7 +1380,7 @@ async def test_supersede_deprecates_overlay_backing_archived_revision(
     # CONFIRMED and link confirmed_revision_id to the served revision (what confirm does).
     materialize = await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={
             "sources": [
                 {
@@ -1439,7 +1440,7 @@ async def test_supersede_deprecates_overlay_backing_archived_revision(
     )
     reimport = await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={
             "sources": [
                 {
@@ -1510,7 +1511,7 @@ async def test_supersede_deprecates_target_when_no_race(
 
     materialize = await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={
             "sources": [
                 {
@@ -1568,7 +1569,7 @@ async def test_supersede_deprecates_target_when_no_race(
     )
     await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={
             "sources": [
                 {
@@ -1635,7 +1636,7 @@ async def test_supersede_recovers_overlay_in_lazy_link_window(
 
     materialize = await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={
             "sources": [
                 {
@@ -1695,7 +1696,7 @@ async def test_supersede_recovers_overlay_in_lazy_link_window(
     )
     await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={
             "sources": [
                 {
@@ -1782,7 +1783,7 @@ async def test_supersede_falls_back_to_enqueue_id_when_no_backing_overlay(
     )
     await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={
             "sources": [
                 {
@@ -1809,6 +1810,609 @@ async def test_supersede_falls_back_to_enqueue_id_when_no_backing_overlay(
         # Fallback to the enqueue-time id deprecated it (no regression vs pre-#940).
         assert overlay_row.status == "deprecated"
         assert overlay_row.deprecated_reason == "superseded_by_reimport"
+
+
+def _spec(title: str, server: str) -> str:
+    """A one-operation OpenAPI document served from ``server``."""
+    return json.dumps(
+        {
+            "openapi": "3.1.0",
+            "info": {"title": title, "version": "1.0.0"},
+            "servers": [{"url": server}],
+            "paths": {
+                "/items": {
+                    "get": {
+                        "operationId": "listItems",
+                        "responses": {"200": {"description": "OK"}},
+                    }
+                }
+            },
+        }
+    )
+
+
+_CATALOG_URL = "https://catalog.example.com/base.json"
+_FRESH_UPSTREAM = _spec("PostHog", "https://upstream-fresh.example.com")
+
+
+async def _run_job(
+    handler: ImportHandler, payload: dict[str, Any], *, created_by: str = "usr_test"
+) -> Any:
+    """Run one import job through ``ImportHandler.execute``.
+
+    The worker database argument (unused by the import handler) is passed positionally so
+    the call does not depend on that parameter's name.
+    """
+    return await handler.execute(str(uuid.uuid4()), None, payload=payload, created_by=created_by)
+
+
+def _supersede_payload(overlay_id: str, *, vendor: str, name: str) -> dict[str, Any]:
+    """The authorized A4b catalog re-import the scope-checked enqueue path produces."""
+    return {
+        "sources": [
+            {
+                "type": "inline",
+                "content": _FRESH_UPSTREAM,
+                "filename": "openapi.json",
+                "vendor": vendor,
+                "api_name": name,
+                "version": "1.0.0",
+                "origin": "catalog",
+                "source_url": _CATALOG_URL,
+                "supersede_active": "true",
+            }
+        ],
+        "supersede_overlay_id": overlay_id,
+    }
+
+
+def _supersede_retry_payload(overlay_id: str, *, vendor: str, name: str) -> dict[str, Any]:
+    """The production-shaped retry of a supersede: a ``type:"url"`` source, no version."""
+    return {
+        "sources": [
+            {
+                "type": "url",
+                "url": _CATALOG_URL,
+                "vendor": vendor,
+                "api_name": name,
+                "origin": "catalog",
+                "source_url": _CATALOG_URL,
+                "supersede_active": "true",
+            }
+        ],
+        "supersede_overlay_id": overlay_id,
+    }
+
+
+async def _api_id(registry_db: DatabaseSession, name: str) -> uuid.UUID:
+    async with registry_db.session() as session:
+        return (await session.execute(select(Api.id).where(Api.name == name))).scalar_one()
+
+
+async def _confirmed_overlay(
+    handler: ImportHandler,
+    registry_db: DatabaseSession,
+    *,
+    vendor: str,
+    name: str,
+    linked: bool = True,
+) -> tuple[str, uuid.UUID]:
+    """Materialize a confirmed overlay on ``vendor/name``; returns (overlay id, its revision).
+
+    ``linked=False`` leaves ``confirmed_revision_id`` NULL (the lazy-link window).
+    """
+    api_id = await _api_id(registry_db, name)
+    async with registry_db.session() as session:
+        overlay = Overlay(
+            api_id=api_id, document=_OVERLAY_DOC, status="pending", created_by="usr_test"
+        )
+        session.add(overlay)
+        await session.commit()
+        overlay_id = overlay.id
+    materialize = await _run_job(
+        handler,
+        {
+            "sources": [
+                {
+                    "type": "inline",
+                    "content": _spec("PostHog", "https://overlaid.example.com"),
+                    "filename": "openapi.json",
+                    "vendor": vendor,
+                    "api_name": name,
+                    "version": "1.0.0",
+                    "origin": "overlay",
+                    "source_url": _CATALOG_URL,
+                }
+            ],
+            "overlay_id": overlay_id,
+        },
+    )
+    overlay_revision_id = uuid.UUID(materialize.body["revisions"][0]["revision_id"])
+    async with registry_db.session() as session:
+        await session.execute(
+            update(Overlay)
+            .where(Overlay.id == overlay_id)
+            .values(
+                status="confirmed",
+                confirmed_revision_id=overlay_revision_id if linked else None,
+            )
+        )
+        await session.commit()
+    return overlay_id, overlay_revision_id
+
+
+async def _overlay_deprecated_events(ctx: Context, overlay_id: str) -> list[Event]:
+    """``overlay.deprecated`` events in the admin DB for ``overlay_id``."""
+    async with ctx.admin_db.session() as session:
+        rows = (
+            (await session.execute(select(Event).where(Event.type == EventType.OVERLAY_DEPRECATED)))
+            .scalars()
+            .all()
+        )
+    return [row for row in rows if (row.data or {}).get("overlay_id") == overlay_id]
+
+
+async def _assert_overlay_still_confirmed(
+    ctx: Context,
+    registry_db: DatabaseSession,
+    overlay_id: str,
+    *,
+    api_id: uuid.UUID,
+    overlay_revision_id: uuid.UUID,
+) -> None:
+    """The overlay's revision is still served on its own row and the overlay reads CONFIRMED."""
+    async with registry_db.session() as session:
+        api = (await session.execute(select(Api).where(Api.id == api_id))).scalar_one()
+        assert api.current_revision_id == overlay_revision_id
+        overlay_rev = (
+            await session.execute(select(ApiRevision).where(ApiRevision.id == overlay_revision_id))
+        ).scalar_one()
+        assert overlay_rev.state == "imported"
+        overlay_row = (
+            await session.execute(select(Overlay).where(Overlay.id == overlay_id))
+        ).scalar_one()
+        assert overlay_row.status == "confirmed"
+        assert overlay_row.deprecated_at is None
+        assert overlay_row.deprecated_reason is None
+    assert await _overlay_deprecated_events(ctx, overlay_id) == []
+
+
+@pytest.mark.parametrize("overlay_linked", [True, False], ids=["linked", "lazy_link"])
+@pytest.mark.parametrize("clean_row_has_current_revision", [False, True])
+async def test_supersede_onto_different_api_row_leaves_overlay_confirmed(
+    integration_context: Context,
+    registry_db: DatabaseSession,
+    _clean_registry: None,
+    clean_row_has_current_revision: bool,
+    overlay_linked: bool,
+) -> None:
+    """#1078: a supersede re-import that lands on a *different* API row deprecates nothing.
+
+    Transition-window shape: a confirmed overlay serves a vendor-doubled row
+    (``posthog-com/posthog-com-posthog-api``) and the authorized A4b re-import resolves
+    the clean identity (``posthog-com/posthog-api``) — a different ``Api`` row. The ingest
+    archives only the clean row's active revision (if any), so the overlay's revision is
+    still served on the doubled row. The worker must leave the overlay CONFIRMED, emit no
+    ``overlay.deprecated`` event, and record the skip on the job result. Parametrized over
+    the resolver's two branches (the clean row has no current revision → nothing archived;
+    or has one → the archived revision has no backing overlay) and over the overlay's link:
+    with ``confirmed_revision_id`` NULL (lazy-link window) only the API check can tell the
+    overlay apart, since there is no linked revision to find still served.
+    """
+    handler = ImportHandler(integration_context)
+    await _import_base(
+        handler,
+        vendor="posthog-com",
+        name="posthog-com-posthog-api",
+        version="1.0.0",
+        origin="catalog",
+    )
+    if clean_row_has_current_revision:
+        await _import_base(
+            handler, vendor="posthog-com", name="posthog-api", version="1.0.0", origin="catalog"
+        )
+    doubled_api_id = await _api_id(registry_db, "posthog-com-posthog-api")
+    overlay_id, overlay_revision_id = await _confirmed_overlay(
+        handler,
+        registry_db,
+        vendor="posthog-com",
+        name="posthog-com-posthog-api",
+        linked=overlay_linked,
+    )
+
+    with patch(f"{_IMPORT_SVC}.record_overlay_supersede_skipped") as skipped_metric:
+        reimport = await _run_job(
+            handler,
+            _supersede_payload(overlay_id, vendor="posthog-com", name="posthog-api"),
+            created_by="usr_operator",
+        )
+    [revision] = reimport.body["revisions"]
+    assert revision["api"]["name"] == "posthog-api"
+    assert revision["supersede_skipped"] == "api_mismatch"
+    skipped_metric.assert_called_once_with("api_mismatch")
+    await _assert_overlay_still_confirmed(
+        integration_context,
+        registry_db,
+        overlay_id,
+        api_id=doubled_api_id,
+        overlay_revision_id=overlay_revision_id,
+    )
+
+
+async def _doubled_and_clean_rows(
+    handler: ImportHandler, registry_db: DatabaseSession
+) -> tuple[uuid.UUID, uuid.UUID, str, uuid.UUID]:
+    """A clean row and a vendor-doubled row both served from ``_CATALOG_URL``.
+
+    The confirmed overlay lives on the doubled row. The clean row is made the *oldest*, so
+    an unscoped oldest-first ``source_url`` lookup resolves the clean row — the row order
+    under which an unscoped recovery lookup picks the wrong API. Returns
+    ``(doubled_api_id, clean_api_id, overlay_id, overlay_revision_id)``.
+    """
+    await _import_base(
+        handler, vendor="posthog-com", name="posthog-api", version="1.0.0", origin="catalog"
+    )
+    await _import_base(
+        handler,
+        vendor="posthog-com",
+        name="posthog-com-posthog-api",
+        version="1.0.0",
+        origin="catalog",
+    )
+    clean_api_id = await _api_id(registry_db, "posthog-api")
+    doubled_api_id = await _api_id(registry_db, "posthog-com-posthog-api")
+    async with registry_db.session() as session:
+        await session.execute(
+            update(Api)
+            .where(Api.id == clean_api_id)
+            .values(created_at=datetime(2020, 1, 1, tzinfo=UTC))
+        )
+        await session.commit()
+    overlay_id, overlay_revision_id = await _confirmed_overlay(
+        handler, registry_db, vendor="posthog-com", name="posthog-com-posthog-api"
+    )
+    return doubled_api_id, clean_api_id, overlay_id, overlay_revision_id
+
+
+async def test_supersede_recovery_deprecates_when_fresh_upstream_landed_on_overlay_row(
+    integration_context: Context,
+    registry_db: DatabaseSession,
+    _clean_registry: None,
+) -> None:
+    """#1078: duplicate-on-retry recovery keys on the overlay's own API row.
+
+    The fresh upstream landed on the overlay's (doubled) row, but the clean row also serves
+    a catalog revision from the same ``source_url`` and is the oldest, so an unscoped
+    lookup resolves the clean row. Recovery must still find the supersede on the overlay's
+    own row and finish the interrupted deprecate instead of skipping it as an API mismatch.
+    """
+    handler = ImportHandler(integration_context)
+    doubled_api_id, clean_api_id, overlay_id, _ = await _doubled_and_clean_rows(
+        handler, registry_db
+    )
+    first = await _run_job(
+        handler,
+        _supersede_payload(overlay_id, vendor="posthog-com", name="posthog-com-posthog-api"),
+        created_by="usr_operator",
+    )
+    fresh_revision_id = uuid.UUID(first.body["revisions"][0]["revision_id"])
+    # The unscoped lookup resolves the *clean* row here — the order the recovery must not
+    # depend on.
+    async with registry_db.session() as session:
+        unscoped = await ApiRevisionRepository.current_revision_for_source_url(
+            session, _CATALOG_URL
+        )
+    assert unscoped is not None and unscoped[0] == clean_api_id
+
+    # Crash between the committed re-ingest and the separate-transaction deprecate.
+    async with registry_db.session() as session:
+        await session.execute(
+            update(Overlay)
+            .where(Overlay.id == overlay_id)
+            .values(status="confirmed", deprecated_at=None, deprecated_reason=None)
+        )
+        await session.commit()
+    with patch(
+        "jentic_one.registry.ingest.fetch.httpx.AsyncClient",
+        return_value=spec_client(_FRESH_UPSTREAM),
+    ):
+        retry = await _run_job(
+            handler,
+            _supersede_retry_payload(
+                overlay_id, vendor="posthog-com", name="posthog-com-posthog-api"
+            ),
+            created_by="usr_operator",
+        )
+
+    assert retry.body == {"revisions": []}
+    async with registry_db.session() as session:
+        api = (await session.execute(select(Api).where(Api.id == doubled_api_id))).scalar_one()
+        assert api.current_revision_id == fresh_revision_id
+        overlay_row = (
+            await session.execute(select(Overlay).where(Overlay.id == overlay_id))
+        ).scalar_one()
+        assert overlay_row.status == "deprecated"
+        assert overlay_row.deprecated_reason == "superseded_by_reimport"
+
+
+async def test_supersede_recovery_skips_when_fresh_upstream_landed_on_other_row(
+    integration_context: Context,
+    registry_db: DatabaseSession,
+    _clean_registry: None,
+) -> None:
+    """#1078: recovery of a supersede that landed on a different row leaves the overlay.
+
+    The fresh upstream landed on the clean row; the overlay's revision is still served on
+    the doubled row. The retry completes (the re-import's effect is durable) but records
+    ``supersede_skipped: api_mismatch`` and leaves the overlay CONFIRMED with no
+    ``overlay.deprecated`` event.
+    """
+    handler = ImportHandler(integration_context)
+    doubled_api_id, _, overlay_id, overlay_revision_id = await _doubled_and_clean_rows(
+        handler, registry_db
+    )
+    first = await _run_job(
+        handler,
+        _supersede_payload(overlay_id, vendor="posthog-com", name="posthog-api"),
+        created_by="usr_operator",
+    )
+    assert first.body["revisions"][0]["supersede_skipped"] == "api_mismatch"
+
+    with (
+        patch(
+            "jentic_one.registry.ingest.fetch.httpx.AsyncClient",
+            return_value=spec_client(_FRESH_UPSTREAM),
+        ),
+        patch(f"{_IMPORT_SVC}.record_overlay_supersede_skipped") as skipped_metric,
+    ):
+        retry = await _run_job(
+            handler,
+            _supersede_retry_payload(overlay_id, vendor="posthog-com", name="posthog-api"),
+            created_by="usr_operator",
+        )
+
+    assert retry.body == {"revisions": [], "supersede_skipped": "api_mismatch"}
+    skipped_metric.assert_called_once_with("api_mismatch")
+    await _assert_overlay_still_confirmed(
+        integration_context,
+        registry_db,
+        overlay_id,
+        api_id=doubled_api_id,
+        overlay_revision_id=overlay_revision_id,
+    )
+
+
+@pytest.mark.parametrize(
+    ("on_superseding_api", "linked_state", "expected_skip"),
+    [
+        # A different API row: skipped whatever the overlay's link says.
+        (False, "imported", "api_mismatch"),
+        (False, None, "api_mismatch"),
+        # Same API row, but the overlay's revision is still the served one.
+        (True, "imported", "revision_still_served"),
+        (True, "published", "revision_still_served"),
+        # Same API row and nothing of the overlay's is served: deprecate.
+        (True, "archived", None),
+        (True, "missing", None),
+        (True, None, None),
+    ],
+    ids=[
+        "mismatch_linked",
+        "mismatch_lazy_link",
+        "still_served_imported",
+        "still_served_published",
+        "archived",
+        "missing_revision",
+        "lazy_link",
+    ],
+)
+async def test_deprecate_superseded_overlay_guard(
+    integration_context: Context,
+    registry_db: DatabaseSession,
+    _clean_registry: None,
+    on_superseding_api: bool,
+    linked_state: str | None,
+    expected_skip: str | None,
+) -> None:
+    """#1078: the same-API guard on real rows — skip reason, overlay state, event, metric."""
+    handler = ImportHandler(integration_context)
+    async with registry_db.session() as session:
+        overlay_api = Api(vendor="guard-vendor", name="guard-api", version="1.0.0")
+        other_api = Api(vendor="guard-vendor", name="guard-other", version="1.0.0")
+        session.add_all([overlay_api, other_api])
+        await session.flush()
+        confirmed_revision_id: uuid.UUID | None = None
+        if linked_state == "missing":
+            confirmed_revision_id = uuid.uuid4()
+        elif linked_state is not None:
+            revision = ApiRevision(
+                api_id=overlay_api.id, state=linked_state, spec_digest="sha256:guard"
+            )
+            session.add(revision)
+            await session.flush()
+            confirmed_revision_id = revision.id
+        overlay = Overlay(
+            api_id=overlay_api.id,
+            document=_OVERLAY_DOC,
+            status="confirmed",
+            confirmed_revision_id=confirmed_revision_id,
+            created_by="usr_author",
+        )
+        session.add(overlay)
+        await session.commit()
+        overlay_id = overlay.id
+        superseding_api_id = overlay_api.id if on_superseding_api else other_api.id
+
+    with (
+        patch(f"{_IMPORT_SVC}.record_overlay_supersede_skipped") as skipped_metric,
+        patch(f"{_IMPORT_SVC}.record_overlay_auto_deprecated") as deprecated_metric,
+    ):
+        skipped = await handler._deprecate_superseded_overlay(
+            "job-guard",
+            overlay_id,
+            superseding_api_id=superseding_api_id,
+            actor_id="usr_operator",
+            actor_type="user",
+        )
+
+    assert skipped == expected_skip
+    async with registry_db.session() as session:
+        row = (await session.execute(select(Overlay).where(Overlay.id == overlay_id))).scalar_one()
+    events = await _overlay_deprecated_events(integration_context, overlay_id)
+    if expected_skip is None:
+        assert row.status == "deprecated"
+        assert row.deprecated_reason == "superseded_by_reimport"
+        assert len(events) == 1
+        deprecated_metric.assert_called_once_with()
+        skipped_metric.assert_not_called()
+    else:
+        assert row.status == "confirmed"
+        assert row.deprecated_at is None
+        assert events == []
+        deprecated_metric.assert_not_called()
+        skipped_metric.assert_called_once_with(expected_skip)
+
+
+async def test_deprecate_superseded_overlay_cas_rejects_relink_after_guard(
+    integration_context: Context,
+    registry_db: DatabaseSession,
+    _clean_registry: None,
+) -> None:
+    """#1078: a relink that lands between the guard's read and the demote blocks the demote.
+
+    The guard sees the overlay's revision archived; before the CAS runs, the overlay is
+    relinked to a fresh, active revision (what a concurrent re-materialize commits). The
+    CAS re-checks the linked revision and the served state, so the overlay stays
+    CONFIRMED and no event is emitted.
+    """
+    handler = ImportHandler(integration_context)
+    async with registry_db.session() as session:
+        api = Api(vendor="cas-vendor", name="cas-api", version="1.0.0")
+        session.add(api)
+        await session.flush()
+        archived = ApiRevision(api_id=api.id, state="archived", spec_digest="sha256:old")
+        rematerialized = ApiRevision(api_id=api.id, state="imported", spec_digest="sha256:new")
+        session.add_all([archived, rematerialized])
+        await session.flush()
+        overlay = Overlay(
+            api_id=api.id,
+            document=_OVERLAY_DOC,
+            status="confirmed",
+            confirmed_revision_id=archived.id,
+            created_by="usr_author",
+        )
+        session.add(overlay)
+        await session.commit()
+        overlay_id, api_id, rematerialized_id = overlay.id, api.id, rematerialized.id
+
+    guard = ImportHandler._supersede_skip_reason
+
+    async def _guard_then_relink(
+        session: Any, overlay: Overlay | None, superseding_api_id: uuid.UUID | None
+    ) -> Any:
+        reason = await guard(session, overlay, superseding_api_id)
+        await session.execute(
+            update(Overlay)
+            .where(Overlay.id == overlay_id)
+            .values(confirmed_revision_id=rematerialized_id)
+            # Leave the guard's loaded overlay as it read it, like a separate transaction.
+            .execution_options(synchronize_session=False)
+        )
+        return reason
+
+    with patch.object(ImportHandler, "_supersede_skip_reason", staticmethod(_guard_then_relink)):
+        skipped = await handler._deprecate_superseded_overlay(
+            "job-cas",
+            overlay_id,
+            superseding_api_id=api_id,
+            actor_id="usr_operator",
+            actor_type="user",
+        )
+
+    assert skipped is None
+    async with registry_db.session() as session:
+        row = (await session.execute(select(Overlay).where(Overlay.id == overlay_id))).scalar_one()
+    assert row.status == "confirmed"
+    assert row.confirmed_revision_id == rematerialized_id
+    assert await _overlay_deprecated_events(integration_context, overlay_id) == []
+
+
+async def test_deprecate_superseded_overlay_cas_rejects_unlinked_rematerialize(
+    integration_context: Context,
+    registry_db: DatabaseSession,
+    _clean_registry: None,
+) -> None:
+    """#1078: a re-materialize committed as current but not yet linked blocks the demote.
+
+    The overlay still links its archived revision, so the guard and every overlay-row
+    CAS predicate pass. Between the guard and the CAS, a re-materialize's ingest makes a
+    fresh overlay-origin revision the API's current one (its relink is a later,
+    separate step). The CAS checks the API row's current revision, so the overlay stays
+    CONFIRMED and no event is emitted; the later relink then points a CONFIRMED overlay
+    at its served revision.
+    """
+    handler = ImportHandler(integration_context)
+    async with registry_db.session() as session:
+        api = Api(vendor="rm-vendor", name="rm-api", version="1.0.0")
+        session.add(api)
+        await session.flush()
+        archived = ApiRevision(
+            api_id=api.id, state="archived", origin="overlay", spec_digest="sha256:old"
+        )
+        rematerialized = ApiRevision(
+            api_id=api.id, state="archived", origin="overlay", spec_digest="sha256:new"
+        )
+        session.add_all([archived, rematerialized])
+        await session.flush()
+        overlay = Overlay(
+            api_id=api.id,
+            document=_OVERLAY_DOC,
+            status="confirmed",
+            confirmed_revision_id=archived.id,
+            created_by="usr_author",
+        )
+        session.add(overlay)
+        await session.commit()
+        overlay_id, api_id, rematerialized_id = overlay.id, api.id, rematerialized.id
+        archived_id = archived.id
+
+    guard = ImportHandler._supersede_skip_reason
+
+    async def _guard_then_rematerialize(
+        session: Any, overlay: Overlay | None, superseding_api_id: uuid.UUID | None
+    ) -> Any:
+        reason = await guard(session, overlay, superseding_api_id)
+        await session.execute(
+            update(ApiRevision)
+            .where(ApiRevision.id == rematerialized_id)
+            .values(state="imported")
+            .execution_options(synchronize_session=False)
+        )
+        await session.execute(
+            update(Api)
+            .where(Api.id == api_id)
+            .values(current_revision_id=rematerialized_id)
+            .execution_options(synchronize_session=False)
+        )
+        return reason
+
+    with patch.object(
+        ImportHandler, "_supersede_skip_reason", staticmethod(_guard_then_rematerialize)
+    ):
+        skipped = await handler._deprecate_superseded_overlay(
+            "job-rm",
+            overlay_id,
+            superseding_api_id=api_id,
+            actor_id="usr_operator",
+            actor_type="user",
+        )
+
+    assert skipped is None
+    async with registry_db.session() as session:
+        row = (await session.execute(select(Overlay).where(Overlay.id == overlay_id))).scalar_one()
+    assert row.status == "confirmed"
+    assert row.confirmed_revision_id == archived_id
+    assert await _overlay_deprecated_events(integration_context, overlay_id) == []
 
 
 async def test_deprecate_superseded_overlay_is_idempotent_under_repeat(
@@ -1893,7 +2497,7 @@ async def test_overlay_materialization_archives_active_revision_of_other_origin(
     )
     result = await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={
             "sources": [
                 {
@@ -1973,7 +2577,7 @@ async def test_overlay_materialization_supersedes_published_base(
     )
     result = await handler.execute(
         job_id=str(uuid.uuid4()),
-        session=None,
+        db=None,
         payload={
             "sources": [
                 {
@@ -2069,7 +2673,7 @@ async def test_overlay_materialization_recovers_link_on_duplicate_reingest(
 
     # First materialize job: produces the overlay revision + link.
     first = await handler.execute(
-        job_id=str(uuid.uuid4()), session=None, payload=job_payload, created_by="usr_test"
+        job_id=str(uuid.uuid4()), db=None, payload=job_payload, created_by="usr_test"
     )
     materialized_rev = uuid.UUID(first.body["revisions"][0]["revision_id"])
     superseded_rev = uuid.UUID(first.body["revisions"][0]["superseded_revision_id"])
@@ -2087,7 +2691,7 @@ async def test_overlay_materialization_recovers_link_on_duplicate_reingest(
 
     # Second (recovery) job with identical content: re-ingest dedupes, handler recovers.
     second = await handler.execute(
-        job_id=str(uuid.uuid4()), session=None, payload=job_payload, created_by="usr_test"
+        job_id=str(uuid.uuid4()), db=None, payload=job_payload, created_by="usr_test"
     )
     # No new revision produced, but the job did not fail.
     assert second.body["revisions"] == []
@@ -2108,22 +2712,13 @@ async def test_url_source_via_mock(
     _clean_registry: None,
 ) -> None:
     """URL source succeeds when the HTTP fetch is mocked."""
-    mock_response = AsyncMock()
-    mock_response.status_code = 200
-    mock_response.text = MINIMAL_OPENAPI
-    mock_response.content = MINIMAL_OPENAPI.encode()
-    mock_response.headers = {"content-length": str(len(MINIMAL_OPENAPI.encode()))}
-
-    mock_client = AsyncMock()
-    mock_client.get = AsyncMock(return_value=mock_response)
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client = spec_client(MINIMAL_OPENAPI)
 
     with patch("jentic_one.registry.ingest.fetch.httpx.AsyncClient", return_value=mock_client):
         handler = ImportHandler(integration_context)
         result = await handler.execute(
             job_id=str(uuid.uuid4()),
-            session=None,
+            db=None,
             payload={
                 "sources": [
                     {
@@ -2146,20 +2741,6 @@ async def test_url_source_via_mock(
     async with registry_db.session() as session:
         rows = (await session.execute(select(ApiRevision))).unique().scalars().all()
         assert len(rows) == 1
-
-
-def _mock_spec_client(spec_text: str) -> AsyncMock:
-    """An httpx.AsyncClient double serving ``spec_text`` for any GET."""
-    mock_response = AsyncMock()
-    mock_response.status_code = 200
-    mock_response.text = spec_text
-    mock_response.content = spec_text.encode()
-    mock_response.headers = {"content-length": str(len(spec_text.encode()))}
-    mock_client = AsyncMock()
-    mock_client.get = AsyncMock(return_value=mock_response)
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=None)
-    return mock_client
 
 
 async def test_catalog_import_lands_clean_identity_from_sub_segment(
@@ -2189,11 +2770,11 @@ async def test_catalog_import_lands_clean_identity_from_sub_segment(
 
     with patch(
         "jentic_one.registry.ingest.fetch.httpx.AsyncClient",
-        return_value=_mock_spec_client(MINIMAL_OPENAPI),
+        return_value=spec_client(MINIMAL_OPENAPI),
     ):
         result = await ImportHandler(integration_context).execute(
             job_id=str(uuid.uuid4()),
-            session=None,
+            db=None,
             payload={"sources": [source]},
             created_by="usr_test",
         )
@@ -2234,13 +2815,13 @@ async def test_catalog_identity_conflict_surfaces_as_readable_job_failure(
     with (
         patch(
             "jentic_one.registry.ingest.fetch.httpx.AsyncClient",
-            return_value=_mock_spec_client(MINIMAL_OPENAPI),
+            return_value=spec_client(MINIMAL_OPENAPI),
         ),
         pytest.raises(IngestJobError, match="catalog identity conflict"),
     ):
         await ImportHandler(integration_context).execute(
             job_id=str(uuid.uuid4()),
-            session=None,
+            db=None,
             payload={
                 "sources": [
                     {
@@ -2283,11 +2864,11 @@ async def test_catalog_reimport_keeps_pre_existing_doubled_identity(
     # vendor-doubled `posthog-com-posthog-api`.
     with patch(
         "jentic_one.registry.ingest.fetch.httpx.AsyncClient",
-        return_value=_mock_spec_client(MINIMAL_OPENAPI),
+        return_value=spec_client(MINIMAL_OPENAPI),
     ):
         await ImportHandler(integration_context).execute(
             job_id=str(uuid.uuid4()),
-            session=None,
+            db=None,
             payload={
                 "sources": [
                     {
@@ -2327,11 +2908,11 @@ async def test_catalog_reimport_keeps_pre_existing_doubled_identity(
     updated_spec["paths"]["/items"]["get"]["summary"] = "List all items"
     with patch(
         "jentic_one.registry.ingest.fetch.httpx.AsyncClient",
-        return_value=_mock_spec_client(json.dumps(updated_spec)),
+        return_value=spec_client(json.dumps(updated_spec)),
     ):
         await ImportHandler(integration_context).execute(
             job_id=str(uuid.uuid4()),
-            session=None,
+            db=None,
             payload={"sources": [source]},
             created_by="usr_test",
         )
@@ -2360,11 +2941,11 @@ async def test_catalog_reimport_after_spec_url_move_keeps_identity_by_catalog_id
     """
     with patch(
         "jentic_one.registry.ingest.fetch.httpx.AsyncClient",
-        return_value=_mock_spec_client(MINIMAL_OPENAPI),
+        return_value=spec_client(MINIMAL_OPENAPI),
     ):
         await ImportHandler(integration_context).execute(
             job_id=str(uuid.uuid4()),
-            session=None,
+            db=None,
             payload={
                 "sources": [
                     {
@@ -2398,11 +2979,11 @@ async def test_catalog_reimport_after_spec_url_move_keeps_identity_by_catalog_id
     updated_spec["paths"]["/items"]["get"]["summary"] = "List all items"
     with patch(
         "jentic_one.registry.ingest.fetch.httpx.AsyncClient",
-        return_value=_mock_spec_client(json.dumps(updated_spec)),
+        return_value=spec_client(json.dumps(updated_spec)),
     ):
         await ImportHandler(integration_context).execute(
             job_id=str(uuid.uuid4()),
-            session=None,
+            db=None,
             payload={"sources": [source]},
             created_by="usr_test",
         )
@@ -2439,3 +3020,85 @@ async def test_upsert_keeps_current_revision_loaded_in_the_session(
         assert again is not None
         assert again.current_revision is not None
         assert again.current_revision.id == locked.current_revision_id
+
+
+async def test_supersede_gate_scopes_to_the_identity_the_reimport_lands_on(
+    integration_context: Context,
+    registry_db: DatabaseSession,
+    _clean_registry: None,
+) -> None:
+    """#1078: the A4b gate and identity resolution pick the same row.
+
+    The overlay lives on the doubled row, which carries the stored ``catalog_api_id``, so
+    the re-import lands there. An older clean sibling serves a catalog revision from the
+    same ``spec_url``, so an unscoped oldest-first lookup would resolve the sibling, find
+    no overlay and skip the ``supersede_active`` stamp; the ingest on the doubled row
+    would then fail on ``ix_api_revisions_one_active``.
+    """
+    handler = ImportHandler(integration_context)
+    doubled_api_id, clean_api_id, overlay_id, _ = await _doubled_and_clean_rows(
+        handler, registry_db
+    )
+    async with registry_db.session() as session:
+        await session.execute(
+            update(Api)
+            .where(Api.id == doubled_api_id)
+            .values(catalog_api_id="posthog.com/posthog-api")
+        )
+        await session.commit()
+    async with registry_db.session() as session:
+        unscoped = await ApiRevisionRepository.current_revision_for_source_url(
+            session, _CATALOG_URL
+        )
+    assert unscoped is not None and unscoped[0] == clean_api_id
+
+    entry = CatalogEntryView(
+        api_id="posthog.com/posthog-api",
+        vendor="posthog.com",
+        path=None,
+        spec_url=_CATALOG_URL,
+        github_url=None,
+        registered=True,
+    )
+    svc = CatalogService(integration_context)
+    operator = Identity(sub="usr_operator", email="o@test.com", permissions=["overlays:confirm"])
+    source = await svc._import_source_for(entry, operator)
+    assert (source["vendor"], source["api_name"]) == ("posthog-com", "posthog-com-posthog-api")
+    assert await svc._authorize_overlay_supersede(entry, operator) == overlay_id
+
+
+async def test_import_job_result_reports_server_url_changes(
+    integration_context: Context,
+    _clean_registry: None,
+) -> None:
+    """The importer sees which declared servers ingest rewrote or dropped (#1241),
+    so a server the stored spec no longer carries is never a silent change."""
+    content = json.loads(MINIMAL_OPENAPI)
+    content["servers"] = [{"url": "https://items.example.com/v1"}, {"url": "/v1"}]
+    payload = {
+        "sources": [
+            {
+                "type": "inline",
+                "content": json.dumps(content),
+                "filename": "openapi.json",
+                "vendor": "servers-vendor",
+                "api_name": "servers-api",
+                "version": "1.0.0",
+            }
+        ]
+    }
+
+    # The DB handle is passed positionally so the call does not depend on its
+    # parameter name.
+    result = await ImportHandler(integration_context).execute(
+        str(uuid.uuid4()), None, payload=payload, created_by="usr_test"
+    )
+
+    assert result.body["revisions"][0]["server_url_changes"] == {
+        "resolved": [],
+        "resolved_count": 0,
+        "dropped": ["/v1"],
+        "dropped_count": 1,
+        "unresolved": [],
+        "unresolved_count": 0,
+    }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import and_, or_, select
@@ -10,9 +11,11 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from jentic_one.control.core.schema.connect_sessions import ConnectSession
 from jentic_one.control.core.schema.credentials import Credential
+from jentic_one.control.repos.prerequisite_repo import AgentVisibility
 from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.auth.permission_catalog import (
     ORG_ADMIN,
+    OWNER_AGENTS_READ,
     OWNER_CREDENTIALS_READ,
 )
 
@@ -38,6 +41,39 @@ _DELEGATION_PERMISSIONS: dict[type[Any], str] = {
 # only — never widened through ``parent_actor_id`` delegation.
 _OWNED_AGENT_MODELS: frozenset[type[Any]] = frozenset({ConnectSession, Credential})
 
+_EXTRA_OWNER_COLUMNS: dict[type[Any], tuple[Any, ...]] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class ScopedModelSpec:
+    """Read-only scoping metadata for one owner-scoped control ORM model."""
+
+    table: str
+    model: str
+    owner_columns: tuple[str, ...]
+    id_column: str | None
+    delegation_permission: str | None
+    owned_agent_axis: bool
+
+
+def scoped_model_specs() -> tuple[ScopedModelSpec, ...]:
+    """Return read-only scoping specs for every owner-scoped control ORM model."""
+    return tuple(
+        ScopedModelSpec(
+            table=model.__tablename__,
+            model=f"{model.__module__}.{model.__qualname__}",
+            owner_columns=(
+                col.key,
+                *(extra.key for extra in _EXTRA_OWNER_COLUMNS.get(model, ())),
+            ),
+            id_column=None,
+            delegation_permission=_DELEGATION_PERMISSIONS.get(model),
+            owned_agent_axis=model in _OWNED_AGENT_MODELS,
+        )
+        for model, col in _OWNER_MODELS.items()
+    )
+
+
 # Session states that still hold a pending credential. Mirrors
 # ``connect_session_repo.LIVE_STATES`` (kept local so this module imports
 # only ORM models; a unit test pins the two together).
@@ -59,16 +95,51 @@ AccessFilterProvider = Callable[[Identity, type], "ColumnElement[bool] | None"]
 _ACCESS_FILTER_PROVIDERS: list[AccessFilterProvider] = []
 
 
+def own_agent_visibility(identity: Identity) -> AgentVisibility:
+    """The agents a caller may enumerate on its own account.
+
+    Its own agents and itself (when the caller is an agent), plus its owner's
+    agents when it holds ``owner:agents:read`` — the same agent visibility the
+    admin surface applies. The tail of :func:`bound_agent_visibility`, which a
+    caller that has already ruled out admin and creator reaches directly.
+    """
+    owner_ids = [identity.sub]
+    if OWNER_AGENTS_READ in identity.permissions and identity.parent_actor_id is not None:
+        owner_ids.append(identity.parent_actor_id)
+    return AgentVisibility(self_id=identity.sub, owner_ids=tuple(owner_ids))
+
+
+def bound_agent_visibility(
+    credential_created_by: str | None, identity: Identity
+) -> AgentVisibility | None:
+    """Bound agents the caller may enumerate on a credential; ``None`` means all.
+
+    ``org:admin`` and the credential's creator see every bound agent. Anyone
+    else sees what :func:`own_agent_visibility` allows. Shared by every surface
+    that names the agents a credential reaches, so one rule governs them all.
+    """
+    if ORG_ADMIN in identity.permissions:
+        return None
+    if credential_created_by is not None and credential_created_by == identity.sub:
+        return None
+    return own_agent_visibility(identity)
+
+
 def register_access_filter_provider(provider: AccessFilterProvider) -> None:
     """Register an extra READ-only visibility-clause provider (idempotent).
 
     Call at import time from a registering package (see the enterprise
     ``register()``). The clause a provider returns is OR-merged into the caller's
-    owner-scoped read filter. Any table the clause references must be readable by
-    the control DB role (i.e. live in the ``control`` schema).
+    owner-scoped read filter. Any table the clause references may live in any
+    schema the control DB role has ``SELECT`` on (deployments must grant it).
     """
     if provider not in _ACCESS_FILTER_PROVIDERS:
         _ACCESS_FILTER_PROVIDERS.append(provider)
+
+
+def access_filter_providers() -> tuple[AccessFilterProvider, ...]:
+    """Return a read-only snapshot of registered extra access-filter providers."""
+    return tuple(_ACCESS_FILTER_PROVIDERS)
 
 
 def _provider_clauses(identity: Identity, model: type[Any]) -> list[ColumnElement[bool]]:
@@ -134,13 +205,20 @@ def build_access_filters(
     bound_credential_ids: list[str] | None = None,
     owned_agent_ids: list[str] | None = None,
     include_shared: bool = False,
+    for_write: bool = False,
 ) -> list[ColumnElement[bool]]:
     """Build SQLAlchemy filter expressions scoping queries to the caller's visibility.
 
     Rules (evaluated in order):
     1. org:admin -> no restriction (empty list).
-    2. Agent with delegation scope + parent_actor_id -> OR filter.
+    2. Agent with delegation scope + parent_actor_id -> OR filter (reads only).
     3. Otherwise -> owner == self.
+
+    ``for_write=True`` builds the filter for a mutation: owner == self only.
+    Owner delegation (``owner:<resource>:read``) is a read permission, so it
+    lets an agent see its owner's rows but never change them. A write filter
+    takes none of the read widenings below; passing one is a programming
+    error (ValueError).
 
     ``bound_credential_ids`` widens visibility for the ``Credential`` model:
     an agent may always read a credential it holds an active (non-suspended)
@@ -170,6 +248,9 @@ def build_access_filters(
 
     Raises ValueError for an unknown model or empty sub.
     """
+    if for_write and (bound_credential_ids or owned_agent_ids or include_shared):
+        raise ValueError("read-only visibility widening passed to a write filter")
+
     if ORG_ADMIN in identity.permissions:
         return []
 
@@ -180,7 +261,8 @@ def build_access_filters(
         col = _OWNER_MODELS[model]
         delegation_permission = _DELEGATION_PERMISSIONS.get(model)
         if (
-            delegation_permission is not None
+            not for_write
+            and delegation_permission is not None
             and delegation_permission in identity.permissions
             and identity.parent_actor_id is not None
         ):

@@ -74,6 +74,16 @@ Results of async executions are polled through the jobs API
 (`GET /jobs/{job_id}`, `GET /jobs/{job_id}/result`) or the
 `get_execution_result` MCP tool.
 
+Async and held jobs persist only the end-to-end headers in `REPLAY_HEADERS`
+and vendor `*-version` headers accepted by `is_replay_header` in
+[`broker/core/proxy_headers.py`](../../src/jentic_one/broker/core/proxy_headers.py).
+Other vendor-specific headers are supported only on synchronous execution.
+Callers that depend on an unlisted header must use the synchronous path: queued
+execution does not persist arbitrary values that may contain credentials, such as
+`X-Api-Key`, in plaintext. Cookies are captured separately as ciphertext, and
+hop-by-hop, broker-consumed, spoofable, framing, and caller authorization headers
+are always excluded.
+
 ## The Broker protocol and `DefaultBroker`
 
 [`shared/broker/broker.py`](../../src/jentic_one/shared/broker/broker.py) defines the `Broker` protocol — `execute()`
@@ -113,7 +123,8 @@ DeadlineRunner( RetryRunner( CircuitBreakerRunner( SigV4SigningRunner( HttpRunne
   bulkhead, mid-stream response-size cap, raw-byte streaming.
 
 At the web edge, admission control sheds load when too many requests are in
-flight ([`broker/web/middleware.py`](../../src/jentic_one/broker/web/middleware.py)) and a per-caller rate limiter answers
+flight ([`broker/web/middleware.py`](../../src/jentic_one/broker/web/middleware.py); a request counts until its
+response is complete, not through any post-response background work) and a per-caller rate limiter answers
 `429` with `RateLimit-*` headers ([`broker/web/deps.py`](../../src/jentic_one/broker/web/deps.py)).
 
 ## Egress controls
@@ -131,6 +142,28 @@ Two layers keep the proxy from being used against the network it runs in:
 
 Validation runs again after server-variable substitution, in both the sync
 and async callers, so an injected variable cannot smuggle in a new host.
+
+The platform's own OAuth calls (credential and OAuth app `token_url` /
+`authorize_url` checks, the endpoints an approver confirms for their own
+client on a connect session, token exchange and refresh, device authorization,
+the identity probe) use the same two layers under `control.egress`, and always
+pin DNS. `control.egress` holds only `allowed_private_subnets` and
+`allowed_internal_domains`; each one left unset is taken from `broker.egress`,
+so an in-network token endpoint allowlisted for the broker is reachable for
+these calls too. Set a key to give these calls a different value (`[]` blocks
+every private range for them even when the broker allows one).
+
+The policy is read by whichever process makes the call. The control surface
+makes the credential and OAuth app writes, the connect-session confirm, the
+code exchange, device authorization and the identity probe; the **broker
+surface** makes the token refresh it runs before injecting an OAuth2
+credential, under its own `control.egress` (inherited from its own
+`broker.egress`). In a combined deployment that is one config. With one process
+per surface, set `control.egress`, and the `broker.egress` keys it inherits,
+identically on the control and broker surfaces; otherwise a token endpoint
+accepted at create time can be refused at refresh (or the reverse), and a
+narrower `control.egress` set on the control surface alone does not constrain
+the refreshes the broker sends.
 
 ## Credential injection
 
@@ -159,10 +192,16 @@ credentials the caller may use for the call — a single cross-DB lookup
 intersecting the agent's credential bindings (admin DB) with the active
 credentials covering the API (control DB); none → `403
 no_credential_binding` (or `403 credential_identity_mismatch` when a bound
-credential is a near-miss), several → resolution disambiguates (or asks for
+credential is a near-miss, `403 credential_binding_suspended` when the
+agent's binding covering the API is suspended), several → resolution disambiguates (or asks for
 `Jentic-Credential-Id` with a `409`) — and the winning binding's permission
 rules are evaluated **default-deny**: no matching rule, no call
 ([`broker/repos/agent_rule_evaluator.py`](../../src/jentic_one/broker/repos/agent_rule_evaluator.py)).
+A rule denial records `PBAC_DENIED`; a served API with no usable binding records
+the same event with reason `no_credential_binding`. Both carry the actor, API,
+operation id, method and spec path template, never the concrete request path,
+query, headers or credential material. An API no credential serves instead keeps
+its `CREDENTIAL_BINDING_UNSERVED` provisioning signal.
 Rule paths match the request path **relative to the API's server URL** — the
 spec's path (`/widgets/42`), normalized, never the full upstream path with
 the server's base path (`/eu/widgets/42` for a server `http://host/{region}`).
@@ -182,21 +221,120 @@ Rules written with the base path baked in can be fixed with
 [upgrades](../operations/upgrades.md#binding-rules-written-against-the-full-upstream-path));
 until then the broker logs `rule_written_with_server_base_path` whenever such
 a rule changes a verdict, in either direction.
-Authorization is direct-only: the retired toolkit path and its
-`broker.direct_bindings_enabled` fallback were removed with the phase-6b
-table drops (setting the flag to `false` now fails config validation).
+Authorization is direct-only: there is no toolkit path, and setting the
+retired `broker.direct_bindings_enabled` flag to `false` fails config
+validation.
+
+### Cache invalidation and staleness bounds
+
+The broker's hot path caches three kinds of authorization lookups in memory per
+process:
+
+- **Token and actor-status verdicts** ([`broker/core/token_validation.py`](../../src/jentic_one/broker/core/token_validation.py),
+  bounded by `broker.resolve_cache_ttl_seconds`, default `3` s).
+- **Direct credential-binding derivations** ([`broker/repos/caching_credential_deriver.py`](../../src/jentic_one/broker/repos/caching_credential_deriver.py),
+  bounded by `broker.toolkit_cache_ttl_s`, default `3` s).
+- **Permission-rule lists** ([`broker/repos/agent_rule_evaluator.py`](../../src/jentic_one/broker/repos/agent_rule_evaluator.py),
+  bounded by `broker.rule_cache_ttl_s`, default `3` s).
+
+`install_broker_auth` ([`broker/core/setup.py`](../../src/jentic_one/broker/core/setup.py)) registers a
+`BrokerCacheInvalidator` on the shared `Context` (`ctx.invalidate_broker_caches(...)`).
+When an agent's credential binding is bound/unbound/resumed, an agent is
+disabled/enabled/archived/purged, an API key or OAuth token is rotated or
+revoked, or a credential or permission rule set is updated/deactivated/deleted
+in the **same process** (e.g. single-process harnesses and in-process tests),
+the hook immediately evicts the affected deriver, rule-evaluator, and
+token/actor-status cache entries with zero wait for the TTL.
+
+In **multi-process deployments** (where the broker runs in its own process or
+across multiple stateless replicas), each broker instance holds its own
+in-memory LRU caches and does not share the control plane's `Context`. Cross-process
+propagation is bounded by the configured TTLs above (default `3` s; set the
+respective TTL to `0` to disable caching). Queued async executions bypass these
+caches and re-authorize against live database state when the worker claims the
+job (`build_queued_execution_authorizer`).
 
 ## What gets recorded
 
 Executions land as append-only `ExecutionRecord` rows in the admin DB
 ([`shared/executions/ingest.py`](../../src/jentic_one/shared/executions/ingest.py)): status, duration, operation and API
 identity, HTTP status, actor, origin, and the credential used (by id and
-name, never the secret). On the buffered and async paths the write happens
-before the response; on the streaming fast path it is a post-response
-background task and **best-effort** — a database failure there is logged and
-counted (`broker.streaming_execution.persist_failures`,
-[monitoring.md](../operations/monitoring.md)) but does not fail the call, so
-a completed call can, rarely, lack its record. Lifecycle events (`EXECUTION_COMPLETED` /
+name, never the secret). Ordinary buffered outcomes and `BrokerError` failures,
+and async executions, persist inline. On the streaming fast path every outcome —
+completed, failed partway through the body, or cut off by a client disconnect —
+writes exactly one record, and the write is **best-effort** and never holds the
+response: it is handed to the app's background-task registry
+([`shared/web/background_tasks.py`](../../src/jentic_one/shared/web/background_tasks.py))
+and bounded by `broker.streaming_persist_timeout_s`; on shutdown the registry
+drains for up to `services.background_task_drain_timeout_s` before the
+databases close. A database failure, timeout, or shutdown cancellation is
+logged and counted (`broker.streaming_execution.persist_failures`,
+`app.background_tasks`, [monitoring.md](../operations/monitoring.md)) but does
+not change the response, so a call can, rarely, lack its record.
+
+A buffered failure with no dedicated non-500 exception handler also schedules
+its audit write on that registry, then re-raises the original exception so the
+client still receives the generic 500. Its one `FAILED` record and
+`EXECUTION_FAILED` event carry only `server_error: <ExceptionClass>`, truncated
+to the record's 128-character error limit — never the exception message. The
+record carries full elapsed duration and no HTTP status, including when a
+post-response stage fails after an upstream response; the execution increments
+`broker.executions.total` once and emits no `broker.execution.duration_ms`
+sample. This background write uses task kind `unmapped_failure_persist` and
+persistence-metric attribute `kind="unmapped_failure"`, versus
+`streaming_execution_persist` and `kind="streaming"` for streaming outcomes.
+A write error or persistence cancellation is counted without starting another
+execution-failure write. A slot-wait timeout is also counted and propagated to
+the supervisor, so `app.background_tasks` reports `outcome="failed"`, never
+`completed`, for that abandoned record.
+
+Status classification never invokes an exception handler to probe its response.
+It follows Starlette's status-code registration first, exception-class MRO second
+precedence, and applies the same metadata rules to an `Exception` override as to
+any other class-level extension. Built-in handlers use pure status mappings. A
+class-level extension handler that returns a non-500 response must declare that
+status on the exception's `status_code` attribute. When a specifically handled
+exception has no declared status, the broker fails safe and audits it as a
+generic 500. A status-code registration selects a handler but does not declare
+its response status, so an unknown status-specific handler also fails safe; the
+extension handler itself runs only for the actual response.
+
+Concurrent off-request execution persists are capped per process
+(`broker.streaming_persist_max_concurrency`,
+clamped to `databases.admin.pool_max - 1`, the admin base pool less one;
+SQLAlchemy's default overflow can open up to 10 connections beyond `pool_max`).
+An excess persist waits for a slot for at most
+`broker.streaming_persist_acquire_timeout_s` and is then abandoned and counted
+(`reason="backlog_timeout"`); the queue is visible as
+`broker.streaming_execution.persist_pending`, partitioned by the same `kind`
+attribute as the failure counter. The wait never touches admission:
+a request releases its admission slot as soon as its response is complete or its
+client disconnects, so persists queued behind a stalled admin database count
+neither toward `broker.admission.in_flight` nor toward `/ready` saturation. The
+acquire timeout bounds how many records such a stall keeps queued in memory and
+how long a *queued* record holds up shutdown; a persist that already holds a
+slot and is writing runs under the task registry's
+`broker.streaming_persist_timeout_s` budget and the admin pool's checkout
+timeout. When the upstream fails partway through a streamed body, the status
+line has already been sent: the broker logs one `upstream_network_failure` (or
+`streaming_response_aborted` for a size-cap or transfer-deadline cut-off) and
+closes the connection without the final chunk, so an HTTP/1.1 chunked or HTTP/2
+client sees a truncated body (an HTTP/1.0 client reads a close-delimited body
+and cannot tell). A streaming call that ends before the response headers — its
+upstream fails (connection refused, a TLS failure, a timeout), the circuit
+breaker fast-fails it, or the request is cancelled — records one `FAILED` row
+with no HTTP status, named by the problem `type` the caller received (or
+`cancelled`), handed to the same registry alongside the error response, which
+never waits on it. A cancelled call's row carries an `EXECUTION_FAILED` event
+that is *not* action-required and feeds no repeated-failure detection — a
+rolling restart with streams in flight is the server's doing, not the agent's.
+A circuit fast-fail also raises the rate-limited `UPSTREAM_CIRCUIT_OPEN` event,
+as on the buffered path, written ahead of the record and in its own
+transaction: the breaker reports an open circuit once per cooldown, so that
+event has no second chance. Such a failure counts
+on `broker.executions.total` but adds no `broker.execution.duration_ms`
+sample — it timed no upstream round trip. Lifecycle events
+(`EXECUTION_COMPLETED` /
 `EXECUTION_FAILED`), permission denials (`PBAC_DENIED`), and credential
 incidents each emit typed events into the monitor.
 

@@ -29,9 +29,9 @@ _PROVIDER_CONFIG_ADAPTER: TypeAdapter[ProviderConfig] = TypeAdapter(ProviderConf
 def _build_provider(name: str, pc: ProviderConfig) -> CredentialProvider:
     """Dispatch on pc.kind to build a provider instance."""
     if isinstance(pc, DirectOAuth2ProviderConfig):
-        return DirectOAuth2Provider(pc)
+        return DirectOAuth2Provider(pc, provider_id=name)
     if isinstance(pc, PipedreamProviderConfig):
-        return PipedreamProvider(pc)
+        return PipedreamProvider(pc, provider_id=name)
     raise UnknownProviderError(name)
 
 
@@ -51,6 +51,30 @@ class ProviderRegistry:
     def list_all(self) -> dict[str, CredentialProvider]:
         """Return all registered providers (read-only snapshot)."""
         return dict(self._providers)
+
+    def mints_from_account_ref(self, name: str) -> bool:
+        """Whether credentials on provider *name* connect as an account reference.
+
+        Such a credential is connected by its ``provider_account_ref`` and
+        refreshes from it, with no local token row. Every other provider keeps
+        its grant in ``oauth_tokens``, so a set ``provider_account_ref`` there
+        is only a display name. An unknown provider is not one, so a
+        credential on it fails closed as needing a reconnect.
+
+        This is about where the grant lives. ``CredentialProvider.managed`` is
+        a different question, whether the provider supplies the OAuth client
+        material (``direct_oauth2`` is managed yet keeps its grant in
+        ``oauth_tokens``); use this predicate, not ``.managed``, to decide
+        connectedness.
+        """
+        try:
+            return self.get(name).mints_from_account_ref
+        except UnknownProviderError:
+            return False
+
+    def account_ref_provider_names(self) -> frozenset[str]:
+        """Registry names for which :meth:`mints_from_account_ref` holds (for SQL filters)."""
+        return frozenset(name for name in self._providers if self.mints_from_account_ref(name))
 
     @classmethod
     def from_config(cls, cfg: CredentialsConfig) -> ProviderRegistry:

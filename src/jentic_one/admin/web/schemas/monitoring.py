@@ -93,7 +93,7 @@ class UsageStatsBlock(BaseModel):
             "Number of asynchronous executions queued in the window that have not finished yet "
             "(still queued or running). They are not part of `total`, which counts finished "
             "executions only. A synchronous execution is counted once it finishes, never here. "
-            "The `toolkit_id`, `api_id` and `agent_id` filters apply; a `status` filter makes "
+            "The `api_id` and `agent_id` filters apply; a `status` filter makes "
             "this 0, since no unfinished execution has a final status."
         ),
         examples=[3],
@@ -112,9 +112,10 @@ class UsageStatsBlock(BaseModel):
     )
     active_now: int = Field(
         description=(
-            "Number of asynchronous executions a worker is running right now, regardless of the "
-            "window. Queued executions not yet picked up by a worker are not counted. The same "
-            "filters apply as for `pending`."
+            "Number of asynchronous executions running on workers when this aggregate was "
+            "sampled, independent of the selected historical window. Cached responses reuse "
+            "that sample for up to 30 seconds. Queued executions not yet picked up by a "
+            "worker are not counted. The same filters apply as for `pending`."
         ),
         examples=[2],
     )

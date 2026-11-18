@@ -117,6 +117,11 @@ The outcomes:
   *bound* credential is a near-miss (its identity does not cover this
   operation), the refusal is `403 credential_identity_mismatch` instead — the
   operator fixes the credential; a new binding or connect would not help.
+  When the agent's binding to a credential covering the API is *suspended*,
+  the refusal is `403 credential_binding_suspended`: only the operator can
+  resume the binding, so the directive offers no connect, and a new connect
+  for the same agent and API answers `409 connect_session_binding_suspended`
+  until the binding is resumed or removed.
 - **1 winner → use it.** The response carries `Jentic-Credential-Id` and
   `Jentic-Credential-Name` (absent when no stored credential was used), and
   the execution record carries the same attribution — every execution names
@@ -185,19 +190,25 @@ spelled out in [Upgrades](../operations/upgrades.md#what-an-upgrade-never-does).
 ## How credentials get in: providers
 
 Every credential names a **provider** — the component that acquires and
-maintains its secret. Three ship
+maintains its secret. Four provider implementations ship: two built-ins and
+two configurable provider types
 ([`control/services/credentials/providers/`](../../src/jentic_one/control/services/credentials/providers/)):
 
 | Provider | Managed | Stored locally (encrypted) | Stays remote |
 | -------- | ------- | -------------------------- | ------------ |
 | `static` | no | the operator-supplied secret (bearer/API key/basic/SigV4/…) | nothing |
+| `device_authorization` | no | the OAuth tokens obtained through device authorization; this public-client flow has no OAuth client secret | nothing |
 | `direct_oauth2` | yes | the OAuth client secret, plus the access and refresh tokens the platform obtains — the platform *is* the OAuth2 client | nothing |
 | `pipedream` | yes | an opaque `provider_account_ref`, plus a short-lived access token cached at refresh time | the durable OAuth grant, held by Pipedream Connect |
 
-`static` is always registered; the OAuth providers are enabled per
-deployment under `credentials.providers.<name>` in the
+`static` and `device_authorization` are always registered. `direct_oauth2`
+and `pipedream` providers are enabled per deployment under
+`credentials.providers.<name>` in the
 [config reference](../reference/config.md) or at runtime with the
 `jentic admin config providers` CLI.
+
+`device_authorization` uses public-client OAuth; its device flow completes
+through the server-side poll scanner, not the redirect callback shown below.
 
 Managed providers acquire tokens through the **connect flow**
 ([`control/services/credentials/connect_service.py`](../../src/jentic_one/control/services/credentials/connect_service.py)):
@@ -209,21 +220,30 @@ sequenceDiagram
     participant CP as Control plane
     participant P as Provider (IdP or Pipedream Connect)
 
-    O->>CP: POST /credentials/{id}/connect
-    CP->>CP: sign state — a TTL'd JWT with a single-use nonce
-    CP-->>O: authorize_url + state
-    O->>P: authorize in the browser
-    P->>CP: callback with code / account_id + state
-    CP->>CP: verify state, consume nonce (replay refused)
+    O->>CP: POST /credentials/{id}/connect (from the browser)
+    CP->>CP: sign state — a TTL'd JWT with a single-use nonce and the hash of a per-flow browser value
+    CP-->>O: authorize_url + state, and the browser value as a short-lived cookie
+    O->>P: authorize in the same browser
+    P->>CP: callback with code / account_id + state (the browser sends the cookie)
+    CP->>CP: verify state, check the browser cookie, consume nonce (replay refused)
     CP->>P: exchange code for tokens (direct_oauth2 only)
     CP->>CP: encrypt tokens before persisting / store account ref
 ```
+
+The callback completes only in the browser that started the connect: call
+`POST /credentials/{id}/connect` (or approve an agent's request with
+`POST /connect-sessions/{id}:confirm`) from the browser that then opens
+`authorize_url`. The response sets an `HttpOnly` cookie, scoped to the
+callback path and valid for `credentials.connect.state_ttl_seconds`, that the
+callback requires. A connect started with `curl` or an API key, then opened in
+a browser, cannot finish. A callback without the matching cookie changes
+nothing and leaves the flow open for the browser that started it.
 
 Tokens are encrypted with the keyset above before they are persisted; a
 completed connect writes an audit entry and a `credential.connected` event,
 a failed one a `credential.connection_failed` event.
 
-**The extension seam.** All three implement the `CredentialProvider`
+**The extension seam.** All four implement the `CredentialProvider`
 Protocol ([`providers/base.py`](../../src/jentic_one/control/services/credentials/providers/base.py)): `begin_connect` / `complete_connect` /
 `refresh`, plus `managed` and `supported_types`, resolved by name through a
 `ProviderRegistry`. This Protocol is where an external vault would plug in.
@@ -240,8 +260,11 @@ lazy and single-flight: a per-credential advisory lock (Postgres) or process
 lock (SQLite) plus a double-check after acquiring, so concurrent calls
 trigger one upstream refresh. Tokens are considered stale ahead of expiry by
 a configurable skew, and the fresh tokens are re-encrypted before persisting.
-A revoked grant (`invalid_grant`) maps to `401 credential_needs_reconnect`
-with a prompt-human directive; a transient IdP failure maps to `502`.
+A revoked grant (`invalid_grant`) maps to `424 credential_needs_reconnect`
+with a prompt-human directive — the caller's own token is valid, so the status
+is the failed-dependency one its sibling credential failures use rather than a
+401 that would send the caller off re-authenticating itself; a transient IdP
+failure maps to `502`.
 
 ## What's audited
 
@@ -271,8 +294,8 @@ the agent:
 - [Deploying Jentic One securely](../security/README.md) — the umbrella
   threat model, deployment tiers, and production checklist.
 - [Same-host setups](../security/same-host/README.md) — what changes when
-  the agent and the credential store share a machine, and what `jentic run`
-  isolation buys.
+  the agent and the credential store share a machine, and the isolation
+  options.
 - [Hardening same-host MCP](../security/same-host/mcp-same-host-hardening.md) —
   the stdio MCP server runs as the desktop user; how to contain it.
 - [Identity and authorization](../architecture/identity-and-authorization.md) —

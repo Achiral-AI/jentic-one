@@ -18,6 +18,7 @@ from jentic_one.admin.repos import (
     UserSecretRepository,
 )
 from jentic_one.admin.services._support.passwords import hash_password
+from jentic_one.admin.services.auth_service import AuthService
 from jentic_one.admin.services.errors import (
     ConflictError,
     EmailAlreadyExistsError,
@@ -228,7 +229,7 @@ async def test_delete_anonymises(integration_context: Context, admin_user: str) 
     )
     user_id = created.user.id
 
-    await service.delete(user_id, identity=Identity(sub="usr_test", email="test@local"))
+    await service.delete(user_id, identity=_ORG_ADMIN)
 
     async with ctx.admin_db.session() as session:
         user = await UserRepository.get_by_id(session, user_id)
@@ -237,6 +238,65 @@ async def test_delete_anonymises(integration_context: Context, admin_user: str) 
     assert user.email.startswith("deleted-") and user.email.endswith("@local")
 
     # Cleanup
+    async with ctx.admin_db.session() as session:
+        await session.execute(delete(InviteToken).where(InviteToken.user_id == user_id))
+        await session.execute(
+            delete(UserPermissionGrant).where(UserPermissionGrant.user_id == user_id)
+        )
+        await session.execute(delete(UserSecret).where(UserSecret.user_id == user_id))
+        await session.execute(delete(User).where(User.id == user_id))
+        await session.commit()
+
+
+async def test_deleted_user_stays_deleted_after_email_patch(
+    integration_context: Context, admin_user: str
+) -> None:
+    """Delete is terminal: ``deleted_at``, not the tombstone email, is the marker.
+
+    An operator cannot launder a deleted row back to life by rewriting its
+    email first: the PATCH itself is refused, and enable, invite reissue and a
+    password reset stay refused whatever the email reads.
+    """
+    ctx = integration_context
+    service = UserService(ctx)
+    org_admin = Identity(sub=admin_user, email="test@local", permissions=["org:admin"])
+    created = await service.create(
+        UserCreatePayload(email="undelete-me@test.local", first_name="Un", last_name="Del"),
+        identity=org_admin,
+    )
+    user_id = created.user.id
+    await service.delete(user_id, identity=org_admin)
+
+    async with ctx.admin_db.session() as session:
+        user = await UserRepository.get_by_id(session, user_id)
+    assert user is not None and user.deleted_at is not None
+
+    with pytest.raises(ConflictError, match="deleted user"):
+        await service.update(
+            user_id, UserUpdatePayload(email="revived@test.local"), identity=org_admin
+        )
+
+    # Even with the email rewritten underneath the service (the guard does not
+    # key on it), the row stays terminal.
+    async with ctx.admin_db.session() as session:
+        await session.execute(
+            update(User).where(User.id == user_id).values(email="revived@test.local")
+        )
+        await session.commit()
+    with pytest.raises(ConflictError, match="deleted user"):
+        await service.enable(user_id, identity=org_admin)
+    with pytest.raises(ConflictError, match="deleted user"):
+        await service.reissue_invite(user_id, identity=org_admin)
+    with pytest.raises(ConflictError, match="deleted user"):
+        await AuthService(ctx).reset_password(
+            email="revived@test.local",
+            temporary_password="temporary-pass-123",  # pragma: allowlist secret
+        )
+
+    async with ctx.admin_db.session() as session:
+        user = await UserRepository.get_by_id(session, user_id)
+    assert user is not None and user.active is False
+
     async with ctx.admin_db.session() as session:
         await session.execute(delete(InviteToken).where(InviteToken.user_id == user_id))
         await session.execute(
@@ -266,11 +326,11 @@ async def test_disable_and_enable(integration_context: Context, admin_user: str)
     )
     user_id = created.user.id
 
-    await service.disable(user_id, identity=Identity(sub="usr_test", email="test@local"))
+    await service.disable(user_id, identity=_ORG_ADMIN)
     user_after_disable = await service.get_by_id(user_id)
     assert user_after_disable.active is False
 
-    await service.enable(user_id, identity=Identity(sub="usr_test", email="test@local"))
+    await service.enable(user_id, identity=_ORG_ADMIN)
     user_after_enable = await service.get_by_id(user_id)
     assert user_after_enable.active is True
 
@@ -295,9 +355,7 @@ async def test_reissue_invite(integration_context: Context, admin_user: str) -> 
     )
     user_id = created.user.id
 
-    invite = await service.reissue_invite(
-        user_id, identity=Identity(sub="usr_test", email="test@local")
-    )
+    invite = await service.reissue_invite(user_id, identity=_ORG_ADMIN)
     assert invite.token.startswith("inv_")
     assert invite.token != created.invite_token
 
@@ -331,12 +389,88 @@ async def test_reissue_invite_redeemed_raises(
 
     service = UserService(ctx)
     with pytest.raises(ConflictError):
-        await service.reissue_invite(user_id, identity=Identity(sub="usr_test", email="test@local"))
+        await service.reissue_invite(user_id, identity=_ORG_ADMIN)
 
     # Cleanup
     async with ctx.admin_db.session() as session:
         await session.execute(delete(UserSecret).where(UserSecret.user_id == user_id))
         await session.execute(delete(User).where(User.id == user_id))
+        await session.commit()
+
+
+async def test_reissue_invite_refused_for_idp_accepted_user(
+    integration_context: Context, admin_user: str
+) -> None:
+    ctx = integration_context
+    async with ctx.admin_db.session() as session:
+        user = await UserRepository.create(
+            session,
+            email="accepted-inv@test.local",
+            first_name="Accepted",
+            last_name="User",
+            auth_provider="oidc",
+            invite_state=InviteState.ACCEPTED,
+            created_by="self",
+        )
+        await session.commit()
+    user_id = user.id
+
+    service = UserService(ctx)
+    with pytest.raises(ConflictError, match="already signed in"):
+        await service.reissue_invite(user_id, identity=_ORG_ADMIN)
+
+    async with ctx.admin_db.session() as session:
+        await session.execute(delete(InviteToken).where(InviteToken.user_id == user_id))
+        await session.execute(delete(User).where(User.id == user_id))
+        await session.commit()
+
+
+async def test_reissue_invite_allowed_for_pending_and_expired(
+    integration_context: Context, admin_user: str
+) -> None:
+    ctx = integration_context
+    service = UserService(ctx)
+    creator = Identity(sub=admin_user, email="test@local", permissions=["org:admin"])
+
+    pending = await service.create(
+        UserCreatePayload(
+            email="reissue-pending@test.local", first_name="Pending", last_name="User"
+        ),
+        identity=creator,
+    )
+    expired = await service.create(
+        UserCreatePayload(
+            email="reissue-expired@test.local", first_name="Expired", last_name="User"
+        ),
+        identity=creator,
+    )
+    async with ctx.admin_db.session() as session:
+        await session.execute(
+            update(InviteToken)
+            .where(InviteToken.user_id == expired.user.id)
+            .values(expires_at=datetime.now(UTC) - timedelta(hours=1))
+        )
+        await session.commit()
+
+    assert (await service.get_by_id(pending.user.id)).invite_state == InviteState.PENDING
+    assert (await service.get_by_id(expired.user.id)).invite_state == InviteState.EXPIRED
+
+    reissued_pending = await service.reissue_invite(pending.user.id, identity=_ORG_ADMIN)
+    assert reissued_pending.token.startswith("inv_")
+    assert reissued_pending.token != pending.invite_token
+
+    reissued_expired = await service.reissue_invite(expired.user.id, identity=_ORG_ADMIN)
+    assert reissued_expired.token.startswith("inv_")
+    assert reissued_expired.token != expired.invite_token
+
+    async with ctx.admin_db.session() as session:
+        for uid in (pending.user.id, expired.user.id):
+            await session.execute(delete(InviteToken).where(InviteToken.user_id == uid))
+            await session.execute(
+                delete(UserPermissionGrant).where(UserPermissionGrant.user_id == uid)
+            )
+            await session.execute(delete(UserSecret).where(UserSecret.user_id == uid))
+            await session.execute(delete(User).where(User.id == uid))
         await session.commit()
 
 

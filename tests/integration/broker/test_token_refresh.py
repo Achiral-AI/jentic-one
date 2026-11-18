@@ -12,11 +12,11 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
-from typing import Any
 
 import pytest
 from sqlalchemy import delete
 
+from jentic_one.broker.services.credentials.errors import RefreshInvalidGrantError
 from jentic_one.broker.services.credentials.refresh import TokenRefresher
 from jentic_one.broker.services.credentials.resolver import (
     CredentialResolver,
@@ -29,12 +29,21 @@ from jentic_one.control.repos import OAuthTokenRepository
 from jentic_one.control.services.credentials.providers.direct_oauth2 import (
     DirectOAuth2Provider,
     InvalidGrantError,
+    _ClientMaterial,
 )
 from jentic_one.control.services.credentials.providers.registry import ProviderRegistry
-from jentic_one.shared.config import DirectOAuth2ProviderConfig
+from jentic_one.control.services.credentials.schemas.credentials import CredentialUpdate
+from jentic_one.control.services.credentials.service import CredentialService
+from jentic_one.shared.auth.identity import Identity
+from jentic_one.shared.config import (
+    ControlEgressConfig,
+    DirectOAuth2ProviderConfig,
+    EgressConfig,
+)
 from jentic_one.shared.context import Context
 from jentic_one.shared.db.session import DatabaseSession
 from jentic_one.shared.models import StoredCredentialType
+from jentic_one.shared.models.credentials import CredentialType
 from jentic_one.shared.schemas import APIReference
 
 pytestmark = pytest.mark.integration
@@ -59,18 +68,35 @@ class _RotatingVendor(DirectOAuth2Provider):
         self.expires_in = expires_in
         self.live_refresh_token = live_refresh_token
         self.sent_refresh_tokens: list[str] = []
+        self.sent_to: list[tuple[str, str]] = []
+        self.sent_egress: list[EgressConfig | None] = []
+        # When set, a refresh pauses after reading the locked token row and
+        # before it reads the client material (token_url, secret).
+        self.hold_before_client_read: asyncio.Event | None = None
+        self.paused = asyncio.Event()
         self._generation = 0
+
+    async def _resolve_client_material(
+        self, ctx: Context, *, credential_id: str
+    ) -> _ClientMaterial:
+        if self.hold_before_client_read is not None:
+            self.paused.set()
+            await self.hold_before_client_read.wait()
+        return await super()._resolve_client_material(ctx, credential_id=credential_id)
 
     async def _post_token(
         self,
         token_url: str,
         payload: dict[str, str],
         *,
-        auth: tuple[str, str] | None = None,
+        egress: EgressConfig | None,
+        basic_auth: tuple[str, str] | None = None,
         as_json: bool = False,
-    ) -> dict[str, Any]:
+    ) -> dict[str, str]:
         sent = payload["refresh_token"]
         self.sent_refresh_tokens.append(sent)
+        self.sent_to.append((token_url, sent))
+        self.sent_egress.append(egress)
         # Widen the race window so concurrent callers queue on the lock.
         await asyncio.sleep(0.1)
         if sent != self.live_refresh_token:
@@ -106,7 +132,9 @@ def _install_vendor(
     return vendor
 
 
-async def _seed(ctx: Context, *, access: str, refresh: str) -> None:
+async def _seed(
+    ctx: Context, *, access: str, refresh: str, provider_account_ref: str | None = None
+) -> None:
     """Seed a credential whose access token expired five minutes ago."""
     async with ctx.control_db.transaction() as session:
         session.add(
@@ -118,6 +146,7 @@ async def _seed(ctx: Context, *, access: str, refresh: str) -> None:
                 api_name=_API.name,
                 api_version=_API.version,
                 provider=_PROVIDER,
+                provider_account_ref=provider_account_ref,
             )
         )
         await session.flush()
@@ -175,6 +204,35 @@ async def test_refresh_expired_token_rotates_and_persists(
     assert token == "at-1"
     assert vendor.sent_refresh_tokens == ["rt-0"]
     assert await _stored_refresh_token(ctx) == "rt-1"
+
+
+async def test_broker_refresh_uses_this_process_control_egress(
+    integration_context: Context, clean_tokens: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The broker's refresh posts under the policy from its own config's ``control.egress``.
+
+    In a split deployment that is the broker surface's config, so the allowlist
+    must be set there as well as on the control surface.
+    """
+    ctx = integration_context
+    monkeypatch.setattr(ctx.config.broker.egress, "allowed_private_subnets", ["10.50.0.0/16"])
+    monkeypatch.setattr(
+        ctx.config.control,
+        "egress",
+        ControlEgressConfig(allowed_internal_domains=[".corp.internal"]),
+    )
+    vendor = _install_vendor(ctx, monkeypatch, expires_in=3600)
+    await _seed(ctx, access="at-0", refresh="rt-0")
+
+    await TokenRefresher(ctx).ensure_fresh(resolved=await _snapshot(ctx), caller="t")
+
+    assert len(vendor.sent_egress) == 1
+    egress = vendor.sent_egress[0]
+    assert egress is not None
+    assert (egress.allowed_private_subnets, egress.allowed_internal_domains) == (
+        ["10.50.0.0/16"],
+        [".corp.internal"],
+    )
 
 
 @pytest.mark.parametrize(
@@ -269,3 +327,85 @@ async def test_concurrent_refreshes_make_one_vendor_call(
     assert {t.result() for t in tasks} == {"at-1"}
     assert vendor.sent_refresh_tokens == ["rt-0"]
     assert await _stored_refresh_token(ctx) == "rt-1"
+
+
+_OLD_TOKEN_URL = "https://idp.example.com/token"
+_NEW_TOKEN_URL = "https://login.other.example.org/token"
+_ADMIN = Identity(sub="admin_1425", permissions=["org:admin"])
+
+
+async def _move_token_url(ctx: Context) -> None:
+    """The cross-origin token_url PATCH (re-entering the client secret)."""
+    await CredentialService(ctx).update(
+        _CRED_ID,
+        CredentialUpdate(
+            type=CredentialType.OAUTH2,
+            token_url=_NEW_TOKEN_URL,
+            client_secret="client-secret-new",  # pragma: allowlist secret
+        ),
+        identity=_ADMIN,
+    )
+
+
+@pytest.mark.parametrize(
+    "provider_account_ref", [None, "alice"], ids=["no-ref", "identity-echo-ref"]
+)
+async def test_refresh_after_token_url_move_needs_reconnect(
+    integration_context: Context,
+    clean_tokens: None,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_account_ref: str | None,
+) -> None:
+    """Pins #1425: a snapshot taken before a cross-origin token_url move must
+    not present its refresh token anywhere once the move has dropped the
+    grant; the refresh fails as needs-reconnect without a vendor call. A
+    connect-session finalise writes the identity-echo display name into
+    ``provider_account_ref``; on a provider that keeps its grant in
+    ``oauth_tokens`` that ref does not stand in for the dropped row."""
+    ctx = integration_context
+    vendor = _install_vendor(ctx, monkeypatch, expires_in=3600)
+    await _seed(ctx, access="at-0", refresh="rt-0", provider_account_ref=provider_account_ref)
+    stale = await _snapshot(ctx)
+
+    await _move_token_url(ctx)
+
+    with pytest.raises(RefreshInvalidGrantError):
+        await TokenRefresher(ctx).ensure_fresh(resolved=stale, caller="t")
+    with pytest.raises(RefreshInvalidGrantError):
+        await TokenRefresher(ctx).ensure_fresh(resolved=await _snapshot(ctx), caller="t")
+    assert vendor.sent_to == []
+
+
+async def test_inflight_refresh_never_sends_old_token_to_new_origin(
+    integration_context: Context, clean_tokens: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pins #1425: a refresh that already holds the lock and read the token
+    row when the cross-origin PATCH arrives finishes against the stored
+    origin; the PATCH waits for it, then drops the grant, and the next
+    refresh needs a reconnect. The old refresh token never reaches the new
+    origin."""
+    ctx = integration_context
+    vendor = _install_vendor(ctx, monkeypatch, expires_in=3600)
+    await _seed(ctx, access="at-0", refresh="rt-0")
+    stale = await _snapshot(ctx)
+    release = asyncio.Event()
+    vendor.hold_before_client_read = release
+
+    async with asyncio.TaskGroup() as tg:
+        refresh = tg.create_task(TokenRefresher(ctx).ensure_fresh(resolved=stale, caller="t"))
+        await asyncio.wait_for(vendor.paused.wait(), timeout=5)
+        move = tg.create_task(_move_token_url(ctx))
+        # The PATCH is held behind the refresh until the refresh commits.
+        await asyncio.sleep(0.3)
+        assert not move.done()
+        release.set()
+
+    assert refresh.result() == "at-1"
+    assert vendor.sent_to == [(_OLD_TOKEN_URL, "rt-0")]
+    async with ctx.control_db.session() as session:
+        assert await OAuthTokenRepository.get_by_credential(session, _CRED_ID) is None
+
+    vendor.hold_before_client_read = None
+    with pytest.raises(RefreshInvalidGrantError):
+        await TokenRefresher(ctx).ensure_fresh(resolved=await _snapshot(ctx), caller="t")
+    assert all(url == _OLD_TOKEN_URL for url, _ in vendor.sent_to)

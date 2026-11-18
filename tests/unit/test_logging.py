@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import logging.config
+from collections.abc import Iterator
 from pathlib import Path
 from typing import cast
-from unittest.mock import MagicMock, patch
 
 import h2.config
 import h2.connection
@@ -17,6 +18,9 @@ import httpx
 import pytest
 import structlog
 from fastapi import FastAPI
+from opentelemetry import context as otel_context
+from opentelemetry import trace
+from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import AsyncAdaptedQueuePool
 from starlette.testclient import TestClient
@@ -28,6 +32,8 @@ from jentic_one.shared.logging import (
     RequestIDMiddleware,
     add_otel_context,
     configure_logging,
+    install_server_log_filters,
+    mark_response_aborted,
     request_id_ctx,
 )
 from jentic_one.shared.redaction import REDACTED
@@ -90,6 +96,22 @@ def test_configure_logging_sets_debug_level(debug_config: AppConfig):
     assert root.level == logging.DEBUG
 
 
+def test_configure_logging_turns_on_first_use_logger_caching(
+    minimal_config: AppConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The test suite pins caching off globally, so the request is checked at the call."""
+    requested: list[object] = []
+    real_configure = structlog.configure
+
+    def spy(*args: object, **kwargs: object) -> None:
+        requested.append(kwargs.get("cache_logger_on_first_use"))
+        real_configure(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(structlog, "configure", spy)
+    configure_logging(minimal_config)
+    assert requested == [True]
+
+
 def test_configure_logging_clamps_httpcore_trace_logs_at_debug(debug_config: AppConfig):
     """httpcore's DEBUG trace lines repr transport exceptions (which can quote an
     outbound header value), so they stay off even when the app runs at DEBUG."""
@@ -110,13 +132,9 @@ def test_http_wire_trace_toggle_lifts_the_httpcore_clamp() -> None:
             "logging": {"http_wire_trace": True},
         }
     )
-    try:
-        configure_logging(config)
-        assert logging.getLogger("httpcore.http11").isEnabledFor(logging.DEBUG)
-        assert logging.getLogger("hpack.hpack").isEnabledFor(logging.DEBUG)
-    finally:
-        logging.getLogger("httpcore").setLevel(logging.INFO)
-        logging.getLogger("hpack").setLevel(logging.INFO)
+    configure_logging(config)
+    assert logging.getLogger("httpcore.http11").isEnabledFor(logging.DEBUG)
+    assert logging.getLogger("hpack.hpack").isEnabledFor(logging.DEBUG)
 
 
 def test_http2_header_encoding_never_logs_header_values_at_debug(
@@ -238,32 +256,41 @@ def test_configure_logging_adds_file_handler_and_writes_json(tmp_path: Path):
             handler.close()
 
 
-def test_add_otel_context_injects_trace_and_span_when_recording():
-    mock_span_context = MagicMock()
-    mock_span_context.trace_id = 0xABCDEF1234567890ABCDEF1234567890
-    mock_span_context.span_id = 0x1234567890ABCDEF
-
-    mock_span = MagicMock()
-    mock_span.is_recording.return_value = True
-    mock_span.get_span_context.return_value = mock_span_context
-
-    with patch("opentelemetry.trace.get_current_span", return_value=mock_span):
-        event_dict: dict[str, object] = {"event": "test"}
-        result = add_otel_context(None, "info", event_dict)
-
-    assert "trace_id" in result
-    assert "span_id" in result
-    assert result["trace_id"] == format(mock_span_context.trace_id, "032x")
-    assert result["span_id"] == format(mock_span_context.span_id, "016x")
+@contextlib.contextmanager
+def _attached_span(span: trace.Span) -> Iterator[None]:
+    token = otel_context.attach(trace.set_span_in_context(span))
+    try:
+        yield
+    finally:
+        otel_context.detach(token)
 
 
-def test_add_otel_context_noop_when_not_recording():
-    mock_span = MagicMock()
-    mock_span.is_recording.return_value = False
+@pytest.mark.parametrize(
+    "trace_flags",
+    [
+        pytest.param(TraceFlags(TraceFlags.SAMPLED), id="sampled"),
+        pytest.param(TraceFlags(TraceFlags.DEFAULT), id="unsampled"),
+    ],
+)
+def test_add_otel_context_injects_trace_and_span_for_a_valid_span_context(trace_flags):
+    """A non-recording span (``exporter: none`` or an unsampled trace) still
+    stamps its trace/span id, so logs correlate with execution records."""
+    span_context = SpanContext(
+        trace_id=0xABCDEF1234567890ABCDEF1234567890,
+        span_id=0x1234567890ABCDEF,
+        is_remote=False,
+        trace_flags=trace_flags,
+    )
+    with _attached_span(NonRecordingSpan(span_context)):
+        result = add_otel_context(None, "info", {"event": "test"})
 
-    with patch("opentelemetry.trace.get_current_span", return_value=mock_span):
-        event_dict: dict[str, object] = {"event": "test"}
-        result = add_otel_context(None, "info", event_dict)
+    assert result["trace_id"] == "abcdef1234567890abcdef1234567890"
+    assert result["span_id"] == "1234567890abcdef"
+
+
+def test_add_otel_context_noop_without_a_valid_span_context():
+    with _attached_span(trace.INVALID_SPAN):
+        result = add_otel_context(None, "info", {"event": "test"})
 
     assert "trace_id" not in result
     assert "span_id" not in result
@@ -513,3 +540,30 @@ def test_access_log_line_reaches_uvicorn_handler_masked(
     out = capsys.readouterr().out
     assert f'"GET /oauth/callback?code={REDACTED}&state={REDACTED} HTTP/1.1" 302' in out
     assert "c_secret" not in out and "s_secret" not in out
+
+
+def _incomplete_response_kept(*, aborted: bool, msg: str) -> bool:
+    """Whether ``uvicorn.error`` keeps ``msg`` in a context that did/didn't abort."""
+    install_server_log_filters()
+    error_logger = logging.getLogger("uvicorn.error")
+    record = error_logger.makeRecord("uvicorn.error", logging.ERROR, __file__, 0, msg, (), None)
+
+    def _check() -> bool:
+        if aborted:
+            mark_response_aborted()
+        return all(f.filter(record) for f in error_logger.filters if isinstance(f, logging.Filter))
+
+    return contextvars.copy_context().run(_check)
+
+
+def test_incomplete_response_line_dropped_only_for_an_aborted_response() -> None:
+    """Pins #1712: the app's deliberate mid-body abort is logged once, structured.
+
+    uvicorn's generic incomplete-response line is suppressed only in the
+    request context that marked its response aborted; elsewhere, and for any
+    other server error line, it is kept.
+    """
+    incomplete = "ASGI callable returned without completing response."
+    assert not _incomplete_response_kept(aborted=True, msg=incomplete)
+    assert _incomplete_response_kept(aborted=False, msg=incomplete)
+    assert _incomplete_response_kept(aborted=True, msg="Exception in ASGI application\n")

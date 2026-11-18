@@ -6,6 +6,7 @@ from jentic_one.admin.repos.actor_permission_grant_repo import ActorPermissionGr
 from jentic_one.admin.repos.agent_credential_binding_repo import AgentCredentialBindingRepository
 from jentic_one.admin.repos.agent_credential_repo import AgentCredentialRepository
 from jentic_one.admin.repos.agent_repo import AgentRepository
+from jentic_one.admin.repos.assertion_jti_repo import AssertionJtiRepository
 from jentic_one.admin.repos.audit_repo import AuditRepository
 from jentic_one.admin.repos.authorization_code_repo import AuthorizationCodeRepository
 from jentic_one.admin.repos.event_repo import EventRepository
@@ -20,6 +21,7 @@ from jentic_one.admin.repos.oauth_client_grant_repo import OAuthClientGrantRepos
 from jentic_one.admin.repos.oauth_client_repo import OAuthClientRepository
 from jentic_one.admin.repos.provider_config_repo import ProviderConfigRepository
 from jentic_one.admin.repos.refresh_token_repo import RefreshTokenRepository
+from jentic_one.admin.repos.token_lineage_repo import TokenLineageRepository, TokenSweep
 from jentic_one.admin.repos.user_permission_grant_repo import UserPermissionGrantRepository
 from jentic_one.admin.repos.user_repo import UserRepository
 from jentic_one.admin.repos.user_secret_repo import UserSecretRepository
@@ -31,6 +33,7 @@ __all__ = [
     "AgentCredentialBindingRepository",
     "AgentCredentialRepository",
     "AgentRepository",
+    "AssertionJtiRepository",
     "AuditRepository",
     "AuthorizationCodeRepository",
     "EventRepository",
@@ -45,6 +48,8 @@ __all__ = [
     "OAuthClientRepository",
     "ProviderConfigRepository",
     "RefreshTokenRepository",
+    "TokenLineageRepository",
+    "TokenSweep",
     "UserPermissionGrantRepository",
     "UserRepository",
     "UserSecretRepository",

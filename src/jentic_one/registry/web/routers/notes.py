@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, Path, Query, Request, Response
 from fastapi.responses import JSONResponse
 from jentic.problem_details import BadRequest
 
-from jentic_one.registry.services.note_service import UNSET, NoteService, NoteView
+from jentic_one.registry.services.note_service import NoteService, NoteView
+from jentic_one.registry.services.schemas import NoteQuery
 from jentic_one.registry.web.schemas.notes import (
     NoteApiReference,
     NoteCreateRequest,
@@ -20,7 +21,6 @@ from jentic_one.registry.web.schemas.notes import (
 )
 from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.context import Context
-from jentic_one.shared.pagination import InvalidCursorError
 from jentic_one.shared.web import get_ctx, get_current_identity
 from jentic_one.shared.web import openapi_examples as ex
 from jentic_one.shared.web.links import build_link
@@ -31,9 +31,11 @@ router = APIRouter(prefix="/notes")
 # by design: there is no ``notes:*`` scope in the
 # catalogue, and access is governed by ownership rather than a scope. Notes carry
 # ``created_by`` and the service layer scopes rows via ``build_access_filters``
-# (``registry/services/note_service.py``), so a caller only ever sees its own
-# notes. Adding a route-level scope here would gate on a permission that does not
-# exist; the ownership model in the service is the enforcement boundary.
+# (``registry/services/note_service.py``): a caller reads its own notes, and a
+# user also reads the notes of agents they own. Writes stay with the note's
+# author (and ``org:admin``). Adding a route-level scope here would gate on a
+# permission that does not exist; the ownership model in the service is the
+# enforcement boundary.
 
 
 def _parse_if_match(header: str | None, *, instance: str) -> int | None:
@@ -98,7 +100,7 @@ def _build_response(request: Request, view: NoteView) -> NoteResponse:
     )
 
 
-@router.post("", status_code=201)
+@router.post("", summary="Create a note", status_code=201, response_model=NoteResponse)
 async def create_note(
     request: Request,
     body: NoteCreateRequest,
@@ -107,31 +109,13 @@ async def create_note(
 ) -> JSONResponse:
     """Create a new note attached to a registry resource."""
     svc = NoteService(ctx)
-    resource_api = None
-    if body.resource.api is not None:
-        resource_api = (
-            body.resource.api.vendor,
-            body.resource.api.name,
-            body.resource.api.version,
-        )
-    view = await svc.create(
-        resource_api=resource_api,
-        resource_operation_id=body.resource.operation_id,
-        resource_execution_id=body.resource.execution_id,
-        resource_credential_id=body.resource.credential_id,
-        type=body.type.value if body.type is not None else None,
-        body=body.body,
-        confidence=body.confidence.value if body.confidence is not None else None,
-        source=body.source.value if body.source is not None else None,
-        identity=identity,
-        related_execution_id=body.related_execution_id,
-    )
+    view = await svc.create(body.to_service_model(), identity=identity)
 
     resp = _build_response(request, view)
     return JSONResponse(status_code=201, content=resp.model_dump(mode="json", by_alias=True))
 
 
-@router.get("")
+@router.get("", summary="List notes", response_model=NoteListResponse)
 async def list_notes(
     request: Request,
     identity: Identity = get_current_identity(),
@@ -179,10 +163,13 @@ async def list_notes(
         openapi_examples=ex.example(ex.USER_ID),
     ),
 ) -> JSONResponse:
-    """List notes with optional filters and cursor pagination."""
+    """List notes with optional filters and cursor pagination.
+
+    Returns the caller's own notes; a user also sees the notes of agents they own.
+    """
     svc = NoteService(ctx)
-    try:
-        page = await svc.list_page(
+    page = await svc.list_page(
+        NoteQuery(
             limit=limit,
             cursor=cursor,
             api=api,
@@ -191,20 +178,16 @@ async def list_notes(
             credential_id=credential_id,
             type=type,
             created_by=created_by,
-            identity=identity,
-        )
-    except InvalidCursorError:
-        raise BadRequest(
-            detail="Invalid pagination cursor",
-            instance=request.url.path,
-        ) from None
+        ),
+        identity=identity,
+    )
 
     data = [_build_response(request, item) for item in page.data]
     resp = NoteListResponse(data=data, has_more=page.has_more, next_cursor=page.next_cursor)
     return JSONResponse(content=resp.model_dump(mode="json", by_alias=True))
 
 
-@router.get("/{note_id}")
+@router.get("/{note_id}", summary="Get a note", response_model=NoteResponse)
 async def get_note(
     request: Request,
     note_id: Annotated[
@@ -213,7 +196,11 @@ async def get_note(
     identity: Identity = get_current_identity(),
     ctx: Context = Depends(get_ctx),
 ) -> Response:
-    """Retrieve a single note by ID."""
+    """Retrieve a single note by ID.
+
+    A user can read the notes of agents they own, but only a note's author (or
+    an org admin) can update or delete it.
+    """
     svc = NoteService(ctx)
     view = await svc.get(note_id, identity=identity)
 
@@ -226,7 +213,7 @@ async def get_note(
     )
 
 
-@router.patch("/{note_id}")
+@router.patch("/{note_id}", summary="Update a note", response_model=NoteResponse)
 async def update_note(
     request: Request,
     note_id: Annotated[
@@ -249,28 +236,12 @@ async def update_note(
     revision = _parse_if_match(if_match, instance=request.url.path)
 
     svc = NoteService(ctx)
-
-    kwargs: dict[str, Any] = {}
-    if "body" in body.model_fields_set:
-        kwargs["body"] = body.body
-    if "type" in body.model_fields_set:
-        kwargs["type"] = body.type.value if body.type is not None else None
-    else:
-        kwargs["type"] = UNSET
-    if "confidence" in body.model_fields_set:
-        kwargs["confidence"] = body.confidence.value if body.confidence is not None else None
-    else:
-        kwargs["confidence"] = UNSET
-    if "source" in body.model_fields_set:
-        kwargs["source"] = body.source.value if body.source is not None else None
-    else:
-        kwargs["source"] = UNSET
-    if "related_execution_id" in body.model_fields_set:
-        kwargs["related_execution_id"] = body.related_execution_id
-    else:
-        kwargs["related_execution_id"] = UNSET
-
-    view = await svc.update(note_id, if_match=revision, identity=identity, **kwargs)
+    view = await svc.update(
+        note_id,
+        body.to_service_model(),
+        if_match=revision,
+        identity=identity,
+    )
 
     resp = _build_response(request, view)
     content = resp.model_dump(mode="json", by_alias=True)
@@ -281,7 +252,7 @@ async def update_note(
     )
 
 
-@router.delete("/{note_id}", status_code=204)
+@router.delete("/{note_id}", summary="Delete a note", status_code=204)
 async def delete_note(
     request: Request,
     note_id: Annotated[

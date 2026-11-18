@@ -1,5 +1,6 @@
 import { renderWithProviders, screen, checkA11y, waitFor } from '@/__tests__/test-utils';
 import userEvent from '@testing-library/user-event';
+import { userEvent as browserUser } from 'vitest/browser';
 import { TruncateWithTooltip } from '@/shared/ui/TruncateWithTooltip';
 
 const LONG = 'a very long string that will not fit inside a tiny fixed-width container';
@@ -9,7 +10,27 @@ function Narrow({ children }: { children: React.ReactNode }) {
 	return <div style={{ width: 40 }}>{children}</div>;
 }
 
+/**
+ * Rest the runner's real cursor in the viewport's bottom-right corner, clear
+ * of the top-left area every test renders into. Another file's real-pointer
+ * action can leave it over where the trigger mounts; Chromium then sends that
+ * trigger a real `mouseover`, which re-opens the bubble behind the synthetic
+ * hover/leave or Escape a test is asserting on.
+ */
+async function parkRealCursor(): Promise<void> {
+	const { unmount } = renderWithProviders(
+		<div
+			data-testid="cursor-park"
+			style={{ position: 'fixed', right: 0, bottom: 0, width: 4, height: 4 }}
+		/>,
+	);
+	await browserUser.hover(screen.getByTestId('cursor-park'));
+	unmount();
+}
+
 describe('TruncateWithTooltip', () => {
+	beforeEach(parkRealCursor);
+
 	it('renders its children inline', () => {
 		renderWithProviders(<TruncateWithTooltip>short</TruncateWithTooltip>);
 		expect(screen.getByText('short')).toBeInTheDocument();
@@ -124,6 +145,30 @@ describe('TruncateWithTooltip', () => {
 		expect(await screen.findByRole('tooltip')).toBeInTheDocument();
 		await user.keyboard('{Escape}');
 		expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+	});
+
+	it('follows its trigger when an ancestor scrolls', async () => {
+		const user = userEvent.setup();
+		renderWithProviders(
+			<div data-testid="scroller" style={{ height: 60, overflowY: 'auto' }}>
+				<div style={{ height: 30 }} />
+				<Narrow>
+					<TruncateWithTooltip>{LONG}</TruncateWithTooltip>
+				</Narrow>
+				<div style={{ height: 400 }} />
+			</div>,
+		);
+		const trigger = screen.getByText(LONG);
+		await waitFor(() => expect(trigger).toHaveAttribute('tabindex', '0'));
+		await user.hover(trigger);
+		const tooltip = await screen.findByRole('tooltip');
+		const before = parseFloat(tooltip.style.top);
+		// The sheet-like scroller moves the trigger up by 20px; the bubble
+		// re-places itself under it on the next frame.
+		const scroller = screen.getByTestId('scroller');
+		scroller.scrollTop = 20;
+		scroller.dispatchEvent(new Event('scroll'));
+		await waitFor(() => expect(parseFloat(tooltip.style.top)).toBeCloseTo(before - 20, 0));
 	});
 
 	it('has no a11y violations', async () => {

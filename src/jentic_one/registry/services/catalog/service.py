@@ -53,6 +53,7 @@ from jentic_one.shared.audit import AuditAction, AuditTargetType, record_audit_b
 from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.auth.permissions import has_effective_permission
 from jentic_one.shared.context import Context
+from jentic_one.shared.db.locks import advisory_lock_key
 from jentic_one.shared.db.utils import utcnow
 from jentic_one.shared.events import emit_event, emit_event_best_effort
 from jentic_one.shared.jobs.enqueue import enqueue_job
@@ -71,6 +72,10 @@ logger = structlog.get_logger(__name__)
 #: discards on completion. Bounded in practice by the max-age + advisory-lock gates
 #: on the refresh that spawns them.
 _SWEEP_TASKS: set[asyncio.Task[None]] = set()
+
+#: Registry-DB advisory-lock key that single-flights the update-notify sweep across
+#: processes (scanner and request-triggered sweeps on every replica/worker).
+UPDATE_SWEEP_LOCK_KEY = advisory_lock_key("jentic_one.registry.catalog_update_sweep")
 
 
 def _is_upstream_tracked(spec: RegisteredSpec, manifest_urls: set[str]) -> bool:
@@ -163,6 +168,10 @@ class CatalogService:
             count = await CatalogRepository.replace(
                 session, source_url=self._cfg.manifest_url, entries=entries
             )
+        # An explicit refresh is the operator's "pick up upstream changes" lever,
+        # so cached preview projections are dropped along with the old snapshot.
+        # The cache is per process: other workers/replicas refetch after the TTL.
+        self._ctx.catalog_preview_cache.clear()
         return CatalogRefreshResult(count=count)
 
     def _is_stale(self, fetched_at: datetime | None) -> bool:
@@ -252,13 +261,14 @@ class CatalogService:
         flaky host never breaks the refresh or the rest of the batch. A ``0``
         interval disables the sweep entirely (air-gapped kill switch).
 
-        Note the refresh's advisory lock is transaction-scoped (it guards only the
-        staleness check). Sweeps are serialized **within a process** by
-        ``Context.update_sweep_lock`` (scanner + read-path trigger can't overlap), but this
-        is **not** globally single-flight across replicas: a rare concurrent double-refresh on
-        two replicas could still emit a duplicate event for the same change. That is
-        deliberately tolerated — the event is idempotent for operators and the next sweep on
-        either replica dedupes on the persisted digest. Probes fan out with bounded
+        Single-flight: sweeps are serialized **within a process** by
+        ``Context.update_sweep_lock`` (scanner + read-path trigger can't overlap) and
+        **across processes** by a non-blocking registry-DB advisory lock
+        (:data:`UPDATE_SWEEP_LOCK_KEY`, a no-op on single-process SQLite). A sweep that
+        loses either race skips quietly — another sweep is already doing the work — so
+        at most one sweep at a time reads and advances the per-API dedupe state, and a
+        changed digest emits once. The residual duplicate is the emit-then-mark crash
+        window described in :meth:`_probe_one`. Probes fan out with bounded
         concurrency (``update_sweep_max_concurrency``, kept below the DB pool) under
         a wall-clock budget (``update_sweep_deadline_seconds``) so a large or hostile
         candidate set can't turn one refresh into an unbounded stall.
@@ -267,23 +277,26 @@ class CatalogService:
         if interval <= 0:
             return
 
-        # Serialize sweeps in-process: the scanner and the read-path trigger can both fire.
-        # The lock.locked() pre-check is a best-effort fast-skip, not a guarantee — it is
-        # TOCTOU, so two triggers racing past it both reach ``async with lock`` and the
-        # second *queues* (waits) rather than skipping. That is harmless: by the time the
-        # queued sweep runs, the first has bumped each candidate's ``last_checked_at``, so
-        # the queued pass no-ops on the per-API interval gate in ``_probe_one``. The
-        # pre-check just avoids the common non-racing back-to-back trigger paying for a
-        # full re-probe (see Context.update_sweep_lock).
+        # In-process guard first (cheap, no DB connection). Every caller checks
+        # locked() before acquiring and there is no await in between, so nobody ever
+        # queues on this lock: a concurrent trigger either skips here or holds it.
         lock = self._ctx.update_sweep_lock
         if lock.locked():
             logger.debug("catalog_update_sweep_skipped_in_flight")
             return
-        async with lock:
+        # The cross-process guard (advisory lock) is taken only once the in-process one
+        # is held; another replica/worker sweeping right now holds it.
+        async with (
+            lock,
+            self._ctx.registry_db.try_advisory_lock(UPDATE_SWEEP_LOCK_KEY) as held,
+        ):
+            if not held:
+                logger.debug("catalog_update_sweep_skipped_locked_elsewhere")
+                return
             await self._do_update_notify_sweep(interval)
 
     async def _do_update_notify_sweep(self, interval: int) -> None:
-        """Sweep body — always called under ``Context.update_sweep_lock``."""
+        """Sweep body — always called under both single-flight locks."""
         async with self._ctx.registry_db.session() as session:
             candidates = await ApiRevisionRepository.registered_specs_for_notify(session)
             # The manifest coverage set is only needed to admit overlay/manual specs
@@ -745,27 +758,43 @@ class CatalogService:
         windowing, so the search box / tag chips in the UI cover every operation
         in the spec — not just the loaded page — and ``total`` reflects the
         filtered count the "Load more" affordance pages through.
+
+        The upstream fetch + projection is cached per spec URL on the process
+        (``Context.catalog_preview_cache``), so paging, filtering, or reloading
+        the same entry within ``catalog.preview_cache_ttl_seconds`` does not
+        refetch it; concurrent misses for one URL share a single fetch (and its
+        failure), and a failed load is remembered for
+        ``catalog.preview_cache_failure_ttl_seconds``.
         """
         entry = await self.get(api_id)
-        if not entry.spec_url:
+        spec_url = entry.spec_url
+        if not spec_url:
             raise CatalogUnavailableError(f"catalog entry '{api_id}' has no spec url")
-        try:
-            doc = await fetch_json(entry.spec_url, config=self._ingest_cfg)
-        except CatalogFetchError as exc:
-            raise CatalogUnavailableError(f"catalog spec unavailable: {exc}") from exc
 
-        projection = mb.project_preview(doc, tag=tag, q=q)
-        total = len(projection.operations)
+        async def _load() -> mb.PreviewProjection:
+            try:
+                doc = await fetch_json(spec_url, config=self._ingest_cfg)
+            except CatalogFetchError as exc:
+                raise CatalogUnavailableError(f"catalog spec unavailable: {exc}") from exc
+            return mb.project_preview(doc)
+
+        # The unfiltered projection is cached (not the raw doc, which can be tens
+        # of MB once parsed); tag/q filtering and windowing run per request on it.
+        projection = await self._ctx.catalog_preview_cache.get_or_load(spec_url, _load)
+        operations = mb.filter_preview_operations(projection.operations, tag=tag, q=q)
+        total = len(operations)
         capped_limit = max(0, min(limit, mb.PREVIEW_MAX_OPERATIONS))
         start = max(0, offset)
-        window = projection.operations[start : start + capped_limit]
+        window = operations[start : start + capped_limit]
         return CatalogPreviewView(
             operations=window,
             total=total,
             offset=start,
             truncated=start + len(window) < total,
             info=projection.info,
-            security_schemes=projection.security_schemes,
+            security_schemes={
+                name: dict(scheme) for name, scheme in projection.security_schemes.items()
+            },
         )
 
     # ── import ───────────────────────────────────────────────────────────────
@@ -846,17 +875,27 @@ class CatalogService:
         was persisted.
         """
         async with self._ctx.registry_db.session() as session:
-            if entry.api_id:
-                by_catalog_id = await ApiRepository.identity_for_catalog_api_id(
-                    session, entry.api_id
-                )
-                if by_catalog_id is not None:
-                    return by_catalog_id
-            if not entry.registered or not entry.spec_url:
-                return None
-            return await ApiRevisionRepository.registered_identity_for_source_url(
-                session, entry.spec_url
-            )
+            return await self._registered_identity_in(session, entry)
+
+    @staticmethod
+    async def _registered_identity_in(
+        session: Any, entry: CatalogEntryView
+    ) -> tuple[str, str] | None:
+        """``_registered_identity`` on the caller's session.
+
+        The single row selection both the import source and the A4b supersede gate key
+        on, so the gate checks for a live overlay on the identity the re-import lands
+        on (#1078).
+        """
+        if entry.api_id:
+            by_catalog_id = await ApiRepository.identity_for_catalog_api_id(session, entry.api_id)
+            if by_catalog_id is not None:
+                return by_catalog_id
+        if not entry.registered or not entry.spec_url:
+            return None
+        return await ApiRevisionRepository.registered_identity_for_source_url(
+            session, entry.spec_url
+        )
 
     async def _derived_api_name(self, entry: CatalogEntryView) -> str:
         """The clash-aware ``api_name`` seed for a first import of ``entry``."""
@@ -891,12 +930,19 @@ class CatalogService:
         find the locally-served current revision and asks whether that revision *is* a
         confirmed overlay's materialization. Only that case is a supersede; a plain
         catalog-origin current revision imports normally.
+
+        The lookup is scoped to the registered identity the re-import lands on
+        (``_registered_identity_in``, the same row selection ``_import_source_for``
+        uses), so a sibling row serving the same ``spec_url`` (e.g. a vendor-doubled row
+        and its clean identity, #1078) cannot make the gate and the ingest disagree. Only
+        a first import, with no registered identity, uses the unscoped lookup.
         """
         if not entry.spec_url:
             return None
         async with self._ctx.registry_db.session() as session:
+            registered = await self._registered_identity_in(session, entry)
             current = await ApiRevisionRepository.current_revision_for_source_url(
-                session, entry.spec_url
+                session, entry.spec_url, identity=registered
             )
             if current is None:
                 return None
@@ -957,8 +1003,8 @@ class CatalogService:
         silently reverting the operator's fix.
 
         If the re-import would change the server hosts of an API with bound credentials,
-        only a caller holding ``credentials:write`` makes it current; otherwise the worker
-        keeps the new revision as a draft for operator review (see
+        only an organisation admin makes it current; otherwise the worker keeps the new
+        revision as a draft for an organisation admin to review and promote (see
         ``registry/ingest/host_change_guard.py``).
         """
         entry = await self.get(api_id)
@@ -967,10 +1013,11 @@ class CatalogService:
         if supersede_overlay_id is not None:
             source["supersede_active"] = "true"
         if may_approve_host_change(identity.permissions):
-            # Server-host change guard: an operator (``credentials:write``) may let a
-            # re-import that changes the API's server hosts become current even when
-            # the API has bound credentials. Everyone else gets such a revision held
-            # as a draft for review. Server-set only; client schemas cannot carry it.
+            # Server-host change guard: an organisation admin may let a re-import that
+            # changes the API's server hosts become current even when the API has
+            # bound credentials. Everyone else gets such a revision held as a draft
+            # for an organisation admin to review and promote. Server-set only; client
+            # schemas cannot carry it.
             source["host_change_approved"] = "true"
         payload: dict[str, Any] = {"sources": [source]}
         if supersede_overlay_id is not None:

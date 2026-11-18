@@ -12,6 +12,7 @@ import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
+from pathlib import Path
 from typing import Any, cast
 
 import httpx
@@ -20,21 +21,22 @@ import pytest
 from jentic_one.broker.adapters.runners.base import RunnerRequest
 from jentic_one.broker.adapters.runners.deadline import DeadlineRunner
 from jentic_one.broker.adapters.runners.http import HttpRunner
-from jentic_one.broker.core.exceptions import (
+from jentic_one.broker.core.errors import (
     BrokerError,
     CircuitOpenError,
     CredentialRefreshTransientError,
     DeadlineExceededError,
     RunnerSchemeUnsupportedError,
     RunnerUnavailableError,
-    TooManyCandidatesError,
     UpstreamResponseTooLargeError,
     UpstreamTimeoutError,
+    UpstreamTransportError,
 )
-from jentic_one.broker.core.problem import status_for_broker_error
+from jentic_one.broker.core.problem import discovery_error_problem, status_for_broker_error
 from jentic_one.broker.web.errors import handle_broker_error
 from jentic_one.mcp import execute as ex
 from jentic_one.mcp.envelopes import CODE_TRANSPORT_ERROR, ToolError
+from jentic_one.shared.discovery.errors import TooManyCandidatesError
 
 
 def _headers(origin: str | None, retry_after: str | None = None) -> httpx.Headers:
@@ -50,12 +52,21 @@ def _body(problem: dict[str, Any]) -> bytes:
     return json.dumps(problem).encode()
 
 
+_PARITY_FIXTURE = Path(__file__).resolve().parents[2] / "fixtures" / "retry-after-parity.json"
+
+
+def _load_retry_after_parity_cases(key: str = "cases") -> list[dict[str, Any]]:
+    data = json.loads(_PARITY_FIXTURE.read_text(encoding="utf-8"))
+    cases = list(data[key])
+    assert cases
+    return cases
+
+
 @pytest.mark.parametrize(
     ("exc", "retry_safe", "want_retryable", "want_recovery"),
     [
         (CircuitOpenError("open", type="circuit_open"), False, True, ex.RECOVER_WAIT),
         (RunnerUnavailableError("down", type="runner_unavailable"), False, True, ex.RECOVER_WAIT),
-        (TooManyCandidatesError("too many"), False, True, ex.RECOVER_WAIT),
         (CredentialRefreshTransientError("cred_1: Timeout"), False, True, ex.RECOVER_WAIT),
         (
             UpstreamTimeoutError("no connect", type="upstream_connect_failed", pre_send=True),
@@ -73,6 +84,19 @@ def _body(problem: dict[str, Any]) -> bytes:
             ex.RECOVER_SCHEME,
         ),
         (UpstreamResponseTooLargeError("too big"), True, False, ex.RECOVER_UNKNOWN),
+        (
+            UpstreamTransportError("refused", type="upstream_connect_failed", pre_send=True),
+            False,
+            True,
+            ex.RECOVER_WAIT,
+        ),
+        (UpstreamTransportError("dropped"), True, False, ex.RECOVER_UNKNOWN),
+        (
+            BrokerError("bad header", type="upstream_request_invalid"),
+            True,
+            False,
+            ex.RECOVER_UNKNOWN,
+        ),
     ],
     ids=lambda v: type(v).__name__ if isinstance(v, Exception) else str(v),
 )
@@ -98,6 +122,19 @@ def test_broker_problem_types_map_to_their_retryable_hint(
     assert got.details["http_status"] == status
     assert got.details["origin"] == "broker"
     assert exc.detail in got.message
+
+
+def test_too_many_candidates_is_a_retryable_wait() -> None:
+    """The broker's ``too_many_candidates`` 503 (operation resolution overloaded,
+    before dispatch) is retryable even for a non-retry-safe call."""
+    problem = discovery_error_problem(TooManyCandidatesError())
+    got = ex.classify_broker_transport_error(
+        problem["status"], _headers(problem["error_origin"]), _body(problem), retry_safe=False
+    )
+    assert got is not None
+    assert got.code == CODE_TRANSPORT_ERROR
+    assert got.extra == {"retryable": True}
+    assert ex.broker_transport_recovery(problem["status"], problem["type"]) == ex.RECOVER_WAIT
 
 
 @pytest.mark.parametrize("problem_type", ["streaming_unsupported", "about:blank", ""])
@@ -137,6 +174,20 @@ def test_rate_limit_429_relays_retry_after() -> None:
     assert got.details is not None
     assert got.details["retry_after_s"] == 7
     assert "(7s)" in got.actionable
+
+
+def test_fractional_retry_after_relays_whole_seconds_rounded_up() -> None:
+    # MCP and the broker share one Retry-After parser (#1957).
+    got = ex.classify_broker_transport_error(
+        503,
+        _headers("broker", retry_after="1.5"),
+        _body({"type": "circuit_open", "title": "Circuit open"}),
+        retry_safe=False,
+    )
+    assert got is not None
+    assert got.details is not None
+    assert got.details["retry_after_s"] == 2
+    assert "(2s)" in got.actionable
 
 
 def test_scheme_unsupported_points_at_search_apis() -> None:
@@ -198,13 +249,68 @@ def test_retry_after_seconds() -> None:
     assert ex.retry_after_seconds(httpx.Headers({})) is None
     assert ex.retry_after_seconds(httpx.Headers({"Retry-After": "12"})) == 12
     assert ex.retry_after_seconds(httpx.Headers({"Retry-After": " 3 "})) == 3
-    assert ex.retry_after_seconds(httpx.Headers({"Retry-After": "1.5"})) == 1.5
+    assert ex.retry_after_seconds(httpx.Headers({"Retry-After": "1.5"})) == 2
     assert ex.retry_after_seconds(httpx.Headers({"Retry-After": "-1"})) is None
     assert ex.retry_after_seconds(httpx.Headers({"Retry-After": "soon"})) is None
     remaining = ex.retry_after_seconds(httpx.Headers({"Retry-After": future}))
     assert remaining is not None
     assert 60 < remaining <= 91
     assert ex.retry_after_seconds(httpx.Headers({"Retry-After": past})) == 0
+
+
+@pytest.mark.parametrize("case", _load_retry_after_parity_cases(), ids=lambda c: c["name"])
+def test_mcp_retry_after_matches_shared_parity_vectors(case: dict[str, Any]) -> None:
+    """Pins #1991: mounted MCP transport errors relay the shared Retry-After delay."""
+    raw = case["header"]
+    want = case["seconds"]
+    only_retry_after = (
+        httpx.Headers({}, encoding="utf-8")
+        if raw is None
+        else httpx.Headers({"Retry-After": raw}, encoding="utf-8")
+    )
+    assert ex.retry_after_seconds(only_retry_after) == want
+
+    items: list[tuple[str, str]] = [
+        ("Content-Type", "application/problem+json"),
+        ("Jentic-Error-Origin", "broker"),
+    ]
+    if raw is not None:
+        items.append(("Retry-After", raw))
+    got = ex.classify_broker_transport_error(
+        503,
+        httpx.Headers(items, encoding="utf-8"),
+        _body({"type": "circuit_open", "title": "Circuit open"}),
+        retry_safe=False,
+    )
+    assert got is not None
+    assert got.details is not None
+    assert got.extra is not None
+    assert got.details.get("retry_after_s") == want
+    assert got.extra.get("retry_after_s") == want
+
+
+@pytest.mark.parametrize(
+    "case", _load_retry_after_parity_cases("http_date_cases"), ids=lambda c: c["name"]
+)
+def test_mcp_http_date_matches_shared_parity_vectors(case: dict[str, Any]) -> None:
+    """Mounted MCP errors apply the shared fixed-clock HTTP-date vectors."""
+    headers = _headers("broker", retry_after=case["header"])
+    want = case["seconds"]
+    now_epoch = 1_609_459_200.0
+    assert ex.retry_after_seconds(headers, now_epoch=now_epoch) == want
+
+    got = ex.classify_broker_transport_error(
+        503,
+        headers,
+        _body({"type": "circuit_open", "title": "Circuit open"}),
+        retry_safe=False,
+        now_epoch=now_epoch,
+    )
+    assert got is not None
+    assert got.details is not None
+    assert got.extra is not None
+    assert got.details.get("retry_after_s") == want
+    assert got.extra.get("retry_after_s") == want
 
 
 @pytest.mark.parametrize(
@@ -216,13 +322,15 @@ def test_retry_after_seconds() -> None:
         (503, "too_many_candidates", ex.RECOVER_WAIT),
         (502, "refresh_transient_error", ex.RECOVER_WAIT),
         (504, "upstream_connect_failed", ex.RECOVER_WAIT),
+        (502, "upstream_connect_failed", ex.RECOVER_WAIT),
         (429, "rate_limit_exceeded", ex.RECOVER_WAIT),
         (429, "", ex.RECOVER_WAIT),
         (504, "upstream_timeout", ex.RECOVER_TIMEOUT),
         (504, "deadline_exceeded", ex.RECOVER_TIMEOUT),
         (501, "runner_scheme_unsupported", ex.RECOVER_SCHEME),
         (502, "upstream_response_too_large", ex.RECOVER_UNKNOWN),
-        (500, "upstream_transport_error", ex.RECOVER_UNKNOWN),
+        (502, "upstream_transport_error", ex.RECOVER_UNKNOWN),
+        (500, "upstream_request_invalid", ex.RECOVER_UNKNOWN),
         (504, "about:blank", ex.RECOVER_UNKNOWN),
         (504, "", ex.RECOVER_UNKNOWN),
         (503, "about:blank", ex.RECOVER_UNKNOWN),
@@ -307,12 +415,28 @@ def _connect_timeout(_req: httpx.Request) -> httpx.Response:
     raise httpx.ConnectTimeout("slow")
 
 
+def _pool_timeout(_req: httpx.Request) -> httpx.Response:
+    raise httpx.PoolTimeout("pool exhausted")
+
+
 def _read_timeout(_req: httpx.Request) -> httpx.Response:
     raise httpx.ReadTimeout("slow")
 
 
+def _connect_refused(_req: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError("refused")
+
+
+def _proxy_refused(_req: httpx.Request) -> httpx.Response:
+    raise httpx.ProxyError("tunnel refused")
+
+
 def _protocol_error(_req: httpx.Request) -> httpx.Response:
     raise httpx.RemoteProtocolError("peer closed")
+
+
+def _local_protocol_error(_req: httpx.Request) -> httpx.Response:
+    raise httpx.LocalProtocolError("bad header")
 
 
 def _oversized(_req: httpx.Request) -> httpx.Response:
@@ -333,13 +457,28 @@ async def _stalls(_req: httpx.Request) -> httpx.Response:
     ("handler", "kwargs", "status", "problem_type", "retry_safe", "want_retryable"),
     [
         (_connect_timeout, {}, 504, "upstream_connect_failed", False, True),
+        (_pool_timeout, {}, 504, "upstream_connect_failed", False, True),
+        (_connect_refused, {}, 502, "upstream_connect_failed", False, True),
+        (_proxy_refused, {}, 502, "upstream_connect_failed", False, True),
         (_read_timeout, {}, 504, "upstream_timeout", False, False),
         (_read_timeout, {}, 504, "upstream_timeout", True, True),
-        (_protocol_error, {}, 500, "upstream_transport_error", True, False),
+        (_protocol_error, {}, 502, "upstream_transport_error", True, False),
+        (_local_protocol_error, {}, 500, "upstream_request_invalid", True, False),
         (_oversized, {"max_response_bytes": 8}, 502, "upstream_response_too_large", True, False),
         (_stalls, {"deadline_s": 0.01}, 504, "deadline_exceeded", True, True),
     ],
-    ids=["connect", "read-unsafe", "read-safe", "transport", "too-large", "deadline"],
+    ids=[
+        "connect",
+        "pool-timeout",
+        "connect-refused",
+        "proxy-refused",
+        "read-unsafe",
+        "read-safe",
+        "transport",
+        "request-invalid",
+        "too-large",
+        "deadline",
+    ],
 )
 async def test_real_broker_5xx_is_a_transport_error(
     handler, kwargs, status, problem_type, retry_safe, want_retryable

@@ -5,15 +5,22 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from jentic_one.admin.core.schema.events import Event
+from jentic_one.shared.db.ids import generate_ksuid
+from jentic_one.shared.db.keyset import apply_desc_keyset, asc_keyset_predicate
+from jentic_one.shared.db.utils import insert_append_only_row
+from jentic_one.shared.pagination import Cursor
 
 
 class EventRepository:
-    """Data access layer for Event entities — flush-only, never commits."""
+    """Data access layer for Event entities.
+
+    Writes within the caller's transaction, never commits.
+    """
 
     @staticmethod
     async def create(
@@ -31,24 +38,33 @@ class EventRepository:
         created_by: str | None,
         actor_id: str | None = None,
         actor_type: str | None = None,
-    ) -> Event:
-        event = Event(
-            type=type,
-            severity=severity,
-            summary=summary,
-            requires_action=requires_action,
-            trace_id=trace_id,
-            detail=detail,
-            data=data if data is not None else {},
-            execution_id=execution_id,
-            job_id=job_id,
-            created_by=created_by,
-            actor_id=actor_id,
-            actor_type=actor_type,
-        )
-        session.add(event)
-        await session.flush()
-        return event
+    ) -> str:
+        """Insert one event and return its id.
+
+        Events are append-only and every emit site needs only the id, so the
+        row is written without an ORM instance (see
+        :func:`insert_append_only_row`). The id is minted here, so nothing is
+        read back. ``created_at`` and ``updated_at`` come from their column
+        defaults.
+        """
+        event_id = generate_ksuid("evt")
+        values: dict[str, Any] = {
+            "id": event_id,
+            "type": type,
+            "severity": severity,
+            "summary": summary,
+            "requires_action": requires_action,
+            "trace_id": trace_id,
+            "detail": detail,
+            "data": data if data is not None else {},
+            "execution_id": execution_id,
+            "job_id": job_id,
+            "created_by": created_by,
+            "actor_id": actor_id,
+            "actor_type": actor_type,
+        }
+        await insert_append_only_row(session, Event, values)
+        return event_id
 
     @staticmethod
     async def get_by_id(
@@ -99,7 +115,7 @@ class EventRepository:
         session: AsyncSession,
         *,
         limit: int = 25,
-        cursor: tuple[datetime, str] | None = None,
+        cursor: Cursor | None = None,
         event_type: list[str] | None = None,
         severity: list[str] | None = None,
         requires_action: bool | None = None,
@@ -111,14 +127,7 @@ class EventRepository:
         filters: list[ColumnElement[bool]] | None = None,
     ) -> list[Event]:
         stmt = select(Event).order_by(Event.created_at.desc(), Event.id.desc()).limit(limit)
-        if cursor is not None:
-            cursor_dt, cursor_id = cursor
-            stmt = stmt.where(
-                or_(
-                    Event.created_at < cursor_dt,
-                    and_(Event.created_at == cursor_dt, Event.id < cursor_id),
-                )
-            )
+        stmt = apply_desc_keyset(stmt, Event.created_at, Event.id, cursor)
         if event_type is not None:
             stmt = stmt.where(Event.type.in_(event_type))
         if severity is not None:
@@ -143,7 +152,7 @@ class EventRepository:
     @staticmethod
     async def list_after_cursor(
         session: AsyncSession,
-        cursor: tuple[datetime, str],
+        cursor: Cursor,
         *,
         limit: int = 100,
         event_type: list[str] | None = None,
@@ -154,20 +163,14 @@ class EventRepository:
         actor_type: str | None = None,
         filters: list[ColumnElement[bool]] | None = None,
     ) -> list[Event]:
-        """Return events after the (created_at, id) cursor using two-tuple comparison.
+        """Return events after ``cursor``, comparing ``(created_at, id)`` as a pair.
 
         Unlike pure KSUID ordering, this correctly handles events created within
         the same second whose random payload yields out-of-order IDs.
         """
-        cursor_dt, cursor_id = cursor
         stmt = (
             select(Event)
-            .where(
-                or_(
-                    Event.created_at > cursor_dt,
-                    and_(Event.created_at == cursor_dt, Event.id > cursor_id),
-                )
-            )
+            .where(asc_keyset_predicate(Event.created_at, Event.id, cursor.timestamp, cursor.id))
             .order_by(Event.created_at.asc(), Event.id.asc())
             .limit(limit)
         )

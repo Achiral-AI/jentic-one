@@ -24,6 +24,7 @@ from jentic_one.shared.db.session import DatabaseSession
 from jentic_one.shared.jobs.execution_handler import ExecutionHandler
 from jentic_one.shared.jobs.handlers import JobHandlerRegistry
 from jentic_one.shared.jobs.protocols import (
+    ActorAuthority,
     InjectedAuth,
     QueuedExecutionRequest,
     QueuedExecutionVerdict,
@@ -43,7 +44,7 @@ class _RecordingExecutor:
         self._result = result
         self.last_request: UpstreamExecRequest | None = None
 
-    async def execute(self, request: UpstreamExecRequest, *, session: Any) -> UpstreamExecResult:
+    async def execute(self, request: UpstreamExecRequest, *, db: Any) -> UpstreamExecResult:
         self.last_request = request
         return self._result
 
@@ -77,6 +78,15 @@ class _StaticAuthorizer:
 
     async def authorize(self, request: QueuedExecutionRequest) -> QueuedExecutionVerdict:
         return self._verdict
+
+
+class _ActiveActor:
+    """Stands in for the broker's live actor read: active, holding the execute permission."""
+
+    async def authority(
+        self, *, actor_id: str, actor_type: str, permission: str, **_lineage: Any
+    ) -> ActorAuthority:
+        return ActorAuthority(active=True, holds_permission=True)
 
 
 def _registry(handler: Any) -> JobHandlerRegistry:
@@ -120,6 +130,8 @@ def _payload() -> dict[str, Any]:
         "api_vendor": "example",
         "api_name": "api",
         "api_version": "1.0.0",
+        "auth_token_sha256": "0" * 64,
+        "auth_method": "opaque",
         # The resolved operation rides the payload as one dict.
         "operation": {"id": "op_widgets", "path": "/v1/widgets", "method": "GET"},
     }
@@ -143,6 +155,7 @@ async def test_async_job_dispatches_through_executor(
         executor=executor,
         credential_injector=injector,  # pragma: allowlist secret
         execution_authorizer=_StaticAuthorizer(QueuedExecutionVerdict(allowed=True)),
+        actor_status=_ActiveActor(),
     )
     job_id = await _insert_execution_job(admin_db, _payload())
 
@@ -163,6 +176,7 @@ async def test_async_job_dispatches_through_executor(
     # persists the human-readable identity.
     assert req.metadata["operation"] == {
         "id": "op_widgets",
+        "operation_id": None,
         "path": "/v1/widgets",
         "method": "GET",
         "relative_path": None,
@@ -185,9 +199,7 @@ async def test_async_job_records_failed_on_pipeline_error(
     """A pipeline error completes the job with a failed result (pre-E4.1 behaviour)."""
 
     class _Raising:
-        async def execute(
-            self, request: UpstreamExecRequest, *, session: Any
-        ) -> UpstreamExecResult:
+        async def execute(self, request: UpstreamExecRequest, *, db: Any) -> UpstreamExecResult:
             raise RuntimeError("upstream circuit open")
 
     handler = ExecutionHandler(executor=_Raising())
@@ -225,6 +237,7 @@ async def test_async_job_denied_at_run_time_records_failed_result(
         execution_authorizer=_StaticAuthorizer(
             QueuedExecutionVerdict(allowed=False, problem=problem)
         ),
+        actor_status=_ActiveActor(),
     )
     job_id = await _insert_execution_job(admin_db, _payload())
 

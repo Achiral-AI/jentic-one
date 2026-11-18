@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.aws.sigv4 import SigV4Material
+from jentic_one.shared.db.protocols import TransactionalDatabase
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,8 +18,9 @@ class InjectedAuth:
 
     Carries headers, query params, cookies, **and** server variables so an
     ``apiKey in: query`` or ``apiKey in: cookie`` credential is never silently
-    dropped (a headers-only return would lose both). Cookie entries are merged
-    into the outbound ``Cookie`` header by the call-site (sync router / worker).
+    dropped (a headers-only return would lose both). Cookie entries are appended
+    to the caller's outbound ``Cookie`` by ``shared.http.injection.apply_injection``,
+    which the sync router and the worker both call.
     Server-variable entries are substituted into the upstream URL template.
 
     ``signing`` carries **decrypted** SigV4 material (exactly as the plaintext
@@ -81,6 +83,20 @@ class CredentialInjector(Protocol):
         ...
 
 
+def auth_lineage_is_current(
+    token_sha256: str | None, method: str | None, expires_at: datetime | None
+) -> bool:
+    """Whether deferred work carries a complete, unexpired caller credential."""
+    if not token_sha256 or not method:
+        return False
+    if method == "jwt" and expires_at is None:
+        return False
+    if expires_at is None:
+        return True
+    aware = expires_at if expires_at.tzinfo is not None else expires_at.replace(tzinfo=UTC)
+    return aware > datetime.now(UTC)
+
+
 @dataclass(frozen=True, slots=True)
 class QueuedExecutionRequest:
     """What the worker knows about a queued execution when it re-authorizes it.
@@ -99,6 +115,7 @@ class QueuedExecutionRequest:
     api_name: str
     api_version: str
     operation_id: str | None = None
+    spec_operation_id: str | None = None
     # The enqueue-time operation's server-relative path
     # (``OperationInfo.relative_path``) — the path the binding rules are
     # re-evaluated on, so enqueue and run time judge the same path. ``None``
@@ -114,6 +131,20 @@ class QueuedExecutionRequest:
     # The job id — used by the authorizer to look up an approved held_executions
     # row when re-evaluating a rule that carries require-approval effect.
     job_id: str | None = None
+    # The enqueue-time request's trace id and the operation's spec path template
+    # (``OperationInfo.path``) — recorded on a denial event so it correlates with
+    # the request and names what was denied without the concrete request path.
+    trace_id: str | None = None
+    operation_path: str | None = None
+    # Optional authentication-channel lineage captured at enqueue or hold filing
+    # so the worker revalidates the submitting token, API key, OAuth client/grant,
+    # or login session generation before running the execution.
+    auth_token_sha256: str | None = None
+    auth_method: str | None = None
+    oauth_client_id: str | None = None
+    oauth_grant_id: str | None = None
+    session_generation: int | None = None
+    auth_expires_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +177,43 @@ class ExecutionAuthorizer(Protocol):
     """
 
     async def authorize(self, request: QueuedExecutionRequest) -> QueuedExecutionVerdict: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ActorAuthority:
+    """What one live read of the enqueuing actor says it may do right now.
+
+    ``active`` — the actor row exists and is active. ``holds_permission`` — the
+    actor still effectively holds the permission asked about. Both are
+    ``False`` for a missing actor or an actor type that is no longer issued.
+    """
+
+    active: bool
+    holds_permission: bool
+
+
+class ActorStatusReader(Protocol):
+    """Reads, in one round-trip, whether the enqueuing actor may still execute.
+
+    The worker holds no token for the enqueuing actor, so both run-time
+    checks — the authorizer's up-front gate and the handler's final check
+    right before credential injection — answer "is the actor active, and does
+    it still hold the execute permission?" from the actor's rows. Implemented
+    broker-side by ``ActorStatusResolver`` and injected at worker startup.
+    """
+
+    async def authority(
+        self,
+        *,
+        actor_id: str,
+        actor_type: str,
+        permission: str,
+        auth_token_sha256: str | None = None,
+        auth_method: str | None = None,
+        oauth_client_id: str | None = None,
+        oauth_grant_id: str | None = None,
+        session_generation: int | None = None,
+    ) -> ActorAuthority: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +254,35 @@ class UpstreamExecResult:
     duration_ms: int
 
 
+class ExecutionRecordNotPersistedError(Exception):
+    """The upstream call was dispatched but its ``executions`` record was not written.
+
+    An ``UpstreamExecutor`` raises it for **any** failure after the call was
+    dispatched other than the broker's own failure with its record committed:
+    the record write failing for any reason (pool checkout timeout, lost
+    connection, driver error, a bug), or the call dying without a record.
+    ``result`` is the verbatim upstream result when the call returned one, and
+    ``None`` otherwise; ``upstream_error`` is then the broker's failure reason.
+    ``runner_failed`` is true when the dispatched call itself crashed (a
+    non-``BrokerError``), so no record write was attempted. It is distinct
+    from a pipeline failure so the worker reports what the upstream actually
+    did, and never requeues a job whose upstream side effect may already have
+    happened.
+    """
+
+    def __init__(
+        self,
+        result: UpstreamExecResult | None,
+        *,
+        upstream_error: str | None = None,
+        runner_failed: bool = False,
+    ) -> None:
+        super().__init__("execution record not persisted")
+        self.result = result
+        self.upstream_error = upstream_error
+        self.runner_failed = runner_failed
+
+
 class UpstreamExecutor(Protocol):
     """Runs one upstream call through the **shared** ``BrokerExecutionPipeline``.
 
@@ -200,10 +297,16 @@ class UpstreamExecutor(Protocol):
 
     Implementations own the ``executions`` record write (the pipeline persists
     it); the worker keeps only the job-result + lifecycle-event persistence.
+    ``db`` is the worker's database: the record is written in a transaction
+    opened on it after the upstream call, never one held across the call.
+    Once the call is dispatched, the only exceptions an implementation raises
+    are the broker's own failure (its record committed) and
+    :class:`ExecutionRecordNotPersistedError`; anything raised before dispatch
+    propagates as itself.
     """
 
     async def execute(
-        self, request: UpstreamExecRequest, *, session: Any
+        self, request: UpstreamExecRequest, *, db: TransactionalDatabase
     ) -> UpstreamExecResult: ...
 
 
@@ -213,49 +316,3 @@ class JobRecord(Protocol):
     id: str
     kind: str
     status: str
-
-
-class JobRepoProtocol(Protocol):
-    """Protocol for job repository operations used by the worker."""
-
-    async def create(
-        self,
-        session: Any,
-        *,
-        kind: Any,
-        status: Any,
-        parent_job_id: str | None = None,
-        execution_id: str | None = None,
-        error: str | None = None,
-    ) -> JobRecord: ...
-
-    async def get_by_id(self, session: Any, job_id: str) -> JobRecord | None: ...
-
-    async def update(
-        self,
-        session: Any,
-        job_id: str,
-        *,
-        status: Any | None = None,
-        error: str | None = None,
-        execution_id: str | None = None,
-    ) -> JobRecord: ...
-
-    async def claim_next_queued(self, session: Any) -> JobRecord | None: ...
-
-
-class JobResultRepoProtocol(Protocol):
-    """Protocol for job result repository operations used by the worker."""
-
-    async def create(
-        self,
-        session: Any,
-        *,
-        job_id: str,
-        kind: str,
-        body: dict[str, Any],
-        content_type: str | None = None,
-        available_until: datetime | None = None,
-    ) -> Any: ...
-
-    async def delete_expired(self, session: Any) -> int: ...

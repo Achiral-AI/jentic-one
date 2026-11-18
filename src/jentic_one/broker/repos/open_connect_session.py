@@ -23,12 +23,28 @@ from jentic_one.shared.models.api_identity import credential_coverage_where
 # Live states mirror ``control.repos.connect_session_repo.LIVE_STATES``:
 # ``created`` waits for the owner's review, ``awaiting_app`` for an OAuth app
 # to connect through, ``polling`` for the vendor flow.
+# Only create sessions: an edit session changes a binding the agent already
+# holds, so it never answers a missing-credential denial.
 # Newest first, so the link names the session the agent opened last.
 _OPEN_SESSION_FOR_API = text(
     "SELECT cs.id FROM connect_sessions cs "
     "JOIN credentials c ON c.id = cs.credential_id "
     "WHERE cs.agent_id = :agent_id AND cs.state IN ('created', 'awaiting_app', 'polling') "
+    "AND cs.intent = 'create' "
     f"AND {credential_coverage_where()} "
+    "ORDER BY cs.created_at DESC, cs.id DESC LIMIT 1"
+)
+
+
+# An open edit of one binding, whoever opened it: a human opening a
+# reviewable edit for the agent is exactly the review the denial should
+# relay, so the directive points at it rather than telling the agent to file
+# a second request for the same change. The API-target query carries no
+# initiator clause either.
+_OPEN_EDIT_FOR_BINDING = text(
+    "SELECT cs.id FROM connect_sessions cs "
+    "WHERE cs.agent_id = :agent_id AND cs.credential_id = :credential_id "
+    "AND cs.intent = 'edit' AND cs.state IN ('created', 'awaiting_app', 'polling') "
     "ORDER BY cs.created_at DESC, cs.id DESC LIMIT 1"
 )
 
@@ -43,11 +59,29 @@ class OpenConnectSessionReader:
         self, *, agent_id: str, vendor: str, name: str, version: str
     ) -> str | None:
         """Return the open session's id, or ``None`` when the agent has none for the API."""
-        async with self._control_db.session() as session:
+        async with self._control_db.read_session() as session:
             row = (
                 await session.execute(
                     _OPEN_SESSION_FOR_API,
                     {"agent_id": agent_id, "vendor": vendor, "name": name, "version": version},
+                )
+            ).first()
+        return str(row[0]) if row is not None else None
+
+    async def find_open_edit_id(self, *, agent_id: str, credential_id: str) -> str | None:
+        """Return the newest open edit of one binding, whoever opened it, or ``None``.
+
+        Read from the primary, where :meth:`find_session_id` reads a replica.
+        The edit this relays is often seconds old (a human opening a review
+        for the agent that was just denied), and a replica that has not caught
+        up would answer "none", sending the agent to file a second request for
+        a change already waiting.
+        """
+        async with self._control_db.session() as session:
+            row = (
+                await session.execute(
+                    _OPEN_EDIT_FOR_BINDING,
+                    {"agent_id": agent_id, "credential_id": credential_id},
                 )
             ).first()
         return str(row[0]) if row is not None else None

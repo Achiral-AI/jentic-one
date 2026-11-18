@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 from collections.abc import AsyncGenerator, Iterator
 from datetime import UTC, datetime, timedelta
 
@@ -28,7 +30,14 @@ from jentic_one.control.repos import AgentPermissionRuleRepository
 from jentic_one.shared.context import Context
 from jentic_one.shared.models import InviteState, StoredCredentialType
 from jentic_one.shared.models.events import EventType
-from tests.web.auth.conftest import OWNER_EMAIL, _build_app, _make_token
+from tests.web.auth.conftest import (
+    OWNER_EMAIL,
+    _build_app,
+    _make_agent_token,
+    _make_token,
+    assert_same_response,
+)
+from tests.web.conftest import seeded_jwt_user
 
 pytestmark = pytest.mark.integration
 
@@ -628,6 +637,150 @@ def test_agent_cannot_purge_its_own_binding(
     assert resp.status_code == 204
 
 
+def test_agent_cannot_change_a_sibling_agents_bindings(
+    owner_client: TestClient,
+    self_agent_client: TestClient,
+    binding_agent_id: str,
+    test_agent_id: str,
+    control_credential_id: str,
+) -> None:
+    """``owner:agents:read`` shows an agent its owner's other agents, read-only.
+
+    With ``agents:write`` it still cannot bind, suspend, purge or resume a
+    binding on a sibling agent: each answers 404 like an agent it cannot
+    see, and the sibling's bindings are unchanged. Its own binding of the
+    owner's credential still works.
+    """
+    sibling_url = f"/agents/{test_agent_id}/credentials"
+    own_url = f"/agents/{binding_agent_id}/credentials"
+
+    resp = self_agent_client.post(sibling_url, json={"credential_id": control_credential_id})
+    assert resp.status_code == 404
+    assert resp.json()["type"] == "actor_not_found"
+    assert _suspended_rows(owner_client, test_agent_id) == {}
+
+    assert (
+        owner_client.post(sibling_url, json={"credential_id": control_credential_id}).status_code
+        == 201
+    )
+    assert self_agent_client.get(sibling_url).status_code == 200
+    for params in ({}, {"purge": "true"}):
+        resp = self_agent_client.delete(f"{sibling_url}/{control_credential_id}", params=params)
+        assert resp.status_code == 404
+        assert resp.json()["type"] == "actor_not_found"
+    assert _suspended_rows(owner_client, test_agent_id) == {control_credential_id: False}
+
+    assert owner_client.delete(f"{sibling_url}/{control_credential_id}").status_code == 204
+    resp = self_agent_client.post(f"{sibling_url}/{control_credential_id}:resume")
+    assert resp.status_code == 404
+    assert resp.json()["type"] == "actor_not_found"
+    assert _suspended_rows(owner_client, test_agent_id) == {control_credential_id: True}
+
+    # Its own binding: bind the owner's credential, then suspend it.
+    resp = self_agent_client.post(own_url, json={"credential_id": control_credential_id})
+    assert resp.status_code == 201
+    assert self_agent_client.delete(f"{own_url}/{control_credential_id}").status_code == 204
+    assert _suspended_rows(owner_client, binding_agent_id) == {control_credential_id: True}
+
+    # The owner still manages the sibling's binding.
+    resp = owner_client.post(f"{sibling_url}/{control_credential_id}:resume")
+    assert resp.status_code == 200
+    resp = owner_client.delete(f"{sibling_url}/{control_credential_id}", params={"purge": "true"})
+    assert resp.status_code == 204
+
+
+@pytest.fixture()
+def delegated_sibling_client(
+    web_context: Context, binding_agent_id: str, owner_user_id: str
+) -> Iterator[TestClient]:
+    """The binding agent with the default delegation scopes and no ``agents:read``."""
+    config = web_context.config.admin.auth
+    claims = {
+        "sub": binding_agent_id,
+        "email": "",
+        "actor_type": "agent",
+        "parent_actor_id": owner_user_id,
+        "permissions": ["owner:agents:read", "owner:credentials:read"],
+        "must_change_password": False,
+    }
+    token = issue_jwt(claims, config.jwt_secret.get_secret_value(), config.jwt_ttl_seconds)
+    app = _build_app(web_context)
+    with TestClient(app, headers={"Authorization": f"Bearer {token}"}) as tc:
+        yield tc
+
+
+def _normalised_problem(body: dict[str, object], agent_id: str) -> dict[str, object]:
+    """A problem body with the requested agent id and per-request ids blanked."""
+    text = json.dumps(body).replace(agent_id, "<agent_id>")
+    normalised: dict[str, object] = json.loads(text)
+    for key in ("request_id", "trace_id"):
+        normalised.pop(key, None)
+    return normalised
+
+
+@pytest.mark.parametrize("suffix", ["", "/credentials"])
+def test_sibling_agent_read_is_indistinguishable_from_unknown_id(
+    owner_client: TestClient,
+    delegated_sibling_client: TestClient,
+    binding_agent_id: str,
+    test_agent_id: str,
+    suffix: str,
+) -> None:
+    """An agent that is not the target, its owner, or org:admin gets the unknown-id 404.
+
+    ``owner:agents:read`` without ``agents:read`` does not reveal that a
+    sibling agent exists: the problem body matches a nonexistent id once the
+    ids are normalised. The agent itself and its owner still read it.
+    """
+    sibling = delegated_sibling_client.get(f"/agents/{test_agent_id}{suffix}")
+    unknown_id = "agnt_does_not_exist"
+    unknown = delegated_sibling_client.get(f"/agents/{unknown_id}{suffix}")
+    assert sibling.status_code == unknown.status_code == 404
+    assert sibling.headers["content-type"] == unknown.headers["content-type"]
+    assert _normalised_problem(sibling.json(), test_agent_id) == _normalised_problem(
+        unknown.json(), unknown_id
+    )
+    assert sibling.json()["type"] == "actor_not_found"
+
+    assert delegated_sibling_client.get(f"/agents/{binding_agent_id}{suffix}").status_code == 200
+    assert owner_client.get(f"/agents/{test_agent_id}{suffix}").status_code == 200
+
+
+@pytest.mark.parametrize("body", [{}, {"description": "changed"}], ids=["empty", "non-empty"])
+def test_sibling_agent_patch_is_indistinguishable_from_unknown_id(
+    web_context: Context,
+    owner_client: TestClient,
+    binding_agent_id: str,
+    owner_user_id: str,
+    test_agent_id: str,
+    body: dict[str, str],
+) -> None:
+    """A sibling holding ``agents:write`` gets the unknown-id 404 from ``PATCH``.
+
+    With ``owner:agents:read`` but not ``agents:read`` it cannot read the
+    sibling, so an empty body must not return the sibling's profile either:
+    both bodies answer exactly like a nonexistent id. The owner's empty
+    ``PATCH`` still returns the agent.
+    """
+    token = _make_agent_token(
+        web_context, binding_agent_id, owner_user_id, ["owner:agents:read", "agents:write"]
+    )
+    unknown_id = "agnt_does_not_exist"
+    with TestClient(
+        _build_app(web_context), headers={"Authorization": f"Bearer {token}"}
+    ) as sibling_client:
+        sibling = sibling_client.patch(f"/agents/{test_agent_id}", json=body)
+        unknown = sibling_client.patch(f"/agents/{unknown_id}", json=body)
+    assert sibling.status_code == 404, sibling.text
+    assert sibling.json()["type"] == "actor_not_found"
+    assert_same_response(sibling, test_agent_id, unknown, unknown_id)
+
+    own = owner_client.patch(f"/agents/{test_agent_id}", json={})
+    assert own.status_code == 200, own.text
+    assert own.json()["id"] == test_agent_id
+    assert own.json()["description"] == "Test agent for web tests"
+
+
 @pytest.mark.asyncio
 async def test_purge_drops_inline_rules_so_rebind_starts_default_deny(
     owner_client: TestClient,
@@ -756,7 +909,7 @@ async def self_registered_alert_id(
 ) -> AsyncGenerator[str, None]:
     """The actionable `agent.self_registered` event DCR files for the agent."""
     async with web_context.admin_db.transaction() as session:
-        event = await EventRepository.create(
+        event_id = await EventRepository.create(
             session,
             type=EventType.AGENT_SELF_REGISTERED,
             severity="info",
@@ -767,10 +920,10 @@ async def self_registered_alert_id(
             actor_id=dcr_agent_id,
             actor_type="agent",
         )
-    yield event.id
+    yield event_id
 
     async with web_context.admin_db.session() as session:
-        await session.execute(delete(Event).where(Event.id == event.id))
+        await session.execute(delete(Event).where(Event.id == event_id))
         await session.commit()
 
 
@@ -840,7 +993,7 @@ async def test_approve_leaves_other_agents_alerts_untouched(
     stay as append-only history regardless of which agent is decided.
     """
     async with web_context.admin_db.transaction() as session:
-        other = await EventRepository.create(
+        other_id = await EventRepository.create(
             session,
             type=EventType.AGENT_SELF_REGISTERED,
             severity="info",
@@ -851,7 +1004,6 @@ async def test_approve_leaves_other_agents_alerts_untouched(
             actor_id="agnt_other_pending",
             actor_type="agent",
         )
-    other_id = other.id
 
     try:
         resp = admin_client.post(f"/agents/{dcr_agent_id}:approve")
@@ -874,6 +1026,13 @@ async def test_approve_leaves_other_agents_alerts_untouched(
             await session.commit()
 
 
+@pytest.fixture()
+async def _rotation_user(web_context: Context) -> AsyncGenerator[str, None]:
+    async with seeded_jwt_user(web_context, "user-needs-rotation") as user_id:
+        yield user_id
+
+
+@pytest.mark.usefixtures("_rotation_user")
 def test_password_rotation_required(web_context: Context) -> None:
     """Tokens with must_change_password=True get 403 on permission-gated endpoints."""
     config = web_context.config.admin.auth
@@ -1015,3 +1174,18 @@ def test_claim_agent_non_user_actor_forbidden(
 def test_claim_agent_unauthenticated(unauthed_client: TestClient, claimable_agent_id: str) -> None:
     resp = unauthed_client.post(f"/agents/{claimable_agent_id}:claim", json={"token": _CLAIM_TOKEN})
     assert resp.status_code == 401
+
+
+#: Cursors that base64-decode to JSON of the wrong shape (#1956).
+_WRONG_SHAPE_CURSORS = [
+    base64.b64encode(raw.encode()).decode()
+    for raw in ("null", "[1]", '{"t": 1, "id": "x"}', '{"t": "2024-01-01", "id": 1}')
+]
+
+
+@pytest.mark.parametrize("cursor", _WRONG_SHAPE_CURSORS)
+def test_list_agents_wrong_shape_cursor_returns_400(admin_client: TestClient, cursor: str) -> None:
+    """A tampered cursor on the auth surface is a 400 ``invalid_cursor``, never a 500."""
+    resp = admin_client.get("/agents", params={"cursor": cursor})
+    assert resp.status_code == 400
+    assert resp.json()["type"] == "invalid_cursor"

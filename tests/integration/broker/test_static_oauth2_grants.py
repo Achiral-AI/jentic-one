@@ -26,7 +26,7 @@ import httpx
 import pytest
 from sqlalchemy import delete, update
 
-from jentic_one.broker.core.exceptions import CredentialNeedsReconnectError
+from jentic_one.broker.core.errors import CredentialNeedsReconnectError
 from jentic_one.broker.services.credentials.orchestrator import CredentialService
 from jentic_one.control.core.schema.credentials import Credential
 from jentic_one.control.core.schema.oauth_client_credentials import OAuthClientCredential
@@ -85,14 +85,9 @@ async def clean_oauth(control_db: DatabaseSession) -> AsyncGenerator[None, None]
 
 
 def _install(monkeypatch: pytest.MonkeyPatch, endpoint: _TokenEndpoint) -> None:
-    real_client = httpx.AsyncClient
-
-    def _client(**kwargs: Any) -> httpx.AsyncClient:
-        kwargs.pop("transport", None)
-        return real_client(transport=httpx.MockTransport(endpoint.handle), **kwargs)
-
     monkeypatch.setattr(
-        "jentic_one.control.services.credentials.providers.oauth2.httpx.AsyncClient", _client
+        "jentic_one.shared.http.idp_client.build_always_pinned_transport",
+        lambda *_args, **_kwargs: httpx.MockTransport(endpoint.handle),
     )
 
 

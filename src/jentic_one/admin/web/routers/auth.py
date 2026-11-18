@@ -16,6 +16,7 @@ from jentic_one.admin.web.deps import (
     get_invite_service,
     get_user_service,
 )
+from jentic_one.admin.web.ratelimit import check_login_rate_limit
 from jentic_one.admin.web.schemas.auth import (
     ChangePasswordRequest,
     CreateAdminRequest,
@@ -27,12 +28,24 @@ from jentic_one.admin.web.schemas.auth import (
 from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.web import get_current_identity
 from jentic_one.shared.web.auth import extract_credential
-from jentic_one.shared.web.openapi_responses import PUBLIC_ERROR_RESPONSES, gone
+from jentic_one.shared.web.openapi_responses import (
+    PUBLIC_ERROR_RESPONSES,
+    gone,
+    too_many_requests,
+)
 
 router = APIRouter()
 
 
-@router.post("/auth/login", summary="Log in")
+@router.post(
+    "/auth/login",
+    summary="Log in",
+    responses={
+        **PUBLIC_ERROR_RESPONSES,
+        **too_many_requests("Too many login attempts from this client network."),
+    },
+    dependencies=[Depends(check_login_rate_limit)],
+)
 async def login(
     body: LoginRequest,
     auth_svc: AuthService = Depends(get_auth_service),
@@ -59,8 +72,9 @@ async def refresh_session(
     ``must_change_password`` gate are re-read from the database at re-mint.
     Refusal modes: 401 ``session_expired`` once the original authentication is
     older than the absolute window (``admin.auth.session_ttl_seconds``), 401
-    ``invalid_credentials`` for deactivated users, non-user tokens, or opaque
-    (non-JWT) credentials. Clients should then send the user back to login.
+    ``unauthorized`` from the auth gate for a disabled, deleted or unknown user,
+    and 401 ``invalid_credentials`` for non-user tokens or opaque (non-JWT)
+    credentials. Clients should then send the user back to login.
     """
     _ = identity  # Auth gate only; the service re-derives everything it needs.
     bundle = await auth_svc.refresh(extract_credential(request))

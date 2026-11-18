@@ -11,6 +11,7 @@ from sqlalchemy import delete
 from jentic_one.admin.core.schema.events import Event
 from jentic_one.admin.repos import EventRepository
 from jentic_one.shared.db.session import DatabaseSession
+from jentic_one.shared.pagination import Cursor
 
 pytestmark = pytest.mark.integration
 
@@ -28,7 +29,7 @@ async def clean_events(admin_db: DatabaseSession) -> AsyncGenerator[None, None]:
 
 async def test_create_generates_ksuid(admin_db: DatabaseSession, clean_events: None) -> None:
     async with admin_db.session() as session:
-        event = await EventRepository.create(
+        event_id = await EventRepository.create(
             session,
             type="execution.completed",
             severity="info",
@@ -36,13 +37,13 @@ async def test_create_generates_ksuid(admin_db: DatabaseSession, clean_events: N
             created_by="usr_test",
         )
         await session.commit()
-        assert event.id.startswith("evt_")
-        assert len(event.id) == 28
+        assert event_id.startswith("evt_")
+        assert len(event_id) == 28
 
 
 async def test_create_and_get_by_id(admin_db: DatabaseSession, clean_events: None) -> None:
     async with admin_db.session() as session:
-        event = await EventRepository.create(
+        event_id = await EventRepository.create(
             session,
             type="execution.failed",
             severity="error",
@@ -56,7 +57,6 @@ async def test_create_and_get_by_id(admin_db: DatabaseSession, clean_events: Non
             created_by="usr_test",
         )
         await session.commit()
-        event_id = event.id
 
     async with admin_db.session() as session:
         loaded = await EventRepository.get_by_id(session, event_id)
@@ -129,6 +129,6 @@ async def test_list_after_cursor(admin_db: DatabaseSession, clean_events: None) 
         await session.commit()
 
     async with admin_db.session() as session:
-        recent = await EventRepository.list_after_cursor(session, (cutoff, ""))
+        recent = await EventRepository.list_after_cursor(session, Cursor(timestamp=cutoff, id=""))
         assert len(recent) >= 1
         assert all(e.created_at > cutoff for e in recent)

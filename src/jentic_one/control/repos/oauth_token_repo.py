@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -9,8 +10,13 @@ from sqlalchemy import and_, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from jentic_one.control.core.schema.oauth_tokens import OAuthToken
+from jentic_one.shared.db.locks import advisory_xact_lock
 
 ExpiryEventKind = Literal["expiring_soon", "expired"]
+
+# Upper bound on IDs bound into one IN (...) clause, well under SQLite's and
+# Postgres's host-parameter limits.
+_ID_BATCH_SIZE = 500
 
 
 class OAuthTokenRepository:
@@ -18,17 +24,35 @@ class OAuthTokenRepository:
 
     @staticmethod
     async def acquire_refresh_lock(session: AsyncSession, credential_id: str) -> None:
-        """Acquire a transaction-scoped advisory lock for refresh single-flight.
+        """Acquire the transaction-scoped lock that serialises a credential's grant.
 
-        On PostgreSQL this uses pg_advisory_xact_lock (released at commit/rollback).
-        On SQLite this is a no-op — the in-process asyncio.Lock handles concurrency.
+        Held by the broker's single-flight refresh and by any control write
+        that drops the grant, so the two never interleave. On PostgreSQL this
+        is ``pg_advisory_xact_lock`` (released at commit/rollback). On SQLite
+        it is a no-op: every write transaction opens with ``BEGIN IMMEDIATE``,
+        which already serialises the refresh transaction against the dropping
+        write across processes.
+        """
+        await advisory_xact_lock(session, hashtext_name=credential_id)
+
+    @staticmethod
+    async def try_acquire_refresh_lock(session: AsyncSession, credential_id: str) -> bool:
+        """Try to acquire the transaction-scoped grant lock without blocking.
+
+        Returns ``True`` when the lock is acquired for this transaction and
+        ``False`` when another transaction holds it. On PostgreSQL this runs
+        ``pg_try_advisory_xact_lock(hashtext(:cid))``. On SQLite it returns
+        ``True``: every write transaction opens with ``BEGIN IMMEDIATE``, which
+        already serialises writers.
         """
         dialect = session.bind.dialect.name if session.bind else "sqlite"
         if dialect == "postgresql":
-            await session.execute(
-                text("SELECT pg_advisory_xact_lock(hashtext(:cid))"),
+            result = await session.execute(
+                text("SELECT pg_try_advisory_xact_lock(hashtext(:cid))"),
                 {"cid": credential_id},
             )
+            return bool(result.scalar_one())
+        return True
 
     @staticmethod
     async def create(
@@ -67,6 +91,23 @@ class OAuthTokenRepository:
         return result.scalar_one_or_none()
 
     @staticmethod
+    async def get_by_credentials(
+        session: AsyncSession, ids: Sequence[str]
+    ) -> dict[str, OAuthToken]:
+        """Batch-resolve credential IDs to their ``OAuthToken`` rows (missing ids omitted)."""
+        if not ids:
+            return {}
+        tokens: dict[str, OAuthToken] = {}
+        for i in range(0, len(ids), _ID_BATCH_SIZE):
+            batch = list(ids[i : i + _ID_BATCH_SIZE])
+            result = await session.execute(
+                select(OAuthToken).where(OAuthToken.credential_id.in_(batch))
+            )
+            for row in result.scalars().all():
+                tokens[row.credential_id] = row
+        return tokens
+
+    @staticmethod
     async def update_tokens(
         session: AsyncSession,
         credential_id: str,
@@ -76,6 +117,12 @@ class OAuthTokenRepository:
         expires_at: datetime | None = None,
         scope: str | None = None,
     ) -> OAuthToken | None:
+        """Merge refreshed token material onto the existing row (RFC 6749 §6).
+
+        Omitted ``encrypted_refresh_token`` and ``scope`` keep their prior
+        values. Intended for the broker refresh path only; reconnect writers
+        must use :meth:`replace_grant`.
+        """
         row = await OAuthTokenRepository.get_by_credential(session, credential_id)
         if row is None:
             return None
@@ -92,6 +139,45 @@ class OAuthTokenRepository:
         row.last_refreshed = datetime.now(UTC)
         await session.flush()
         return row
+
+    @staticmethod
+    async def replace_grant(
+        session: AsyncSession,
+        credential_id: str,
+        *,
+        encrypted_access_token: str,
+        encrypted_refresh_token: str | None = None,
+        expires_at: datetime | None = None,
+        scope: str | None = None,
+        app_registration_id: str | None = None,
+    ) -> OAuthToken | None:
+        """Replace the credential's grant unconditionally with a newly issued one.
+
+        Sets every field as supplied (``None`` clears the column), clears
+        ``revoked_at``, and stamps ``last_refreshed`` to now.
+        """
+        row = await OAuthTokenRepository.get_by_credential(session, credential_id)
+        if row is None:
+            return None
+        row.encrypted_access_token = encrypted_access_token
+        row.encrypted_refresh_token = encrypted_refresh_token
+        row.expires_at = expires_at
+        row.scope = scope
+        row.app_registration_id = app_registration_id
+        row.revoked_at = None
+        row.last_refreshed = datetime.now(UTC)
+        await session.flush()
+        return row
+
+    @staticmethod
+    async def delete_by_credential(session: AsyncSession, credential_id: str) -> bool:
+        """Delete the credential's token row; ``True`` when one existed."""
+        row = await OAuthTokenRepository.get_by_credential(session, credential_id)
+        if row is None:
+            return False
+        await session.delete(row)
+        await session.flush()
+        return True
 
     @staticmethod
     async def mark_revoked(session: AsyncSession, credential_id: str) -> OAuthToken | None:

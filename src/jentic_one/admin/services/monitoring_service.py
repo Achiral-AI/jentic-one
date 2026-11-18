@@ -124,7 +124,6 @@ def _evict_stale(cache: dict[Any, Any], now: float) -> None:
 
 @dataclass(slots=True, frozen=True)
 class UsageFilters:
-    toolkit_id: str | None = field(default=None)
     api_id: str | None = field(default=None)
     agent_id: str | None = field(default=None)
     status: str | None = field(default=None)
@@ -135,6 +134,9 @@ class MonitoringService:
 
     def __init__(self, ctx: Context) -> None:
         self._ctx = ctx
+        # `_cache`, `_usage_cache`, and `_grouped_totals_cache` store org-wide
+        # totals (unscoped by caller identity) and must remain gated behind
+        # `org:admin`.
         self._cache: dict[int, _CacheEntry] = {}
         self._locks: dict[int, asyncio.Lock] = {}
         self._usage_cache: dict[tuple[Any, ...], _UsageCacheEntry] = {}
@@ -166,11 +168,18 @@ class MonitoringService:
             return result
 
     async def _query(self, days: int) -> ExecutionStats:
-        cutoff = datetime.now(tz=UTC) - timedelta(days=days)
+        # Both routes resolve "now" the same way, so the overview and the usage
+        # charts agree on which minute the window ends in. The upper bound also
+        # keeps a row stamped in the future out of the totals: `total` and
+        # `success_rate_percent` below are sums over these buckets, so an
+        # unbounded window let one such row inflate both without expiring.
+        _, until_ts = self._resolve_window(None, None)
+        until = datetime.fromtimestamp(until_ts, tz=UTC)
+        cutoff = until - timedelta(days=days)
 
-        async with self._ctx.admin_db.session() as session:
-            daily_rows = await MonitoringRepository.daily_buckets(session, cutoff)
-            top_rows = await MonitoringRepository.top_operations(session, cutoff)
+        async with self._ctx.admin_db.read_snapshot() as session:
+            daily_rows = await MonitoringRepository.daily_buckets(session, cutoff, until)
+            top_rows = await MonitoringRepository.top_operations(session, cutoff, until)
 
         total = sum(b.total for b in daily_rows)
         success = sum(b.success for b in daily_rows)
@@ -300,12 +309,9 @@ class MonitoringService:
     def _resolve_window(since: int | None, until: int | None) -> tuple[int, int]:
         """Resolve optional epoch bounds to ``(since, until)``; defaults to the last 24h."""
         current_ts = int(datetime.now(tz=UTC).timestamp())
-        # Round the fallback UP to the next minute boundary: requests arriving
-        # within the same 60s window still share an identical cache key, but —
-        # because every aggregate filters `started_at < until` strictly — the
-        # current partial minute is INCLUDED. Flooring here made executions
-        # invisible to the volume chart / KPI for up to a minute while the
-        # executions feed (no upper bound) already listed them (#913).
+        # Round the fallback UP to the next minute boundary so strict
+        # `started_at < until` filtering includes the current partial minute
+        # while requests within the minute share a stable cache key (#913).
         stable_now_ts = (current_ts // 60 + 1) * 60
         resolved_until = until if until is not None else stable_now_ts
         resolved_since = since if since is not None else resolved_until - 86400
@@ -361,15 +367,14 @@ class MonitoringService:
     def _compute_trend_points(window_seconds: int, bucket_seconds: int) -> int:
         """Number of per-entity trend segments for a window.
 
-        One segment per aggregate bucket tier (24h → 24 hourly, 7d → 28
-        six-hour, 30d → 30 daily) instead of a fixed 12: equal twelfths of a
-        multi-day window (e.g. 14h for 7d) can never line up with calendar
-        days, which made the volume chart's day axis span more days than the
-        window. When the window is an exact multiple of the bucket size,
-        day-aligned bounds put segments exactly on day boundaries; a
-        DST-stretched window drifts slightly but stays re-bucketable into
-        day bars client-side. Capped so a pathologically wide window can't
-        inflate the payload.
+        Uses one segment per aggregate bucket tier (24h → 24 hourly, 7d → 28
+        six-hour, 30d → 30 daily) to preserve bucket and calendar-day alignment,
+        whereas equal twelfths of a multi-day window (e.g. 14h for 7d) would not
+        align with calendar days. When the window is an exact multiple of the
+        bucket size, day-aligned bounds put segments directly on day boundaries;
+        a DST-stretched window drifts slightly but stays re-bucketable into day
+        bars client-side. Capped so a pathologically wide window cannot inflate
+        the payload.
         """
         return max(1, min(60, round(window_seconds / bucket_seconds)))
 
@@ -379,11 +384,15 @@ class MonitoringService:
             return None
         api_vendor: str | None = None
         api_name: str | None = None
-        if filters.api_id and "/" in filters.api_id:
-            api_vendor = filters.api_id.split("/")[0]
-            api_name = filters.api_id.split("/", 1)[1]
+        if filters.api_id:
+            # `api_id` is `vendor/name`. A value carrying no `/` names the
+            # vendor alone and filters on that: dropping it instead would
+            # answer a narrower question with org-wide totals under a 200,
+            # which is the one outcome a filter must never produce. An
+            # unmatched vendor correctly returns nothing.
+            api_vendor, _, rest = filters.api_id.partition("/")
+            api_name = rest or None
         f = UsageQueryFilters(
-            toolkit_id=filters.toolkit_id,
             api_vendor=api_vendor,
             api_name=api_name,
             actor_id=filters.agent_id,
@@ -408,7 +417,13 @@ class MonitoringService:
 
         repo_filters = self._build_repo_filters(filters)
 
-        async with self._ctx.admin_db.session() as session:
+        # One snapshot for every figure describing the window, so the response
+        # cannot contradict itself: each statement would otherwise take its own
+        # snapshot, and a commit landing between them leaves `total` disagreeing
+        # with the sum of its buckets, or top rows summing past it. The body is
+        # then cached and re-served for the whole TTL, so one interleaved write
+        # is visible for 30s.
+        async with self._ctx.admin_db.read_snapshot() as session:
             stats_row = await MonitoringRepository.overall_stats(
                 session, cutoff, until_dt, filters=repo_filters
             )
@@ -429,6 +444,13 @@ class MonitoringService:
                 filters=repo_filters,
             )
 
+        # Read outside the historical aggregate's snapshot so `active_now`
+        # describes worker state at sampling time rather than at that snapshot.
+        # The complete `UsageStats`, including this sample, is then cached and
+        # may be re-served for up to 30 seconds.
+        async with self._ctx.admin_db.read_session() as session:
+            active_now = await MonitoringRepository.active_now(session, filters=repo_filters)
+
         return UsageStats(
             since=since,
             until=until,
@@ -441,7 +463,7 @@ class MonitoringService:
             avg_ms=stats_row.avg_ms,
             p50_ms=stats_row.p50_ms,
             p95_ms=stats_row.p95_ms,
-            active_now=stats_row.active_now,
+            active_now=active_now,
             buckets=[
                 {
                     "ts": b.ts,

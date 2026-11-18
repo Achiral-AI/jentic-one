@@ -19,6 +19,10 @@ export type PermissionRuleReadSchema = {
      */
     effect: PermissionRuleReadSchema.effect;
     /**
+     * ID of the rule (`apr_…` on a binding, `prr_…` in a rule set), so a connect-session edit can name it in `remove` or `before`.
+     */
+    id?: (string | null);
+    /**
      * How `path` is interpreted: `regex` (full-match), `prefix` or `exact`.
      */
     match_mode?: PermissionRuleReadSchema.match_mode;
@@ -27,7 +31,7 @@ export type PermissionRuleReadSchema = {
      */
     methods?: (Array<string> | null);
     /**
-     * OpenAPI operation IDs the rule matches; null matches all.
+     * OpenAPI operationIds the rule matches by exact equality (existing `op_…` registry operation IDs also match their revision); null matches all.
      */
     operations?: (Array<string> | null);
     /**

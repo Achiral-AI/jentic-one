@@ -6,11 +6,16 @@ import {
 	type CredentialUpdateRequest,
 } from '@/shared/credentials/api';
 import type {
+	AmendCreateBody,
+	AmendEditBody,
 	ConfirmSessionBody,
 	ConnectRequest,
+	EditRuleView,
 	ExistingCredential,
 	PermissionRule,
 	ReviewAgent,
+	ReviewEdit,
+	SessionRevision,
 	ReviewProvenance,
 	ReviewScheme,
 	SessionStatus,
@@ -19,6 +24,9 @@ import type {
 	VendorSummary,
 } from '@/shared/credentials/api/vendors-types';
 import type { ApiResponse, CatalogEntryResponse } from '@/shared/api';
+
+/** The mock caller: the agent's owner, who reviews its requests. */
+const MOCK_REVIEWER_ID = 'usr_mock_owner';
 
 /**
  * In-memory credentials store for MSW (mocked dev — Mode A — and browser/e2e
@@ -35,6 +43,7 @@ let seq = 0;
 // e2e exercise the abandoned-connect path deterministically. Defaults to true
 // so existing flows (mocked dev, other specs) still auto-complete.
 let connectAutoCompletes = true;
+const connectFlowCompletions = new Map<string, string>();
 
 /** Toggle whether the mocked connect flow auto-completes. For tests. */
 export function setConnectAutoCompletes(value: boolean): void {
@@ -93,6 +102,7 @@ export function resetCredentialsStore(seed: Credential[] = []): void {
 	store = [...seed];
 	seq = seed.length;
 	connectAutoCompletes = true;
+	connectFlowCompletions.clear();
 }
 
 /** Append credentials to the current store, keeping what is already there. */
@@ -423,9 +433,19 @@ export interface MockConnectSession {
 	confirmProblem?: { status: number; type: string; endsSession?: boolean };
 	/** How the session ended once its row went (`:reject`, `:cancel`, an existing credential). */
 	outcome?: MockSessionOutcome;
+	/** An edit session's review block; set, the session edits an existing binding. */
+	edit?: ReviewEdit | null;
+	/** An edit session's revision history (defaults to its current revision alone). */
+	revisions?: SessionRevision[];
+	/** A create session's current revision (defaults to revision 1); `:amend` moves it. */
+	revision?: { id: string; number: number };
+	/** When a human last rejected this agent's ask for the same target (the review shows it). */
+	last_rejected_at?: string | null;
+	/** The binding moved since an edit was opened; `:rebase` clears it. */
+	stale?: boolean;
 }
 
-type MockSessionOutcome = 'rejected' | 'cancelled' | 'connected';
+type MockSessionOutcome = 'rejected' | 'cancelled' | 'connected' | 'applied';
 
 /** Sessions whose row went (`:reject`, `:cancel`, an existing credential), newest last. */
 let endedConnectSessions: MockConnectSession[] = [];
@@ -476,7 +496,8 @@ export function getEndedMockConnectSessions(): readonly MockConnectSession[] {
 /** End a session the way `_mark_terminal` does: the row and its pending credential go. */
 function endMockConnectSession(session: MockConnectSession, outcome: MockSessionOutcome): void {
 	connectSessionsStore = connectSessionsStore.filter((s) => s.session_id !== session.session_id);
-	store = store.filter((c) => c.credential_id !== session.credential_id);
+	// An edit's credential is the live one: only a create session takes its own with it.
+	if (!session.edit) store = store.filter((c) => c.credential_id !== session.credential_id);
 	endedConnectSessions.push({ ...session, outcome });
 }
 
@@ -511,11 +532,16 @@ const MANUAL_CONFIRM_KINDS: Record<string, string> = {
 
 /** `:confirm` kinds a session accepts, mirroring the backend's `_allowed_confirm_kinds`. */
 function allowedConfirmKinds(session: MockConnectSession): string[] {
+	if (session.edit) return ['edit'];
 	const primary =
 		session.state === 'awaiting_app'
 			? 'own_oauth_client'
 			: (MANUAL_CONFIRM_KINDS[session.resolved_flow ?? ''] ?? 'oauth');
-	return [primary, 'existing_credential', 'reauthorize'];
+	return [primary, 'existing_credential'];
+}
+
+function createRevision(session: MockConnectSession): { id: string; number: number } {
+	return session.revision ?? { id: `csr_${session.session_id}_1`, number: 1 };
 }
 
 function reviewDigest(session: MockConnectSession): string {
@@ -568,12 +594,13 @@ export function seedMockAgentConnectSession(
 		api: { vendor: overrides.vendor_key, name: 'default', version: '1.0.0' },
 		details: { grant_type: 'authorization_code', connected: false },
 	});
-	store.push(pending);
+	// An edit works on the live credential; only a create mints a pending one.
+	if (!overrides.edit) store.push(pending);
 	const row: MockConnectSession = {
 		session_id: `sess_agent_${agentConnectSeedSeq}`,
 		poll_token: `ptok_agent_${agentConnectSeedSeq}`,
 		state: 'created',
-		credential_id: pending.credential_id,
+		credential_id: overrides.edit?.binding.credential_id ?? pending.credential_id,
 		requested_by_actor_id: overrides.agent_id,
 		created_at: new Date().toISOString(),
 		ownerCanAct: true,
@@ -665,6 +692,7 @@ const connectSessionsHandlers = [
 				approval_url: `https://jentic.example.test/app/agents?approve=${sessionId}`,
 				poll_token: pollToken,
 				resolved_flow: confirmChallengeKind,
+				revision_id: `csr_${sessionId}_1`,
 			},
 			{ status: 201 },
 		);
@@ -689,6 +717,7 @@ const connectSessionsHandlers = [
 				error_code: null,
 				created_at: s.created_at,
 				credential_id: s.credential_id,
+				intent: s.edit ? 'edit' : 'create',
 			})),
 			has_more: false,
 			next_cursor: null,
@@ -713,6 +742,10 @@ const connectSessionsHandlers = [
 			scheme: gated.scheme ?? null,
 			pinned_hosts: gated.pinned_hosts ?? null,
 			digest: reviewDigest(gated),
+			revision: gated.edit?.revision ?? createRevision(gated),
+			edit: gated.edit ?? null,
+			last_rejected_at: gated.last_rejected_at ?? null,
+			stale: gated.stale ?? false,
 			can_confirm: gated.can_confirm ?? true,
 			existing_credentials: gated.existing_credentials ?? [],
 			requested_by_actor_id: gated.requested_by_actor_id,
@@ -726,6 +759,113 @@ const connectSessionsHandlers = [
 			reason: gated.reason,
 			requested_permission_rules: gated.requested_permission_rules,
 			api_reference: { vendor: gated.vendor_key, name: gated.vendor_key, version: '1.0.0' },
+		});
+	}),
+
+	// An edit's reviewer changing the request: a new revision recorded as theirs.
+	// Bringing a stale edit up to date: a new revision, and no longer stale.
+	http.post('/connect-sessions/:sessionId\\:rebase', ({ params, request }) => {
+		const gated = gateSession(params.sessionId, request.url);
+		if (!isMockSession(gated)) return gated;
+		const edit = gated.edit;
+		if (!edit) return new HttpResponse(null, { status: 400 });
+		const number = edit.revision.number + 1;
+		gated.stale = false;
+		gated.edit = { ...edit, revision: { id: `csr_${gated.session_id}_${number}`, number } };
+		return HttpResponse.json({
+			session_id: gated.session_id,
+			revision_id: gated.edit.revision.id,
+			revision_number: number,
+		});
+	}),
+
+	http.post('/connect-sessions/:sessionId\\:amend', async ({ params, request }) => {
+		const gated = gateSession(params.sessionId, request.url);
+		if (!isMockSession(gated)) return gated;
+		const edit = gated.edit;
+		if (!edit) {
+			// A new connection request: the rules sent replace the ask (and the digest).
+			const body = (await request.json()) as AmendCreateBody;
+			const number = createRevision(gated).number + 1;
+			gated.revision = { id: `csr_${gated.session_id}_${number}`, number };
+			gated.digest = `dig_${gated.session_id}_${number}`;
+			if (body.requested_permission_rules) {
+				gated.requested_permission_rules = body.requested_permission_rules;
+			}
+			return HttpResponse.json({
+				session_id: gated.session_id,
+				revision_id: gated.revision.id,
+				revision_number: number,
+			});
+		}
+		const body = (await request.json()) as AmendEditBody;
+		const granted = edit.current.granted_scopes ?? [];
+		// A rule the binding has keeps its id; one the agent asked for keeps who asked.
+		const key = (r: PermissionRule) =>
+			JSON.stringify([r.effect, r.methods ?? null, r.path ?? null, r.match_mode ?? 'regex']);
+		const own = new Map(edit.current.rules.map((r) => [key(r), r]));
+		const asked = new Map(edit.result.rules.filter((r) => r.added_by).map((r) => [key(r), r]));
+		const rules: EditRuleView[] = body.rules
+			? body.rules.set.map((rule) => {
+					const mine = own.get(key(rule));
+					if (mine) return { ...rule, id: mine.id, added_by: null };
+					return {
+						...rule,
+						id: null,
+						added_by: asked.get(key(rule))?.added_by ?? MOCK_REVIEWER_ID,
+					};
+				})
+			: edit.result.rules;
+		const scopes = body.scopes ? [...body.scopes.set].sort() : edit.result.scopes;
+		const notes = { ...(edit.result.scope_notes ?? {}) };
+		for (const scope of scopes.filter((s) => !granted.includes(s))) {
+			notes[scope] ??= { added_by: MOCK_REVIEWER_ID, comment: null };
+		}
+		const number = edit.revision.number + 1;
+		gated.edit = {
+			...edit,
+			revision: { id: `csr_${gated.session_id}_${number}`, number },
+			result: { ...edit.result, rules, scopes, scope_notes: notes },
+			needs_vendor_consent: JSON.stringify([...granted].sort()) !== JSON.stringify(scopes),
+		};
+		return HttpResponse.json({
+			session_id: gated.session_id,
+			revision_id: gated.edit.revision.id,
+			revision_number: number,
+		});
+	}),
+
+	// Paged like the route: the client asks for one page at a time and follows
+	// `next_cursor`, so a mock that always answers `has_more: false` leaves
+	// that loop unexercised — which is how the client came to discard it.
+	http.get('/connect-sessions/:sessionId/revisions', ({ params, request }) => {
+		const gated = gateSession(params.sessionId, request.url);
+		if (!isMockSession(gated)) return gated;
+		const current = gated.edit?.revision ?? createRevision(gated);
+		const all = gated.revisions ?? [
+			{
+				id: current.id,
+				number: current.number,
+				created_by: gated.requested_by_actor_id,
+				created_at: gated.created_at,
+				proposal: {},
+				result: gated.edit?.result ?? {
+					rules: gated.requested_permission_rules,
+					scopes: gated.requested_scopes,
+				},
+			},
+		];
+		const url = new URL(request.url);
+		const limit = Number(url.searchParams.get('limit') ?? 50);
+		const cursor = url.searchParams.get('cursor');
+		const after = cursor ? all.findIndex((r) => r.id === atob(cursor)) + 1 : 0;
+		const page = all.slice(after, after + limit);
+		const has_more = after + page.length < all.length;
+		return HttpResponse.json({
+			limit,
+			has_more,
+			next_cursor: has_more && page.length > 0 ? btoa(page[page.length - 1].id) : null,
+			data: page,
 		});
 	}),
 
@@ -750,9 +890,32 @@ const connectSessionsHandlers = [
 				allowed_kinds: allowed,
 			});
 		}
+		if (body.kind === 'edit') {
+			const editBlock = gated.edit;
+			if (!editBlock)
+				return problem(400, 'Bad Request', 'Not an edit.', 'confirm_kind_mismatch');
+			if (body.revision_id !== editBlock.revision.id) {
+				return problem(409, 'Conflict', 'The request changed.', 'revision_changed', {
+					current_revision_id: editBlock.revision.id,
+				});
+			}
+			const granted = [...(editBlock.current.granted_scopes ?? [])].sort();
+			const confirmed = body.confirmed_scopes ? [...body.confirmed_scopes].sort() : granted;
+			if (JSON.stringify(confirmed) !== JSON.stringify(granted)) {
+				// Scopes added or removed: the vendor sign-in for the new set runs
+				// first; the change applies with the grant.
+				gated.state = 'polling';
+				return HttpResponse.json({
+					kind: 'authorization_code',
+					authorize_url: `https://vendor.example.test/oauth/authorize?edit=${gated.session_id}`,
+				});
+			}
+			endMockConnectSession(gated, 'applied');
+			return HttpResponse.json({ kind: 'connected', credential_id: gated.credential_id });
+		}
 		// Checked when given; required for every non-OAuth variant.
 		const needsReview = kind !== 'oauth' || gated.target_kind === 'api';
-		if (needsReview || body.digest != null) {
+		if (needsReview || ('digest' in body && body.digest != null)) {
 			const expected = reviewAgent(gated)?.agent_id ?? null;
 			if (
 				body.digest !== reviewDigest(gated) ||
@@ -764,7 +927,7 @@ const connectSessionsHandlers = [
 		if (needsReview && body.permission_rules.length === 0) {
 			return problem(422, 'Unprocessable Entity', 'Rules required.', 'rules_required');
 		}
-		if (kind === 'existing_credential' || kind === 'reauthorize') {
+		if (kind === 'existing_credential') {
 			const credentialId = (body as { credential_id: string }).credential_id;
 			const candidate = (gated.existing_credentials ?? []).find(
 				(c) => c.credential_id === credentialId,
@@ -777,10 +940,7 @@ const connectSessionsHandlers = [
 					'existing_credential_not_found',
 				);
 			}
-			if (kind === 'reauthorize' && !candidate.can_reauthorize) {
-				return problem(409, 'Conflict', 'Cannot re-authorize.', 'reauthorize_unavailable');
-			}
-			if (kind === 'existing_credential' && !candidate.can_bind) {
+			if (!candidate.can_bind) {
 				return problem(
 					409,
 					'Conflict',
@@ -791,16 +951,18 @@ const connectSessionsHandlers = [
 					},
 				);
 			}
+			if (candidate.needs_vendor_consent && (candidate.missing_scopes ?? []).length > 0) {
+				// The vendor is asked for the missing scopes first; the session
+				// binds the credential once that grant lands.
+				gated.state = 'polling';
+				return HttpResponse.json({
+					kind: 'authorization_code',
+					authorize_url: `https://vendor.example.test/oauth/authorize?consent=${credentialId}`,
+				});
+			}
 			// The session's own pending credential is not needed; it takes the
 			// session row with it.
 			endMockConnectSession(gated, 'connected');
-			if (kind === 'reauthorize') {
-				return HttpResponse.json({
-					kind: 'reauthorize',
-					credential_id: credentialId,
-					authorize_url: `https://vendor.example.test/oauth/authorize?reauthorize=${credentialId}`,
-				});
-			}
 			return HttpResponse.json({ kind: 'connected', credential_id: credentialId });
 		}
 		if (kind === 'api_key' || kind === 'bearer' || kind === 'basic') {
@@ -839,9 +1001,29 @@ const connectSessionsHandlers = [
 	}),
 
 	http.get('/connect-sessions/:sessionId/status', ({ params, request }) => {
+		if (!connectSessionsStore.some((s) => s.session_id === String(params.sessionId))) {
+			return undefined;
+		}
 		const gated = gateSession(params.sessionId, request.url);
 		if (!isMockSession(gated)) return gated;
 		return HttpResponse.json(gated.status);
+	}),
+
+	http.get('/connect-sessions/:sessionId/status', ({ params, request }) => {
+		const ended = endedConnectSessions.find((s) => s.session_id === String(params.sessionId));
+		if (!ended || new URL(request.url).searchParams.get('poll_token') !== ended.poll_token) {
+			return problem(
+				403,
+				'Forbidden',
+				'Unknown session or invalid poll token.',
+				'invalid_poll_token',
+			);
+		}
+		return HttpResponse.json(
+			ended.outcome === 'applied' || ended.outcome === 'connected'
+				? { ...ended.status, status: ended.outcome, error_code: null }
+				: { ...ended.status, status: 'failed', error_code: ended.outcome },
+		);
 	}),
 
 	http.post('/connect-sessions/:sessionId\\:cancel', ({ params, request }) => {
@@ -955,6 +1137,14 @@ export const credentialsHandlers = [
 		});
 	}),
 
+	http.get('/credentials/:id/connect/:flowId/status', ({ params }) => {
+		const cred = store.find((c) => c.credential_id === String(params.id));
+		const completion = connectFlowCompletions.get(String(params.flowId));
+		return HttpResponse.json({
+			status: cred && completion && completion === cred.updated_at ? 'connected' : 'pending',
+		});
+	}),
+
 	http.get('/credentials/:id', ({ params }) => {
 		const cred = store.find((c) => c.credential_id === params.id);
 		if (!cred) return new HttpResponse(null, { status: 404 });
@@ -1010,6 +1200,7 @@ export const credentialsHandlers = [
 
 	http.post('/credentials/:id/connect', async ({ params }) => {
 		const id = String(params.id);
+		const flowId = `flow_${++seq}`;
 		const cred = store.find((c) => c.credential_id === id);
 		const managed = cred?.provider === 'pipedream';
 
@@ -1023,7 +1214,9 @@ export const credentialsHandlers = [
 				const target = store.find((c) => c.credential_id === id);
 				if (target) {
 					target.provider_account_ref = managed ? `apn_${seq}_mock` : 'connected';
+					target.details = { ...(target.details ?? {}), connected: true };
 					target.updated_at = new Date().toISOString();
+					connectFlowCompletions.set(flowId, target.updated_at);
 				}
 			}, 600);
 		}
@@ -1033,6 +1226,7 @@ export const credentialsHandlers = [
 			: `https://provider.example.com/oauth/authorize?credential=${id}&state=mock-state`;
 		return HttpResponse.json({
 			kind: 'authorization_code',
+			flow_id: flowId,
 			authorize_url: authorizeUrl,
 			state: 'mock-state',
 		});

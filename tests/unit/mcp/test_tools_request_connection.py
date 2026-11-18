@@ -19,8 +19,10 @@ from typing import Any, ClassVar
 from unittest.mock import MagicMock
 
 import pytest
+from fastapi import FastAPI
 from mcp.shared.exceptions import MCPError
 
+import jentic_one.mcp.access as access_mod
 import jentic_one.mcp.tools as tools_mod
 from jentic_one.control.services.integrations.connect_session_service import (
     ApiTarget,
@@ -29,6 +31,8 @@ from jentic_one.control.services.integrations.connect_session_service import (
 from jentic_one.control.services.integrations.errors import (
     AuthTypeNotDeclaredError,
     AuthTypeRequiredError,
+    BindingSuspendedError,
+    ConnectOpenError,
     InvalidOAuthAppRegistrationError,
     ManualFlowsDisabledError,
     NoDeclaredSchemeError,
@@ -46,6 +50,11 @@ from jentic_one.control.services.vendors.service import (
     UnknownVendorError,
     UnsupportedFlowError,
     VendorNotConfiguredError,
+)
+from jentic_one.control.web.connect_limits import (
+    MCP_LIMITER_ATTR,
+    ROUTE_LIMITER_ATTR,
+    connect_limiter,
 )
 from jentic_one.mcp.tools import CallEnv, dispatch_tool_call
 from jentic_one.shared.auth.identity import Identity
@@ -69,6 +78,7 @@ def _env(
     sub: str = "agnt_1",
     catalog_auto_importer: Any = None,
     security_schemes_lookup: Any = None,
+    connect_limiter: RateLimiter | None = None,
 ) -> CallEnv:
     ctx = MagicMock()
     ctx.config.auth = AuthConfig(canonical_base_url="https://auth.example.com")
@@ -82,6 +92,14 @@ def _env(
         session_id=None,
         catalog_auto_importer=catalog_auto_importer,
         security_schemes_lookup=security_schemes_lookup,
+        # A fresh limiter per env, so one test's spend never bleeds into another's.
+        connect_limiter=connect_limiter
+        or RateLimiter(
+            MemoryStateBackend(),
+            default_rpm=30,
+            burst=10,
+            namespace="test_mcp_integrations_connect",
+        ),
     )
 
 
@@ -117,19 +135,7 @@ def service(monkeypatch: pytest.MonkeyPatch) -> None:
     _FakeConnectSessionService.seams = []
     _FakeConnectSessionService.error = None
     _FakeConnectSessionService.created = _CREATED
-    monkeypatch.setattr(tools_mod, "ConnectSessionService", _FakeConnectSessionService)
-    # A fresh limiter per test: the module-level one is shared process state
-    # and an earlier test's spend must never bleed into this one's budget.
-    monkeypatch.setattr(
-        tools_mod,
-        "_connect_limiter",
-        RateLimiter(
-            MemoryStateBackend(),
-            default_rpm=30,
-            burst=10,
-            namespace="test_mcp_integrations_connect",
-        ),
-    )
+    monkeypatch.setattr(access_mod, "ConnectSessionService", _FakeConnectSessionService)
 
 
 # ── validation arms ──────────────────────────────────────────────────────────
@@ -343,7 +349,7 @@ async def test_ambiguous_vendor_lists_candidates_and_asks_the_user(
         _vendor_entry("oar_c", "googleapis-com", "Inactive elsewhere"),
         _vendor_entry(None, "github", "GitHub"),
     ]
-    monkeypatch.setattr(tools_mod, "VendorRegistryService", _FakeVendorRegistryService)
+    monkeypatch.setattr(access_mod, "VendorRegistryService", _FakeVendorRegistryService)
     _FakeConnectSessionService.error = AmbiguousVendorError(
         "googleapis-com", None, ["oar_a", "oar_b"]
     )
@@ -374,7 +380,7 @@ async def test_ambiguous_vendor_without_capabilities_read_still_asks_the_user(
     """The candidate list rides the GET /vendors gate (capabilities:read), like
     the Go mount's read; without it the advice still routes to the user."""
     _FakeVendorRegistryService.entries = [_vendor_entry("oar_a", "googleapis-com", "Gmail")]
-    monkeypatch.setattr(tools_mod, "VendorRegistryService", _FakeVendorRegistryService)
+    monkeypatch.setattr(access_mod, "VendorRegistryService", _FakeVendorRegistryService)
     _FakeConnectSessionService.error = AmbiguousVendorError(
         "googleapis-com", None, ["oar_a", "oar_b"]
     )
@@ -503,17 +509,15 @@ async def test_vendor_not_configured_is_broker_denied_operator_action() -> None:
 async def test_rate_limit_is_retryable_transport_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        tools_mod,
-        "_connect_limiter",
-        RateLimiter(
+    env = _env(
+        ["credentials:connect"],
+        connect_limiter=RateLimiter(
             MemoryStateBackend(),
             default_rpm=1,
             burst=1,
             namespace="test_mcp_integrations_connect_tight",
         ),
     )
-    env = _env(["credentials:connect"])
     first = await dispatch_tool_call(env, "request_connection", {"vendor": "github"})
     assert not first.is_error, first.content
 
@@ -525,6 +529,37 @@ async def test_rate_limit_is_retryable_transport_error(
     assert payload["retryable"] is True
     assert payload["retry_after_s"] >= 0
     assert len(_FakeConnectSessionService.calls) == 1
+
+
+async def test_http_and_mcp_connect_share_per_actor_rate_limit_budget() -> None:
+    """HTTP ``POST /integrations:connect`` and MCP ``request_connection`` draw
+    from the same per-actor token bucket on ``app.state``."""
+    app = FastAPI()
+    shared = RateLimiter(
+        MemoryStateBackend(),
+        default_rpm=1,
+        burst=2,
+        namespace="integrations_connect",
+    )
+    setattr(app.state, ROUTE_LIMITER_ATTR, shared)
+
+    route_lim = connect_limiter(app, ROUTE_LIMITER_ATTR)
+    mcp_lim = connect_limiter(app, MCP_LIMITER_ATTR)
+    assert route_lim is mcp_lim
+
+    # Spend 1 of the 2 burst tokens on the HTTP route limiter for agnt_1.
+    route_decision = await route_lim.acquire("agnt_1")
+    assert route_decision.allowed is True
+
+    # Spend the 2nd token via MCP request_connection for the same actor.
+    env = _env(["credentials:connect"], sub="agnt_1", connect_limiter=mcp_lim)
+    first_mcp = await dispatch_tool_call(env, "request_connection", {"vendor": "github"})
+    assert not first_mcp.is_error, first_mcp.content
+
+    # The 3rd attempt (across HTTP + MCP) is rate-limited.
+    second_mcp = await dispatch_tool_call(env, "request_connection", {"vendor": "github"})
+    assert second_mcp.is_error
+    assert _payload(second_mcp)["error_code"] == "TRANSPORT_ERROR"
 
 
 # ── registry-API targets (Go: the api / auth_type arms) ──────────────────────
@@ -638,6 +673,7 @@ _TARGET = "stripe-com/stripe-com-api/2024-06-20"
         (SecuritySchemesLookupUnavailableError(), "BROKER_DENIED", None, "registry"),
         (TooManyOpenSessionsError("agent", 10), "BROKER_DENIED", None, "Do not open more"),
         (RecentlyRejectedError(3600), "BROKER_DENIED", None, "Do not ask again"),
+        (BindingSuspendedError("agt_1"), "BROKER_DENIED", None, "ask your operator to resume"),
     ],
 )
 async def test_api_target_errors_map_like_the_go_mount(
@@ -658,3 +694,32 @@ async def test_api_target_errors_map_like_the_go_mount(
         assert payload["details"]["options"] == ["api_key", "oauth2"]
     if isinstance(error, ManualFlowsDisabledError | NoDeclaredSchemeError):
         assert _TARGET in payload["actionable_step"]
+
+
+async def test_an_open_request_is_relayed_not_an_error() -> None:
+    _FakeConnectSessionService.error = ConnectOpenError(
+        "cs_open", "https://auth.example.com/connect/cs_open"
+    )
+    result = await dispatch_tool_call(
+        _env(["credentials:connect"]), "request_connection", {"vendor": "github"}
+    )
+    assert not result.is_error
+    payload = _payload(result)
+    assert payload["session_id"] == "cs_open"
+    assert payload["approval_url"] == "https://auth.example.com/connect/cs_open"
+    assert payload["already_open"] is True
+
+
+async def test_suspended_binding_on_a_vendor_target_tells_the_agent_to_ask_its_operator() -> None:
+    _FakeConnectSessionService.error = BindingSuspendedError("agt_1")
+    result = await dispatch_tool_call(
+        _env(["credentials:connect"]), "request_connection", {"vendor": "github"}
+    )
+    assert result.is_error
+
+    payload = _payload(result)
+    assert payload["error_code"] == "BROKER_DENIED"
+    assert payload["retryable"] is False
+    assert "next_tool" not in payload
+    assert "ask your operator to resume" in payload["actionable_step"]
+    assert "request_connection" not in payload["actionable_step"]

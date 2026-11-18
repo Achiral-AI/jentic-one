@@ -4,37 +4,88 @@ from __future__ import annotations
 
 import json
 import typing
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
+import structlog
+from fastapi import FastAPI, Request
+from fastapi.exception_handlers import websocket_request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError, WebSocketRequestValidationError
+from fastapi.testclient import TestClient
+from jentic.problem_details import ProblemDetailException
+from sqlalchemy.exc import DBAPIError
+from starlette.exceptions import HTTPException
 
-from jentic_one.broker.core.exceptions import (
+from jentic_one.__main__ import _expand_allowed_dbs
+from jentic_one.broker.core.directives import (
     AgentDirective,
     AgentStrategy,
+    ambiguous_credential_binding_directive,
+    credential_binding_suspended_directive,
+    credential_identity_mismatch_directive,
+    direct_action_denied_directive,
+    direct_credential_identity_mismatch_directive,
+    held_execution_directive,
+    no_credential_binding_directive,
+    suggested_permission_rules,
+    switch_toolkit_directive,
+)
+from jentic_one.broker.core.errors import (
+    AmbiguousCredentialMatchError,
+    BrokerError,
     CredentialNeedsReconnectError,
     CredentialNotProvisionedError,
     CredentialRefreshTransientError,
     CredentialUndecryptableError,
     DeadlineExceededError,
-    ErrorOrigin,
-    OperationNotFoundError,
-    TooManyCandidatesError,
     UpstreamResponseTooLargeError,
     UpstreamTimeoutError,
-    ambiguous_credential_binding_directive,
-    credential_identity_mismatch_directive,
-    direct_action_denied_directive,
-    direct_credential_identity_mismatch_directive,
-    no_credential_binding_directive,
-    suggested_permission_rules,
-    switch_toolkit_directive,
+    UpstreamTransportError,
 )
 from jentic_one.broker.core.headers import JenticHeader
 from jentic_one.broker.core.problem import STATUS_BY_ERROR, broker_error_problem
-from jentic_one.broker.web.errors import handle_broker_error, problem_response
+from jentic_one.broker.core.schemas import (
+    HeldExecutionAcceptedLinks,
+    HeldExecutionAcceptedResponse,
+)
+from jentic_one.broker.web.app import create_app as create_broker_app
+from jentic_one.broker.web.errors import (
+    handle_broker_error,
+    handle_database_unavailable,
+    handle_discovery_error,
+    handle_http_exception,
+    handle_validation,
+    install_broker_error_handlers,
+    problem_response,
+)
+from jentic_one.broker.web.routers.execute import _FIXED_STATUS_BY_HANDLER
 from jentic_one.control.web.schemas.permission_rules import PermissionRuleSchema
 from jentic_one.shared.access_guidance import ConnectTarget
+from jentic_one.shared.broker.execution import ErrorOrigin
 from jentic_one.shared.broker.protocols import IdentityMismatch
+from jentic_one.shared.config import AppConfig
+from jentic_one.shared.context import Context
+from jentic_one.shared.db.errors import (
+    DatabaseCommitOutcomeUnknownError,
+    DatabaseUnavailableError,
+)
+from jentic_one.shared.discovery.errors import (
+    AmbiguousMatchError,
+    DiscoveryError,
+    MethodNotAllowedError,
+    OperationNotFoundError,
+    TooManyCandidatesError,
+)
+from jentic_one.shared.jobs.hold import HELD_AGENT_DIRECTIVE
+from jentic_one.shared.state.backend import StateBackendCapacityError
+from jentic_one.shared.web.app_factory import spa_aware_problem_detail_handler
+from jentic_one.shared.web.errors import (
+    DB_COMMIT_OUTCOME_UNKNOWN_DETAIL,
+    request_validation_error_handler,
+    state_backend_capacity_error_handler,
+    unhandled_exception_handler,
+)
 
 
 def _body(resp: Any) -> dict[str, Any]:
@@ -48,9 +99,10 @@ def test_directive_factories_emit_known_strategies() -> None:
     """Every directive factory must emit a strategy in the AgentStrategy
     vocabulary. This is the recovery contract autonomous agents depend on; a
     factory drifting to an unknown strategy (or the enum being trimmed) would
-    silently break the loop. The Go ``agentDirective`` struct
-    (cli/internal/cmd/execute.go) mirrors these same values by hand — keep them
-    in lock-step until the contract is a shared OpenAPI schema (review P1-1)."""
+    silently break the loop. Go decodes directives into ``ux.Directive``
+    (``cli/internal/cli/ux/execute.go``) via ``agentops.ParseAgentDirective``
+    (``cli/internal/agentops/classify.go``); Python factories and Go directive
+    handling must remain aligned on the wire vocabulary."""
     directives = [
         switch_toolkit_directive(503),
         credential_identity_mismatch_directive(
@@ -80,9 +132,22 @@ def test_directive_factories_emit_known_strategies() -> None:
             )
         ),
         direct_action_denied_directive(),
+        credential_binding_suspended_directive(vendor="acme", name="widgets", version="1.0.0"),
     ]
     for d in directives:
         assert d.strategy in _ALLOWED_STRATEGIES, d.strategy
+
+
+def test_credential_binding_suspended_directive_asks_the_operator_only() -> None:
+    """A suspended binding is the operator's to lift: no connect leg of any kind."""
+    d = credential_binding_suspended_directive(vendor="acme", name="widgets", version="1.0.0")
+    assert d.strategy == "prompt_human"
+    assert d.parameters == {"api": {"vendor": "acme", "name": "widgets", "version": "1.0.0"}}
+    instruction = d.human_readable_instruction
+    assert "operator" in instruction
+    assert "suspended" in instruction
+    assert "jentic connect" not in instruction
+    assert "request_connection" not in instruction
 
 
 def test_no_credential_binding_directive_names_surviving_commands() -> None:
@@ -380,8 +445,9 @@ def test_problem_response_merges_extra_and_headers() -> None:
 
 
 def test_status_table_maps_taxonomy() -> None:
-    assert STATUS_BY_ERROR[OperationNotFoundError] == 404
+    assert STATUS_BY_ERROR[AmbiguousCredentialMatchError] == 409
     assert STATUS_BY_ERROR[UpstreamTimeoutError] == 504
+    assert STATUS_BY_ERROR[UpstreamTransportError] == 502
 
 
 def test_status_table_maps_credential_errors() -> None:
@@ -389,7 +455,11 @@ def test_status_table_maps_credential_errors() -> None:
     # BrokerError -> 500.
     assert STATUS_BY_ERROR[CredentialNotProvisionedError] == 424
     assert STATUS_BY_ERROR[CredentialUndecryptableError] == 424
-    assert STATUS_BY_ERROR[CredentialNeedsReconnectError] == 401
+    # A revoked *stored* grant is a failed dependency, not a challenge to the
+    # caller's own bearer token: it shares 424 with its sibling credential
+    # failures. A 401 here would tell an SDK to re-authenticate itself, which
+    # can never clear a revoked upstream grant.
+    assert STATUS_BY_ERROR[CredentialNeedsReconnectError] == 424
     assert STATUS_BY_ERROR[CredentialRefreshTransientError] == 502
 
 
@@ -399,9 +469,8 @@ def test_status_table_maps_credential_errors() -> None:
     [
         (CredentialNotProvisionedError("nope"), 424),
         (CredentialUndecryptableError("undecryptable"), 424),
-        (CredentialNeedsReconnectError("reconnect"), 401),
+        (CredentialNeedsReconnectError("reconnect"), 424),
         (CredentialRefreshTransientError("transient"), 502),
-        (OperationNotFoundError("missing"), 404),
     ],
 )
 async def test_handler_maps_credential_errors(error: Any, expected_status: int) -> None:
@@ -410,7 +479,7 @@ async def test_handler_maps_credential_errors(error: Any, expected_status: int) 
 
 
 def test_broker_error_carries_contract() -> None:
-    err = OperationNotFoundError(
+    err = BrokerError(
         "no match",
         origin=ErrorOrigin.BROKER,
         directive=AgentDirective(strategy="fatal", human_readable_instruction="give up"),
@@ -428,7 +497,7 @@ def test_broker_error_carries_contract() -> None:
         (DeadlineExceededError("late"), 504, "deadline_exceeded"),
         (CredentialRefreshTransientError("cred_1: Timeout"), 502, "refresh_transient_error"),
         (UpstreamResponseTooLargeError("too big"), 502, "upstream_response_too_large"),
-        (TooManyCandidatesError("too many"), 503, "too_many_candidates"),
+        (UpstreamTransportError("transport"), 502, "upstream_transport_error"),
     ],
     ids=lambda v: type(v).__name__ if isinstance(v, Exception) else str(v),
 )
@@ -446,3 +515,234 @@ def test_explicit_type_overrides_the_class_default() -> None:
     assert UpstreamTimeoutError("x", type="upstream_connect_failed").type == (
         "upstream_connect_failed"
     )
+
+
+def test_database_unavailable_is_a_broker_origin_503_without_internals() -> None:
+    """A lost broker-DB connection answers a typed 503, not a bare 500.
+
+    The driver message (host, user, SQL) never reaches the client, and no
+    retry directive is offered because the failure may follow dispatch.
+    """
+    app = FastAPI()
+    install_broker_error_handlers(app)
+
+    @app.get("/boom")
+    async def boom() -> None:
+        raise DatabaseUnavailableError("connection is closed host=db.internal user=broker")
+
+    resp = TestClient(app).get("/boom")
+
+    assert resp.status_code == 503
+    assert resp.headers["content-type"].startswith("application/problem+json")
+    assert resp.headers[JenticHeader.ERROR_ORIGIN.value] == "broker"
+    body = resp.json()
+    assert body["type"] == "database_unavailable"
+    assert body["error_origin"] == "broker"
+    assert "agent_directive" not in body
+    assert "db.internal" not in resp.text
+
+
+def test_database_unavailable_log_has_no_traceback_or_sql() -> None:
+    """The 503 log names the error type and a short detail, never the chained SQL.
+
+    The cause is a SQLAlchemy error whose ``str()`` carries the statement and
+    bound parameters; a traceback would render it. A subclass (connection lost
+    at commit) resolves to the same 503 handler.
+    """
+    app = FastAPI()
+    install_broker_error_handlers(app)
+
+    @app.get("/boom")
+    async def boom() -> None:
+        cause = DBAPIError(
+            "SELECT secret FROM creds WHERE id = %(id)s",
+            {"id": "hunter2"},
+            Exception("connection is closed"),
+            connection_invalidated=True,
+        )
+        raise DatabaseCommitOutcomeUnknownError("connection is closed") from cause
+
+    with structlog.testing.capture_logs() as logs:
+        resp = TestClient(app).get("/boom")
+
+    assert resp.status_code == 503
+    assert resp.json()["type"] == "database_unavailable"
+    [entry] = [e for e in logs if e["event"] == "broker_database_unavailable"]
+    assert entry["log_level"] == "warning"
+    assert "exc_info" not in entry
+    assert entry["error_type"] == "DatabaseCommitOutcomeUnknownError"
+    assert entry["cause"] == "DBAPIError"
+    assert entry["error"] == "connection is closed"
+    rendered = repr(entry)
+    assert "SELECT" not in rendered
+    assert "hunter2" not in rendered
+
+
+def test_commit_outcome_unknown_asks_the_client_to_check_before_retrying() -> None:
+    """A write that may have landed gets the shared check-before-retrying detail."""
+    app = FastAPI()
+    install_broker_error_handlers(app)
+
+    @app.get("/boom")
+    async def boom() -> None:
+        raise DatabaseCommitOutcomeUnknownError("connection is closed")
+
+    resp = TestClient(app).get("/boom")
+
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["type"] == "database_unavailable"
+    assert body["detail"] == DB_COMMIT_OUTCOME_UNKNOWN_DETAIL
+    assert "agent_directive" not in body
+
+
+def test_action_denied_directive_offers_the_edit_or_points_at_the_open_one() -> None:
+    """A rules denial names the binding and the minimal rule to ask for; with an
+    edit already open it links the owner to that one instead."""
+    rules = suggested_permission_rules(method="post", path="/v1/send")
+    asked = direct_action_denied_directive(credential_id="cred_1", suggested_rules=rules)
+    assert asked.strategy == "prompt_human"
+    assert asked.parameters["edit"] == {"credential_id": "cred_1", "suggested_rules": rules}
+    assert asked.parameters["suggested_command"] == "jentic access edit cred_1"
+    assert "request_access_change" in asked.human_readable_instruction
+
+    pending = direct_action_denied_directive(
+        credential_id="cred_1",
+        suggested_rules=rules,
+        open_edit_url="https://one.example/app/agents?approve=cs_1",
+    )
+    assert pending.parameters == {"provisioning_url": "https://one.example/app/agents?approve=cs_1"}
+    assert "amend" in pending.human_readable_instruction
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exc", "status", "want_type"),
+    [
+        (
+            OperationNotFoundError(detail="Operation not found — unregistered upstream URL."),
+            404,
+            "operation_not_found",
+        ),
+        (MethodNotAllowedError(["GET", "PUT"]), 405, "method_not_allowed"),
+        (AmbiguousMatchError(2), 409, "ambiguous_match"),
+        (TooManyCandidatesError(), 503, "too_many_candidates"),
+    ],
+    ids=lambda v: type(v).__name__ if isinstance(v, Exception) else str(v),
+)
+async def test_discovery_errors_render_as_broker_problems(
+    exc: DiscoveryError, status: int, want_type: str
+) -> None:
+    """#1962: the shared discovery errors (raised by the broker for an unregistered
+    URL, and by the in-process registry resolver) render as broker problems:
+    their own status and ``type``, ``broker`` origin, and ``Allow`` on a 405."""
+    request = Request(
+        {"type": "http", "method": "GET", "path": "/api.example.com/x", "headers": []}
+    )
+    resp = await handle_discovery_error(request, exc)
+    assert resp.status_code == status
+    assert resp.media_type == "application/problem+json"
+    assert resp.headers[JenticHeader.ERROR_ORIGIN.value] == "broker"
+    expected: dict[str, Any] = {
+        "type": want_type,
+        "title": exc.detail,
+        "status": status,
+        "detail": exc.detail,
+        "error_origin": "broker",
+        "instance": "/api.example.com/x",
+    }
+    if isinstance(exc, MethodNotAllowedError):
+        expected["allowed_methods"] = ["GET", "PUT"]
+        assert resp.headers["Allow"] == "GET, PUT"
+    else:
+        assert "Allow" not in resp.headers
+    assert _body(resp) == expected
+
+
+def test_installed_handlers_render_a_raised_discovery_error() -> None:
+    """A discovery error escaping a broker route is a typed problem, never a 500."""
+    app = FastAPI()
+    install_broker_error_handlers(app)
+
+    @app.get("/boom")
+    async def boom() -> None:
+        raise TooManyCandidatesError()
+
+    resp = TestClient(app).get("/boom")
+    assert resp.status_code == 503
+    assert resp.json()["type"] == "too_many_candidates"
+    assert resp.headers[JenticHeader.ERROR_ORIGIN.value] == "broker"
+
+
+def test_every_registered_http_handler_has_a_classification_contract(
+    sample_config_dict: dict[str, Any],
+) -> None:
+    """A new broker handler registration must also update failure classification."""
+    config = AppConfig.model_validate(sample_config_dict)
+    ctx = Context(config, allowed_dbs=_expand_allowed_dbs(["broker"], config))
+    app = create_broker_app(ctx)
+
+    assert app.exception_handlers == {
+        HTTPException: handle_http_exception,
+        RequestValidationError: handle_validation,
+        WebSocketRequestValidationError: websocket_request_validation_exception_handler,
+        ProblemDetailException: spa_aware_problem_detail_handler,
+        StateBackendCapacityError: state_backend_capacity_error_handler,
+        Exception: unhandled_exception_handler,
+        BrokerError: handle_broker_error,
+        DiscoveryError: handle_discovery_error,
+        DatabaseUnavailableError: handle_database_unavailable,
+    }
+    assert {
+        handle_validation: 422,
+        request_validation_error_handler: 422,
+        state_backend_capacity_error_handler: 503,
+        handle_database_unavailable: 503,
+        unhandled_exception_handler: 500,
+    } == _FIXED_STATUS_BY_HANDLER
+
+
+def test_held_execution_directive_is_a_structured_object() -> None:
+    """A held 202 carries the same directive object a denial does, not bare prose.
+
+    An agent switching on ``agent_directive.strategy`` must keep working when a
+    human decision is required — the one moment the field matters most. The
+    prose stays reachable as ``human_readable_instruction``.
+    """
+    directive = held_execution_directive(
+        held_execution_id="held_abc",
+        review_url="https://jentic.example/app/agents/approvals/held_abc",
+        instruction=HELD_AGENT_DIRECTIVE,
+    )
+    assert directive.strategy == "prompt_human"
+    assert directive.human_readable_instruction == HELD_AGENT_DIRECTIVE
+    assert directive.parameters == {
+        "held_execution_id": "held_abc",
+        "review_url": "https://jentic.example/app/agents/approvals/held_abc",
+    }
+
+
+def test_held_accepted_response_serializes_the_directive_as_an_object() -> None:
+    """The 202 body's ``agent_directive`` is an object with the directive's three keys."""
+    body = HeldExecutionAcceptedResponse(
+        held_execution_id="held_abc",
+        review_url="https://jentic.example/app/agents/approvals/held_abc",
+        expires_at=datetime(2026, 1, 1, tzinfo=UTC),
+        agent_directive=held_execution_directive(
+            held_execution_id="held_abc",
+            review_url="https://jentic.example/app/agents/approvals/held_abc",
+            instruction=HELD_AGENT_DIRECTIVE,
+        ),
+        links=HeldExecutionAcceptedLinks(
+            self_link="/executions/holds/held_abc",
+            result="/executions/holds/held_abc/result",
+            withdraw="/executions/holds/held_abc:withdraw",
+        ),
+    )
+    dumped = json.loads(body.model_dump_json(by_alias=True))
+    assert set(dumped["agent_directive"]) == {
+        "strategy",
+        "parameters",
+        "human_readable_instruction",
+    }
+    assert dumped["agent_directive"]["strategy"] == "prompt_human"

@@ -2,23 +2,77 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+
+from sqlalchemy import or_
 from sqlalchemy.sql.elements import ColumnElement
 
 from jentic_one.registry.core.schema.notes import Note
 from jentic_one.shared.auth.identity import Identity
+from jentic_one.shared.auth.permission_catalog import ORG_ADMIN
 
-ORG_ADMIN = "org:admin"
+_OWNER_MODELS: dict[type[Any], Any] = {
+    Note: Note.created_by,
+}
 
 
-def build_access_filters(identity: Identity, model: type[Note]) -> list[ColumnElement[bool]]:
+@dataclass(frozen=True, slots=True)
+class ScopedModelSpec:
+    """Read-only scoping metadata for one owner-scoped registry ORM model."""
+
+    table: str
+    model: str
+    owner_columns: tuple[str, ...]
+    id_column: str | None
+    delegation_permission: str | None
+    owned_agent_axis: bool
+
+
+def scoped_model_specs() -> tuple[ScopedModelSpec, ...]:
+    """Return read-only scoping specs for every owner-scoped registry ORM model."""
+    return tuple(
+        ScopedModelSpec(
+            table=model.__tablename__,
+            model=f"{model.__module__}.{model.__qualname__}",
+            owner_columns=(col.key,),
+            id_column=None,
+            delegation_permission=None,
+            owned_agent_axis=False,
+        )
+        for model, col in _OWNER_MODELS.items()
+    )
+
+
+def build_access_filters(
+    identity: Identity,
+    model: type[Note],
+    *,
+    owned_agent_ids: list[str] | None = None,
+    for_write: bool = False,
+) -> list[ColumnElement[bool]]:
     """Build SQLAlchemy filter expressions scoping queries to the caller's visibility.
 
     Rules (evaluated in order):
     1. org:admin → no restriction (empty list).
-    2. Otherwise → created_by == self.
+    2. Otherwise → created_by == self, OR-merged on reads with
+       ``created_by IN owned_agent_ids``.
+
+    ``owned_agent_ids`` (READ call sites only) lets a human read the notes
+    their own agents wrote. Agents live in the admin DB, so the service
+    resolves the ids there and passes them in; this module stays single-DB.
+    The ids are keyed on the caller's own ``sub`` — owner delegation
+    (``parent_actor_id``) never widens notes, so an agent sees only its own.
+
+    ``for_write=True`` builds the filter for a mutation: created_by == self
+    only, so an owner can read an agent's note but not change it. Passing
+    ``owned_agent_ids`` with it is a programming error (ValueError).
 
     Raises ValueError for an unknown model or empty sub.
     """
+    if for_write and owned_agent_ids:
+        raise ValueError("read-only visibility widening passed to a write filter")
+
     if ORG_ADMIN in identity.permissions:
         return []
 
@@ -26,6 +80,9 @@ def build_access_filters(identity: Identity, model: type[Note]) -> list[ColumnEl
         raise ValueError("empty sub reached scoped read")
 
     if model is Note:
-        return [Note.created_by == identity.sub]
+        owner_clause = Note.created_by == identity.sub
+        if owned_agent_ids:
+            return [or_(owner_clause, Note.created_by.in_(owned_agent_ids))]
+        return [owner_clause]
 
     raise ValueError(f"no access filter defined for {model.__name__}")

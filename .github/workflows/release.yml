@@ -133,12 +133,26 @@ jobs:
       contents: read
     uses: ./.github/workflows/smoke-helm.yml
 
+  # The full CI matrix on the tagged commit — no path filters, no pass-marker
+  # skips — including the jobs PRs don't run (cross-OS install + smoke,
+  # goreleaser snapshot, app-image scan). Nothing publishes until it is green.
+  ci:
+    name: Full CI matrix
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read # the pass-marker lookup lists Actions caches
+      security-events: write # the scorecard job's SARIF upload (skipped on tags)
+    uses: ./.github/workflows/ci.yml
+    with:
+      full: true
+
   publish-image:
     name: Publish app image to GHCR
     # Needs smoke too: the image (and :latest) is part of the release, so it
     # must not publish while any deployment mode is red — same bar as the
     # binaries.
-    needs: [gate, smoke]
+    needs: [gate, smoke, ci]
     runs-on: ubuntu-latest
     # Serialize image publishes across concurrently pushed tags so two runs
     # can't interleave their :latest pushes (last-writer-wins is still the
@@ -220,6 +234,22 @@ jobs:
               --load .
           done
 
+      # Each shipped arch must carry exactly the `uv export --locked --no-dev`
+      # set the test suite ran against (#1819). The guard runs the export in
+      # the builder's own pinned Python + uv images via `docker run` (no
+      # environment passed in, repo mounted read-only), so this job installs
+      # no uv action alongside its id-token grant and can't drift from the
+      # image's uv version.
+      - name: Check image packages match uv.lock (per arch)
+        env:
+          IMAGE: ${{ steps.build.outputs.image }}
+          VERSION: ${{ steps.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            make check-image-lock IMAGE="${IMAGE}:${VERSION}-${arch}" PLATFORM="linux/${arch}"
+          done
+
       # CVE gate before anything is pushed — for EVERY shipped arch, not just
       # amd64 (an index scan doesn't reliably cover each arch). Same policy as
       # the ci.yml image-scan job: fixable HIGH/CRITICAL fail, overrides live in
@@ -247,7 +277,7 @@ jobs:
       # comment above): no third-party tool runs with the registry
       # credential on disk.
       - name: Log in to GHCR
-        uses: docker/login-action@v4.6.0
+        uses: docker/login-action@v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -402,7 +432,7 @@ jobs:
     # where the CLI shipped but the container image it documents did not (or
     # vice versa). If either publish half fails, the whole release run is red
     # and gets re-run from the tag.
-    needs: [gate, smoke, publish-image]
+    needs: [gate, smoke, ci, publish-image]
     runs-on: ubuntu-latest
     permissions:
       contents: write # attach artifacts to the GitHub Release
@@ -425,6 +455,30 @@ jobs:
       # binaries. This pure `diff` closes that hole unconditionally.
       - name: Vendored specs match source (release gate)
         run: make check-vendored-specs
+        working-directory: cli
+      # Pipeline review F4/E1: the app image already asserts /health .version ==
+      # tag (gate job); mirror that for the CLI binaries so a bad ldflag stamp
+      # can't ship a binary whose `--version` disagrees with the tag. This runs
+      # BEFORE `goreleaser release`, which uploads assets and pushes the package
+      # channels as it goes: a mismatch found afterwards leaves a public release
+      # that cannot be un-published. `goreleaser build --single-target` builds
+      # only the host (linux/amd64) binaries, with the same version stamp the
+      # release build computes from the tag, and publishes nothing.
+      - name: Build host CLI binary for the version check
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: build --clean --single-target --id jentic
+          workdir: cli
+      - name: Binary version matches tag
+        run: |
+          set -euo pipefail
+          want="${GITHUB_REF_NAME#v}"
+          bin="$(find dist -type f -name jentic -path '*linux_amd64*' | head -n1)"
+          test -n "${bin}" || { echo "::error::could not locate built jentic binary under cli/dist"; ls -R dist || true; exit 1; }
+          got="$("${bin}" --version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+          echo "tag=${want} binary=${got}"
+          test "${got}" = "${want}" || { echo "::error::jentic --version (${got}) != tag (${want})"; exit 1; }
         working-directory: cli
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
@@ -449,20 +503,6 @@ jobs:
           # jentic/scoop-bucket only (same shape as HOMEBREW_TAP_TOKEN).
           SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
           COSIGN_YES: "true"
-      # Pipeline review F4/E1: the app image already asserts /health .version ==
-      # tag (gate job); mirror that for the CLI binaries so a bad ldflag stamp
-      # can't ship a binary whose `--version` disagrees with the tag. GoReleaser
-      # writes the amd64 linux binary under cli/dist/jentic_linux_amd64_v1/.
-      - name: Binary version matches tag
-        run: |
-          set -euo pipefail
-          want="${GITHUB_REF_NAME#v}"
-          bin="$(find dist -type f -name jentic -path '*linux_amd64*' | head -n1)"
-          test -n "${bin}" || { echo "::error::could not locate built jentic binary under cli/dist"; ls -R dist || true; exit 1; }
-          got="$("${bin}" --version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
-          echo "tag=${want} binary=${got}"
-          test "${got}" = "${want}" || { echo "::error::jentic --version (${got}) != tag (${want})"; exit 1; }
-        working-directory: cli
       # Mirror the app release tag onto the CLI's Go module path. The CLI lives in
       # a subdirectory (module github.com/jentic/jentic-one/cli), so `go get
       # .../cli@vX.Y.Z` only resolves if a `cli/vX.Y.Z` git tag exists. We point it

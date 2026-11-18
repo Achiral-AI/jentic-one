@@ -481,7 +481,7 @@ def _expected_split_refs(subchart: str) -> dict[str, str]:
 def test_render_app_secrets_split_mounts_only_what_each_surface_reads() -> None:
     """generate=true hands each Python surface exactly the secrets its code reads.
 
-    The expectation is derived from shared/config.py GUARDED_FIELD_SURFACES (the same
+    The expectation is derived from shared/config/_secrets.py GUARDED_FIELD_SURFACES (the same
     table that relaxes the production guard for a standalone surface), so the
     chart and the loader cannot drift apart: a surface the chart starves of a
     secret it reads would fail its production boot; a surface handed one it
@@ -1015,6 +1015,34 @@ def test_render_dead_logging_values_are_gone() -> None:
 
 
 @pytest.mark.smoke
+def test_render_sampling_ratio_reaches_the_app_and_is_opt_in() -> None:
+    """`global.observability.otel.samplingRatio` sets the app's
+    `observability.tracing.sample_ratio`, on every first-party service, only
+    when set — an always-on env var would outrank a mounted config file. The
+    collector sidecar gets no sampling env: its config never reads one."""
+    for doc in _manifests(*_ALL_SURFACES_ON, "--set", "global.observability.otel.enabled=true"):
+        if doc.get("kind") != "Deployment":
+            continue
+        for container in doc["spec"]["template"]["spec"]["containers"]:
+            names = _env_names(container)
+            assert "JENTIC__OBSERVABILITY__TRACING__SAMPLE_RATIO" not in names
+            assert "OTEL_SAMPLING_RATIO" not in names
+    # An integer 0 from --set is falsy in Go templates; it must still render.
+    deployments = {
+        doc["metadata"]["name"]: doc
+        for doc in _manifests(
+            *_ALL_SURFACES_ON, "--set", "global.observability.otel.samplingRatio=0"
+        )
+        if doc.get("kind") == "Deployment"
+    }
+    assert set(deployments) >= {f"jentic-{name}" for name in _SUBCHART_APPS} | {"jentic-app"}
+    for name, doc in deployments.items():
+        assert {"name": "JENTIC__OBSERVABILITY__TRACING__SAMPLE_RATIO", "value": "0"} in _env(
+            doc["spec"]["template"]["spec"]["containers"][0]
+        ), name
+
+
+@pytest.mark.smoke
 def test_render_migrate_job_extra_args() -> None:
     """migrate.extraArgs reaches the runner; by default the Job passes none.
 
@@ -1216,3 +1244,47 @@ def test_render_bundled_postgres_raises_connection_ceiling() -> None:
     sts = next(doc for doc in docs if doc.get("kind") == "StatefulSet")
     container = sts["spec"]["template"]["spec"]["containers"][0]
     assert container["args"] == ["-c", "max_connections=200"]
+
+
+def _install_notes(*args: str) -> str:
+    """Render the chart's NOTES.txt (``helm template`` never renders it)."""
+    if shutil.which("helm") is None:
+        pytest.skip("helm not installed")
+    result = subprocess.run(
+        ["helm", "install", "jentic", str(CHART_DIR), "--dry-run=client", *args],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.split("NOTES:", 1)[1]
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("values", "overrides", "warned"),
+    [
+        ("local-combined.yaml", (), None),
+        # The parts shape enables the gateway, so its exemption is exercised.
+        ("local-parts.yaml", ("--set", "gateway.replicas=3"), None),
+        # A disabled surface's replicas never render a pod, so it never warns.
+        ("local-combined.yaml", ("--set", "control.replicas=2"), None),
+        ("local-combined.yaml", ("--set", "app.replicas=2"), "app.replicas=2"),
+        (
+            "local-parts.yaml",
+            ("--set", "broker.replicas=3", "--set", "registry.replicas=2"),
+            "registry.replicas=2, broker.replicas=3",
+        ),
+    ],
+)
+def test_notes_warn_when_a_stateful_surface_runs_more_than_one_replica(
+    values: str, overrides: tuple[str, ...], warned: str | None
+) -> None:
+    """One process per surface: >1 replica warns (gateway exempt) and never fails."""
+    notes = _install_notes("-f", str(VALUES_DIR / values), *overrides)
+    if warned is None:
+        assert "WARNING" not in notes
+    else:
+        assert "WARNING: more than one replica" in notes
+        assert warned in notes
+        assert "register_state_backend" in notes

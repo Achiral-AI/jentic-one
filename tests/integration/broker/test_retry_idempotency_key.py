@@ -1,11 +1,12 @@
-"""Integration test: the retry gate sees a caller's ``Idempotency-Key`` (#1711).
+"""Integration test: post-send retry gate does not re-send a keyed ``POST`` (#1799).
 
 Drives the buffered execution step (``run_execution``) through the real
 ``Deadline → Retry → HttpRunner`` envelope against a local HTTP upstream on a
 real socket that answers ``503, 503, 200``, and persists the execution record to
-the real admin DB. A keyed ``POST`` is status-retried to the ``200``; a key-less
-``POST`` gets the first ``503`` verbatim; a ``GET`` is retried by method. The
-``Idempotency-Key`` header is broker-consumed and never reaches the upstream.
+the real admin DB. Because ``Idempotency-Key`` is broker-consumed and never
+forwarded upstream, neither a keyed nor a key-less ``POST`` is status-retried
+post-send (both return the first ``503`` verbatim after 1 upstream attempt),
+while a ``GET`` is retried by method to ``200``.
 """
 
 from __future__ import annotations
@@ -86,12 +87,13 @@ async def clean(integration_context: Context) -> AsyncGenerator[None, None]:
 @pytest.mark.parametrize(
     ("method", "keyed", "expected_status", "expected_attempts"),
     [
-        pytest.param("POST", True, 200, 3, id="keyed-post-retried"),
+        pytest.param("POST", True, 503, 1, id="keyed-post-not-retried"),
         pytest.param("POST", False, 503, 1, id="keyless-post-not-retried"),
+        pytest.param("PATCH", True, 503, 1, id="keyed-patch-not-retried"),
         pytest.param("GET", False, 200, 3, id="get-retried-by-method"),
     ],
 )
-async def test_status_retry_gate_honours_idempotency_key(
+async def test_status_retry_gate_does_not_resend_keyed_post(
     integration_context: Context,
     upstream: _Upstream,
     clean: None,
@@ -102,8 +104,8 @@ async def test_status_retry_gate_honours_idempotency_key(
 ) -> None:
     inbound = {"Content-Type": "application/json", "Host": "broker.local"}
     if keyed:
-        inbound["Idempotency-Key"] = "0b5c0d8e-1711-4c1e-9f00-000000001711"
-    body = b'{"amount": 1}' if method == "POST" else None
+        inbound["Idempotency-Key"] = "0b5c0d8e-1799-4c1e-9f00-000000001799"
+    body = b'{"amount": 1}' if method in ("POST", "PATCH") else None
     ctx_req = ExecuteRequestContext(
         upstream_url=f"http://127.0.0.1:{upstream.port}/charges",
         method=method,
@@ -113,17 +115,15 @@ async def test_status_retry_gate_honours_idempotency_key(
 
     async with httpx.AsyncClient() as client:
         runner = build_runner(HttpRunner(client), deadline_s=10.0, retry=retry)
-        async with integration_context.admin_db.transaction() as session:
-            outcome = await run_execution(
-                ctx_req,
-                body=body,
-                headers=forward_headers(inbound, {}),
-                session=session,
-                broker=default_broker(runner),
-                actor_id=_ACTOR,
-                actor_type="agent",
-                has_idempotency_key=keyed,
-            )
+        outcome = await run_execution(
+            ctx_req,
+            body=body,
+            headers=forward_headers(inbound, {}),
+            admin_db=integration_context.admin_db,
+            broker=default_broker(runner),
+            actor_id=_ACTOR,
+            actor_type="agent",
+        )
 
     assert outcome.result.status_code == expected_status
     assert len(upstream.heads) == expected_attempts

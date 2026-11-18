@@ -20,6 +20,8 @@ from jentic_one.control.services.vendors.service import (
     UnsupportedFlowError,
     VendorNotConfiguredError,
 )
+from jentic_one.control.web.connect_binding import warn_if_callback_on_another_host
+from jentic_one.control.web.connect_limits import install_connect_limiters
 from jentic_one.control.web.errors import (
     connect_session_error_handler,
     credential_service_error_handler,
@@ -80,6 +82,16 @@ def get_exception_handlers() -> list[tuple[type[Exception], Any]]:
     ]
 
 
+def install_on_app(app: FastAPI, ctx: Context) -> None:
+    """Install the control surface's shared state (the connect-flow rate limiters).
+
+    Also warns once at startup when the configured OAuth callback is on a
+    different host from the public origin (browser-bound connects would fail).
+    """
+    install_connect_limiters(app, ctx)
+    warn_if_callback_on_another_host(ctx)
+
+
 def create_app(ctx: Context, container: AppContainer | None = None) -> FastAPI:
     """Create the control FastAPI application for standalone deployment.
 
@@ -94,6 +106,7 @@ def create_app(ctx: Context, container: AppContainer | None = None) -> FastAPI:
         enabled_apps={"control"},
         container=container,
     )
+    install_on_app(app, ctx)
     for exc_class, handler in get_exception_handlers():
         app.add_exception_handler(exc_class, handler)
     return app

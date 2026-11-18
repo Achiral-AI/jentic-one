@@ -16,11 +16,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-import httpx
 import structlog
 
-from jentic_one.shared.egress import build_strict_pinned_transport
-from jentic_one.shared.url_validation import validate_upstream_url
+from jentic_one.control.services.credentials.providers.base import ProviderError
+from jentic_one.control.services.credentials.providers.oauth2 import (
+    parse_oauth_expires_in,
+    sanitize_oauth_error_slug,
+)
+from jentic_one.shared.config import EgressConfig
+from jentic_one.shared.http.idp_client import IdpResponse, IdpTransportError, idp_request
 
 _logger = structlog.get_logger(__name__)
 
@@ -82,65 +86,91 @@ class PollResult:
     token_type: str | None = None
 
 
+def _required_string(data: dict[str, object], field: str) -> str:
+    """Read a required non-empty string without coercing malformed JSON values."""
+    value = data.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"missing or invalid {field}")
+    return value
+
+
+def _optional_string(data: dict[str, object], field: str) -> str | None:
+    """Read an optional string, accepting absence and JSON null but no coercion."""
+    value = data.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"invalid {field}")
+    return value
+
+
+async def _post_form(url: str, payload: dict[str, str], egress: EgressConfig | None) -> IdpResponse:
+    """POST a form to a vendor endpoint under the bounded IdP client."""
+    try:
+        return await idp_request(
+            "POST",
+            url,
+            egress=egress,
+            data=payload,
+            headers={"Accept": "application/json"},
+        )
+    except IdpTransportError as exc:
+        if exc.kind == "unsafe_url":
+            raise DeviceAuthorizationUpstreamError(
+                0, f"unsafe upstream URL: {exc.detail}"
+            ) from None
+        raise DeviceAuthorizationUpstreamError(0, exc.detail or exc.kind) from None
+
+
 async def begin_device_authorization(
     *,
     authorization_endpoint: str,
     client_id: str,
     scopes: list[str],
-    timeout_seconds: float = 15.0,
+    egress: EgressConfig | None,
 ) -> BeginResult:
     """Start a device flow session with the vendor.
 
     RFC 8628 §3.1: POST { client_id, scope } → 200 with device_code, etc.
+    ``egress`` is the control-plane egress policy, applied to the URL check and
+    the connect-time DNS pin.
     """
     payload = {"client_id": client_id}
     if scopes:
         payload["scope"] = " ".join(scopes)
 
-    # Defense-in-depth SSRF guard: the ``authorization_endpoint`` originates from
-    # operator config, but a config error or compromised entry could point at a
-    # private / metadata target. Strict-default policy (``egress=None``) — OAuth
-    # device authorization endpoints are always public HTTPS in practice.
-    try:
-        safe_url = validate_upstream_url(authorization_endpoint)
-    except ValueError as exc:
-        raise DeviceAuthorizationUpstreamError(0, f"unsafe upstream URL: {exc}") from exc
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=timeout_seconds, transport=build_strict_pinned_transport()
-        ) as client:
-            response = await client.post(
-                safe_url,
-                data=payload,
-                headers={"Accept": "application/json"},
-            )
-    except ValueError as exc:
-        # Raised by the pinning transport: the host re-resolved to a blocked
-        # address or did not resolve at all.
-        raise DeviceAuthorizationUpstreamError(0, f"unsafe upstream URL: {exc}") from exc
+    # ``idp_request`` re-validates the endpoint (SSRF guard), pins the connection,
+    # and bounds the exchange by a total deadline and a body cap.
+    response = await _post_form(authorization_endpoint, payload, egress)
     if response.status_code != 200:
         raise DeviceAuthorizationUpstreamError(response.status_code)
     try:
-        data: dict[str, str | int] = response.json()
+        data: object = response.json()
     except ValueError as exc:
         raise DeviceAuthorizationUpstreamError(response.status_code, "non-JSON response") from exc
+    if not isinstance(data, dict):
+        raise DeviceAuthorizationUpstreamError(
+            response.status_code, "malformed device authorization response"
+        )
 
     try:
-        device_code = str(data["device_code"])
-        user_code = str(data["user_code"])
-        verification_uri = str(data["verification_uri"])
-        expires_in = int(data.get("expires_in", 900))
-        interval = int(data.get("interval", 5))
-    except (KeyError, ValueError) as exc:
+        device_code = _required_string(data, "device_code")
+        user_code = _required_string(data, "user_code")
+        verification_uri = _required_string(data, "verification_uri")
+        verification_uri_complete = _optional_string(data, "verification_uri_complete")
+        expires_in = parse_oauth_expires_in(data.get("expires_in", 900))
+        raw_interval = data.get("interval", 5)
+        if isinstance(raw_interval, bool):
+            raise ValueError("boolean interval")
+        interval = int(raw_interval)
+        if interval < 1:
+            raise ValueError("interval must be at least one second")
+    except (KeyError, TypeError, ValueError, OverflowError, ProviderError) as exc:
         # Never echo the parsed body — it carries the device_code.
         raise DeviceAuthorizationUpstreamError(
             response.status_code, "malformed device authorization response"
         ) from exc
 
-    verification_uri_complete = (
-        str(data["verification_uri_complete"]) if "verification_uri_complete" in data else None
-    )
     return BeginResult(
         device_code=device_code,
         user_code=user_code,
@@ -156,7 +186,7 @@ async def poll_device_authorization(
     token_endpoint: str,
     client_id: str,
     device_code: str,
-    timeout_seconds: float = 15.0,
+    egress: EgressConfig | None,
 ) -> PollResult:
     """Poll the vendor's token endpoint once for the device flow result.
 
@@ -175,44 +205,47 @@ async def poll_device_authorization(
         "device_code": device_code,
         "client_id": client_id,
     }
-    # Defense-in-depth SSRF guard — mirror of ``begin_device_authorization``.
     # The token endpoint is stored on ``device_authorization_credentials`` at
-    # ``prepare`` time from operator config; validate every poll in case
-    # the DB row is tampered with post-vault.
+    # ``prepare`` time; ``idp_request`` validates it on every poll in case the DB
+    # row is tampered with post-vault.
+    response = await _post_form(token_endpoint, payload, egress)
     try:
-        safe_url = validate_upstream_url(token_endpoint)
-    except ValueError as exc:
-        raise DeviceAuthorizationUpstreamError(0, f"unsafe upstream URL: {exc}") from exc
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=timeout_seconds, transport=build_strict_pinned_transport()
-        ) as client:
-            response = await client.post(
-                safe_url,
-                data=payload,
-                headers={"Accept": "application/json"},
-            )
-    except ValueError as exc:
-        raise DeviceAuthorizationUpstreamError(0, f"unsafe upstream URL: {exc}") from exc
-    try:
-        data = response.json() if response.text else {}
+        data = response.json() if response.body else {}
     except ValueError as exc:
         # A form-encoded 200 success (access_token=…) lands here — never
         # carry the body into the exception or a log line.
         raise DeviceAuthorizationUpstreamError(response.status_code, "non-JSON response") from exc
 
-    if response.status_code == 200 and "access_token" in data:
+    if response.status_code == 200 and isinstance(data, dict) and "access_token" in data:
+        raw_access_token = data.get("access_token")
+        if not isinstance(raw_access_token, str) or not raw_access_token.strip():
+            raise DeviceAuthorizationUpstreamError(response.status_code, "malformed token response")
+        try:
+            expires_in = (
+                parse_oauth_expires_in(data["expires_in"]) if "expires_in" in data else None
+            )
+        except ProviderError as exc:
+            raise DeviceAuthorizationUpstreamError(
+                response.status_code, "invalid expires_in"
+            ) from exc
+        try:
+            refresh_token = _optional_string(data, "refresh_token")
+            scope = _optional_string(data, "scope")
+            token_type = _optional_string(data, "token_type")
+        except ValueError as exc:
+            raise DeviceAuthorizationUpstreamError(
+                response.status_code, "malformed token response"
+            ) from exc
         return PollResult(
             status="success",
-            access_token=str(data["access_token"]),
-            refresh_token=(str(data["refresh_token"]) if "refresh_token" in data else None),
-            scope=str(data["scope"]) if "scope" in data else None,
-            expires_in=int(data["expires_in"]) if "expires_in" in data else None,
-            token_type=str(data["token_type"]) if "token_type" in data else None,
+            access_token=raw_access_token,
+            refresh_token=refresh_token,
+            scope=scope,
+            expires_in=expires_in,
+            token_type=token_type,
         )
 
-    error = str(data.get("error", "")).lower() if isinstance(data, dict) else ""
+    error = sanitize_oauth_error_slug(data.get("error")) if isinstance(data, dict) else None
     if error == "authorization_pending":
         return PollResult(status="pending")
     if error == "slow_down":
@@ -227,6 +260,6 @@ async def poll_device_authorization(
     _logger.warning(
         "device_authorization.unexpected_poll_response",
         status=response.status_code,
-        error=error or None,
+        error=error,
     )
     raise DeviceAuthorizationUpstreamError(response.status_code)

@@ -11,18 +11,23 @@ Exercises the real HTTP path (router → service → DB) to pin two invariants:
 
 from __future__ import annotations
 
+import base64
 from collections.abc import AsyncGenerator, Iterator
 from datetime import datetime
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy import delete, text
 
 from jentic_one.admin.repos import AgentCredentialBindingRepository
 from jentic_one.control.repos import OAuthClientCredentialRepository
+from jentic_one.control.services.credentials.providers.pipedream import PipedreamProvider
+from jentic_one.control.services.credentials.providers.registry import ProviderRegistry
 from jentic_one.registry.core.schema.apis import Api
 from jentic_one.registry.repos.api_repo import ApiRepository
 from jentic_one.shared.auth.identity import Identity
+from jentic_one.shared.config import PipedreamProviderConfig
 from jentic_one.shared.context import Context
 from jentic_one.shared.models import ActorType
 from tests.web.control.conftest import CRED_WRITER_IDENTITY, _build_app, _effective
@@ -124,157 +129,231 @@ def test_patch_key_rotation_moves_updated_at(cred_writer_client: TestClient) -> 
     assert _parse_ts(resp.json()["updated_at"]) > _parse_ts(before["updated_at"])
 
 
-# --- api_key additional secret headers (Datadog DD-APPLICATION-KEY) ---
+# --- Per-type PATCH coverage (#1425) ---
 
 
-def _datadog_body(**overrides: object) -> dict[str, object]:
-    body: dict[str, object] = {
-        "type": "api_key",
-        "name": "web-cred-datadog",
-        "api": {"vendor": "datadoghq.com", "name": "datadog", "version": "v2"},
-        "provider": "static",
-        "key": "dd-api-key-value",  # pragma: allowlist secret
-        "location": "header",
-        "field_name": "DD-API-KEY",
-        "additional_headers": {"DD-APPLICATION-KEY": "dd-app-key-value"},
-    }
-    body.update(overrides)
-    return body
-
-
-def test_additional_headers_are_listed_by_name_only(cred_writer_client: TestClient) -> None:
-    resp = cred_writer_client.post("/credentials", json=_datadog_body())
-    assert resp.status_code == 201, resp.text
-    assert "dd-app-key-value" not in resp.text
-    assert resp.json()["secret"]["additional_header_names"] == ["DD-APPLICATION-KEY"]
-
-    cred_id = resp.json()["credential"]["credential_id"]
-    got = cred_writer_client.get(f"/credentials/{cred_id}")
-    assert "dd-app-key-value" not in got.text
-    assert got.json()["details"]["additional_header_names"] == ["DD-APPLICATION-KEY"]
-
-
-def test_api_key_without_additional_headers_lists_none(cred_writer_client: TestClient) -> None:
-    cred_id = _create_api_key(cred_writer_client)
-
-    got = cred_writer_client.get(f"/credentials/{cred_id}").json()
-
-    assert "additional_header_names" not in got["details"]
-
-
-@pytest.mark.parametrize(
-    "additional_headers",
-    [
-        {f"X-Extra-{i}": f"secret-value-{i}" for i in range(6)},
-        {"Bad Header": "secret-value"},
-        {"X-Ok": "line\r\nInjected: yes"},
-        {"dd-api-key": "collides with the key header"},
-        {"X-Empty": ""},
-    ],
-    ids=["too-many", "bad-name", "control-char", "collides-with-key", "empty-value"],
-)
-def test_invalid_additional_headers_are_rejected(
-    cred_writer_client: TestClient, additional_headers: dict[str, str]
+def test_patch_oauth2_token_url_and_scopes_without_secret(
+    cred_writer_client: TestClient,
 ) -> None:
-    resp = cred_writer_client.post(
-        "/credentials", json=_datadog_body(additional_headers=additional_headers)
-    )
-
-    assert resp.status_code == 422, resp.text
-    for value in additional_headers.values():
-        if value:
-            assert value not in resp.text
-
-
-def test_patch_replaces_additional_headers(cred_writer_client: TestClient) -> None:
-    created = cred_writer_client.post("/credentials", json=_datadog_body()).json()
-    cred_id = created["credential"]["credential_id"]
+    """Pins #1425: token_url/scopes edits persist without re-sending client_secret."""
+    cred_id = _create_oauth2(cred_writer_client, grant_type="client_credentials", name="o-1425")
     before = cred_writer_client.get(f"/credentials/{cred_id}").json()
 
     resp = cred_writer_client.patch(
         f"/credentials/{cred_id}",
-        json={"type": "api_key", "additional_headers": {"X-Other-Key": "other-value"}},
+        json={"type": "oauth2", "token_url": "https://auth.example/v2/t", "scopes": ["c", "d"]},
     )
-
     assert resp.status_code == 200, resp.text
-    assert "other-value" not in resp.text
-    assert resp.json()["details"]["additional_header_names"] == ["X-Other-Key"]
     assert _parse_ts(resp.json()["updated_at"]) > _parse_ts(before["updated_at"])
+    got = cred_writer_client.get(f"/credentials/{cred_id}").json()
+    assert got["details"]["token_url"] == "https://auth.example/v2/t"
+    assert got["details"]["scopes"] == ["c", "d"]
 
-    cleared = cred_writer_client.patch(
-        f"/credentials/{cred_id}", json={"type": "api_key", "additional_headers": {}}
+    # Scopes alone apply too, and ``[]`` clears them; token_url is untouched.
+    resp = cred_writer_client.patch(
+        f"/credentials/{cred_id}", json={"type": "oauth2", "scopes": []}
     )
-    assert cleared.status_code == 200, cleared.text
-    assert "additional_header_names" not in cleared.json()["details"]
+    assert resp.status_code == 200, resp.text
+    got = cred_writer_client.get(f"/credentials/{cred_id}").json()
+    assert got["details"]["token_url"] == "https://auth.example/v2/t"
+    assert got["details"].get("scopes") is None
+    assert "webtest-secret" not in resp.text
 
 
-def test_patch_additional_headers_cannot_collide_with_the_key_header(
-    cred_writer_client: TestClient,
-) -> None:
-    created = cred_writer_client.post("/credentials", json=_datadog_body()).json()
-    cred_id = created["credential"]["credential_id"]
+def test_patch_oauth2_unsafe_token_url_is_rejected(cred_writer_client: TestClient) -> None:
+    """A token_url edit is SSRF-validated even when no client_secret is sent."""
+    cred_id = _create_oauth2(cred_writer_client, grant_type="client_credentials", name="o-ssrf")
 
     resp = cred_writer_client.patch(
         f"/credentials/{cred_id}",
-        json={"type": "api_key", "additional_headers": {"DD-API-KEY": "x"}},
+        json={"type": "oauth2", "token_url": "https://169.254.169.254/latest"},
     )
-
-    # The stored key header is only known to the service, hence 400 not 422.
     assert resp.status_code == 400, resp.text
-    assert resp.json()["type"] == "invalid_credential_input"
+    got = cred_writer_client.get(f"/credentials/{cred_id}").json()
+    assert got["details"]["token_url"] == "https://auth.example/token"
 
 
-# --- oauth2 refresh_token grant seeded by the caller (Workday) ---
-
-
-def _workday_body(**overrides: object) -> dict[str, object]:
+@pytest.mark.parametrize(
+    ("field", "bad_url"),
+    [
+        ("token_url", "http://auth.example/token"),
+        ("token_url", "auth.example/token"),
+        ("authorize_url", "http://auth.example/authorize"),
+        ("authorize_url", "auth.example/authorize"),
+    ],
+)
+def test_create_oauth2_non_https_urls_are_rejected(
+    cred_writer_client: TestClient, field: str, bad_url: str
+) -> None:
+    """Pins #1779: OAuth2 credential create rejects plain-http and scheme-less endpoints."""
     body: dict[str, object] = {
         "type": "oauth2",
-        "name": "web-cred-workday",
-        "api": {"vendor": "workday.com", "name": "", "version": ""},
+        "name": f"o-1779-{field}",
+        "api": {"vendor": "webtest-oauth.example", "name": "", "version": ""},
         "provider": "static",
-        "grant_type": "refresh_token",
-        "token_url": "https://wd2-impl-services1.workday.com/ccx/oauth2/acme/token",
-        "client_id": "wd-client",
-        "client_secret": "wd-client-secret",  # pragma: allowlist secret
-        "refresh_token": "wd-refresh-token-value",  # pragma: allowlist secret
+        "grant_type": "authorization_code",
+        "token_url": "https://auth.example/token",
+        "authorize_url": "https://auth.example/authorize",
+        "client_id": "webtest-client",
+        "client_secret": "webtest-secret",  # pragma: allowlist secret
+        field: bad_url,
     }
-    body.update(overrides)
-    return body
+    resp = cred_writer_client.post("/credentials", json=body)
+    assert resp.status_code == 400, resp.text
+    problem = resp.json()
+    assert problem["type"] == "invalid_credential_input"
+    assert problem["detail"] == f"Invalid {field}: must use https"
+    assert "webtest-secret" not in resp.text
 
 
-def test_refresh_token_grant_never_returns_the_refresh_token(
+@pytest.mark.parametrize("bad_url", ["http://auth.example/v2/t", "auth.example/v2/t"])
+def test_patch_oauth2_non_https_token_url_is_rejected(
+    cred_writer_client: TestClient, bad_url: str
+) -> None:
+    """Pins #1779: OAuth2 credential PATCH rejects plain-http and scheme-less token_url."""
+    cred_id = _create_oauth2(cred_writer_client, grant_type="client_credentials", name="o-1779-p")
+
+    resp = cred_writer_client.patch(
+        f"/credentials/{cred_id}",
+        json={"type": "oauth2", "token_url": bad_url},
+    )
+    assert resp.status_code == 400, resp.text
+    problem = resp.json()
+    assert problem["type"] == "invalid_credential_input"
+    assert problem["detail"] == "Invalid token_url: must use https"
+    got = cred_writer_client.get(f"/credentials/{cred_id}").json()
+    assert got["details"]["token_url"] == "https://auth.example/token"
+
+
+def test_patch_oauth2_cross_origin_token_url_requires_secret(
     cred_writer_client: TestClient,
 ) -> None:
-    resp = cred_writer_client.post("/credentials", json=_workday_body())
-    assert resp.status_code == 201, resp.text
-    assert "wd-refresh-token-value" not in resp.text
-    assert resp.json()["secret"]["grant_type"] == "refresh_token"
+    """Moving token_url to another origin must re-enter client_secret: the
+    stored secret is write-only, so a bare repoint would send it elsewhere."""
+    cred_id = _create_oauth2(cred_writer_client, grant_type="client_credentials", name="o-xo")
 
-    cred_id = resp.json()["credential"]["credential_id"]
-    got = cred_writer_client.get(f"/credentials/{cred_id}")
-    assert "wd-refresh-token-value" not in got.text
-    assert got.json()["details"]["grant_type"] == "refresh_token"
-    assert got.json()["details"]["connected"] is True
-
-
-def test_refresh_token_grant_requires_a_refresh_token(cred_writer_client: TestClient) -> None:
-    body = _workday_body()
-    del body["refresh_token"]
-
-    resp = cred_writer_client.post("/credentials", json=body)
-
-    assert resp.status_code == 400, resp.text
-    assert resp.json()["type"] == "invalid_credential_input"
-
-
-def test_refresh_token_needs_the_refresh_token_grant(cred_writer_client: TestClient) -> None:
-    resp = cred_writer_client.post(
-        "/credentials", json=_workday_body(grant_type="client_credentials")
+    resp = cred_writer_client.patch(
+        f"/credentials/{cred_id}",
+        json={"type": "oauth2", "token_url": "https://other.example/t"},
     )
-
     assert resp.status_code == 400, resp.text
-    assert "wd-refresh-token-value" not in resp.text
+    got = cred_writer_client.get(f"/credentials/{cred_id}").json()
+    assert got["details"]["token_url"] == "https://auth.example/token"
+
+    resp = cred_writer_client.patch(
+        f"/credentials/{cred_id}",
+        json={
+            "type": "oauth2",
+            "token_url": "https://other.example/t",
+            "client_secret": "fresh-web-secret",  # pragma: allowlist secret
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["details"]["token_url"] == "https://other.example/t"
+    assert "fresh-web-secret" not in resp.text
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"type": "oauth2", "client_secret": "   "},
+        {"type": "oauth2", "scopes": ["ok", ""]},
+        {"type": "oauth2", "scopes": ["a b"]},
+    ],
+)
+def test_patch_blank_or_malformed_values_are_400(
+    cred_writer_client: TestClient, body: dict[str, object]
+) -> None:
+    """Whitespace-only secrets and non-token scope items never reach storage."""
+    cred_id = _create_oauth2(cred_writer_client, grant_type="client_credentials", name="o-blank")
+    before = cred_writer_client.get(f"/credentials/{cred_id}").json()
+    resp = cred_writer_client.patch(f"/credentials/{cred_id}", json=body)
+    assert resp.status_code == 400, resp.text
+    assert cred_writer_client.get(f"/credentials/{cred_id}").json() == before
+
+
+def test_patch_no_auth_rename_and_deactivate(cred_writer_client: TestClient) -> None:
+    """Pins #1425: a no_auth credential can be renamed and toggled inactive."""
+    created = cred_writer_client.post(
+        "/credentials",
+        json={
+            "type": "no_auth",
+            "name": "open-meteo",
+            "api": {"vendor": "open-meteo.com", "name": "", "version": ""},
+        },
+    )
+    assert created.status_code == 201, created.text
+    cred_id = created.json()["credential"]["credential_id"]
+
+    resp = cred_writer_client.patch(
+        f"/credentials/{cred_id}",
+        json={"type": "no_auth", "name": "open-meteo renamed", "active": False},
+    )
+    assert resp.status_code == 200, resp.text
+    got = cred_writer_client.get(f"/credentials/{cred_id}").json()
+    assert got["name"] == "open-meteo renamed"
+    assert got["active"] is False
+    assert got["type"] == "no_auth"
+
+
+def test_patch_sigv4_region_and_service_without_rotation(
+    cred_writer_client: TestClient,
+) -> None:
+    """Region/service edits apply without rotating the keypair."""
+    created = cred_writer_client.post(
+        "/credentials",
+        json={
+            "type": "sigv4",
+            "name": "sigv4-1425",
+            "api": {"vendor": "amazonaws.com", "name": "", "version": ""},
+            "access_key_id": "AKIAWEBTEST000000",
+            "secret_access_key": "web-sigv4-secret",  # pragma: allowlist secret
+            "aws_region": "us-east-1",
+            "aws_service": "aoss",
+        },
+    )
+    assert created.status_code == 201, created.text
+    cred_id = created.json()["credential"]["credential_id"]
+
+    resp = cred_writer_client.patch(
+        f"/credentials/{cred_id}",
+        json={"type": "sigv4", "aws_region": "eu-west-1", "aws_service": "execute-api"},
+    )
+    assert resp.status_code == 200, resp.text
+    details = cred_writer_client.get(f"/credentials/{cred_id}").json()["details"]
+    assert details["aws_region"] == "eu-west-1"
+    assert details["aws_service"] == "execute-api"
+    assert details["access_key_id"] == "AKIAWEBTEST000000"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"type": "api_key", "name": ""},
+        {"type": "no_auth", "name": ""},
+        {"type": "bearer_token", "token": ""},
+        {"type": "api_key", "key": ""},
+        {"type": "basic", "username": ""},
+        {"type": "basic", "password": ""},
+        {"type": "oauth2", "client_secret": ""},
+        {"type": "oauth2", "token_url": ""},
+        {"type": "sigv4", "access_key_id": "", "secret_access_key": ""},
+        {"type": "sigv4", "session_token": ""},
+        {"type": "sigv4", "aws_region": ""},
+        {"type": "sigv4", "aws_service": ""},
+    ],
+)
+def test_patch_empty_secret_is_rejected(
+    cred_writer_client: TestClient, body: dict[str, object]
+) -> None:
+    """Pins #1425: an empty name/secret/signing field is a 422, never stored."""
+    # Field validation runs at the request boundary, before the service checks
+    # the stored type, so one api_key credential serves every variant.
+    cred_id = _create_api_key(cred_writer_client)
+
+    resp = cred_writer_client.patch(f"/credentials/{cred_id}", json=body)
+    assert resp.status_code == 422, resp.text
+    assert "sk-web-test-key-123" not in resp.text
 
 
 # --- OAuth connect state on the redacted projection (#890) ---
@@ -297,46 +376,6 @@ def _create_oauth2(client: TestClient, *, grant_type: str, name: str) -> str:
     assert resp.status_code == 201, resp.text
     credential_id: str = resp.json()["credential"]["credential_id"]
     return credential_id
-
-
-async def test_oauth2_client_options_are_stored_without_defaults(
-    cred_writer_client: TestClient, web_context: Context
-) -> None:
-    """A credential's vendor quirks reach its OAuth client row; unknown keys are refused."""
-    payload: dict[str, object] = {
-        "type": "oauth2",
-        "name": "web-cred-options",
-        "api": {"vendor": "webtest-oauth.example", "name": "", "version": ""},
-        "provider": "static",
-        "grant_type": "authorization_code",
-        "token_url": "https://auth.example/token",
-        "authorize_url": "https://auth.example/authorize",
-        "client_id": "webtest-client",
-        "client_secret": "webtest-secret",
-        "client_options": {
-            "token_auth_method": "client_secret_basic",
-            "pkce": True,
-            "redirect_uri": "https://app.example/api/connectors/notion/callback",
-        },
-    }
-    resp = cred_writer_client.post("/credentials", json=payload)
-    assert resp.status_code == 201, resp.text
-    cred_id = resp.json()["credential"]["credential_id"]
-
-    async with web_context.control_db.session() as session:
-        row = await OAuthClientCredentialRepository.get_by_credential(session, cred_id)
-    assert row is not None
-    assert row.client_options == {
-        "token_auth_method": "client_secret_basic",
-        "pkce": True,
-        "redirect_uri": "https://app.example/api/connectors/notion/callback",
-    }
-
-    bad = cred_writer_client.post(
-        "/credentials",
-        json={**payload, "name": "web-cred-options-bad", "client_options": {"colour": "red"}},
-    )
-    assert bad.status_code == 422
 
 
 async def test_authorization_code_connected_flips_on_token(
@@ -416,19 +455,42 @@ async def test_authorization_code_connected_flips_on_token(
 
 
 async def test_managed_provider_account_ref_counts_as_connected(
-    cred_writer_client: TestClient, web_context: Context
+    cred_writer_client: TestClient, web_context: Context, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Managed providers (e.g. Pipedream) complete connect by stamping
+    """Providers that connect as an account reference (e.g. Pipedream) stamp
     `provider_account_ref` without a local token row — the ref alone must
     read as connected, or the picker would warn forever on a working
-    credential.
+    credential. On any other provider the ref is only a display name (the
+    connect-session identity echo writes one), so without a token row the
+    credential stays disconnected (#1425).
     """
+    pipedream = PipedreamProvider(
+        PipedreamProviderConfig(
+            project_id="proj_webtest",
+            client_id="pd-client",
+            client_secret=SecretStr("pd-secret"),
+        )
+    )
+    monkeypatch.setattr(
+        web_context,
+        "_providers",
+        ProviderRegistry({**web_context.providers.list_all(), "webtest_pipedream": pipedream}),
+    )
     cred_id = _create_oauth2(
         cred_writer_client, grant_type="authorization_code", name="web-cred-managed"
     )
     async with web_context.control_db.session() as session:
         await session.execute(
             text("UPDATE credentials SET provider_account_ref = 'acc_webtest' WHERE id = :cred"),
+            {"cred": cred_id},
+        )
+        await session.commit()
+    got = cred_writer_client.get(f"/credentials/{cred_id}").json()
+    assert got["details"]["connected"] is False
+
+    async with web_context.control_db.session() as session:
+        await session.execute(
+            text("UPDATE credentials SET provider = 'webtest_pipedream' WHERE id = :cred"),
             {"cred": cred_id},
         )
         await session.commit()
@@ -698,7 +760,14 @@ def test_agent_permissions_lifecycle(
     base = f"/credentials/{credential_id}/agents/{agent_id}/permissions"
 
     # A fresh binding has no rules — default-deny with nothing to show.
-    assert cred_writer_client.get(base).json() == {"data": []}
+    assert cred_writer_client.get(base).json() == {
+        "data": [],
+        "rule_set": None,
+        "granted_scopes": None,
+        "suspended": False,
+        "scopes_editable": False,
+        "scope_catalog": None,
+    }
 
     # PUT an ordered list: deny DELETE first, then allow the rest.
     rules = [
@@ -712,6 +781,11 @@ def test_agent_permissions_lifecycle(
         ("deny", ["DELETE"]),
         ("allow", ["GET", "POST"]),
     ]
+
+    # GET reads the rules back with the ids an edit names them by.
+    read = cred_writer_client.get(base).json()["data"]
+    assert [r["effect"] for r in read] == ["deny", "allow"]
+    assert all(r["id"].startswith("apr_") for r in read)
 
     # PUT is idempotent replacement, not append.
     resp = cred_writer_client.put(base, json=rules)
@@ -1441,6 +1515,28 @@ def test_rule_set_attach_requires_creator_admin_or_curated(
     # org:admin attaches any set, including another user's.
     resp = cred_writer_client.put(attach, json={"rule_set_id": others["rule_set_id"]})
     assert resp.status_code == 204
+    # Each non-admin sees only bindings on credentials/agents visible to them;
+    # org:admin sees the full count, and delete still guards the row (#1858).
+    others_id = others["rule_set_id"]
+    assert (
+        other_writer_client.get(f"/permission-rule-sets/{others_id}").json()["binding_count"] == 0
+    )
+    patched = other_writer_client.patch(
+        f"/permission-rule-sets/{others_id}", json={"description": "updated"}
+    )
+    assert patched.status_code == 200
+    assert patched.json()["binding_count"] == 0
+    assert (
+        plain_writer_client.get(f"/permission-rule-sets/{others_id}").json()["binding_count"] == 1
+    )
+    assert cred_writer_client.get(f"/permission-rule-sets/{others_id}").json()["binding_count"] == 1
+    delete_resp = other_writer_client.delete(f"/permission-rule-sets/{others_id}")
+    assert delete_resp.status_code == 409
+    assert delete_resp.json()["type"] == "rule_set_in_use"
+    assert (
+        delete_resp.json()["detail"]
+        == "Permission rule set is still referenced by one or more bindings; detach them first"
+    )
     assert plain_writer_client.delete(attach).status_code == 204
 
 
@@ -1582,3 +1678,583 @@ async def test_direct_binding_widens_credential_visibility(
     # And an agent with no binding at all sees nothing (unchanged baseline).
     with _agent_client(web_context, "agnt_never_bound") as client:
         assert client.get(f"/credentials/{credential_id}").status_code == 404
+
+
+# --- Owner delegation is read-only on credential writes ---
+
+
+@pytest.fixture()
+async def owner_credential(
+    plain_writer_client: TestClient, web_context: Context
+) -> AsyncGenerator[str, None]:
+    """A credential created by the plain (non-admin) writer; removed afterwards."""
+    yield _create_api_key(plain_writer_client)
+    async with web_context.control_db.session() as session:
+        await session.execute(
+            text("DELETE FROM credentials WHERE created_by = :who"), {"who": _PLAIN_WRITER_SUB}
+        )
+        await session.commit()
+
+
+@pytest.fixture()
+def delegated_writer_agent_client(web_context: Context) -> Iterator[TestClient]:
+    """An agent of the plain writer holding credentials:write plus owner delegation."""
+    identity = Identity(
+        sub="agnt_webtest_delegated_writer",
+        email="delegated-writer@test.local",
+        permissions=_effective("credentials:read", "credentials:write", "owner:credentials:read"),
+        actor_type=ActorType.AGENT,
+        parent_actor_id=_PLAIN_WRITER_SUB,
+    )
+    app = _build_app(web_context, identity)
+    with TestClient(app) as tc:
+        yield tc
+
+
+def test_owner_delegation_reads_but_cannot_write_owner_credential(
+    plain_writer_client: TestClient,
+    delegated_writer_agent_client: TestClient,
+    owner_credential: str,
+) -> None:
+    """owner:credentials:read shows the agent its owner's credential, read-only.
+
+    PATCH and DELETE answer the same 404 as a credential the agent cannot
+    see, even with credentials:write, and the row is unchanged.
+    """
+    path = f"/credentials/{owner_credential}"
+    before = plain_writer_client.get(path).json()
+    assert delegated_writer_agent_client.get(path).status_code == 200
+
+    resp = delegated_writer_agent_client.patch(
+        path, json={"type": "api_key", "name": "renamed", "key": "sk-web-test-other"}
+    )
+    assert resp.status_code == 404
+    assert resp.json()["type"] == "credential_not_found"
+    resp = delegated_writer_agent_client.delete(path)
+    assert resp.status_code == 404
+    assert resp.json()["type"] == "credential_not_found"
+
+    after = plain_writer_client.get(path)
+    assert after.status_code == 200
+    assert after.json()["name"] == before["name"] == "web-cred-589"
+    assert after.json()["updated_at"] == before["updated_at"]
+
+    # The owner still edits and deletes it.
+    resp = plain_writer_client.patch(path, json={"type": "api_key", "name": "owner-renamed"})
+    assert resp.status_code == 200, resp.text
+    assert plain_writer_client.delete(path).status_code == 204
+
+
+# --- Editing a binding through a connect session ---
+
+
+def test_edit_connection_round_trip(
+    cred_writer_client: TestClient, bound_agents: tuple[str, list[str]]
+) -> None:
+    """Begin an edit, read its review, confirm the revision, and see it applied."""
+    credential_id, (agent_id, _) = bound_agents
+    base = f"/credentials/{credential_id}/agents/{agent_id}/permissions"
+    read = {"effect": "allow", "methods": ["GET"], "path": "/v1/.*"}
+    assert cred_writer_client.put(base, json=[read]).status_code == 200
+    [rule_id] = [r["id"] for r in cred_writer_client.get(base).json()["data"]]
+
+    # A human names the agent; set is not combined with add/remove.
+    resp = cred_writer_client.post(
+        "/integrations:edit-connection", json={"credential_id": credential_id}
+    )
+    assert resp.status_code == 400, resp.text
+    resp = cred_writer_client.post(
+        "/integrations:edit-connection",
+        json={
+            "credential_id": credential_id,
+            "agent_id": agent_id,
+            "rules": {"set": [read], "remove": [rule_id]},
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    resp = cred_writer_client.post(
+        "/integrations:edit-connection",
+        json={"credential_id": credential_id, "agent_id": agent_id, "rules": {"remove": ["apr_x"]}},
+    )
+    assert (resp.status_code, resp.json()["type"]) == (422, "unknown_rule"), resp.text
+    directive = resp.json()["agent_directive"]
+    assert directive["strategy"] == "check_access"
+    assert directive["parameters"]["credential_id"] == credential_id
+    assert directive["parameters"]["suggested_command"] == f"jentic access show {credential_id}"
+    assert directive["parameters"]["access_url"].endswith(base)
+
+    # A rule the schema refuses (a condition-less allow) points at the access too.
+    resp = cred_writer_client.post(
+        "/integrations:edit-connection",
+        json={
+            "credential_id": credential_id,
+            "agent_id": agent_id,
+            "rules": {"add": [{"rule": {"effect": "allow"}}]},
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["agent_directive"]["parameters"]["credential_id"] == credential_id
+
+    send = {"effect": "allow", "methods": ["POST"], "path": "/v1/send"}
+    resp = cred_writer_client.post(
+        "/integrations:edit-connection",
+        json={
+            "credential_id": credential_id,
+            "agent_id": agent_id,
+            "rules": {"add": [{"rule": send, "before": rule_id}]},
+            "reason": "needs to send",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    created = resp.json()
+    assert created["resolved_flow"] == "edit"
+    assert created["revision_id"].startswith("csr_")
+
+    resp = cred_writer_client.post(
+        "/integrations:edit-connection",
+        json={"credential_id": credential_id, "agent_id": agent_id, "rules": {"remove": [rule_id]}},
+    )
+    # A binding can have several open edits at once.
+    assert resp.status_code == 201, resp.text
+    second = resp.json()["session_id"]
+
+    listed = cred_writer_client.get("/connect-sessions").json()["data"]
+    intents = {r["session_id"]: r["intent"] for r in listed}
+    assert intents[created["session_id"]] == intents[second] == "edit"
+
+    resp = cred_writer_client.post(
+        f"/connect-sessions/{created['session_id']}:amend",
+        json={"rules": {"set": [{"effect": "allow"}]}},
+    )
+    # A malformed amend is refused without naming what the session changes: the
+    # 422 is raised before the route settles who is asking, so a directive here
+    # would tell any caller the credential and agent behind a session id.
+    assert resp.status_code == 422, resp.text
+    assert "agent_directive" not in resp.json()
+
+    history = cred_writer_client.get(f"/connect-sessions/{created['session_id']}/revisions")
+    assert history.status_code == 200, history.text
+    assert [(r["id"], r["number"]) for r in history.json()["data"]] == [(created["revision_id"], 1)]
+
+    review = cred_writer_client.get(f"/connect-sessions/{created['session_id']}").json()
+    edit = review["edit"]
+    assert edit["revision"] == {"id": created["revision_id"], "number": 1}
+    assert [r["path"] for r in edit["result"]["rules"]] == ["/v1/send", "/v1/.*"]
+    assert edit["widens_access"] is True
+
+    # Confirm with the rules exactly as the review returned them (ids aside).
+    reviewed = [
+        {k: v for k, v in r.items() if k not in ("id", "added_by")} for r in edit["result"]["rules"]
+    ]
+    assert [r["added_by"] for r in edit["result"]["rules"]] == [CRED_WRITER_IDENTITY.sub, None]
+    resp = cred_writer_client.post(
+        f"/connect-sessions/{created['session_id']}:confirm",
+        json={
+            "kind": "edit",
+            "revision_id": created["revision_id"],
+            "permission_rules": reviewed,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"kind": "connected", "credential_id": credential_id}
+    assert [r["path"] for r in cred_writer_client.get(base).json()["data"]] == [
+        "/v1/send",
+        "/v1/.*",
+    ]
+    status = cred_writer_client.get(f"/connect-sessions/{created['session_id']}/status").json()
+    assert status["status"] == "applied"
+
+
+def test_edit_connection_apply_and_conflicts(
+    cred_writer_client: TestClient, bound_agents: tuple[str, list[str]]
+) -> None:
+    """A human's applied change lands at once; an open edit it breaks is conflicted."""
+    credential_id, (agent_id, _) = bound_agents
+    base = f"/credentials/{credential_id}/agents/{agent_id}/permissions"
+    read = {"effect": "allow", "methods": ["GET"], "path": "/v1/.*"}
+    assert cred_writer_client.put(base, json=[read]).status_code == 200
+    [rule_id] = [r["id"] for r in cred_writer_client.get(base).json()["data"]]
+
+    # An open request that removes the read rule.
+    resp = cred_writer_client.post(
+        "/integrations:edit-connection",
+        json={"credential_id": credential_id, "agent_id": agent_id, "rules": {"remove": [rule_id]}},
+    )
+    assert resp.status_code == 201, resp.text
+    open_id = resp.json()["session_id"]
+
+    # Applying a change writes it at once, beside the open request.
+    send = {"effect": "allow", "methods": ["POST"], "path": "/v1/send"}
+    resp = cred_writer_client.post(
+        "/integrations:edit-connection",
+        json={
+            "credential_id": credential_id,
+            "agent_id": agent_id,
+            "rules": {"set": [send]},
+            "apply": True,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    assert (resp.json()["status"], resp.json()["challenge"]) == ("applied", None)
+    assert [r["path"] for r in cred_writer_client.get(base).json()["data"]] == ["/v1/send"]
+
+    # The open request's rule is gone. The read says the request is stale and
+    # writes nothing; :rebase resolves it onto the binding as it is now, and
+    # the part that no longer fits comes back as a conflict.
+    stale = cred_writer_client.get(f"/connect-sessions/{open_id}").json()
+    assert stale["stale"] is True and stale["edit"]["conflicts"] == []
+    rebased = cred_writer_client.post(f"/connect-sessions/{open_id}:rebase")
+    assert rebased.status_code == 200, rebased.text
+    review = cred_writer_client.get(f"/connect-sessions/{open_id}").json()
+    assert review["stale"] is False
+    assert review["revision"]["id"] == rebased.json()["revision_id"]
+    assert review["edit"]["conflicts"] == [{"kind": "missing_rule", "rule_id": rule_id}]
+    confirm = {
+        "kind": "edit",
+        "revision_id": review["revision"]["id"],
+        "permission_rules": [send],
+    }
+    resp = cred_writer_client.post(f"/connect-sessions/{open_id}:confirm", json=confirm)
+    assert (resp.status_code, resp.json()["type"]) == (409, "edit_conflicted"), resp.text
+    assert resp.json()["conflicts"] == review["edit"]["conflicts"]
+    resp = cred_writer_client.post(
+        f"/connect-sessions/{open_id}:confirm", json=confirm | {"resolve_conflicts": True}
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_a_rule_comment_is_saved_and_read_back(
+    cred_writer_client: TestClient, bound_agents: tuple[str, list[str]]
+) -> None:
+    """A rule keeps its comment, sent as ``comment`` or as the ``_comment`` reads use."""
+    credential_id, (agent_id, _) = bound_agents
+    base = f"/credentials/{credential_id}/agents/{agent_id}/permissions"
+    rules = [
+        {"effect": "allow", "methods": ["GET"], "path": "/v1/.*", "comment": "Read anything"},
+        {"effect": "deny", "path": "/v1/admin", "match_mode": "prefix", "_comment": "Never admin"},
+    ]
+    assert cred_writer_client.put(base, json=rules).status_code == 200
+    read = cred_writer_client.get(base).json()["data"]
+    assert [r["_comment"] for r in read] == ["Read anything", "Never admin"]
+    # A rule read back is accepted as is.
+    echoed = [{k: v for k, v in r.items() if k not in ("id", "_system")} for r in read]
+    assert cred_writer_client.put(base, json=echoed).status_code == 200
+    too_long = [{"effect": "deny", "path": "/x", "comment": "x" * 501}]
+    assert cred_writer_client.put(base, json=too_long).status_code == 422
+
+
+#: Cursors that base64-decode to JSON of the wrong shape (#1956).
+_WRONG_SHAPE_CURSORS = [
+    base64.b64encode(raw.encode()).decode()
+    for raw in ("null", "[1]", '{"t": 1, "id": "x"}', '{"t": "2024-01-01", "id": 1}')
+]
+
+
+@pytest.mark.parametrize("cursor", _WRONG_SHAPE_CURSORS)
+def test_list_credentials_wrong_shape_cursor_returns_400(
+    cred_writer_client: TestClient, cursor: str
+) -> None:
+    """A tampered cursor on the control surface is a 400 ``invalid_cursor``, never a 500."""
+    resp = cred_writer_client.get("/credentials", params={"cursor": cursor})
+    assert resp.status_code == 400
+    assert resp.json()["type"] == "invalid_cursor"
+
+
+async def _oauth_table_counts(ctx: Context) -> dict[str, int]:
+    """Count rows in ``credentials`` and the OAuth2 secret tables."""
+    tables = (
+        "credentials",
+        "oauth_client_credentials",
+        "device_authorization_credentials",
+        "oauth_tokens",
+    )
+    async with ctx.control_db.session() as session:
+        counts: dict[str, int] = {}
+        for table in tables:
+            row = await session.execute(text(f"SELECT COUNT(*) FROM {table}"))
+            counts[table] = int(row.scalar_one())
+        return counts
+
+
+@pytest.mark.parametrize(
+    "bad_grant",
+    [
+        "password",
+        "implicit",
+        "",
+        "   ",
+        "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    ],
+)
+async def test_create_oauth2_unsupported_grant_type_returns_400_without_db_rows(
+    cred_writer_client: TestClient, web_context: Context, bad_grant: str
+) -> None:
+    """Pins #1428: POST /credentials rejects unsupported or blank OAuth2 grant
+    types with 400 invalid_credential_input and persists neither credential nor
+    secret rows."""
+    before_counts = await _oauth_table_counts(web_context)
+
+    resp = cred_writer_client.post(
+        "/credentials",
+        json={
+            "type": "oauth2",
+            "name": "o-1428-unsupported-grant",
+            "api": {"vendor": "webtest-oauth.example", "name": "", "version": ""},
+            "provider": "static",
+            "grant_type": bad_grant,
+            "token_url": "https://93.184.216.34/oauth/token",
+            "authorize_url": "https://93.184.216.34/oauth/authorize",
+            "client_id": "webtest-client",
+            "client_secret": "webtest-secret",  # pragma: allowlist secret
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    problem = resp.json()
+    assert problem["type"] == "invalid_credential_input"
+    assert problem["status"] == 400
+    assert problem["instance"] == "/credentials"
+    assert "grant_type" in problem["detail"]
+    assert "webtest-secret" not in resp.text
+
+    after_counts = await _oauth_table_counts(web_context)
+    assert after_counts == before_counts
+
+
+def test_create_oauth2_omitted_and_supported_grants_succeed(
+    cred_writer_client: TestClient,
+) -> None:
+    """Pins #1428: omitted grant_type defaults to client_credentials, and
+    supported grants including secret-less device_code succeed over HTTP."""
+    omitted = cred_writer_client.post(
+        "/credentials",
+        json={
+            "type": "oauth2",
+            "name": "o-1428-omitted",
+            "api": {"vendor": "webtest-oauth.example", "name": "", "version": ""},
+            "provider": "static",
+            "token_url": "https://93.184.216.34/oauth/token",
+            "client_id": "webtest-client",
+            "client_secret": "webtest-secret",  # pragma: allowlist secret
+        },
+    )
+    assert omitted.status_code == 201, omitted.text
+    omitted_id = omitted.json()["credential"]["credential_id"]
+    assert omitted.json()["secret"]["grant_type"] == "client_credentials"
+    assert (
+        cred_writer_client.get(f"/credentials/{omitted_id}").json()["details"]["grant_type"]
+        == "client_credentials"
+    )
+
+    device = cred_writer_client.post(
+        "/credentials",
+        json={
+            "type": "oauth2",
+            "name": "o-1428-device",
+            "api": {"vendor": "webtest-oauth.example", "name": "", "version": ""},
+            "provider": "static",
+            "grant_type": "device_code",
+            "token_url": "https://93.184.216.34/oauth/token",
+            "authorize_url": "https://93.184.216.34/oauth/device",
+            "client_id": "webtest-device-client",
+        },
+    )
+    assert device.status_code == 201, device.text
+    device_id = device.json()["credential"]["credential_id"]
+    assert device.json()["secret"]["grant_type"] == "device_code"
+    assert (
+        cred_writer_client.get(f"/credentials/{device_id}").json()["details"]["grant_type"]
+        == "device_code"
+    )
+
+
+# --- api_key additional secret headers (Datadog DD-APPLICATION-KEY) ---
+
+
+def _datadog_body(**overrides: object) -> dict[str, object]:
+    body: dict[str, object] = {
+        "type": "api_key",
+        "name": "web-cred-datadog",
+        "api": {"vendor": "datadoghq.com", "name": "datadog", "version": "v2"},
+        "provider": "static",
+        "key": "dd-api-key-value",  # pragma: allowlist secret
+        "location": "header",
+        "field_name": "DD-API-KEY",
+        "additional_headers": {"DD-APPLICATION-KEY": "dd-app-key-value"},
+    }
+    body.update(overrides)
+    return body
+
+
+def test_additional_headers_are_listed_by_name_only(cred_writer_client: TestClient) -> None:
+    resp = cred_writer_client.post("/credentials", json=_datadog_body())
+    assert resp.status_code == 201, resp.text
+    assert "dd-app-key-value" not in resp.text
+    assert resp.json()["secret"]["additional_header_names"] == ["DD-APPLICATION-KEY"]
+
+    cred_id = resp.json()["credential"]["credential_id"]
+    got = cred_writer_client.get(f"/credentials/{cred_id}")
+    assert "dd-app-key-value" not in got.text
+    assert got.json()["details"]["additional_header_names"] == ["DD-APPLICATION-KEY"]
+
+
+def test_api_key_without_additional_headers_lists_none(cred_writer_client: TestClient) -> None:
+    cred_id = _create_api_key(cred_writer_client)
+
+    got = cred_writer_client.get(f"/credentials/{cred_id}").json()
+
+    assert "additional_header_names" not in got["details"]
+
+
+@pytest.mark.parametrize(
+    "additional_headers",
+    [
+        {f"X-Extra-{i}": f"secret-value-{i}" for i in range(6)},
+        {"Bad Header": "secret-value"},
+        {"X-Ok": "line\r\nInjected: yes"},
+        {"dd-api-key": "collides with the key header"},
+        {"X-Empty": ""},
+    ],
+    ids=["too-many", "bad-name", "control-char", "collides-with-key", "empty-value"],
+)
+def test_invalid_additional_headers_are_rejected(
+    cred_writer_client: TestClient, additional_headers: dict[str, str]
+) -> None:
+    resp = cred_writer_client.post(
+        "/credentials", json=_datadog_body(additional_headers=additional_headers)
+    )
+
+    assert resp.status_code == 422, resp.text
+    for value in additional_headers.values():
+        if value:
+            assert value not in resp.text
+
+
+def test_patch_replaces_additional_headers(cred_writer_client: TestClient) -> None:
+    created = cred_writer_client.post("/credentials", json=_datadog_body()).json()
+    cred_id = created["credential"]["credential_id"]
+    before = cred_writer_client.get(f"/credentials/{cred_id}").json()
+
+    resp = cred_writer_client.patch(
+        f"/credentials/{cred_id}",
+        json={"type": "api_key", "additional_headers": {"X-Other-Key": "other-value"}},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert "other-value" not in resp.text
+    assert resp.json()["details"]["additional_header_names"] == ["X-Other-Key"]
+    assert _parse_ts(resp.json()["updated_at"]) > _parse_ts(before["updated_at"])
+
+    cleared = cred_writer_client.patch(
+        f"/credentials/{cred_id}", json={"type": "api_key", "additional_headers": {}}
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert "additional_header_names" not in cleared.json()["details"]
+
+
+def test_patch_additional_headers_cannot_collide_with_the_key_header(
+    cred_writer_client: TestClient,
+) -> None:
+    created = cred_writer_client.post("/credentials", json=_datadog_body()).json()
+    cred_id = created["credential"]["credential_id"]
+
+    resp = cred_writer_client.patch(
+        f"/credentials/{cred_id}",
+        json={"type": "api_key", "additional_headers": {"DD-API-KEY": "x"}},
+    )
+
+    # The stored key header is only known to the service, hence 400 not 422.
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["type"] == "invalid_credential_input"
+
+
+# --- oauth2 refresh_token grant seeded by the caller (Workday) ---
+
+
+def _workday_body(**overrides: object) -> dict[str, object]:
+    body: dict[str, object] = {
+        "type": "oauth2",
+        "name": "web-cred-workday",
+        "api": {"vendor": "workday.com", "name": "", "version": ""},
+        "provider": "static",
+        "grant_type": "refresh_token",
+        "token_url": "https://wd2-impl-services1.workday.com/ccx/oauth2/acme/token",
+        "client_id": "wd-client",
+        "client_secret": "wd-client-secret",  # pragma: allowlist secret
+        "refresh_token": "wd-refresh-token-value",  # pragma: allowlist secret
+    }
+    body.update(overrides)
+    return body
+
+
+def test_refresh_token_grant_never_returns_the_refresh_token(
+    cred_writer_client: TestClient,
+) -> None:
+    resp = cred_writer_client.post("/credentials", json=_workday_body())
+    assert resp.status_code == 201, resp.text
+    assert "wd-refresh-token-value" not in resp.text
+    assert resp.json()["secret"]["grant_type"] == "refresh_token"
+
+    cred_id = resp.json()["credential"]["credential_id"]
+    got = cred_writer_client.get(f"/credentials/{cred_id}")
+    assert "wd-refresh-token-value" not in got.text
+    assert got.json()["details"]["grant_type"] == "refresh_token"
+    assert got.json()["details"]["connected"] is True
+
+
+def test_refresh_token_grant_requires_a_refresh_token(cred_writer_client: TestClient) -> None:
+    body = _workday_body()
+    del body["refresh_token"]
+
+    resp = cred_writer_client.post("/credentials", json=body)
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["type"] == "invalid_credential_input"
+
+
+def test_refresh_token_needs_the_refresh_token_grant(cred_writer_client: TestClient) -> None:
+    resp = cred_writer_client.post(
+        "/credentials", json=_workday_body(grant_type="client_credentials")
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "wd-refresh-token-value" not in resp.text
+
+
+async def test_oauth2_client_options_are_stored_without_defaults(
+    cred_writer_client: TestClient, web_context: Context
+) -> None:
+    """A credential's vendor quirks reach its OAuth client row; unknown keys are refused."""
+    payload: dict[str, object] = {
+        "type": "oauth2",
+        "name": "web-cred-options",
+        "api": {"vendor": "webtest-oauth.example", "name": "", "version": ""},
+        "provider": "static",
+        "grant_type": "authorization_code",
+        "token_url": "https://auth.example/token",
+        "authorize_url": "https://auth.example/authorize",
+        "client_id": "webtest-client",
+        "client_secret": "webtest-secret",
+        "client_options": {
+            "token_auth_method": "client_secret_basic",
+            "pkce": True,
+            "redirect_uri": "https://app.example/api/connectors/notion/callback",
+        },
+    }
+    resp = cred_writer_client.post("/credentials", json=payload)
+    assert resp.status_code == 201, resp.text
+    cred_id = resp.json()["credential"]["credential_id"]
+
+    async with web_context.control_db.session() as session:
+        row = await OAuthClientCredentialRepository.get_by_credential(session, cred_id)
+    assert row is not None
+    assert row.client_options == {
+        "token_auth_method": "client_secret_basic",
+        "pkce": True,
+        "redirect_uri": "https://app.example/api/connectors/notion/callback",
+    }
+
+    bad = cred_writer_client.post(
+        "/credentials",
+        json={**payload, "name": "web-cred-options-bad", "client_options": {"colour": "red"}},
+    )
+    assert bad.status_code == 422

@@ -3,17 +3,27 @@
 from __future__ import annotations
 
 import datetime as dt
+from typing import Literal
 
 import structlog
 
 from jentic_one.control.core.schema.credentials import Credential
+from jentic_one.control.core.schema.oauth_app_registrations import OAuthAppRegistration
 from jentic_one.control.repos import (
+    ConnectNonceRepository,
     CredentialRepository,
+    OAuthClientCredentialRepository,
     OAuthTokenRepository,
 )
-from jentic_one.control.repos.prerequisite_repo import PrerequisiteRepository
+from jentic_one.control.repos.oauth_app_registration_repo import (
+    OAuthAppRegistrationRepository,
+)
 from jentic_one.control.scoping.filters import build_access_filters
-from jentic_one.control.services.credentials.errors import CredentialNotFoundError
+from jentic_one.control.services.credentials.errors import (
+    ConnectRequiresReviewError,
+    ConnectScopeWideningError,
+    CredentialNotFoundError,
+)
 from jentic_one.control.services.credentials.schemas.connect import (
     ConnectCallback,
     ConnectChallenge,
@@ -21,8 +31,14 @@ from jentic_one.control.services.credentials.schemas.connect import (
 )
 from jentic_one.control.services.credentials.schemas.provision import APIReference
 from jentic_one.control.services.credentials.state import (
+    BrowserBindingClaim,
     StateError,
     consume_callback_state,
+    decode_state,
+)
+from jentic_one.control.services.credentials.token_endpoint import (
+    may_carry_refresh_token,
+    minted_at_current_origin,
 )
 from jentic_one.shared.audit import AuditAction, AuditTargetType, record_audit_best_effort
 from jentic_one.shared.auth.identity import Identity
@@ -33,13 +49,38 @@ from jentic_one.shared.models.events import EventSeverity, EventType
 
 logger = structlog.get_logger()
 
-# Bound agents read for the re-authorize re-check: the permitted agent plus any
-# other is enough to refuse.
-_SOLE_BINDING_PROBE = 2
-
 
 class ConnectFlowError(Exception):
     """Raised when the connect flow fails for a domain reason."""
+
+
+def _stored_scopes(
+    credential: Credential, registration: OAuthAppRegistration | None = None
+) -> set[str] | None:
+    """Return the stored scope set for a device or authorization-code credential."""
+    dfc = credential.device_authorization_credential
+    if dfc is not None:
+        scopes = set(dfc.requested_scopes or ()) | set(dfc.granted_scopes or ())
+        if credential.oauth_token is not None and credential.oauth_token.scope:
+            scopes |= set(credential.oauth_token.scope.split())
+        return scopes
+    occ = credential.oauth_client_credential
+    if occ is not None:
+        if occ.scope:
+            return set(occ.scope.split())
+        if credential.oauth_token is not None and credential.oauth_token.scope:
+            return set(credential.oauth_token.scope.split())
+        return set()
+    if credential.oauth_app_registration_id is not None:
+        if credential.oauth_token is not None and credential.oauth_token.scope:
+            return set(credential.oauth_token.scope.split())
+        if registration is not None:
+            if registration.authorization_code_details is not None:
+                return set(registration.authorization_code_details.default_scopes or ())
+            if registration.device_authorization_details is not None:
+                return set(registration.device_authorization_details.default_scopes or ())
+        return set()
+    return None
 
 
 class ConnectService:
@@ -55,24 +96,54 @@ class ConnectService:
         *,
         identity: Identity,
         redirect_uri: str | None = None,
-        sole_agent_id: str | None = None,
+        browser_binding: BrowserBindingClaim | None = None,
     ) -> ConnectChallenge:
-        """Load the caller's credential, resolve provider, initiate connect flow.
+        """Load the caller's write-owned credential, resolve provider, initiate connect flow.
 
-        Connecting writes tokens onto the credential, so it is scoped like any
-        other credential write: a credential the caller cannot see is a 404.
+        Connecting overwrites the credential's stored tokens, so it requires
+        write ownership (``for_write=True``). An agent that can only read the
+        credential through owner delegation receives
+        :class:`ConnectRequiresReviewError` (403 ``connect_requires_review``)
+        pointing at the reviewed connect-session flow; any other miss raises
+        :class:`CredentialNotFoundError` (404). Requested scopes may only
+        narrow the stored scope set; widening raises
+        :class:`ConnectScopeWideningError` (422 ``scope_widening_requires_review``).
 
-        ``sole_agent_id`` marks a re-authorize that must stay sole-bound; it is
-        only honoured from this keyword, never from ``request.extra``, so an
-        HTTP caller cannot inject it through the request body.
+        ``browser_binding`` names the browser that may finish the flow: its
+        hash rides the signed state and the callback requires the matching
+        cookie. Without it the state is unbound and every callback for it
+        is refused.
         """
-        access_filters = build_access_filters(identity, Credential)
+        access_filters = build_access_filters(identity, Credential, for_write=True)
         async with self._ctx.control_db.session() as session:
             credential = await CredentialRepository.get_by_id(
                 session, credential_id, filters=access_filters
             )
             if credential is None:
+                if identity.actor_type == ActorType.AGENT:
+                    read_filters = build_access_filters(identity, Credential)
+                    visible = await CredentialRepository.get_by_id(
+                        session, credential_id, filters=read_filters
+                    )
+                    if visible is not None:
+                        raise ConnectRequiresReviewError(credential_id)
                 raise CredentialNotFoundError(credential_id)
+
+            registration: OAuthAppRegistration | None = None
+            if (
+                request.scopes
+                and credential.device_authorization_credential is None
+                and credential.oauth_client_credential is None
+                and credential.oauth_app_registration_id is not None
+            ):
+                registration = await OAuthAppRegistrationRepository.get_by_id(
+                    session, credential.oauth_app_registration_id
+                )
+            stored_scopes = _stored_scopes(credential, registration)
+            if request.scopes and stored_scopes is not None:
+                widened = [scope for scope in request.scopes if scope not in stored_scopes]
+                if widened:
+                    raise ConnectScopeWideningError(credential_id, widened)
 
             provider_name = credential.provider
             api = APIReference(
@@ -83,35 +154,67 @@ class ConnectService:
 
         provider = self._ctx.providers.get(provider_name)
 
-        extra = {k: v for k, v in request.extra.items() if k != "sole_agent_id"}
+        extra = dict(request.extra)
         extra.update(
             credential_id=credential_id,
+            provider_id=provider_name,
             actor_id=identity.sub,
             actor_type=str(identity.actor_type),
         )
-        if sole_agent_id is not None:
-            extra["sole_agent_id"] = sole_agent_id
         enriched_request = ConnectRequest(
             scopes=request.scopes,
             extra=extra,
             redirect_uri=redirect_uri,
+            browser_binding_hash=browser_binding.digest if browser_binding else None,
+            browser_host=browser_binding.host if browser_binding else None,
         )
 
-        return await provider.begin_connect(self._ctx, api=api, request=enriched_request)
+        challenge = await provider.begin_connect(self._ctx, api=api, request=enriched_request)
+        if challenge.kind == "authorization_code":
+            state = decode_state(
+                self._ctx.config.credentials.connect.state_secret.get_secret_value(),
+                challenge.state,
+            )
+            if state.session_id is None:
+                challenge.flow_id = state.nonce
+        return challenge
+
+    async def get_flow_status(
+        self, credential_id: str, flow_id: str, *, identity: Identity
+    ) -> Literal["pending", "connected"]:
+        """Return only the requested visible flow's terminal completion state."""
+        access_filters = build_access_filters(identity, Credential)
+        async with self._ctx.control_db.session() as session:
+            credential = await CredentialRepository.get_by_id(
+                session, credential_id, filters=access_filters
+            )
+            if credential is None:
+                raise CredentialNotFoundError(credential_id)
+            connected = await ConnectNonceRepository.is_completed(
+                session, nonce=flow_id, credential_id=credential_id
+            )
+        return "connected" if connected else "pending"
 
     async def complete(
         self,
         raw_state: str,
         callback: ConnectCallback,
+        *,
+        browser_binding: str | None,
     ) -> str:
-        """Verify state, exchange code via provider, persist tokens. Returns credential_id."""
+        """Verify state, exchange code via provider, persist tokens. Returns credential_id.
+
+        ``browser_binding`` is the binding cookie the callback carried.
+        """
         # Shared prologue with ``ConnectSessionService.complete_from_callback``
         # so replay protection lives in exactly one place. ``StateError``
         # covers every failure mode (expired / invalid / missing-actor /
         # nonce already consumed); we surface the taxonomy back to the
         # router via ``ConnectFlowError`` for the standalone path.
         try:
-            state = await consume_callback_state(self._ctx, raw_state)
+            state = await consume_callback_state(
+                self._ctx, raw_state, browser_binding=browser_binding
+            )
         except StateError as exc:
             raise ConnectFlowError(str(exc)) from exc
 
@@ -128,15 +231,46 @@ class ConnectService:
             # theme-8 Phase 4): that actor can no longer own a credential.
             raise ConnectFlowError(f"Unsupported actor_type in state: {state.actor_type}") from exc
         try:
-            if state.sole_agent_id is not None:
-                await self._require_sole_binding(state.credential_id, state.sole_agent_id)
+            async with self._ctx.control_db.session() as session:
+                credential = await CredentialRepository.get_by_id(session, state.credential_id)
+                if credential is None:
+                    raise CredentialNotFoundError(state.credential_id)
+                if credential.provider != state.provider:
+                    raise ConnectFlowError(
+                        f"State provider {state.provider!r} does not match "
+                        f"credential provider {credential.provider!r}"
+                    )
+
             provider = self._ctx.providers.get(state.provider)
             result = await provider.complete_connect(self._ctx, state=state, callback=callback)
 
             async with self._ctx.control_db.transaction() as session:
+                # Same lock as the broker refresh and a token_url edit, then
+                # re-check the endpoint: a cross-origin edit that committed
+                # while the code was being exchanged has moved the credential
+                # away from the origin this grant was minted at, and storing
+                # it would hand its refresh token to the new origin.
+                await OAuthTokenRepository.acquire_refresh_lock(session, state.credential_id)
                 credential = await CredentialRepository.get_by_id(session, state.credential_id)
                 if credential is None:
                     raise CredentialNotFoundError(state.credential_id)
+                if credential.provider != state.provider:
+                    raise ConnectFlowError(
+                        f"State provider {state.provider!r} does not match "
+                        f"credential provider {credential.provider!r}"
+                    )
+                current_token_url = await OAuthClientCredentialRepository.current_token_url(
+                    session, credential
+                )
+                if not minted_at_current_origin(result.token_url, current_token_url):
+                    logger.warning(
+                        "oauth_connect_discarded_token_url_moved",
+                        credential_id=state.credential_id,
+                    )
+                    raise ConnectFlowError(
+                        "the credential's token_url moved to another origin while connecting; "
+                        "reconnect the credential"
+                    )
 
                 existing_token = await OAuthTokenRepository.get_by_credential(
                     session, state.credential_id
@@ -149,13 +283,30 @@ class ConnectService:
                     )
 
                     if existing_token is not None:
-                        await OAuthTokenRepository.update_tokens(
+                        if (
+                            encrypted_refresh is None
+                            and existing_token.encrypted_refresh_token is not None
+                        ):
+                            if may_carry_refresh_token(
+                                existing_token,
+                                new_registration_id=credential.oauth_app_registration_id,
+                                connected_as=None,
+                                stored_account_ref=credential.provider_account_ref,
+                            ):
+                                encrypted_refresh = existing_token.encrypted_refresh_token
+                            else:
+                                logger.info(
+                                    "oauth_reconnect_dropped_prior_refresh_token",
+                                    credential_id=state.credential_id,
+                                )
+                        await OAuthTokenRepository.replace_grant(
                             session,
                             state.credential_id,
                             encrypted_access_token=encrypted_access,
                             encrypted_refresh_token=encrypted_refresh,
                             expires_at=result.expires_at,
                             scope=result.scope,
+                            app_registration_id=credential.oauth_app_registration_id,
                         )
                     else:
                         await OAuthTokenRepository.create(
@@ -165,6 +316,7 @@ class ConnectService:
                             encrypted_refresh_token=encrypted_refresh,
                             expires_at=result.expires_at,
                             scope=result.scope,
+                            app_registration_id=credential.oauth_app_registration_id,
                             created_by=created_by,
                         )
                 elif result.provider_account_ref:
@@ -183,16 +335,15 @@ class ConnectService:
                         **result.server_variables,
                     }
 
-                # Always bump `updated_at` on the credential row when a connect
-                # completes, regardless of whether `provider_account_ref` changed.
-                # The SPA polls `GET /credentials/{id}` and uses `updated_at` (or a
-                # `provider_account_ref` change) as the "the connection completed"
-                # signal so it can close the OAuth popup. `direct_oauth2` stores
-                # tokens in a sibling table and returns no `provider_account_ref`,
-                # so without this explicit touch the credentials row never changes
-                # and the SPA's polling loop times out, leaving the popup stuck on
-                # `{"status":"connected"}`.
+                # Keep the credential snapshot fresh for ordinary cache consumers.
+                # Connect completion itself is correlated through the nonce below,
+                # not inferred from this row's timestamp or account reference.
                 credential.updated_at = dt.datetime.now(dt.UTC)
+                await ConnectNonceRepository.mark_completed(
+                    session,
+                    nonce=state.nonce,
+                    credential_id=state.credential_id,
+                )
                 await session.flush()
         except Exception:
             await self._emit_connect_telemetry(
@@ -221,25 +372,6 @@ class ConnectService:
             actor_type=actor_type,
         )
         return state.credential_id
-
-    async def _require_sole_binding(self, credential_id: str, sole_agent_id: str) -> None:
-        """Refuse a re-authorize whose credential gained another bound agent meanwhile.
-
-        Checked before the code is exchanged, so the wider grant is never
-        stored. Suspended bindings count: lifting the suspension would hand
-        that agent the wider scopes too.
-        """
-        async with self._ctx.admin_db.session() as admin_session:
-            rows = await PrerequisiteRepository.list_agents_for_credential(
-                admin_session, credential_id=credential_id, limit=_SOLE_BINDING_PROBE
-            )
-        if any(row.agent_id != sole_agent_id for row in rows):
-            logger.warning(
-                "oauth_reauthorize_refused_other_agent_bound",
-                credential_id=credential_id,
-                agent_id=sole_agent_id,
-            )
-            raise ConnectFlowError("re-authorize refused: another agent is bound to the credential")
 
     async def _emit_connect_telemetry(
         self, *, type: str, summary: str, created_by: str, actor_type: ActorType

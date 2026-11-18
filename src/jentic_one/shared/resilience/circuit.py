@@ -17,9 +17,16 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
+import structlog
+
+from jentic_one.shared.state.backend import StateBackendCapacityError
+
+_logger = structlog.get_logger(__name__)
+
 _OPEN_PREFIX = "cb:open:"
 _TOTAL_PREFIX = "cb:total:"
 _FAIL_PREFIX = "cb:fail:"
+_REPORT_PREFIX = "cb:report:"
 _OPEN_VALUE = b"1"
 
 
@@ -82,6 +89,27 @@ class CircuitBreaker:
             )
         return CircuitDecision(state=CircuitState.CLOSED, allowed=True, retry_after_s=0)
 
+    async def claim_open_report(self, host: str) -> bool:
+        """Whether this caller reports ``host``'s open circuit; ``True`` once per cooldown.
+
+        A ``set_if_absent`` claim with the cooldown as its TTL, so of every
+        refusal an open circuit causes, on every process sharing the store,
+        one per cooldown reports it. The claim only gates telemetry, so a
+        claim the store refuses (its ``cb`` namespace is full) or fails
+        reports nothing and is logged; the caller's 503 is never replaced by
+        the store's error.
+        """
+        try:
+            return await self._store.set_if_absent(
+                f"{_REPORT_PREFIX}{host}", _OPEN_VALUE, ttl_s=self._cooldown_s
+            )
+        except StateBackendCapacityError:
+            _logger.debug("circuit_breaker_report_skipped", host=host, reason="store_full")
+            return False
+        except Exception as exc:
+            _logger.warning("circuit_breaker_report_skipped", host=host, error=type(exc).__name__)
+            return False
+
     async def record(self, host: str, *, ok: bool) -> None:
         """Record a call outcome; trip the latch if the window crosses threshold.
 
@@ -89,7 +117,19 @@ class CircuitBreaker:
         an in-window increment keeps it, so the ratio is always over the same
         rolling window. The latch is set with ``set_if_absent`` so concurrent
         trippers don't extend an already-open circuit's cooldown.
+
+        A counter or latch write the store refuses (its ``cb`` namespace is
+        full) skips this outcome and is logged. It runs after the upstream call
+        has already completed, so failing the request would discard a real
+        response. The breaker is an availability guard, not a correctness one:
+        while the namespace is full it may trip late or not at all.
         """
+        try:
+            await self._record(host, ok=ok)
+        except StateBackendCapacityError:
+            _logger.warning("circuit_breaker_record_skipped", host=host, reason="store_full")
+
+    async def _record(self, host: str, *, ok: bool) -> None:
         total = await self._store.incr_with_ttl(f"{_TOTAL_PREFIX}{host}", ttl_s=self._window_s)
         failures = 0
         if not ok:
@@ -99,9 +139,16 @@ class CircuitBreaker:
         if ok or total < self._min_calls:
             return
         if failures / total >= self._failure_ratio:
-            await self._store.set_if_absent(
-                f"{_OPEN_PREFIX}{host}", _OPEN_VALUE, ttl_s=self._cooldown_s
-            )
+            try:
+                await self._store.set_if_absent(
+                    f"{_OPEN_PREFIX}{host}", _OPEN_VALUE, ttl_s=self._cooldown_s
+                )
+            except StateBackendCapacityError:
+                # The window crossed the threshold but the circuit cannot open:
+                # calls to this host keep flowing until the namespace frees up.
+                _logger.warning(
+                    "circuit_breaker_record_skipped", host=host, reason="open_latch_refused"
+                )
 
 
 __all__ = ["CircuitBreaker", "CircuitDecision", "CircuitState"]

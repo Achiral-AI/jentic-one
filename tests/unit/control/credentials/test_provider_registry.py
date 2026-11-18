@@ -13,7 +13,11 @@ from jentic_one.control.services.credentials.providers import (
     StaticProvider,
     UnknownProviderError,
 )
-from jentic_one.shared.config import CredentialsConfig, PipedreamProviderConfig
+from jentic_one.shared.config import (
+    CredentialsConfig,
+    DirectOAuth2ProviderConfig,
+    PipedreamProviderConfig,
+)
 
 
 def test_from_config_always_includes_static() -> None:
@@ -57,7 +61,7 @@ def test_from_config_builds_pipedream_provider() -> None:
     registry = ProviderRegistry.from_config(cfg)
     provider = registry.get("my_pipedream")
     assert isinstance(provider, PipedreamProvider)
-    assert provider.name == "pipedream"
+    assert provider.name == "my_pipedream"
 
 
 def test_from_config_multiple_pipedream_instances() -> None:
@@ -81,6 +85,8 @@ def test_from_config_multiple_pipedream_instances() -> None:
     assert isinstance(p1, PipedreamProvider)
     assert isinstance(p2, PipedreamProvider)
     assert p1 is not p2
+    assert p1.name == "pipedream_slack"
+    assert p2.name == "pipedream_github"
 
 
 def test_from_config_and_dynamic_builds_runtime_pipedream() -> None:
@@ -129,3 +135,27 @@ def test_get_stays_synchronous() -> None:
     cfg = CredentialsConfig()
     registry = ProviderRegistry.from_config(cfg)
     assert not inspect.iscoroutinefunction(registry.get)
+
+
+def test_mints_from_account_ref_only_for_account_ref_providers() -> None:
+    """Pins #1425: the "managed provider" predicate keys on the provider's
+    kind, not on ``provider_account_ref``, and on the registry name the
+    credential stores (any config key). Only Pipedream connects as an account
+    reference; providers that keep their grant in ``oauth_tokens`` and
+    unknown names do not."""
+    cfg = CredentialsConfig(
+        providers={
+            "my_pipedream": PipedreamProviderConfig(
+                project_id="proj_1",
+                client_id="c_id",
+                client_secret=SecretStr("c_secret"),
+            ),
+            "my_oauth": DirectOAuth2ProviderConfig(redirect_uri="https://app.example.com/cb"),
+        }
+    )
+    registry = ProviderRegistry.from_config(cfg)
+
+    assert registry.mints_from_account_ref("my_pipedream") is True
+    for name in ("my_oauth", "device_authorization", "static", "not_registered"):
+        assert registry.mints_from_account_ref(name) is False
+    assert registry.account_ref_provider_names() == frozenset({"my_pipedream"})

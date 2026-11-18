@@ -5,7 +5,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from jentic_one.shared.db.protocols import TransactionalDatabase
 from jentic_one.shared.models.jobs import JobKind
+
+
+class NonRetryableJobError(Exception):
+    """Raised by a handler when no later attempt can change the job's outcome.
+
+    The worker moves the job to ``failed`` on the attempt that raised it, with
+    ``str(exc)`` as ``job.error``, instead of requeueing it with backoff. Every
+    other handler exception keeps the ``worker.max_attempts`` retry budget, so
+    raise this only for a failure that is a pure function of the job's input
+    (e.g. a payload or document that fails validation).
+    """
 
 
 @dataclass
@@ -22,7 +34,7 @@ class JobHandler(Protocol):
     async def execute(
         self,
         job_id: str,
-        session: Any,
+        db: TransactionalDatabase,
         *,
         payload: dict[str, Any] | None = None,
         created_by: str | None = None,
@@ -30,10 +42,18 @@ class JobHandler(Protocol):
     ) -> JobResultPayload:
         """Run the job.
 
+        ``db`` is the worker's ``DatabaseSession``. The worker opens no
+        transaction around the handler: a handler opens its own short
+        transactions on ``db``, so no connection (and, on SQLite, no write lock)
+        is held across slow work such as an upstream call or a spec fetch.
+
         ``created_by``/``actor_type`` carry the enqueuing actor's id and kind.
         Handlers that write audit entries (which require a real actor) must
         reject a missing ``created_by``; handlers that only emit system
         lifecycle events may treat it as optional.
+
+        Raising :class:`NonRetryableJobError` fails the job on this attempt;
+        any other exception is retried with backoff.
         """
         ...
 

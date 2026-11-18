@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jentic/jentic-one/cli/internal/cli/ux"
 )
@@ -428,6 +429,81 @@ func TestMCPRequestConnection_429IsRetryableTransportError(t *testing.T) {
 	}
 }
 
+func TestMCPRequestConnection_429RetryAfterShapes(t *testing.T) {
+	cases := []struct {
+		name      string
+		header    func() string
+		wantSet   bool
+		wantExact float64
+		wantMin   float64
+		wantMax   float64
+	}{
+		{name: "integer seconds", header: func() string { return "2" }, wantSet: true, wantExact: 2},
+		{name: "fractional seconds rounds up", header: func() string { return "1.2" }, wantSet: true, wantExact: 2},
+		{
+			name: "http-date ~30s ahead",
+			header: func() string {
+				return time.Now().UTC().Truncate(time.Second).Add(32 * time.Second).Format(http.TimeFormat)
+			},
+			wantSet: true,
+			wantMin: 25,
+			wantMax: 35,
+		},
+		{name: "inf rejected", header: func() string { return "inf" }, wantSet: false},
+		{name: "NaN rejected", header: func() string { return "NaN" }, wantSet: false},
+		{name: "exponent rejected", header: func() string { return "1e3" }, wantSet: false},
+		{name: "negative rejected", header: func() string { return "-1" }, wantSet: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hdr := tc.header()
+			cp := &connectControlPlane{
+				status:  http.StatusTooManyRequests,
+				body:    `{"detail":"rate limit exceeded"}`,
+				headers: map[string]string{"Retry-After": hdr},
+			}
+			srv := httptest.NewServer(cp.handler())
+			defer srv.Close()
+
+			s := stampedTestMCPServer(t)
+			res, err := s.handleRequestConnection(activeCtx(srv.URL), callToolRequest("request_connection", `{"vendor":"github"}`))
+			if err != nil {
+				t.Fatalf("handleRequestConnection: %v", err)
+			}
+			if !res.IsError {
+				t.Fatalf("want IsError result")
+			}
+			payload := decodeToolJSON(t, res)
+			if payload["error_code"] != ux.CodeTransportError {
+				t.Errorf("error_code = %v, want %q", payload["error_code"], ux.CodeTransportError)
+			}
+			if payload["retryable"] != true {
+				t.Errorf("retryable = %v, want true", payload["retryable"])
+			}
+			got, has := payload["retry_after_s"]
+			if !tc.wantSet {
+				if has {
+					t.Errorf("retry_after_s = %v, want key absent for %q", got, hdr)
+				}
+				return
+			}
+			if !has {
+				t.Fatalf("retry_after_s absent for %q", hdr)
+			}
+			gotF, ok := got.(float64)
+			if !ok {
+				t.Fatalf("retry_after_s = %T (%v), want float64", got, got)
+			}
+			if tc.wantExact != 0 && gotF != tc.wantExact {
+				t.Errorf("retry_after_s = %v, want %v", gotF, tc.wantExact)
+			}
+			if tc.wantMax != 0 && (gotF < tc.wantMin || gotF > tc.wantMax) {
+				t.Errorf("retry_after_s = %v, want in [%v, %v]", gotF, tc.wantMin, tc.wantMax)
+			}
+		})
+	}
+}
+
 func TestMCPRequestConnection_503IsOperatorConfigAction(t *testing.T) {
 	cp := &connectControlPlane{status: http.StatusServiceUnavailable, body: `{"detail":"vendor 'github' flow 'authorization_code' not configured: no client_id"}`}
 	srv := httptest.NewServer(cp.handler())
@@ -581,6 +657,10 @@ func TestMCPRequestConnection_APITargetErrorCodes(t *testing.T) {
 		},
 		{http.StatusTooManyRequests, `{"type":"too_many_open_sessions","detail":"cap"}`, ux.CodeBrokerDenied, "", "Do not open more"},
 		{http.StatusTooManyRequests, `{"type":"recently_rejected","detail":"rejected"}`, ux.CodeBrokerDenied, "", "Do not ask again"},
+		{
+			http.StatusConflict, `{"type":"connect_session_binding_suspended","detail":"suspended"}`,
+			ux.CodeBrokerDenied, "", "ask your operator to resume it",
+		},
 	} {
 		t.Run(tc.body, func(t *testing.T) {
 			cp := &connectControlPlane{status: tc.status, body: tc.body, headers: map[string]string{"Retry-After": "3600"}}
@@ -607,5 +687,31 @@ func TestMCPRequestConnection_APITargetErrorCodes(t *testing.T) {
 				t.Errorf("actionable_step %q must contain %q", step, tc.wantStep)
 			}
 		})
+	}
+}
+
+func TestMCPRequestConnection_OpenSessionIsRelayedNotAnError(t *testing.T) {
+	cp := &connectControlPlane{
+		status: http.StatusConflict,
+		body: `{"type":"connect_open","status":409,"detail":"already open",
+			"session_id":"cs_open","approval_url":"https://one.example/connect/cs_open"}`,
+	}
+	srv := httptest.NewServer(cp.handler())
+	defer srv.Close()
+
+	s := stampedTestMCPServer(t)
+	res, err := s.handleRequestConnection(activeCtx(srv.URL), callToolRequest("request_connection", `{"vendor":"github"}`))
+	if err != nil {
+		t.Fatalf("handleRequestConnection: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("an open request must not be an error: %s", toolResultText(res))
+	}
+	payload := decodeToolJSON(t, res)
+	if payload["session_id"] != "cs_open" || payload["already_open"] != true {
+		t.Errorf("payload = %v, want the open session flagged already_open", payload)
+	}
+	if payload["approval_url"] != "https://one.example/connect/cs_open" {
+		t.Errorf("approval_url = %v", payload["approval_url"])
 	}
 }

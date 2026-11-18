@@ -10,11 +10,24 @@ import "regexp"
 
 // Admin authentication settings.
 type AdminAuthConfig struct {
+	// Maximum seconds a password or OAuth client-secret hash or verification waits
+	// for one of the ``argon2_max_concurrency`` slots before failing with HTTP 503
+	// and a ``Retry-After`` header.
+	Argon2AcquireTimeoutS float64 `json:"argon2_acquire_timeout_s" yaml:"argon2_acquire_timeout_s" mapstructure:"argon2_acquire_timeout_s"`
+
+	// Per-process cap on concurrent argon2id password and OAuth client-secret hashes
+	// and verifications across all surfaces. Each argon2id call allocates 64 MiB
+	// (``memory_cost=65536``), so the default of 4 bounds peak argon2 memory at 256
+	// MiB per process. Calls beyond the cap wait up to ``argon2_acquire_timeout_s``
+	// for a slot and then fail with HTTP 503 + ``Retry-After`` instead of allocating
+	// another 64 MiB buffer.
+	Argon2MaxConcurrency int `json:"argon2_max_concurrency" yaml:"argon2_max_concurrency" mapstructure:"argon2_max_concurrency"`
+
 	// How long a locked admin account stays locked before logins are accepted again.
-	FailedLoginLockoutSeconds int `json:"failed_login_lockout_seconds,omitempty,omitzero" yaml:"failed_login_lockout_seconds,omitempty" mapstructure:"failed_login_lockout_seconds,omitempty"`
+	FailedLoginLockoutSeconds int `json:"failed_login_lockout_seconds" yaml:"failed_login_lockout_seconds" mapstructure:"failed_login_lockout_seconds"`
 
 	// Consecutive failed logins after which an admin account is locked.
-	FailedLoginLockoutThreshold int `json:"failed_login_lockout_threshold,omitempty,omitzero" yaml:"failed_login_lockout_threshold,omitempty" mapstructure:"failed_login_lockout_threshold,omitempty"`
+	FailedLoginLockoutThreshold int `json:"failed_login_lockout_threshold" yaml:"failed_login_lockout_threshold" mapstructure:"failed_login_lockout_threshold"`
 
 	// HMAC secret that signs admin login JWTs. Required in production (empty or
 	// placeholder values are rejected at startup); in development an ephemeral
@@ -23,12 +36,12 @@ type AdminAuthConfig struct {
 
 	// Lifetime of one admin login JWT. ``POST /auth/refresh`` re-mints the token, so
 	// this bounds a single token, not the session.
-	JwtTtlSeconds int `json:"jwt_ttl_seconds,omitempty,omitzero" yaml:"jwt_ttl_seconds,omitempty" mapstructure:"jwt_ttl_seconds,omitempty"`
+	JwtTtlSeconds int `json:"jwt_ttl_seconds" yaml:"jwt_ttl_seconds" mapstructure:"jwt_ttl_seconds"`
 
 	// Absolute cap on a web session: refresh re-mints the login JWT only while ``now
 	// - auth_time`` stays inside this window, so a leaked token cannot be kept alive
 	// indefinitely. Must be >= ``jwt_ttl_seconds``.
-	SessionTtlSeconds int `json:"session_ttl_seconds,omitempty,omitzero" yaml:"session_ttl_seconds,omitempty" mapstructure:"session_ttl_seconds,omitempty"`
+	SessionTtlSeconds int `json:"session_ttl_seconds" yaml:"session_ttl_seconds" mapstructure:"session_ttl_seconds"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -41,6 +54,24 @@ func (j *AdminAuthConfig) UnmarshalJSON(value []byte) error {
 	var plain Plain
 	if err := json.Unmarshal(value, &plain); err != nil {
 		return err
+	}
+	if v, ok := raw["argon2_acquire_timeout_s"]; !ok || v == nil {
+		plain.Argon2AcquireTimeoutS = 5.0
+	}
+	if 60 < plain.Argon2AcquireTimeoutS {
+		return fmt.Errorf("field %s: must be <= %v", "argon2_acquire_timeout_s", 60)
+	}
+	if 0 >= plain.Argon2AcquireTimeoutS {
+		return fmt.Errorf("field %s: must be > %v", "argon2_acquire_timeout_s", 0)
+	}
+	if v, ok := raw["argon2_max_concurrency"]; !ok || v == nil {
+		plain.Argon2MaxConcurrency = 4
+	}
+	if 64 < plain.Argon2MaxConcurrency {
+		return fmt.Errorf("field %s: must be <= %v", "argon2_max_concurrency", 64)
+	}
+	if 1 > plain.Argon2MaxConcurrency {
+		return fmt.Errorf("field %s: must be >= %v", "argon2_max_concurrency", 1)
 	}
 	if v, ok := raw["failed_login_lockout_seconds"]; !ok || v == nil {
 		plain.FailedLoginLockoutSeconds = 900
@@ -72,17 +103,63 @@ type AdminConfig struct {
 	// Auth corresponds to the JSON schema field "auth".
 	Auth *AdminAuthConfig `json:"auth,omitempty,omitzero" yaml:"auth,omitempty" mapstructure:"auth,omitempty"`
 
+	// Events corresponds to the JSON schema field "events".
+	Events *AdminEventsConfig `json:"events,omitempty,omitzero" yaml:"events,omitempty" mapstructure:"events,omitempty"`
+
 	// Invite corresponds to the JSON schema field "invite".
 	Invite *AdminInviteConfig `json:"invite,omitempty,omitzero" yaml:"invite,omitempty" mapstructure:"invite,omitempty"`
 }
 
+// Admin event-stream settings.
+type AdminEventsConfig struct {
+	// Minimum seconds between re-verifications of an open ``GET /events/stream``: its
+	// credential, ``events:read`` / ``org:admin`` permission, and the scope of the
+	// events it delivers. Checks run only at a poll or page boundary, so a check
+	// happens at the first poll or page after the interval elapses; an idle stream
+	// polls every few seconds, so a value below its poll interval behaves as that
+	// interval. A disabled caller, a revoked or expired token, or a revoked
+	// permission ends the stream at that check; a narrower permission set narrows it.
+	// Permissions are those the credential carries: API keys and ``at_`` access
+	// tokens resolve them live (an ephemeral agent ``at_`` keeps the subset it was
+	// minted with). A login session JWT carries the set it was issued with, but
+	// removing any of a user's effective permissions revokes their login sessions, so
+	// a stream opened with one ends at that check. The stream re-verifies the token
+	// it was opened with, so a permission added to a user reaches a login-session
+	// stream once the client reconnects with a newer login JWT.
+	StreamRecheckSeconds float64 `json:"stream_recheck_seconds" yaml:"stream_recheck_seconds" mapstructure:"stream_recheck_seconds"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *AdminEventsConfig) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	type Plain AdminEventsConfig
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if v, ok := raw["stream_recheck_seconds"]; !ok || v == nil {
+		plain.StreamRecheckSeconds = 5.0
+	}
+	if 0 >= plain.StreamRecheckSeconds {
+		return fmt.Errorf("field %s: must be > %v", "stream_recheck_seconds", 0)
+	}
+	*j = AdminEventsConfig(plain)
+	return nil
+}
+
 // Admin invite token settings.
 type AdminInviteConfig struct {
-	// Pepper corresponds to the JSON schema field "pepper".
+	// HMAC key for stored invite-token hashes. Required in production (empty or
+	// placeholder values are rejected at startup); in development an ephemeral
+	// per-process value is generated when empty. Changing it invalidates every
+	// outstanding invite.
 	Pepper string `json:"pepper,omitempty,omitzero" yaml:"pepper,omitempty" mapstructure:"pepper,omitempty"`
 
-	// TtlDays corresponds to the JSON schema field "ttl_days".
-	TtlDays int `json:"ttl_days,omitempty,omitzero" yaml:"ttl_days,omitempty" mapstructure:"ttl_days,omitempty"`
+	// Days an admin invite token stays redeemable after it is issued.
+	TtlDays int `json:"ttl_days" yaml:"ttl_days" mapstructure:"ttl_days"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -108,24 +185,30 @@ func (j *AdminInviteConfig) UnmarshalJSON(value []byte) error {
 
 // Platform-actors OAuth surface configuration.
 type AuthConfig struct {
-	// AccessTtlSeconds corresponds to the JSON schema field "access_ttl_seconds".
-	AccessTtlSeconds int `json:"access_ttl_seconds,omitempty,omitzero" yaml:"access_ttl_seconds,omitempty" mapstructure:"access_ttl_seconds,omitempty"`
+	// Lifetime (seconds) of an OAuth access token issued by the auth surface.
+	AccessTtlSeconds int `json:"access_ttl_seconds" yaml:"access_ttl_seconds" mapstructure:"access_ttl_seconds"`
 
-	// AssertionMaxTtlSeconds corresponds to the JSON schema field
-	// "assertion_max_ttl_seconds".
-	AssertionMaxTtlSeconds int `json:"assertion_max_ttl_seconds,omitempty,omitzero" yaml:"assertion_max_ttl_seconds,omitempty" mapstructure:"assertion_max_ttl_seconds,omitempty"`
+	// Furthest in the future (seconds) a JWT-Bearer client assertion's ``exp`` may
+	// be; assertions expiring later are rejected.
+	AssertionMaxTtlSeconds int `json:"assertion_max_ttl_seconds" yaml:"assertion_max_ttl_seconds" mapstructure:"assertion_max_ttl_seconds"`
 
-	// AuthCodeTtlSeconds corresponds to the JSON schema field
-	// "auth_code_ttl_seconds".
-	AuthCodeTtlSeconds int `json:"auth_code_ttl_seconds,omitempty,omitzero" yaml:"auth_code_ttl_seconds,omitempty" mapstructure:"auth_code_ttl_seconds,omitempty"`
+	// Lifetime (seconds) of an OAuth authorization code before it must be exchanged.
+	AuthCodeTtlSeconds int `json:"auth_code_ttl_seconds" yaml:"auth_code_ttl_seconds" mapstructure:"auth_code_ttl_seconds"`
 
-	// CanonicalBaseUrl corresponds to the JSON schema field "canonical_base_url".
+	// Public origin of the auth surface (``scheme://host[:port]``, no path), used for
+	// the OIDC issuer, the JWT-Bearer assertion audience and the SPA login callback.
+	// Unset falls back to ``server.public_base_url``, then the request or bind
+	// origin. A value with a path breaks the OAuth well-known discovery routes.
 	CanonicalBaseUrl string `json:"canonical_base_url,omitempty,omitzero" yaml:"canonical_base_url,omitempty" mapstructure:"canonical_base_url,omitempty"`
 
-	// ClaimTtlSeconds corresponds to the JSON schema field "claim_ttl_seconds".
-	ClaimTtlSeconds int `json:"claim_ttl_seconds,omitempty,omitzero" yaml:"claim_ttl_seconds,omitempty" mapstructure:"claim_ttl_seconds,omitempty"`
+	// Lifetime (seconds) of the agent-ownership claim token minted at agent
+	// registration. Has no effect unless a claim-token minter is installed; the
+	// default build mints none.
+	ClaimTtlSeconds int `json:"claim_ttl_seconds" yaml:"claim_ttl_seconds" mapstructure:"claim_ttl_seconds"`
 
-	// IdSigning corresponds to the JSON schema field "id_signing".
+	// ES256 keys for signing OIDC ID tokens. The first entry signs; every entry is
+	// published in the JWKS, so append the next key and later move it first to
+	// rotate. The local-dev key is rejected in production.
 	IdSigning []SigningKeyConfig `json:"id_signing,omitempty,omitzero" yaml:"id_signing,omitempty" mapstructure:"id_signing,omitempty"`
 
 	// Idp corresponds to the JSON schema field "idp".
@@ -137,15 +220,26 @@ type AuthConfig struct {
 	// OauthRateLimit corresponds to the JSON schema field "oauth_rate_limit".
 	OauthRateLimit *OAuthRateLimitConfig `json:"oauth_rate_limit,omitempty,omitzero" yaml:"oauth_rate_limit,omitempty" mapstructure:"oauth_rate_limit,omitempty"`
 
-	// PlatformClients corresponds to the JSON schema field "platform_clients".
+	// Static first-party OAuth clients that authenticate with PKCE only (no secret).
+	// When ``auth.canonical_base_url`` is set, the operator SPA (``jentic-one-spa``)
+	// is added automatically if not listed.
 	PlatformClients []PlatformClientConfig `json:"platform_clients,omitempty,omitzero" yaml:"platform_clients,omitempty" mapstructure:"platform_clients,omitempty"`
 
-	// RatTtlSeconds corresponds to the JSON schema field "rat_ttl_seconds".
-	RatTtlSeconds int `json:"rat_ttl_seconds,omitempty,omitzero" yaml:"rat_ttl_seconds,omitempty" mapstructure:"rat_ttl_seconds,omitempty"`
+	// Lifetime (seconds) of the registration access token returned when an agent
+	// registers, which the agent uses to check its registration status.
+	RatTtlSeconds int `json:"rat_ttl_seconds" yaml:"rat_ttl_seconds" mapstructure:"rat_ttl_seconds"`
 
-	// RefreshTtlSeconds corresponds to the JSON schema field "refresh_ttl_seconds".
-	RefreshTtlSeconds int `json:"refresh_ttl_seconds,omitempty,omitzero" yaml:"refresh_ttl_seconds,omitempty" mapstructure:"refresh_ttl_seconds,omitempty"`
+	// Maximum absolute lifetime (seconds, default 90 days) of an OAuth refresh-token
+	// family from initial mint, across rotations. Set to null to disable the family
+	// cap.
+	RefreshFamilyMaxAgeSeconds interface{} `json:"refresh_family_max_age_seconds" yaml:"refresh_family_max_age_seconds" mapstructure:"refresh_family_max_age_seconds"`
+
+	// Lifetime (seconds, default 7 days) of an OAuth refresh token; each refresh
+	// rotates it and the new token gets a fresh lifetime.
+	RefreshTtlSeconds int `json:"refresh_ttl_seconds" yaml:"refresh_ttl_seconds" mapstructure:"refresh_ttl_seconds"`
 }
+
+type AuthConfigRefreshFamilyMaxAgeSeconds_0 *int
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *AuthConfig) UnmarshalJSON(value []byte) error {
@@ -176,40 +270,13 @@ func (j *AuthConfig) UnmarshalJSON(value []byte) error {
 	if v, ok := raw["rat_ttl_seconds"]; !ok || v == nil {
 		plain.RatTtlSeconds = 900
 	}
+	if v, ok := raw["refresh_family_max_age_seconds"]; !ok || v == nil {
+		plain.RefreshFamilyMaxAgeSeconds = 7776000.0
+	}
 	if v, ok := raw["refresh_ttl_seconds"]; !ok || v == nil {
 		plain.RefreshTtlSeconds = 604800
 	}
 	*j = AuthConfig(plain)
-	return nil
-}
-
-type BackendKind string
-
-const BackendKindMemory BackendKind = "memory"
-const BackendKindRedis BackendKind = "redis"
-
-var enumValues_BackendKind = []interface{}{
-	"memory",
-	"redis",
-}
-
-// UnmarshalJSON implements json.Unmarshaler.
-func (j *BackendKind) UnmarshalJSON(value []byte) error {
-	var v string
-	if err := json.Unmarshal(value, &v); err != nil {
-		return err
-	}
-	var ok bool
-	for _, expected := range enumValues_BackendKind {
-		if reflect.DeepEqual(v, expected) {
-			ok = true
-			break
-		}
-	}
-	if !ok {
-		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_BackendKind, v)
-	}
-	*j = BackendKind(v)
 	return nil
 }
 
@@ -223,10 +290,18 @@ type BrokerConfig struct {
 	// Idempotency corresponds to the JSON schema field "idempotency".
 	Idempotency *IdempotencyConfig `json:"idempotency,omitempty,omitzero" yaml:"idempotency,omitempty" mapstructure:"idempotency,omitempty"`
 
-	// JobsApiBaseUrl corresponds to the JSON schema field "jobs_api_base_url".
+	// Public base URL of the admin API (e.g. ``https://api.example.com``), used for
+	// the links a broker returns for async and held executions (``/jobs/{id}``,
+	// ``/executions/holds/{id}``, the approval review page). Unset, they are relative
+	// to the broker's own origin (the review page link tries
+	// ``server.public_base_url`` first); set it when the broker runs without the
+	// admin surface.
 	JobsApiBaseUrl interface{} `json:"jobs_api_base_url,omitempty,omitzero" yaml:"jobs_api_base_url,omitempty" mapstructure:"jobs_api_base_url,omitempty"`
 
-	// JwtSecret corresponds to the JSON schema field "jwt_secret".
+	// HS256 shared secret for verifying self-contained JWTs at the broker (signature
+	// and ``exp`` only), for development and tests. Unset disables this path;
+	// ``jwt_verification.trusted_issuers`` takes precedence when set and is the
+	// production option.
 	JwtSecret interface{} `json:"jwt_secret,omitempty,omitzero" yaml:"jwt_secret,omitempty" mapstructure:"jwt_secret,omitempty"`
 
 	// JwtVerification corresponds to the JSON schema field "jwt_verification".
@@ -235,25 +310,72 @@ type BrokerConfig struct {
 	// Resilience corresponds to the JSON schema field "resilience".
 	Resilience *BrokerResilienceConfig `json:"resilience,omitempty,omitzero" yaml:"resilience,omitempty" mapstructure:"resilience,omitempty"`
 
-	// ResolveCacheTtlSeconds corresponds to the JSON schema field
-	// "resolve_cache_ttl_seconds".
-	ResolveCacheTtlSeconds float64 `json:"resolve_cache_ttl_seconds,omitempty,omitzero" yaml:"resolve_cache_ttl_seconds,omitempty" mapstructure:"resolve_cache_ttl_seconds,omitempty"`
+	// Seconds the broker caches a token or API-key validation verdict (and a JWT
+	// caller's active status) in process. Bounds how long a revoked token or disabled
+	// agent keeps working on each broker; 0 disables the cache.
+	ResolveCacheTtlSeconds float64 `json:"resolve_cache_ttl_seconds" yaml:"resolve_cache_ttl_seconds" mapstructure:"resolve_cache_ttl_seconds"`
 
-	// RuleCacheMaxEntries corresponds to the JSON schema field
-	// "rule_cache_max_entries".
-	RuleCacheMaxEntries int `json:"rule_cache_max_entries,omitempty,omitzero" yaml:"rule_cache_max_entries,omitempty" mapstructure:"rule_cache_max_entries,omitempty"`
+	// Maximum entries in each broker process's permission-rule cache, one per active
+	// (agent, credential) binding; least recently used entries are evicted first.
+	RuleCacheMaxEntries int `json:"rule_cache_max_entries" yaml:"rule_cache_max_entries" mapstructure:"rule_cache_max_entries"`
 
-	// RuleCacheTtlS corresponds to the JSON schema field "rule_cache_ttl_s".
-	RuleCacheTtlS float64 `json:"rule_cache_ttl_s,omitempty,omitzero" yaml:"rule_cache_ttl_s,omitempty" mapstructure:"rule_cache_ttl_s,omitempty"`
+	// Seconds the broker caches the permission rules of an (agent, credential)
+	// binding in process; a rule change reaches each broker within this long. 0
+	// disables the cache.
+	RuleCacheTtlS float64 `json:"rule_cache_ttl_s" yaml:"rule_cache_ttl_s" mapstructure:"rule_cache_ttl_s"`
 
-	// ToolkitCacheTtlS corresponds to the JSON schema field "toolkit_cache_ttl_s".
-	ToolkitCacheTtlS float64 `json:"toolkit_cache_ttl_s,omitempty,omitzero" yaml:"toolkit_cache_ttl_s,omitempty" mapstructure:"toolkit_cache_ttl_s,omitempty"`
+	// Emit a W3C ``Server-Timing`` header on execute responses with per-stage
+	// durations (``jentic-auth``, ``jentic-egress``, ``jentic-discover``,
+	// ``jentic-rules``, ``jentic-body``, ``jentic-idempotency``, ``jentic-cred``,
+	// ``jentic-upstream``, ``jentic-persist``, ``jentic-total``) for authenticated
+	// callers. A broker-generated error raised before the upstream call lists the
+	// stages that ran without durations. ``jentic-upstream`` includes the
+	// circuit-breaker check, so a circuit-open ``503`` carries durations even though
+	// no upstream request was sent. Off by default: timing data aids side-channel
+	// probing and fingerprinting, so enable it only where callers are trusted with it
+	// (e.g. while diagnosing latency). Streaming responses carry only the stages
+	// known before the headers are sent (no ``jentic-persist``).
+	ServerTiming bool `json:"server_timing,omitempty,omitzero" yaml:"server_timing,omitempty" mapstructure:"server_timing,omitempty"`
+
+	// How long (seconds) a streaming execution persist waits for one of the
+	// ``broker.streaming_persist_max_concurrency`` slots. Past it the record is
+	// abandoned: logged as ``streaming_execution_persist_abandoned`` and counted on
+	// ``broker.streaming_execution.persist_failures`` (``reason=backlog_timeout``).
+	// The wait runs after the response is complete or the client has disconnected,
+	// when the request no longer holds its admission slot, so the wait delays neither
+	// the client nor ``/ready``. The timeout bounds how long a stalled admin database
+	// can keep records queued in memory, including at shutdown; it does not bound the
+	// write itself once a slot is held.
+	StreamingPersistAcquireTimeoutS float64 `json:"streaming_persist_acquire_timeout_s" yaml:"streaming_persist_acquire_timeout_s" mapstructure:"streaming_persist_acquire_timeout_s"`
+
+	// Per-process cap on concurrent post-response persists of streaming execution
+	// records (each holds one admin-DB connection). Excess persists wait for a slot,
+	// up to ``broker.streaming_persist_acquire_timeout_s``; the waiting and writing
+	// counts are exported as ``broker.streaming_execution.persist_pending``. The
+	// effective cap is clamped to ``databases.admin.pool_max - 1`` (minimum 1; a
+	// ``streaming_persist_limit_clamped`` warning is logged when it applies), so with
+	// ``pool_max >= 2`` persists never take every connection of the admin base pool.
+	// ``pool_max`` is the base pool size only; SQLAlchemy's default overflow can open
+	// up to 10 more connections on top of it.
+	StreamingPersistMaxConcurrency int `json:"streaming_persist_max_concurrency" yaml:"streaming_persist_max_concurrency" mapstructure:"streaming_persist_max_concurrency"`
+
+	// Budget (seconds) for writing one streaming execution's record and lifecycle
+	// event. The write runs after the response, off the request, so it never delays
+	// the client; past the budget it is abandoned, logged and counted on
+	// ``app.background_tasks`` (``kind=streaming_execution_persist``,
+	// ``outcome=timed_out``).
+	StreamingPersistTimeoutS float64 `json:"streaming_persist_timeout_s" yaml:"streaming_persist_timeout_s" mapstructure:"streaming_persist_timeout_s"`
+
+	// Seconds the broker caches an agent's derived credential bindings in process.
+	// The cache is per instance, so a grant or revoke takes effect cluster-wide only
+	// once this lapses on every broker; 0 disables the cache.
+	ToolkitCacheTtlS float64 `json:"toolkit_cache_ttl_s" yaml:"toolkit_cache_ttl_s" mapstructure:"toolkit_cache_ttl_s"`
 
 	// Timeout (seconds) handed to the execution runner for one upstream call on the
 	// buffered sync path and the async job worker. Distinct from the transport-level
 	// ``broker.resilience.upstream`` timeouts and the ``request_deadline_s``
 	// envelope.
-	UpstreamTimeoutS float64 `json:"upstream_timeout_s,omitempty,omitzero" yaml:"upstream_timeout_s,omitempty" mapstructure:"upstream_timeout_s,omitempty"`
+	UpstreamTimeoutS float64 `json:"upstream_timeout_s" yaml:"upstream_timeout_s" mapstructure:"upstream_timeout_s"`
 }
 
 type BrokerConfigJobsApiBaseUrl_0 *string
@@ -280,6 +402,27 @@ func (j *BrokerConfig) UnmarshalJSON(value []byte) error {
 	if v, ok := raw["rule_cache_ttl_s"]; !ok || v == nil {
 		plain.RuleCacheTtlS = 3.0
 	}
+	if v, ok := raw["server_timing"]; !ok || v == nil {
+		plain.ServerTiming = false
+	}
+	if v, ok := raw["streaming_persist_acquire_timeout_s"]; !ok || v == nil {
+		plain.StreamingPersistAcquireTimeoutS = 5.0
+	}
+	if 0 >= plain.StreamingPersistAcquireTimeoutS {
+		return fmt.Errorf("field %s: must be > %v", "streaming_persist_acquire_timeout_s", 0)
+	}
+	if v, ok := raw["streaming_persist_max_concurrency"]; !ok || v == nil {
+		plain.StreamingPersistMaxConcurrency = 5
+	}
+	if 0 >= plain.StreamingPersistMaxConcurrency {
+		return fmt.Errorf("field %s: must be > %v", "streaming_persist_max_concurrency", 0)
+	}
+	if v, ok := raw["streaming_persist_timeout_s"]; !ok || v == nil {
+		plain.StreamingPersistTimeoutS = 10.0
+	}
+	if 0 >= plain.StreamingPersistTimeoutS {
+		return fmt.Errorf("field %s: must be > %v", "streaming_persist_timeout_s", 0)
+	}
 	if v, ok := raw["toolkit_cache_ttl_s"]; !ok || v == nil {
 		plain.ToolkitCacheTtlS = 3.0
 	}
@@ -292,20 +435,17 @@ func (j *BrokerConfig) UnmarshalJSON(value []byte) error {
 
 // Resilience envelope: admission + rate limit / circuit.
 //
-// The shared-state “backend“ selection drives *both* the rate limiter and
-// the circuit breaker (memory default; Redis is cluster-wide). Queue
-// backpressure / async-credential / retention knobs are future work.
+// The rate limiter and circuit breaker run on the process's shared-state
+// backend (the top-level “state:“ section). Queue backpressure /
+// async-credential / retention knobs are future work.
 type BrokerResilienceConfig struct {
-	// Backend corresponds to the JSON schema field "backend".
-	Backend *StateBackendConfig `json:"backend,omitempty,omitzero" yaml:"backend,omitempty" mapstructure:"backend,omitempty"`
-
 	// CircuitBreaker corresponds to the JSON schema field "circuit_breaker".
 	CircuitBreaker *CircuitBreakerConfig `json:"circuit_breaker,omitempty,omitzero" yaml:"circuit_breaker,omitempty" mapstructure:"circuit_breaker,omitempty"`
 
 	// Hard admission cap on concurrently executing brokered calls, **per broker
-	// process** — replicas multiply it. At the cap, new requests are shed with 429 +
+	// process** — replicas multiply it. At the cap, new requests are shed with 503 +
 	// ``Retry-After: shed_retry_after_s``.
-	MaxInFlight int `json:"max_in_flight,omitempty,omitzero" yaml:"max_in_flight,omitempty" mapstructure:"max_in_flight,omitempty"`
+	MaxInFlight int `json:"max_in_flight" yaml:"max_in_flight" mapstructure:"max_in_flight"`
 
 	// RateLimit corresponds to the JSON schema field "rate_limit".
 	RateLimit *RateLimitConfig `json:"rate_limit,omitempty,omitzero" yaml:"rate_limit,omitempty" mapstructure:"rate_limit,omitempty"`
@@ -313,7 +453,7 @@ type BrokerResilienceConfig struct {
 	// Fraction of ``max_in_flight`` at/above which ``/ready`` reports unready, so the
 	// LB drains this instance before it hits the hard admission shed wall. Kept < 1.0
 	// for that headroom.
-	ReadinessSaturationThreshold float64 `json:"readiness_saturation_threshold,omitempty,omitzero" yaml:"readiness_saturation_threshold,omitempty" mapstructure:"readiness_saturation_threshold,omitempty"`
+	ReadinessSaturationThreshold float64 `json:"readiness_saturation_threshold" yaml:"readiness_saturation_threshold" mapstructure:"readiness_saturation_threshold"`
 
 	// Overall wall-clock budget (seconds) for one upstream call, enforced by the
 	// always-on DeadlineRunner outside the circuit breaker — distinct from the
@@ -321,14 +461,14 @@ type BrokerResilienceConfig struct {
 	// 504 with a ``wait`` agent directive; 0 disables the budget. Size ABOVE upstream
 	// read timeouts so a single healthy slow attempt isn't pre-empted by the envelope
 	// deadline.
-	RequestDeadlineS float64 `json:"request_deadline_s,omitempty,omitzero" yaml:"request_deadline_s,omitempty" mapstructure:"request_deadline_s,omitempty"`
+	RequestDeadlineS float64 `json:"request_deadline_s" yaml:"request_deadline_s" mapstructure:"request_deadline_s"`
 
 	// Retry corresponds to the JSON schema field "retry".
 	Retry *RetryConfig `json:"retry,omitempty,omitzero" yaml:"retry,omitempty" mapstructure:"retry,omitempty"`
 
-	// ``Retry-After`` (seconds) returned with the 429 when admission sheds at
+	// ``Retry-After`` (seconds) returned with the 503 when admission sheds at
 	// ``max_in_flight``.
-	ShedRetryAfterS int `json:"shed_retry_after_s,omitempty,omitzero" yaml:"shed_retry_after_s,omitempty" mapstructure:"shed_retry_after_s,omitempty"`
+	ShedRetryAfterS int `json:"shed_retry_after_s" yaml:"shed_retry_after_s" mapstructure:"shed_retry_after_s"`
 
 	// Upstream corresponds to the JSON schema field "upstream".
 	Upstream *UpstreamClientConfig `json:"upstream,omitempty,omitzero" yaml:"upstream,omitempty" mapstructure:"upstream,omitempty"`
@@ -369,29 +509,49 @@ func (j *BrokerResilienceConfig) UnmarshalJSON(value []byte) error {
 
 // Public API catalog settings (manifest source + staleness).
 type CatalogConfig struct {
-	// ManifestMaxAgeSeconds corresponds to the JSON schema field
-	// "manifest_max_age_seconds".
-	ManifestMaxAgeSeconds int `json:"manifest_max_age_seconds,omitempty,omitzero" yaml:"manifest_max_age_seconds,omitempty" mapstructure:"manifest_max_age_seconds,omitempty"`
+	// Age (seconds) after which the cached catalog manifest is refreshed on the next
+	// catalog read. 0 disables automatic refresh (only ``POST /catalog:refresh``).
+	ManifestMaxAgeSeconds int `json:"manifest_max_age_seconds" yaml:"manifest_max_age_seconds" mapstructure:"manifest_max_age_seconds"`
 
 	// Manifest source for the public API catalog. Full default:
 	// https://raw.githubusercontent.com/jentic/jentic-public-apis/main/apis/openapi/apis.json
-	ManifestUrl string `json:"manifest_url,omitempty,omitzero" yaml:"manifest_url,omitempty" mapstructure:"manifest_url,omitempty"`
+	ManifestUrl string `json:"manifest_url" yaml:"manifest_url" mapstructure:"manifest_url"`
 
-	// UpdateCheckIntervalSeconds corresponds to the JSON schema field
-	// "update_check_interval_seconds".
-	UpdateCheckIntervalSeconds int `json:"update_check_interval_seconds,omitempty,omitzero" yaml:"update_check_interval_seconds,omitempty" mapstructure:"update_check_interval_seconds,omitempty"`
+	// How long a failed catalog preview fetch (upstream unavailable, oversized or
+	// unparseable spec) is remembered per spec URL before it is retried, so repeated
+	// previews of a broken spec do not refetch it on every request. Zero retries on
+	// the next request. Ignored when the preview cache is disabled.
+	PreviewCacheFailureTtlSeconds int `json:"preview_cache_failure_ttl_seconds" yaml:"preview_cache_failure_ttl_seconds" mapstructure:"preview_cache_failure_ttl_seconds"`
 
-	// UpdateSweepDeadlineSeconds corresponds to the JSON schema field
-	// "update_sweep_deadline_seconds".
-	UpdateSweepDeadlineSeconds int `json:"update_sweep_deadline_seconds,omitempty,omitzero" yaml:"update_sweep_deadline_seconds,omitempty" mapstructure:"update_sweep_deadline_seconds,omitempty"`
+	// Maximum number of catalog spec projections held in memory per process (least
+	// recently used evicted first). Zero disables the cache.
+	PreviewCacheMaxEntries int `json:"preview_cache_max_entries" yaml:"preview_cache_max_entries" mapstructure:"preview_cache_max_entries"`
 
-	// UpdateSweepJitterRatio corresponds to the JSON schema field
-	// "update_sweep_jitter_ratio".
-	UpdateSweepJitterRatio float64 `json:"update_sweep_jitter_ratio,omitempty,omitzero" yaml:"update_sweep_jitter_ratio,omitempty" mapstructure:"update_sweep_jitter_ratio,omitempty"`
+	// How long a catalog preview's upstream spec projection is reused before
+	// refetching. Zero disables the cache. The cache is per process: `POST
+	// /catalog:refresh` clears it only on the process that serves the refresh, so
+	// other workers or replicas can serve the previous projection until this TTL
+	// expires.
+	PreviewCacheTtlSeconds int `json:"preview_cache_ttl_seconds" yaml:"preview_cache_ttl_seconds" mapstructure:"preview_cache_ttl_seconds"`
 
-	// UpdateSweepMaxConcurrency corresponds to the JSON schema field
-	// "update_sweep_max_concurrency".
-	UpdateSweepMaxConcurrency int `json:"update_sweep_max_concurrency,omitempty,omitzero" yaml:"update_sweep_max_concurrency,omitempty" mapstructure:"update_sweep_max_concurrency,omitempty"`
+	// Seconds between update-check sweeps, which conditionally re-fetch the spec URLs
+	// of upstream-tracked APIs and emit ``catalog.update_available`` when an upstream
+	// spec changed; each API is probed at most once per interval. ``POST
+	// /catalog:refresh`` also triggers a sweep. 0 disables the check entirely (no
+	// events, no egress).
+	UpdateCheckIntervalSeconds int `json:"update_check_interval_seconds" yaml:"update_check_interval_seconds" mapstructure:"update_check_interval_seconds"`
+
+	// Wall-clock budget (seconds) for one update-check sweep; it stops when exceeded.
+	UpdateSweepDeadlineSeconds int `json:"update_sweep_deadline_seconds" yaml:"update_sweep_deadline_seconds" mapstructure:"update_sweep_deadline_seconds"`
+
+	// Random extra delay added to each sweep interval, as a fraction of it (next
+	// sweep after ``interval * (1 + uniform(0, ratio))``), so replicas started
+	// together drift apart. 0 disables jitter.
+	UpdateSweepJitterRatio float64 `json:"update_sweep_jitter_ratio" yaml:"update_sweep_jitter_ratio" mapstructure:"update_sweep_jitter_ratio"`
+
+	// Maximum concurrent spec probes in one update-check sweep. Keep it below the
+	// registry database pool size so sweeps never starve request traffic.
+	UpdateSweepMaxConcurrency int `json:"update_sweep_max_concurrency" yaml:"update_sweep_max_concurrency" mapstructure:"update_sweep_max_concurrency"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -410,6 +570,24 @@ func (j *CatalogConfig) UnmarshalJSON(value []byte) error {
 	}
 	if v, ok := raw["manifest_url"]; !ok || v == nil {
 		plain.ManifestUrl = "https://raw.githubusercontent.com/jentic/jentic-public-apis/main/apis/openapi/apis.json"
+	}
+	if v, ok := raw["preview_cache_failure_ttl_seconds"]; !ok || v == nil {
+		plain.PreviewCacheFailureTtlSeconds = 30
+	}
+	if 0 > plain.PreviewCacheFailureTtlSeconds {
+		return fmt.Errorf("field %s: must be >= %v", "preview_cache_failure_ttl_seconds", 0)
+	}
+	if v, ok := raw["preview_cache_max_entries"]; !ok || v == nil {
+		plain.PreviewCacheMaxEntries = 16
+	}
+	if 0 > plain.PreviewCacheMaxEntries {
+		return fmt.Errorf("field %s: must be >= %v", "preview_cache_max_entries", 0)
+	}
+	if v, ok := raw["preview_cache_ttl_seconds"]; !ok || v == nil {
+		plain.PreviewCacheTtlSeconds = 300
+	}
+	if 0 > plain.PreviewCacheTtlSeconds {
+		return fmt.Errorf("field %s: must be >= %v", "preview_cache_ttl_seconds", 0)
 	}
 	if v, ok := raw["update_check_interval_seconds"]; !ok || v == nil {
 		plain.UpdateCheckIntervalSeconds = 86400
@@ -441,23 +619,27 @@ func (j *CatalogConfig) UnmarshalJSON(value []byte) error {
 // fast-fails for “cooldown_s“. “observation“ mode tracks + emits
 // “would_block“ but still calls the upstream (safe-rollout dry run).
 type CircuitBreakerConfig struct {
-	// CooldownS corresponds to the JSON schema field "cooldown_s".
-	CooldownS int `json:"cooldown_s,omitempty,omitzero" yaml:"cooldown_s,omitempty" mapstructure:"cooldown_s,omitempty"`
+	// Seconds an open circuit fast-fails calls before the upstream is tried again.
+	CooldownS int `json:"cooldown_s" yaml:"cooldown_s" mapstructure:"cooldown_s"`
 
-	// Enabled corresponds to the JSON schema field "enabled".
-	Enabled bool `json:"enabled,omitempty,omitzero" yaml:"enabled,omitempty" mapstructure:"enabled,omitempty"`
+	// Track upstream failures per host and fast-fail calls to a host whose circuit is
+	// open (5xx responses and transport errors count as failures).
+	Enabled bool `json:"enabled" yaml:"enabled" mapstructure:"enabled"`
 
-	// EnforcementMode corresponds to the JSON schema field "enforcement_mode".
-	EnforcementMode CircuitBreakerConfigEnforcementMode `json:"enforcement_mode,omitempty,omitzero" yaml:"enforcement_mode,omitempty" mapstructure:"enforcement_mode,omitempty"`
+	// ``blocking`` fast-fails calls while the circuit is open; ``observation`` still
+	// calls the upstream and only counts ``circuit_would_block_total``, to validate
+	// thresholds before blocking.
+	EnforcementMode CircuitBreakerConfigEnforcementMode `json:"enforcement_mode" yaml:"enforcement_mode" mapstructure:"enforcement_mode"`
 
-	// FailureRatio corresponds to the JSON schema field "failure_ratio".
-	FailureRatio float64 `json:"failure_ratio,omitempty,omitzero" yaml:"failure_ratio,omitempty" mapstructure:"failure_ratio,omitempty"`
+	// Failure fraction within ``window_s`` at which the circuit opens.
+	FailureRatio float64 `json:"failure_ratio" yaml:"failure_ratio" mapstructure:"failure_ratio"`
 
-	// MinCalls corresponds to the JSON schema field "min_calls".
-	MinCalls int `json:"min_calls,omitempty,omitzero" yaml:"min_calls,omitempty" mapstructure:"min_calls,omitempty"`
+	// Minimum calls in the window before the failure ratio can open the circuit, so a
+	// single early failure does not trip it.
+	MinCalls int `json:"min_calls" yaml:"min_calls" mapstructure:"min_calls"`
 
-	// WindowS corresponds to the JSON schema field "window_s".
-	WindowS int `json:"window_s,omitempty,omitzero" yaml:"window_s,omitempty" mapstructure:"window_s,omitempty"`
+	// Rolling window (seconds) over which failures and totals are counted.
+	WindowS int `json:"window_s" yaml:"window_s" mapstructure:"window_s"`
 }
 
 type CircuitBreakerConfigEnforcementMode string
@@ -528,7 +710,9 @@ type ConfigSchemaJson struct {
 	// Admin corresponds to the JSON schema field "admin".
 	Admin *AdminConfig `json:"admin,omitempty,omitzero" yaml:"admin,omitempty" mapstructure:"admin,omitempty"`
 
-	// Apps corresponds to the JSON schema field "apps".
+	// Surfaces this process serves: any of ``registry``, ``admin``, ``control``,
+	// ``auth``, or ``broker`` alone (the broker cannot be combined with other
+	// surfaces). Also decides which secrets production requires.
 	Apps []string `json:"apps,omitempty,omitzero" yaml:"apps,omitempty" mapstructure:"apps,omitempty"`
 
 	// Auth corresponds to the JSON schema field "auth".
@@ -582,6 +766,12 @@ type ConfigSchemaJson struct {
 	// Services corresponds to the JSON schema field "services".
 	Services *ServicesConfig `json:"services,omitempty,omitzero" yaml:"services,omitempty" mapstructure:"services,omitempty"`
 
+	// The process's shared-state backend, built once and shared by every surface the
+	// process serves. The deprecated broker.resilience.backend section (and its
+	// JENTIC__BROKER__RESILIENCE__BACKEND__* env vars) is still read into it for one
+	// release.
+	State *StateBackendConfig `json:"state,omitempty,omitzero" yaml:"state,omitempty" mapstructure:"state,omitempty"`
+
 	// Telemetry corresponds to the JSON schema field "telemetry".
 	Telemetry *TelemetryConfig `json:"telemetry,omitempty,omitzero" yaml:"telemetry,omitempty" mapstructure:"telemetry,omitempty"`
 
@@ -612,11 +802,14 @@ func (j *ConfigSchemaJson) UnmarshalJSON(value []byte) error {
 
 // Configuration for the OAuth connect flow.
 type ConnectConfig struct {
-	// StateSecret corresponds to the JSON schema field "state_secret".
+	// Key that signs the OAuth connect ``state`` parameter. Required in production
+	// (empty or placeholder values are rejected at startup); in development an
+	// ephemeral per-process value is generated when empty.
 	StateSecret string `json:"state_secret,omitempty,omitzero" yaml:"state_secret,omitempty" mapstructure:"state_secret,omitempty"`
 
-	// StateTtlSeconds corresponds to the JSON schema field "state_ttl_seconds".
-	StateTtlSeconds int `json:"state_ttl_seconds,omitempty,omitzero" yaml:"state_ttl_seconds,omitempty" mapstructure:"state_ttl_seconds,omitempty"`
+	// Seconds a signed connect ``state`` (and its browser-binding cookie) stays
+	// valid, i.e. how long a user has to finish the provider's consent screen.
+	StateTtlSeconds int `json:"state_ttl_seconds" yaml:"state_ttl_seconds" mapstructure:"state_ttl_seconds"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -646,26 +839,26 @@ type ControlConnectConfig struct {
 	// vendor-registry key), where a human enters the credential, or brings an OAuth
 	// app, when approving them in the dashboard. On by default; while off, `:connect`
 	// refuses API targets with `manual_flows_disabled`.
-	ManualFlowsEnabled bool `json:"manual_flows_enabled,omitempty,omitzero" yaml:"manual_flows_enabled,omitempty" mapstructure:"manual_flows_enabled,omitempty"`
+	ManualFlowsEnabled bool `json:"manual_flows_enabled" yaml:"manual_flows_enabled" mapstructure:"manual_flows_enabled"`
 
 	// Hours an API-target connect session (a human-entered credential, or an OAuth
 	// API waiting for an app) stays open before it expires. Vendor OAuth sessions
 	// keep their fixed 30-minute lifetime.
-	ManualFlowsTtlHours int `json:"manual_flows_ttl_hours,omitempty,omitzero" yaml:"manual_flows_ttl_hours,omitempty" mapstructure:"manual_flows_ttl_hours,omitempty"`
+	ManualFlowsTtlHours int `json:"manual_flows_ttl_hours" yaml:"manual_flows_ttl_hours" mapstructure:"manual_flows_ttl_hours"`
 
 	// Most open connect sessions one agent may hold at once while
 	// `manual_flows_enabled` is on; one more `:connect` gets 429
 	// `too_many_open_sessions`.
-	MaxOpenSessionsPerAgent int `json:"max_open_sessions_per_agent,omitempty,omitzero" yaml:"max_open_sessions_per_agent,omitempty" mapstructure:"max_open_sessions_per_agent,omitempty"`
+	MaxOpenSessionsPerAgent int `json:"max_open_sessions_per_agent" yaml:"max_open_sessions_per_agent" mapstructure:"max_open_sessions_per_agent"`
 
 	// Most open connect sessions across one user and the agents they own while
 	// `manual_flows_enabled` is on; one more `:connect` gets 429
 	// `too_many_open_sessions`.
-	MaxOpenSessionsPerOwner int `json:"max_open_sessions_per_owner,omitempty,omitzero" yaml:"max_open_sessions_per_owner,omitempty" mapstructure:"max_open_sessions_per_owner,omitempty"`
+	MaxOpenSessionsPerOwner int `json:"max_open_sessions_per_owner" yaml:"max_open_sessions_per_owner" mapstructure:"max_open_sessions_per_owner"`
 
-	// Hours after a human rejects an agent's connect request during which the agent's
-	// repeat `:connect` for the same target gets 429 `recently_rejected`. 0 turns the
-	// cooldown off.
+	// Hours after a human rejects an agent's connect or access-change request during
+	// which the agent's repeat ask for the same target (or binding) gets 429
+	// `recently_rejected`. Off (0) by default: an agent may ask again at once.
 	RejectionCooldownHours int `json:"rejection_cooldown_hours,omitempty,omitzero" yaml:"rejection_cooldown_hours,omitempty" mapstructure:"rejection_cooldown_hours,omitempty"`
 }
 
@@ -702,7 +895,7 @@ func (j *ControlConnectConfig) UnmarshalJSON(value []byte) error {
 		return fmt.Errorf("field %s: must be >= %v", "max_open_sessions_per_owner", 1)
 	}
 	if v, ok := raw["rejection_cooldown_hours"]; !ok || v == nil {
-		plain.RejectionCooldownHours = 24
+		plain.RejectionCooldownHours = 0
 	}
 	if 0 > plain.RejectionCooldownHours {
 		return fmt.Errorf("field %s: must be >= %v", "rejection_cooldown_hours", 0)
@@ -711,13 +904,71 @@ func (j *ControlConnectConfig) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// Private-network allowlist for the platform's OAuth and credential calls.
+//
+// Holds only the two allowlist keys. A key left unset takes its value from
+// the matching “broker.egress“ key. These calls always pin DNS, so there is
+// no “dns_pinning_enabled“ key here, and unknown keys are rejected.
+type ControlEgressConfig struct {
+	// Domain suffixes (e.g. ``[".corp.internal"]``) whose resolved private IP is
+	// permitted for these calls; unset inherits
+	// `broker.egress.allowed_internal_domains`. The resolved IP must still fall in an
+	// allowed subnet. Accepts a YAML list or a comma-separated string.
+	AllowedInternalDomains *ControlEgressConfigAllowedInternalDomains `json:"allowed_internal_domains,omitempty,omitzero" yaml:"allowed_internal_domains,omitempty" mapstructure:"allowed_internal_domains,omitempty"`
+
+	// CIDRs exempted from the private-IP block for these calls (e.g.
+	// ``["10.50.0.0/16"]``); unset inherits `broker.egress.allowed_private_subnets`,
+	// and `[]` blocks every private range for these calls even when the broker allows
+	// one. The cloud-metadata and platform-credential IPs are never exempted. Accepts
+	// a YAML list or a comma-separated string.
+	AllowedPrivateSubnets *ControlEgressConfigAllowedPrivateSubnets `json:"allowed_private_subnets,omitempty,omitzero" yaml:"allowed_private_subnets,omitempty" mapstructure:"allowed_private_subnets,omitempty"`
+}
+
+// Domain suffixes (e.g. “[".corp.internal"]“) whose resolved private IP is
+// permitted for these calls; unset inherits
+// `broker.egress.allowed_internal_domains`. The resolved IP must still fall in an
+// allowed subnet. Accepts a YAML list or a comma-separated string.
+type ControlEgressConfigAllowedInternalDomains []string
+
+type ControlEgressConfigAllowedInternalDomains_0 []string
+
+// CIDRs exempted from the private-IP block for these calls (e.g.
+// “["10.50.0.0/16"]“); unset inherits `broker.egress.allowed_private_subnets`,
+// and `[]` blocks every private range for these calls even when the broker allows
+// one. The cloud-metadata and platform-credential IPs are never exempted. Accepts
+// a YAML list or a comma-separated string.
+type ControlEgressConfigAllowedPrivateSubnets []string
+
+type ControlEgressConfigAllowedPrivateSubnets_0 []string
+
 // Control surface configuration.
 //
-// Unknown subkeys are ignored, so a “control:“ section written for another
-// release keeps validating.
+// “egress“ is the allowlist for the platform's outbound OAuth and credential
+// calls. Each “control.egress“ key left unset takes its value from the
+// matching “broker.egress“ key. The policy is read by whichever process makes
+// the call: the control surface for credential and OAuth app writes, the
+// connect-session confirm, code exchange, device authorization and the
+// identity probe, and the broker surface for the token refresh it runs before
+// injecting a credential. With one process per surface, set “control.egress“
+// (and the “broker.egress“ keys it inherits) identically on both.
+//
+// Unknown subkeys of “control:“ are ignored, so a section written for
+// another release keeps validating; “control.egress“ rejects unknown keys so
+// a mistyped allowlist key fails at startup instead of silently allowing less.
 type ControlSurfaceConfig struct {
 	// Agent connect-session settings.
 	Connect *ControlConnectConfig `json:"connect,omitempty,omitzero" yaml:"connect,omitempty" mapstructure:"connect,omitempty"`
+
+	// Private-network allowlist for the platform's OAuth and credential calls: OAuth2
+	// credential and OAuth app registration URL checks, own-client endpoints
+	// confirmed on a connect session, token exchange and refresh, device
+	// authorization, and the vendor identity probe. Each key left unset takes its
+	// value from `broker.egress`; set a key (e.g. `allowed_private_subnets: []`) to
+	// override it for these calls alone. These calls always pin DNS. The process
+	// making the call reads it, and the broker surface makes token refresh calls, so
+	// with one process per surface set it identically on the control and broker
+	// surfaces.
+	Egress *ControlEgressConfig `json:"egress,omitempty,omitzero" yaml:"egress,omitempty" mapstructure:"egress,omitempty"`
 }
 
 // Credentials subsystem configuration.
@@ -728,10 +979,17 @@ type CredentialsConfig struct {
 	// Encryption corresponds to the JSON schema field "encryption".
 	Encryption *EncryptionConfig `json:"encryption,omitempty,omitzero" yaml:"encryption,omitempty" mapstructure:"encryption,omitempty"`
 
-	// Providers corresponds to the JSON schema field "providers".
+	// Credential providers keyed by provider id, which credentials name in their
+	// ``provider`` field; ``kind`` selects the provider type. The built-in ``static``
+	// and ``device_authorization`` providers are always present, and the connect flow
+	// uses the ``direct_oauth2`` entry.
 	Providers CredentialsConfigProviders `json:"providers,omitempty,omitzero" yaml:"providers,omitempty" mapstructure:"providers,omitempty"`
 }
 
+// Credential providers keyed by provider id, which credentials name in their
+// “provider“ field; “kind“ selects the provider type. The built-in “static“
+// and “device_authorization“ providers are always present, and the connect flow
+// uses the “direct_oauth2“ entry.
 type CredentialsConfigProviders map[string]interface{}
 
 // Connection parameters for a single database.
@@ -744,18 +1002,18 @@ type CredentialsConfigProviders map[string]interface{}
 type DatabaseConfig struct {
 	// Database engine for this connection: ``postgres`` uses the server connection
 	// fields; ``sqlite`` uses ``path`` and ignores them.
-	Backend DatabaseConfigBackend `json:"backend,omitempty,omitzero" yaml:"backend,omitempty" mapstructure:"backend,omitempty"`
+	Backend DatabaseConfigBackend `json:"backend" yaml:"backend" mapstructure:"backend"`
 
 	// SQLite: per-connection wait for a held write lock, in milliseconds, before
 	// failing with ``database is locked``.
-	BusyTimeoutMs int `json:"busy_timeout_ms,omitempty,omitzero" yaml:"busy_timeout_ms,omitempty" mapstructure:"busy_timeout_ms,omitempty"`
+	BusyTimeoutMs int `json:"busy_timeout_ms" yaml:"busy_timeout_ms" mapstructure:"busy_timeout_ms"`
 
 	// PostgreSQL server hostname.
-	Host string `json:"host,omitempty,omitzero" yaml:"host,omitempty" mapstructure:"host,omitempty"`
+	Host string `json:"host" yaml:"host" mapstructure:"host"`
 
 	// SQLite journal mode (persistent per database file). ``WAL`` lets a writer and
 	// readers proceed concurrently instead of blocking each other.
-	JournalMode string `json:"journal_mode,omitempty,omitzero" yaml:"journal_mode,omitempty" mapstructure:"journal_mode,omitempty"`
+	JournalMode string `json:"journal_mode" yaml:"journal_mode" mapstructure:"journal_mode"`
 
 	// PostgreSQL database name. Required for the ``postgres`` backend.
 	Name string `json:"name,omitempty,omitzero" yaml:"name,omitempty" mapstructure:"name,omitempty"`
@@ -768,47 +1026,67 @@ type DatabaseConfig struct {
 	Path interface{} `json:"path,omitempty,omitzero" yaml:"path,omitempty" mapstructure:"path,omitempty"`
 
 	// Maximum connections in the PostgreSQL connection pool (ignored for SQLite).
-	PoolMax int `json:"pool_max,omitempty,omitzero" yaml:"pool_max,omitempty" mapstructure:"pool_max,omitempty"`
+	PoolMax int `json:"pool_max" yaml:"pool_max" mapstructure:"pool_max"`
+
+	// PostgreSQL: test pooled connections on checkout and transparently replace a
+	// dead one. By default the wire ping (three round trips on asyncpg: ``BEGIN``,
+	// ``;``, ``ROLLBACK``) runs only when the connection has sat idle in the pool for
+	// at least ``pool_pre_ping_idle_s`` seconds; active checkouts within that window
+	// skip the wire ping unless the driver connection is already closed. With
+	// ``false``, ``pool_recycle_s`` and TCP keepalive do not cover a Postgres restart
+	// or failover, a pooler/proxy restart, or a terminated backend: after such an
+	// event the first request on each pool per process can fail with an HTTP 503
+	// (work run through the retrying transaction helper is re-run on a fresh
+	// connection instead). Only disable it where those events are rare and that error
+	// is acceptable. Ignored for SQLite.
+	PoolPrePing bool `json:"pool_pre_ping" yaml:"pool_pre_ping" mapstructure:"pool_pre_ping"`
+
+	// PostgreSQL: seconds a connection must sit idle in the pool before checkout runs
+	// the ``pool_pre_ping`` wire check. Active checkouts returning within this window
+	// skip the wire ping unless the driver connection is already closed. ``0`` pings
+	// on every checkout. Only applies when ``pool_pre_ping`` is ``true``. Ignored for
+	// SQLite.
+	PoolPrePingIdleS float64 `json:"pool_pre_ping_idle_s" yaml:"pool_pre_ping_idle_s" mapstructure:"pool_pre_ping_idle_s"`
 
 	// PostgreSQL: replace a pooled connection once it is this many seconds old, on
 	// its next checkout, so a connection silently dropped by a middlebox or left
 	// behind by a server restart is retired before use. Keep it below any server,
 	// proxy, or NAT idle timeout on the path. ``0`` disables recycling. Ignored for
 	// SQLite.
-	PoolRecycleS int `json:"pool_recycle_s,omitempty,omitzero" yaml:"pool_recycle_s,omitempty" mapstructure:"pool_recycle_s,omitempty"`
+	PoolRecycleS int `json:"pool_recycle_s" yaml:"pool_recycle_s" mapstructure:"pool_recycle_s"`
 
 	// PostgreSQL server port.
-	Port int `json:"port,omitempty,omitzero" yaml:"port,omitempty" mapstructure:"port,omitempty"`
+	Port int `json:"port" yaml:"port" mapstructure:"port"`
 
 	// PostgreSQL schema for this connection: created if missing by the migration
 	// runner (``CREATE SCHEMA IF NOT EXISTS``) and put first on ``search_path``, so
 	// several connections can share one database.
-	SchemaName string `json:"schema_name,omitempty,omitzero" yaml:"schema_name,omitempty" mapstructure:"schema_name,omitempty"`
+	SchemaName string `json:"schema_name" yaml:"schema_name" mapstructure:"schema_name"`
 
 	// PostgreSQL: enable TCP keepalive on each pooled connection's client socket so a
 	// peer that vanished while the connection sat idle is detected in about
 	// ``tcp_keepalive_idle_s + tcp_keepalive_count * tcp_keepalive_interval_s``
 	// seconds instead of the OS default of hours. ``false`` leaves the socket at the
 	// OS defaults. Ignored for SQLite.
-	TcpKeepalive bool `json:"tcp_keepalive,omitempty,omitzero" yaml:"tcp_keepalive,omitempty" mapstructure:"tcp_keepalive,omitempty"`
+	TcpKeepalive bool `json:"tcp_keepalive" yaml:"tcp_keepalive" mapstructure:"tcp_keepalive"`
 
 	// PostgreSQL: unanswered TCP keepalive probes before the connection is declared
 	// dead (``TCP_KEEPCNT``). Only applies when ``tcp_keepalive`` is ``true``.
 	// Ignored for SQLite.
-	TcpKeepaliveCount int `json:"tcp_keepalive_count,omitempty,omitzero" yaml:"tcp_keepalive_count,omitempty" mapstructure:"tcp_keepalive_count,omitempty"`
+	TcpKeepaliveCount int `json:"tcp_keepalive_count" yaml:"tcp_keepalive_count" mapstructure:"tcp_keepalive_count"`
 
 	// PostgreSQL: seconds a connection may sit idle before the first TCP keepalive
 	// probe is sent (``TCP_KEEPIDLE``; ``TCP_KEEPALIVE`` on macOS). Only applies when
 	// ``tcp_keepalive`` is ``true``. Ignored for SQLite.
-	TcpKeepaliveIdleS int `json:"tcp_keepalive_idle_s,omitempty,omitzero" yaml:"tcp_keepalive_idle_s,omitempty" mapstructure:"tcp_keepalive_idle_s,omitempty"`
+	TcpKeepaliveIdleS int `json:"tcp_keepalive_idle_s" yaml:"tcp_keepalive_idle_s" mapstructure:"tcp_keepalive_idle_s"`
 
 	// PostgreSQL: seconds between unanswered TCP keepalive probes
 	// (``TCP_KEEPINTVL``). Only applies when ``tcp_keepalive`` is ``true``. Ignored
 	// for SQLite.
-	TcpKeepaliveIntervalS int `json:"tcp_keepalive_interval_s,omitempty,omitzero" yaml:"tcp_keepalive_interval_s,omitempty" mapstructure:"tcp_keepalive_interval_s,omitempty"`
+	TcpKeepaliveIntervalS int `json:"tcp_keepalive_interval_s" yaml:"tcp_keepalive_interval_s" mapstructure:"tcp_keepalive_interval_s"`
 
 	// PostgreSQL role to connect as.
-	User string `json:"user,omitempty,omitzero" yaml:"user,omitempty" mapstructure:"user,omitempty"`
+	User string `json:"user" yaml:"user" mapstructure:"user"`
 }
 
 type DatabaseConfigBackend string
@@ -874,6 +1152,15 @@ func (j *DatabaseConfig) UnmarshalJSON(value []byte) error {
 	}
 	if v, ok := raw["pool_max"]; !ok || v == nil {
 		plain.PoolMax = 10
+	}
+	if v, ok := raw["pool_pre_ping"]; !ok || v == nil {
+		plain.PoolPrePing = true
+	}
+	if v, ok := raw["pool_pre_ping_idle_s"]; !ok || v == nil {
+		plain.PoolPrePingIdleS = 1.0
+	}
+	if 0 > plain.PoolPrePingIdleS {
+		return fmt.Errorf("field %s: must be >= %v", "pool_pre_ping_idle_s", 0)
 	}
 	if v, ok := raw["pool_recycle_s"]; !ok || v == nil {
 		plain.PoolRecycleS = 1800
@@ -963,25 +1250,39 @@ func (j *DatabasesConfig) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
-// Configuration for a direct OAuth2 provider (full settings land in M5).
+// Configuration for a direct OAuth2 provider.
 type DirectOAuth2ProviderConfig struct {
-	// AuthorizeExtraParams corresponds to the JSON schema field
-	// "authorize_extra_params".
+	// Extra query parameters appended to every authorize URL. The defaults force the
+	// consent screen and ask Google for a refresh token; for Microsoft, Okta or Auth0
+	// add the ``offline_access`` scope to ``default_scopes`` instead. Keys that
+	// collide with the OAuth2 parameters the provider builds (``response_type``,
+	// ``client_id``, ``redirect_uri``, ``state``, ``scope``) override them and break
+	// the connect flow.
 	AuthorizeExtraParams DirectOAuth2ProviderConfigAuthorizeExtraParams `json:"authorize_extra_params,omitempty,omitzero" yaml:"authorize_extra_params,omitempty" mapstructure:"authorize_extra_params,omitempty"`
 
-	// DefaultScopes corresponds to the JSON schema field "default_scopes".
+	// Scopes requested on the authorize URL when a connect request names none.
 	DefaultScopes []string `json:"default_scopes,omitempty,omitzero" yaml:"default_scopes,omitempty" mapstructure:"default_scopes,omitempty"`
 
-	// ExpirySkewSeconds corresponds to the JSON schema field "expiry_skew_seconds".
-	ExpirySkewSeconds int `json:"expiry_skew_seconds,omitempty,omitzero" yaml:"expiry_skew_seconds,omitempty" mapstructure:"expiry_skew_seconds,omitempty"`
+	// How many seconds before an access token's real expiry the broker refreshes it.
+	// Applied at comparison time; the stored expiry is never shifted.
+	ExpirySkewSeconds int `json:"expiry_skew_seconds" yaml:"expiry_skew_seconds" mapstructure:"expiry_skew_seconds"`
 
 	// Kind corresponds to the JSON schema field "kind".
-	Kind string `json:"kind,omitempty,omitzero" yaml:"kind,omitempty" mapstructure:"kind,omitempty"`
+	Kind string `json:"kind" yaml:"kind" mapstructure:"kind"`
 
-	// RedirectUri corresponds to the JSON schema field "redirect_uri".
+	// OAuth callback URL registered with the IdP. Unset, it is derived per request as
+	// ``{server.public_base_url or request origin}/credentials/oauth/callback``; set
+	// it only when the public origin differs from ``server.public_base_url`` (e.g. a
+	// proxy the app cannot see). Matched byte-for-byte by the IdP.
 	RedirectUri interface{} `json:"redirect_uri,omitempty,omitzero" yaml:"redirect_uri,omitempty" mapstructure:"redirect_uri,omitempty"`
 }
 
+// Extra query parameters appended to every authorize URL. The defaults force the
+// consent screen and ask Google for a refresh token; for Microsoft, Okta or Auth0
+// add the “offline_access“ scope to “default_scopes“ instead. Keys that
+// collide with the OAuth2 parameters the provider builds (“response_type“,
+// “client_id“, “redirect_uri“, “state“, “scope“) override them and break
+// the connect flow.
 type DirectOAuth2ProviderConfigAuthorizeExtraParams map[string]string
 
 type DirectOAuth2ProviderConfigRedirectUri_0 *string
@@ -1012,13 +1313,13 @@ func (j *DirectOAuth2ProviderConfig) UnmarshalJSON(value []byte) error {
 
 // Outbound SSRF/egress policy for upstream calls.
 //
-// Defaults are **strict** (both lists empty) — identical to the historical
-// hard-coded behaviour: every private range and the cloud-metadata host are
-// blocked. The two allowlists exist because the broker is frequently installed
-// *inside* a corporate network to bridge to internal/legacy APIs, where the
-// default block is a false positive. Both are opt-in, auditable operator
-// decisions; the cloud-metadata IP is a **hard, non-overridable** deny so a
-// credential-stealing SSRF can never be allowlisted by accident.
+// Defaults are **strict** (both lists empty): every private range and the
+// cloud-metadata host are blocked. The two allowlists exist because the
+// broker is frequently installed *inside* a corporate network to bridge to
+// internal/legacy APIs, where the default block is a false positive. Both are
+// opt-in, auditable operator decisions; the cloud-metadata IP is a **hard,
+// non-overridable** deny so a credential-stealing SSRF can never be
+// allowlisted by accident.
 type EgressConfig struct {
 	// Domain suffixes (e.g. ``[".svc.cluster.local"]``) whose resolved private IP is
 	// permitted. The resolved IP must still fall in an allowed subnet. Accepts a YAML
@@ -1034,7 +1335,7 @@ type EgressConfig struct {
 	// Pin the outbound connection to the IP validated at connect time, closing the
 	// DNS-rebinding TOCTOU between pre-request validation and the runner's own
 	// resolution. Disable only to debug egress issues.
-	DnsPinningEnabled bool `json:"dns_pinning_enabled,omitempty,omitzero" yaml:"dns_pinning_enabled,omitempty" mapstructure:"dns_pinning_enabled,omitempty"`
+	DnsPinningEnabled bool `json:"dns_pinning_enabled" yaml:"dns_pinning_enabled" mapstructure:"dns_pinning_enabled"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -1057,10 +1358,15 @@ func (j *EgressConfig) UnmarshalJSON(value []byte) error {
 
 // Envelope-encryption keyset configuration.
 type EncryptionConfig struct {
-	// ActiveId corresponds to the JSON schema field "active_id".
-	ActiveId string `json:"active_id,omitempty,omitzero" yaml:"active_id,omitempty" mapstructure:"active_id,omitempty"`
+	// Id of the key that encrypts new values; must match an entry in ``entries``.
+	// Older keys stay usable for decryption, so rotate by adding a key and switching
+	// this id.
+	ActiveId string `json:"active_id" yaml:"active_id" mapstructure:"active_id"`
 
-	// Entries corresponds to the JSON schema field "entries".
+	// AES-256-GCM keys (32 bytes, base64) for credentials at rest. Every entry can
+	// decrypt; ids must be unique. Empty still boots, but credential writes and
+	// approval-gated executions then fail. Never remove a key that still has data
+	// encrypted under it.
 	Entries []EncryptionKey `json:"entries,omitempty,omitzero" yaml:"entries,omitempty" mapstructure:"entries,omitempty"`
 }
 
@@ -1101,7 +1407,8 @@ func (j *EncryptionConfig) UnmarshalJSON(value []byte) error {
 // value) fail validation loudly rather than booting a server that cannot
 // decrypt its own credentials.
 type EncryptionKey struct {
-	// Id corresponds to the JSON schema field "id".
+	// Key id (``[a-zA-Z0-9_-]+``), stored as the prefix of every value encrypted with
+	// this key so it can be decrypted after rotation.
 	Id string `json:"id" yaml:"id" mapstructure:"id"`
 
 	// Base64-encoded key material, inline in the config.
@@ -1153,33 +1460,43 @@ func (j *EncryptionKey) UnmarshalJSON(value []byte) error {
 // “grace_period_seconds“ before the gate fails closed. Only an explicit
 // "not entitled" answer from AWS locks out immediately.
 type EntitlementConfig struct {
-	// Enabled corresponds to the JSON schema field "enabled".
+	// Gate the HTTP surface on an active AWS Marketplace subscription (503 except
+	// health checks when AWS reports the deployment is not entitled). Off makes no
+	// AWS calls.
 	Enabled bool `json:"enabled,omitempty,omitzero" yaml:"enabled,omitempty" mapstructure:"enabled,omitempty"`
 
 	// Endpoint corresponds to the JSON schema field "endpoint".
 	Endpoint interface{} `json:"endpoint,omitempty,omitzero" yaml:"endpoint,omitempty" mapstructure:"endpoint,omitempty"`
 
-	// GracePeriodSeconds corresponds to the JSON schema field "grace_period_seconds".
-	GracePeriodSeconds int `json:"grace_period_seconds,omitempty,omitzero" yaml:"grace_period_seconds,omitempty" mapstructure:"grace_period_seconds,omitempty"`
+	// How long (seconds) the last definitive verdict holds while the AWS API is
+	// unreachable or erroring, before the gate fails closed. An explicit "not
+	// entitled" answer locks out immediately.
+	GracePeriodSeconds int `json:"grace_period_seconds" yaml:"grace_period_seconds" mapstructure:"grace_period_seconds"`
 
-	// LicenseDimensions corresponds to the JSON schema field "license_dimensions".
+	// Contract pricing only: entitlement dimension keys checked out from the buyer's
+	// license; every one must be granted. Accepts a YAML list or a comma-separated
+	// string.
 	LicenseDimensions []string `json:"license_dimensions,omitempty,omitzero" yaml:"license_dimensions,omitempty" mapstructure:"license_dimensions,omitempty"`
 
-	// LicenseSku corresponds to the JSON schema field "license_sku".
+	// Contract pricing only: the Marketplace product ID from the portal
+	// (``CheckoutLicense`` ``ProductSKU``) — not the product code; the portal issues
+	// both. Required when ``pricing_model`` is ``contract``.
 	LicenseSku interface{} `json:"license_sku,omitempty,omitzero" yaml:"license_sku,omitempty" mapstructure:"license_sku,omitempty"`
 
-	// PricingModel corresponds to the JSON schema field "pricing_model".
-	PricingModel EntitlementConfigPricingModel `json:"pricing_model,omitempty,omitzero" yaml:"pricing_model,omitempty" mapstructure:"pricing_model,omitempty"`
+	// Which Marketplace API the check calls: ``contract`` uses License Manager
+	// ``CheckoutLicense`` (requires ``license_sku``); ``usage`` uses Metering Service
+	// ``RegisterUsage`` (hourly/usage pricing).
+	PricingModel EntitlementConfigPricingModel `json:"pricing_model" yaml:"pricing_model" mapstructure:"pricing_model"`
 
-	// ProductCode corresponds to the JSON schema field "product_code".
+	// Marketplace product code issued by the AWS Marketplace portal for the container
+	// product. Required when ``enabled``.
 	ProductCode interface{} `json:"product_code,omitempty,omitzero" yaml:"product_code,omitempty" mapstructure:"product_code,omitempty"`
 
-	// RefreshIntervalSeconds corresponds to the JSON schema field
-	// "refresh_interval_seconds".
-	RefreshIntervalSeconds int `json:"refresh_interval_seconds,omitempty,omitzero" yaml:"refresh_interval_seconds,omitempty" mapstructure:"refresh_interval_seconds,omitempty"`
+	// Seconds between entitlement re-checks after the one at startup.
+	RefreshIntervalSeconds int `json:"refresh_interval_seconds" yaml:"refresh_interval_seconds" mapstructure:"refresh_interval_seconds"`
 
-	// Region corresponds to the JSON schema field "region".
-	Region string `json:"region,omitempty,omitzero" yaml:"region,omitempty" mapstructure:"region,omitempty"`
+	// AWS region the License Manager / Metering Service calls go to.
+	Region string `json:"region" yaml:"region" mapstructure:"region"`
 }
 
 type EntitlementConfigEndpoint_0 *string
@@ -1257,15 +1574,15 @@ type HeldExecutionsConfig struct {
 	// Maximum pending approvals per agent. An execute call that would file another
 	// hold beyond this is denied with the ``approval_pending_limit_reached`` problem
 	// type.
-	MaxPendingPerAgent int `json:"max_pending_per_agent,omitempty,omitzero" yaml:"max_pending_per_agent,omitempty" mapstructure:"max_pending_per_agent,omitempty"`
+	MaxPendingPerAgent int `json:"max_pending_per_agent" yaml:"max_pending_per_agent" mapstructure:"max_pending_per_agent"`
 
 	// Seconds the result of an approved execution stays readable via ``GET
 	// /jobs/{id}/result`` before the result sweep removes it. Defaults to 24 hours.
-	ResultRetentionSeconds int `json:"result_retention_seconds,omitempty,omitzero" yaml:"result_retention_seconds,omitempty" mapstructure:"result_retention_seconds,omitempty"`
+	ResultRetentionSeconds int `json:"result_retention_seconds" yaml:"result_retention_seconds" mapstructure:"result_retention_seconds"`
 
 	// Seconds a pending approval lives before the expiry sweep marks it ``expired``
 	// and fails its held job with a permission-denied result. Defaults to 24 hours.
-	TtlSeconds int `json:"ttl_seconds,omitempty,omitzero" yaml:"ttl_seconds,omitempty" mapstructure:"ttl_seconds,omitempty"`
+	TtlSeconds int `json:"ttl_seconds" yaml:"ttl_seconds" mapstructure:"ttl_seconds"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -1303,8 +1620,8 @@ func (j *HeldExecutionsConfig) UnmarshalJSON(value []byte) error {
 
 // “Idempotency-Key“ replay store.
 //
-// Sync “FULL“-mode replay over the shared-state “AtomicStore“ (memory
-// default; Redis ⇒ cross-instance). Two TTLs: a *short* “pending_ttl_s“ claim
+// Sync “FULL“-mode replay over the shared-state “AtomicStore“ (the
+// “state:“ backend). Two TTLs: a *short* “pending_ttl_s“ claim
 // (sized to the request deadline + buffer, so a crash mid-flight frees the key
 // in seconds rather than the full replay window) promoted to the *long*
 // “ttl_s“ only once the response is stored. Responses over
@@ -1314,18 +1631,29 @@ func (j *HeldExecutionsConfig) UnmarshalJSON(value []byte) error {
 // Compliance modes (“metadata_only“ / kill-switch), “require_for_mutations“,
 // async same-“job_id“ replay, and at-rest encryption are future work.
 type IdempotencyConfig struct {
-	// Enabled corresponds to the JSON schema field "enabled".
-	Enabled bool `json:"enabled,omitempty,omitzero" yaml:"enabled,omitempty" mapstructure:"enabled,omitempty"`
+	// Honour the ``Idempotency-Key`` request header on broker executions: a repeat of
+	// a completed key replays the stored response instead of calling the upstream
+	// again. Off ignores the header.
+	Enabled bool `json:"enabled" yaml:"enabled" mapstructure:"enabled"`
 
-	// MaxResponseBytes corresponds to the JSON schema field "max_response_bytes".
-	MaxResponseBytes int `json:"max_response_bytes,omitempty,omitzero" yaml:"max_response_bytes,omitempty" mapstructure:"max_response_bytes,omitempty"`
+	// Largest response body (bytes) stored for byte-for-byte replay. Larger responses
+	// are recorded without their body: a replay still prevents the duplicate call but
+	// does not return the body.
+	MaxResponseBytes int `json:"max_response_bytes" yaml:"max_response_bytes" mapstructure:"max_response_bytes"`
 
-	// PendingTtlS corresponds to the JSON schema field "pending_ttl_s".
-	PendingTtlS float64 `json:"pending_ttl_s,omitempty,omitzero" yaml:"pending_ttl_s,omitempty" mapstructure:"pending_ttl_s,omitempty"`
+	// Lifetime (seconds) of the in-flight claim on an ``Idempotency-Key``, so a
+	// broker killed mid-request frees the key within seconds. Size it just above
+	// ``broker.resilience.request_deadline_s``.
+	PendingTtlS float64 `json:"pending_ttl_s" yaml:"pending_ttl_s" mapstructure:"pending_ttl_s"`
 
-	// TtlS corresponds to the JSON schema field "ttl_s".
-	TtlS float64 `json:"ttl_s,omitempty,omitzero" yaml:"ttl_s,omitempty" mapstructure:"ttl_s,omitempty"`
+	// Replay window of a completed Idempotency-Key record, in seconds. Unset, it is
+	// 3600 (1 h) on the memory shared-state backend and 86400 (24 h) on any other
+	// backend. On memory, every record is held in process for this long, so the TTL
+	// divides the sustained idempotent request rate the idem budget can hold.
+	TtlS interface{} `json:"ttl_s,omitempty,omitzero" yaml:"ttl_s,omitempty" mapstructure:"ttl_s,omitempty"`
 }
+
+type IdempotencyConfigTtlS_0 *float64
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *IdempotencyConfig) UnmarshalJSON(value []byte) error {
@@ -1346,9 +1674,6 @@ func (j *IdempotencyConfig) UnmarshalJSON(value []byte) error {
 	}
 	if v, ok := raw["pending_ttl_s"]; !ok || v == nil {
 		plain.PendingTtlS = 35.0
-	}
-	if v, ok := raw["ttl_s"]; !ok || v == nil {
-		plain.TtlS = 86400.0
 	}
 	*j = IdempotencyConfig(plain)
 	return nil
@@ -1390,7 +1715,7 @@ type IdpConfig struct {
 	// Adapter selector: ``google`` supplies Google's well-known endpoints and ``hd``
 	// claim handling; any other value uses the generic standards-compliant OIDC
 	// adapter.
-	Provider string `json:"provider,omitempty,omitzero" yaml:"provider,omitempty" mapstructure:"provider,omitempty"`
+	Provider string `json:"provider" yaml:"provider" mapstructure:"provider"`
 
 	// OAuth scopes requested on the IdP authorization redirect.
 	Scopes []string `json:"scopes,omitempty,omitzero" yaml:"scopes,omitempty" mapstructure:"scopes,omitempty"`
@@ -1443,15 +1768,27 @@ type IngestConfig struct {
 	// Egress corresponds to the JSON schema field "egress".
 	Egress *EgressConfig `json:"egress,omitempty,omitzero" yaml:"egress,omitempty" mapstructure:"egress,omitempty"`
 
-	// FetchTimeoutS corresponds to the JSON schema field "fetch_timeout_s".
-	FetchTimeoutS float64 `json:"fetch_timeout_s,omitempty,omitzero" yaml:"fetch_timeout_s,omitempty" mapstructure:"fetch_timeout_s,omitempty"`
+	// Timeout (seconds) for fetching a spec or the catalog manifest from a URL.
+	FetchTimeoutS float64 `json:"fetch_timeout_s" yaml:"fetch_timeout_s" mapstructure:"fetch_timeout_s"`
 
-	// MaxRedirects corresponds to the JSON schema field "max_redirects".
-	MaxRedirects int `json:"max_redirects,omitempty,omitzero" yaml:"max_redirects,omitempty" mapstructure:"max_redirects,omitempty"`
+	// Cap on the raw `POST /apis` request body (all sources together). Unset means
+	// twice `max_spec_bytes`, which covers one maximum-size inline spec with typical
+	// JSON-string escaping; raise it for batches of heavily escaped specs (`\uXXXX`
+	// or HTML-escaped content). Each inline source's content is separately capped at
+	// `max_spec_bytes`.
+	MaxImportRequestBytes interface{} `json:"max_import_request_bytes,omitempty,omitzero" yaml:"max_import_request_bytes,omitempty" mapstructure:"max_import_request_bytes,omitempty"`
 
-	// MaxSpecBytes corresponds to the JSON schema field "max_spec_bytes".
-	MaxSpecBytes int `json:"max_spec_bytes,omitempty,omitzero" yaml:"max_spec_bytes,omitempty" mapstructure:"max_spec_bytes,omitempty"`
+	// Maximum HTTP redirects followed when fetching a spec or the catalog manifest;
+	// each hop is re-checked against the egress policy.
+	MaxRedirects int `json:"max_redirects" yaml:"max_redirects" mapstructure:"max_redirects"`
+
+	// Largest API spec (bytes) accepted from a URL fetch or an inline import source,
+	// fetched for a catalog preview, or produced by applying an overlay (default 25
+	// MiB).
+	MaxSpecBytes int `json:"max_spec_bytes" yaml:"max_spec_bytes" mapstructure:"max_spec_bytes"`
 }
+
+type IngestConfigMaxImportRequestBytes_0 *int
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *IngestConfig) UnmarshalJSON(value []byte) error {
@@ -1485,13 +1822,16 @@ func (j *IngestConfig) UnmarshalJSON(value []byte) error {
 // with “leeway_s“ clock-skew. Empty (the default) leaves the asymmetric path
 // off — the legacy HS256 “broker.jwt_secret“ path (dev/test) still applies.
 type JwtVerificationConfig struct {
-	// Audience corresponds to the JSON schema field "audience".
+	// Required ``aud`` claim on trusted-issuer JWTs. Unset, tokens must not carry an
+	// ``aud`` claim at all (any token with one is rejected).
 	Audience interface{} `json:"audience,omitempty,omitzero" yaml:"audience,omitempty" mapstructure:"audience,omitempty"`
 
-	// LeewayS corresponds to the JSON schema field "leeway_s".
-	LeewayS float64 `json:"leeway_s,omitempty,omitzero" yaml:"leeway_s,omitempty" mapstructure:"leeway_s,omitempty"`
+	// Clock-skew tolerance (seconds) applied to ``exp``, ``nbf`` and ``iat``.
+	LeewayS float64 `json:"leeway_s" yaml:"leeway_s" mapstructure:"leeway_s"`
 
-	// TrustedIssuers corresponds to the JSON schema field "trusted_issuers".
+	// Identity providers whose self-contained JWTs the broker accepts, each verified
+	// against its published JWKS. When non-empty this takes precedence over
+	// ``broker.jwt_secret``; empty leaves the JWKS path off.
 	TrustedIssuers []TrustedIssuerConfig `json:"trusted_issuers,omitempty,omitzero" yaml:"trusted_issuers,omitempty" mapstructure:"trusted_issuers,omitempty"`
 }
 
@@ -1552,20 +1892,23 @@ func (j *LocalLoginConfig) UnmarshalJSON(value []byte) error {
 
 // File logging sink (in addition to stdout).
 type LoggingConfig struct {
-	// FileBackupCount corresponds to the JSON schema field "file_backup_count".
-	FileBackupCount int `json:"file_backup_count,omitempty,omitzero" yaml:"file_backup_count,omitempty" mapstructure:"file_backup_count,omitempty"`
+	// Number of rotated log files kept beside the active one; older ones are deleted.
+	FileBackupCount int `json:"file_backup_count" yaml:"file_backup_count" mapstructure:"file_backup_count"`
 
-	// FileDir corresponds to the JSON schema field "file_dir".
-	FileDir string `json:"file_dir,omitempty,omitzero" yaml:"file_dir,omitempty" mapstructure:"file_dir,omitempty"`
+	// Directory for the log file (relative paths resolve against the working
+	// directory); created at startup if missing.
+	FileDir string `json:"file_dir" yaml:"file_dir" mapstructure:"file_dir"`
 
-	// FileEnabled corresponds to the JSON schema field "file_enabled".
+	// Also write logs to a size-rotated file. The file is always JSON lines, whatever
+	// ``runtime.debug`` selects for stdout.
 	FileEnabled bool `json:"file_enabled,omitempty,omitzero" yaml:"file_enabled,omitempty" mapstructure:"file_enabled,omitempty"`
 
-	// FileMaxBytes corresponds to the JSON schema field "file_max_bytes".
-	FileMaxBytes int `json:"file_max_bytes,omitempty,omitzero" yaml:"file_max_bytes,omitempty" mapstructure:"file_max_bytes,omitempty"`
+	// Size in bytes at which the log file is rotated (default 10 MiB); 0 never
+	// rotates.
+	FileMaxBytes int `json:"file_max_bytes" yaml:"file_max_bytes" mapstructure:"file_max_bytes"`
 
-	// FileName corresponds to the JSON schema field "file_name".
-	FileName string `json:"file_name,omitempty,omitzero" yaml:"file_name,omitempty" mapstructure:"file_name,omitempty"`
+	// Log file name inside ``file_dir``.
+	FileName string `json:"file_name" yaml:"file_name" mapstructure:"file_name"`
 
 	// Let the outbound wire-trace DEBUG loggers (httpcore, hpack) through when the
 	// log level is DEBUG. Off by default: those lines can quote outbound header
@@ -1610,10 +1953,16 @@ func (j *LoggingConfig) UnmarshalJSON(value []byte) error {
 
 // “server.mcp“ sub-config.
 type McpConfig struct {
-	// BrokerUrl corresponds to the JSON schema field "broker_url".
-	BrokerUrl string `json:"broker_url,omitempty,omitzero" yaml:"broker_url,omitempty" mapstructure:"broker_url,omitempty"`
+	// Broker base URL the MCP ``execute`` tools forward calls to, carrying the
+	// caller's bearer token. The default matches the local install (loopback broker
+	// on port 8100); split deployments set the broker service's URL. Plain
+	// ``http://`` is refused for non-loopback hosts.
+	BrokerUrl string `json:"broker_url" yaml:"broker_url" mapstructure:"broker_url"`
 
-	// Enabled corresponds to the JSON schema field "enabled".
+	// Serve the Streamable HTTP MCP endpoint at ``/mcp``. Off, ``/mcp`` answers a
+	// plain 404, unless ``oauth.enabled`` keeps its 401 + ``WWW-Authenticate``
+	// discovery challenge so OAuth clients can walk the RFC 9728 chain before the
+	// endpoint is turned on.
 	Enabled bool `json:"enabled,omitempty,omitzero" yaml:"enabled,omitempty" mapstructure:"enabled,omitempty"`
 
 	// Oauth corresponds to the JSON schema field "oauth".
@@ -1647,14 +1996,19 @@ func (j *McpConfig) UnmarshalJSON(value []byte) error {
 // etc.) extends this model in place — fields here must keep their names and
 // defaults.
 type McpOAuthConfig struct {
-	// AutoApproveClients corresponds to the JSON schema field "auto_approve_clients".
+	// Activate dynamically registered OAuth clients immediately. Off, a new
+	// registration lands pending and inactive in the admin queue until an operator
+	// approves it; enable only where self-registered clients are acceptable without
+	// review (e.g. a single-user self-hosted install).
 	AutoApproveClients bool `json:"auto_approve_clients,omitempty,omitzero" yaml:"auto_approve_clients,omitempty" mapstructure:"auto_approve_clients,omitempty"`
 
-	// Enabled corresponds to the JSON schema field "enabled".
+	// Serve the MCP interactive-OAuth surface: anonymous dynamic client registration
+	// (``POST /oauth-clients``) and the ``/mcp``-scoped OAuth discovery documents.
+	// Off, those routes answer a plain 404.
 	Enabled bool `json:"enabled,omitempty,omitzero" yaml:"enabled,omitempty" mapstructure:"enabled,omitempty"`
 
 	// RegistrationGcDays corresponds to the JSON schema field "registration_gc_days".
-	RegistrationGcDays int `json:"registration_gc_days,omitempty,omitzero" yaml:"registration_gc_days,omitempty" mapstructure:"registration_gc_days,omitempty"`
+	RegistrationGcDays int `json:"registration_gc_days" yaml:"registration_gc_days" mapstructure:"registration_gc_days"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -1681,14 +2035,178 @@ func (j *McpOAuthConfig) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// Bounds for the in-process (“memory“) shared-state backend.
+//
+// Every key belongs to a namespace, its prefix up to the first “:“
+// (“idem“ for Idempotency-Key records, “idem-body“ for their stored
+// response bodies, “auth“ for the auth surface's single-use markers,
+// “login-csrf“ for login CSRF nonces, “cb“ for circuit-breaker counters
+// and their open-circuit report claims, “broker-authfail“ and
+// “broker-authfail-emit“ for the broker's auth-failure counters,
+// “mcp-session“ and “mcp-session-cap“ for the MCP session-event dedupe,
+// “repeated_failure“ for the broker's repeated-failure counters, and so
+// on). Each namespace has its own budget, so one key kind filling up
+// never starves another. A namespace that is full of live entries refuses
+// new writes (the request that needed it gets a 503) rather than evicting a
+// live entry; the telemetry namespaces (“broker-authfail*“, the “cb“
+// report claims, “mcp-session*“) only skip the count or fall back to the
+// database dedupe instead. Ignored by every other backend.
+type MemoryBackendConfig struct {
+	// Default most approximate bytes (key + value + about 750 bytes of per-entry
+	// overhead) one key namespace may hold before its writes are refused.
+	MaxBytesPerNamespace int `json:"max_bytes_per_namespace" yaml:"max_bytes_per_namespace" mapstructure:"max_bytes_per_namespace"`
+
+	// Default most live entries one key namespace may hold before its writes are
+	// refused.
+	MaxEntriesPerNamespace int `json:"max_entries_per_namespace" yaml:"max_entries_per_namespace" mapstructure:"max_entries_per_namespace"`
+
+	// Most approximate bytes all namespaces of the memory backend may hold together
+	// (201326592, 192 MiB, by default); a write past it is refused like a full
+	// namespace, never by evicting a live entry. A process builds one backend shared
+	// by every surface it serves, so this caps the whole process's shared state.
+	// Raise the container memory limit together with it.
+	MaxTotalBytes int `json:"max_total_bytes" yaml:"max_total_bytes" mapstructure:"max_total_bytes"`
+
+	// Per-namespace budget overrides, keyed by namespace (the key prefix before the
+	// first ``:``). Unless overridden here, idem (Idempotency-Key records) is 250000
+	// entries / 134217728 bytes (128 MiB) and idem-body (their stored response
+	// bodies) 1000000 entries / 33554432 bytes (32 MiB), each with a 0.1 per-caller
+	// share; login-csrf (login page CSRF nonces) uses max_entries_per_namespace /
+	// max_bytes_per_namespace with a 0.02 per-client share, about 370 live nonces per
+	// IPv4 address or IPv6 /64 at the defaults (about 900 bytes each, 5-minute TTL),
+	// twice what the default authorize rate limit lets one client network request in
+	// that time; repeated_failure (the broker's repeated-failure counters, which gate
+	// the execution.repeated_failure database scan) is 10000 entries / 8780000 bytes
+	// (about 8.4 MiB), about 2500 concurrently failing actor + credential + operation
+	// keys, and fails open when full (every failure runs the scan); every other
+	// namespace uses max_entries_per_namespace / max_bytes_per_namespace. The
+	// sustained idempotent request rate idem can hold is min(max_entries, max_bytes /
+	// record_bytes) / broker.idempotency.ttl_s, where record_bytes is about 1000
+	// bytes plus the response headers (capped at 512 bytes): about 30 req/s at the
+	// defaults and a 1 h TTL, and a tenth of that per caller. Above it,
+	// Idempotency-Key requests get 503 idempotency_unavailable; bodies (about 830
+	// bytes + body length each) stop being stored for replay sooner, about 5 req/s of
+	// 1 KiB bodies, without refusing requests.
+	Namespaces MemoryBackendConfigNamespaces `json:"namespaces,omitempty,omitzero" yaml:"namespaces,omitempty" mapstructure:"namespaces,omitempty"`
+}
+
+// Per-namespace budget overrides, keyed by namespace (the key prefix before the
+// first “:“). Unless overridden here, idem (Idempotency-Key records) is 250000
+// entries / 134217728 bytes (128 MiB) and idem-body (their stored response bodies)
+// 1000000 entries / 33554432 bytes (32 MiB), each with a 0.1 per-caller share;
+// login-csrf (login page CSRF nonces) uses max_entries_per_namespace /
+// max_bytes_per_namespace with a 0.02 per-client share, about 370 live nonces per
+// IPv4 address or IPv6 /64 at the defaults (about 900 bytes each, 5-minute TTL),
+// twice what the default authorize rate limit lets one client network request in
+// that time; repeated_failure (the broker's repeated-failure counters, which gate
+// the execution.repeated_failure database scan) is 10000 entries / 8780000 bytes
+// (about 8.4 MiB), about 2500 concurrently failing actor + credential + operation
+// keys, and fails open when full (every failure runs the scan); every other
+// namespace uses max_entries_per_namespace / max_bytes_per_namespace. The
+// sustained idempotent request rate idem can hold is min(max_entries, max_bytes /
+// record_bytes) / broker.idempotency.ttl_s, where record_bytes is about 1000 bytes
+// plus the response headers (capped at 512 bytes): about 30 req/s at the defaults
+// and a 1 h TTL, and a tenth of that per caller. Above it, Idempotency-Key
+// requests get 503 idempotency_unavailable; bodies (about 830 bytes + body length
+// each) stop being stored for replay sooner, about 5 req/s of 1 KiB bodies,
+// without refusing requests.
+type MemoryBackendConfigNamespaces map[string]MemoryNamespaceBudgetConfig
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *MemoryBackendConfig) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	type Plain MemoryBackendConfig
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if v, ok := raw["max_bytes_per_namespace"]; !ok || v == nil {
+		plain.MaxBytesPerNamespace = 16777216
+	}
+	if 1 > plain.MaxBytesPerNamespace {
+		return fmt.Errorf("field %s: must be >= %v", "max_bytes_per_namespace", 1)
+	}
+	if v, ok := raw["max_entries_per_namespace"]; !ok || v == nil {
+		plain.MaxEntriesPerNamespace = 100000
+	}
+	if 1 > plain.MaxEntriesPerNamespace {
+		return fmt.Errorf("field %s: must be >= %v", "max_entries_per_namespace", 1)
+	}
+	if v, ok := raw["max_total_bytes"]; !ok || v == nil {
+		plain.MaxTotalBytes = 201326592
+	}
+	if 1 > plain.MaxTotalBytes {
+		return fmt.Errorf("field %s: must be >= %v", "max_total_bytes", 1)
+	}
+	*j = MemoryBackendConfig(plain)
+	return nil
+}
+
+// Entry-count and approximate byte budget for one memory-backend key namespace.
+type MemoryNamespaceBudgetConfig struct {
+	// Most approximate bytes (key + value + about 750 bytes of per-entry overhead)
+	// the namespace may hold.
+	MaxBytes int `json:"max_bytes" yaml:"max_bytes" mapstructure:"max_bytes"`
+
+	// Most live entries the namespace may hold.
+	MaxEntries int `json:"max_entries" yaml:"max_entries" mapstructure:"max_entries"`
+
+	// Most of max_entries and max_bytes that one owner (the key's second ``:``
+	// segment: for idem and idem-body the calling actor, for login-csrf the client's
+	// IPv4 address or IPv6 /64) may hold; an owner over its share is refused without
+	// affecting the others. Unset, it is 0.1 for idem and idem-body, 0.02 for
+	// login-csrf and unlimited elsewhere; 1.0 lets one owner use the whole namespace.
+	MaxOwnerShare interface{} `json:"max_owner_share,omitempty,omitzero" yaml:"max_owner_share,omitempty" mapstructure:"max_owner_share,omitempty"`
+}
+
+type MemoryNamespaceBudgetConfigMaxOwnerShare_0 *float64
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *MemoryNamespaceBudgetConfig) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["max_bytes"]; raw != nil && !ok {
+		return fmt.Errorf("field max_bytes in MemoryNamespaceBudgetConfig: required")
+	}
+	if _, ok := raw["max_entries"]; raw != nil && !ok {
+		return fmt.Errorf("field max_entries in MemoryNamespaceBudgetConfig: required")
+	}
+	type Plain MemoryNamespaceBudgetConfig
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if 1 > plain.MaxBytes {
+		return fmt.Errorf("field %s: must be >= %v", "max_bytes", 1)
+	}
+	if 1 > plain.MaxEntries {
+		return fmt.Errorf("field %s: must be >= %v", "max_entries", 1)
+	}
+	*j = MemoryNamespaceBudgetConfig(plain)
+	return nil
+}
+
 // Metrics exporter configuration.
 type MetricsConfig struct {
-	// ExportIntervalSeconds corresponds to the JSON schema field
-	// "export_interval_seconds".
-	ExportIntervalSeconds int `json:"export_interval_seconds,omitempty,omitzero" yaml:"export_interval_seconds,omitempty" mapstructure:"export_interval_seconds,omitempty"`
+	// Seconds between OTLP metric pushes. Ignored unless ``exporter`` is ``otlp``.
+	ExportIntervalSeconds int `json:"export_interval_seconds" yaml:"export_interval_seconds" mapstructure:"export_interval_seconds"`
 
-	// Exporter corresponds to the JSON schema field "exporter".
-	Exporter MetricsConfigExporter `json:"exporter,omitempty,omitzero" yaml:"exporter,omitempty" mapstructure:"exporter,omitempty"`
+	// Where metrics go: ``otlp`` pushes to the OTLP endpoint named by the standard
+	// ``OTEL_EXPORTER_OTLP_*`` environment variables, ``prometheus`` serves a scrape
+	// endpoint at ``/metrics``, and ``none`` records nothing.
+	Exporter MetricsConfigExporter `json:"exporter" yaml:"exporter" mapstructure:"exporter"`
+
+	// Explicit histogram bucket boundaries (milliseconds, strictly increasing, all >
+	// 0) for the request-latency histograms listed in docs/operations/monitoring.md;
+	// seconds-unit histograms get the list divided by 1000. Must be identical on
+	// every process whose series are aggregated together. As an env var, a
+	// comma-separated list.
+	LatencyBucketsMs []float64 `json:"latency_buckets_ms" yaml:"latency_buckets_ms" mapstructure:"latency_buckets_ms"`
 }
 
 type MetricsConfigExporter string
@@ -1740,6 +2258,32 @@ func (j *MetricsConfig) UnmarshalJSON(value []byte) error {
 	if v, ok := raw["exporter"]; !ok || v == nil {
 		plain.Exporter = "otlp"
 	}
+	if v, ok := raw["latency_buckets_ms"]; !ok || v == nil {
+		plain.LatencyBucketsMs = []float64{
+			1.0,
+			2.0,
+			5.0,
+			10.0,
+			15.0,
+			20.0,
+			25.0,
+			50.0,
+			100.0,
+			250.0,
+			500.0,
+			1000.0,
+			2500.0,
+			5000.0,
+			10000.0,
+			30000.0,
+		}
+	}
+	if plain.LatencyBucketsMs != nil && len(plain.LatencyBucketsMs) < 1 {
+		return fmt.Errorf("field %s length: must be >= %d", "latency_buckets_ms", 1)
+	}
+	if len(plain.LatencyBucketsMs) > 64 {
+		return fmt.Errorf("field %s length: must be <= %d", "latency_buckets_ms", 64)
+	}
 	*j = MetricsConfig(plain)
 	return nil
 }
@@ -1747,7 +2291,7 @@ func (j *MetricsConfig) UnmarshalJSON(value []byte) error {
 // Pre-auth rate limit tunables for OAuth endpoints.
 type OAuthRateLimitConfig struct {
 	// Burst allowance on top of ``approval_status_rpm``.
-	ApprovalStatusBurst int `json:"approval_status_burst,omitempty,omitzero" yaml:"approval_status_burst,omitempty" mapstructure:"approval_status_burst,omitempty"`
+	ApprovalStatusBurst int `json:"approval_status_burst" yaml:"approval_status_burst" mapstructure:"approval_status_burst"`
 
 	// Sustained requests/minute allowed on the approval-pending status poll (``GET
 	// /oauth/approval/status``). Its own namespace, so polling can never drain the
@@ -1755,37 +2299,47 @@ type OAuthRateLimitConfig struct {
 	// default keeps ~10 concurrent pending tabs behind one NAT inside the bucket, and
 	// the page honors ``Retry-After`` with backoff, so saturation degrades to a
 	// slower cadence rather than a thundering retry.
-	ApprovalStatusRpm int `json:"approval_status_rpm,omitempty,omitzero" yaml:"approval_status_rpm,omitempty" mapstructure:"approval_status_rpm,omitempty"`
+	ApprovalStatusRpm int `json:"approval_status_rpm" yaml:"approval_status_rpm" mapstructure:"approval_status_rpm"`
 
 	// Burst allowance on top of ``authorize_rpm``.
-	AuthorizeBurst int `json:"authorize_burst,omitempty,omitzero" yaml:"authorize_burst,omitempty" mapstructure:"authorize_burst,omitempty"`
+	AuthorizeBurst int `json:"authorize_burst" yaml:"authorize_burst" mapstructure:"authorize_burst"`
 
-	// Sustained requests/minute allowed on the unauthenticated ``/authorize``
-	// endpoints, keyed per ``client_id``+IP — except the local-login routes, which
-	// carry no query ``client_id`` and fall back to a bare-IP key. Behind a proxy,
-	// set ``auth.oauth_rate_limit.trusted_proxies`` or every client shares the
-	// proxy's IP bucket.
-	AuthorizeRpm int `json:"authorize_rpm,omitempty,omitzero" yaml:"authorize_rpm,omitempty" mapstructure:"authorize_rpm,omitempty"`
+	// Sustained requests/minute allowed per client network (IPv4 address or IPv6 /64)
+	// across the unauthenticated authorization flow: ``/authorize``, the IdP
+	// callback, the consent page, its submit and inline agent create, and the
+	// local-login form share one bucket, whatever ``client_id`` they name. A sign-in
+	// spends two to six requests (more after a mistyped password), so the defaults
+	// admit at least five back-to-back sign-ins and then at least five a minute per
+	// network; raise both for a large shared NAT or egress IP. Behind a proxy, set
+	// ``auth.oauth_rate_limit.trusted_proxies`` or every client shares the proxy's
+	// bucket.
+	AuthorizeRpm int `json:"authorize_rpm" yaml:"authorize_rpm" mapstructure:"authorize_rpm"`
 
 	// Burst allowance on top of ``exchange_rpm``.
-	ExchangeBurst int `json:"exchange_burst,omitempty,omitzero" yaml:"exchange_burst,omitempty" mapstructure:"exchange_burst,omitempty"`
+	ExchangeBurst int `json:"exchange_burst" yaml:"exchange_burst" mapstructure:"exchange_burst"`
 
-	// Sustained requests/minute allowed per ``client_id``+IP on the token endpoint
-	// (also reused per-IP for token revocation).
-	ExchangeRpm int `json:"exchange_rpm,omitempty,omitzero" yaml:"exchange_rpm,omitempty" mapstructure:"exchange_rpm,omitempty"`
+	// Sustained requests/minute allowed per ``client_id`` + client network (IPv4
+	// address or IPv6 /64) on the token endpoint (also reused per client network for
+	// token revocation).
+	ExchangeRpm int `json:"exchange_rpm" yaml:"exchange_rpm" mapstructure:"exchange_rpm"`
 
 	// Burst allowance on top of ``registration_rpm``.
-	RegistrationBurst int `json:"registration_burst,omitempty,omitzero" yaml:"registration_burst,omitempty" mapstructure:"registration_burst,omitempty"`
+	RegistrationBurst int `json:"registration_burst" yaml:"registration_burst" mapstructure:"registration_burst"`
 
-	// Sustained requests/minute allowed per IP on anonymous dynamic client
-	// registration (``POST /oauth-clients``).
-	RegistrationRpm int `json:"registration_rpm,omitempty,omitzero" yaml:"registration_rpm,omitempty" mapstructure:"registration_rpm,omitempty"`
+	// Sustained requests/minute allowed per client network (IPv4 address or IPv6 /64)
+	// on anonymous dynamic client registration (``POST /oauth-clients``) and agent
+	// self-registration (``POST /register``), in its own bucket.
+	RegistrationRpm int `json:"registration_rpm" yaml:"registration_rpm" mapstructure:"registration_rpm"`
 
-	// Socket IPs of reverse proxies whose ``X-Forwarded-For`` header is honored when
-	// deriving the per-client rate-limit identity. Empty (default) means the socket
+	// Reverse proxies whose ``X-Forwarded-For`` header is honored when deriving the
+	// per-client rate-limit identity: IP addresses or CIDR networks (e.g.
+	// ``10.0.0.0/8``, ``fd00::/8``), matched against the socket address and each
+	// forwarded hop by network membership. Accepts a YAML list or a comma-separated
+	// string. Invalid entries fail config load. Empty (default) means the socket
 	// address is used as-is — behind a reverse proxy every request then carries the
-	// proxy's IP and all clients share one bucket, so list the proxy IPs when
-	// deploying behind one.
+	// proxy's IP and all clients share one bucket, so list the proxy IPs or pod CIDR
+	// when deploying behind one. Only list ranges your proxies alone hold: any host
+	// inside a trusted network can choose its own rate-limit identity.
 	TrustedProxies []string `json:"trusted_proxies,omitempty,omitzero" yaml:"trusted_proxies,omitempty" mapstructure:"trusted_proxies,omitempty"`
 }
 
@@ -1837,27 +2391,28 @@ type ObservabilityConfig struct {
 	Tracing *TracingConfig `json:"tracing,omitempty,omitzero" yaml:"tracing,omitempty" mapstructure:"tracing,omitempty"`
 }
 
-// Configuration for a Pipedream-hosted OAuth provider (full settings land in M6).
+// Configuration for a Pipedream-hosted OAuth provider.
 type PipedreamProviderConfig struct {
-	// ClientId corresponds to the JSON schema field "client_id".
+	// Pipedream OAuth client id.
 	ClientId string `json:"client_id" yaml:"client_id" mapstructure:"client_id"`
 
-	// ClientSecret corresponds to the JSON schema field "client_secret".
+	// Pipedream OAuth client secret.
 	ClientSecret string `json:"client_secret" yaml:"client_secret" mapstructure:"client_secret"`
 
-	// ConnectBaseUrl corresponds to the JSON schema field "connect_base_url".
-	ConnectBaseUrl string `json:"connect_base_url,omitempty,omitzero" yaml:"connect_base_url,omitempty" mapstructure:"connect_base_url,omitempty"`
+	// Base URL of the Pipedream Connect API.
+	ConnectBaseUrl string `json:"connect_base_url" yaml:"connect_base_url" mapstructure:"connect_base_url"`
 
-	// Environment corresponds to the JSON schema field "environment".
-	Environment PipedreamProviderConfigEnvironment `json:"environment,omitempty,omitzero" yaml:"environment,omitempty" mapstructure:"environment,omitempty"`
+	// Pipedream project environment the connections live in.
+	Environment PipedreamProviderConfigEnvironment `json:"environment" yaml:"environment" mapstructure:"environment"`
 
-	// ExpirySkewSeconds corresponds to the JSON schema field "expiry_skew_seconds".
-	ExpirySkewSeconds int `json:"expiry_skew_seconds,omitempty,omitzero" yaml:"expiry_skew_seconds,omitempty" mapstructure:"expiry_skew_seconds,omitempty"`
+	// How many seconds before an access token's real expiry the broker refreshes it.
+	// Applied at comparison time; the stored expiry is never shifted.
+	ExpirySkewSeconds int `json:"expiry_skew_seconds" yaml:"expiry_skew_seconds" mapstructure:"expiry_skew_seconds"`
 
 	// Kind corresponds to the JSON schema field "kind".
-	Kind string `json:"kind,omitempty,omitzero" yaml:"kind,omitempty" mapstructure:"kind,omitempty"`
+	Kind string `json:"kind" yaml:"kind" mapstructure:"kind"`
 
-	// ProjectId corresponds to the JSON schema field "project_id".
+	// Pipedream project id.
 	ProjectId string `json:"project_id" yaml:"project_id" mapstructure:"project_id"`
 }
 
@@ -1936,10 +2491,11 @@ func (j *PipedreamProviderConfig) UnmarshalJSON(value []byte) error {
 // defined in config (not the oauth_clients DB table) because they are
 // deployment-time constants, not admin-managed dynamic registrations.
 type PlatformClientConfig struct {
-	// ClientId corresponds to the JSON schema field "client_id".
+	// OAuth client id the first-party client presents.
 	ClientId string `json:"client_id" yaml:"client_id" mapstructure:"client_id"`
 
-	// RedirectUris corresponds to the JSON schema field "redirect_uris".
+	// Allowed absolute redirect URIs (exact match). ``https`` is required except for
+	// ``localhost`` / ``127.0.0.1``, where ``http`` is accepted.
 	RedirectUris []string `json:"redirect_uris" yaml:"redirect_uris" mapstructure:"redirect_uris"`
 }
 
@@ -1975,14 +2531,17 @@ func (j *PlatformClientConfig) UnmarshalJSON(value []byte) error {
 // backend (“RateLimitStore“); with the memory backend the limit is
 // per-instance, with Redis it is cluster-wide — no call-site change.
 type RateLimitConfig struct {
-	// Burst corresponds to the JSON schema field "burst".
-	Burst int `json:"burst,omitempty,omitzero" yaml:"burst,omitempty" mapstructure:"burst,omitempty"`
+	// Token-bucket capacity: the most requests a caller can spend at once. Also the
+	// ``RateLimit-Limit`` header value.
+	Burst int `json:"burst" yaml:"burst" mapstructure:"burst"`
 
-	// DefaultRpm corresponds to the JSON schema field "default_rpm".
-	DefaultRpm int `json:"default_rpm,omitempty,omitzero" yaml:"default_rpm,omitempty" mapstructure:"default_rpm,omitempty"`
+	// Sustained refill rate of each caller's token bucket, in requests per minute.
+	DefaultRpm int `json:"default_rpm" yaml:"default_rpm" mapstructure:"default_rpm"`
 
-	// Enabled corresponds to the JSON schema field "enabled".
-	Enabled bool `json:"enabled,omitempty,omitzero" yaml:"enabled,omitempty" mapstructure:"enabled,omitempty"`
+	// Rate-limit broker executions per caller; over the limit the broker answers 429
+	// with ``RateLimit-*`` and ``Retry-After`` headers. Per instance on the memory
+	// state backend, cluster-wide on Redis.
+	Enabled bool `json:"enabled" yaml:"enabled" mapstructure:"enabled"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -2024,14 +2583,17 @@ func (j *RateLimitConfig) UnmarshalJSON(value []byte) error {
 // of how many clients poll. Every failure degrades to "latest unknown" (no
 // banner) rather than erroring — the version probe must never break the app.
 type ReleaseCheckConfig struct {
-	// CacheTtlSeconds corresponds to the JSON schema field "cache_ttl_seconds".
-	CacheTtlSeconds int `json:"cache_ttl_seconds,omitempty,omitzero" yaml:"cache_ttl_seconds,omitempty" mapstructure:"cache_ttl_seconds,omitempty"`
+	// Seconds the latest-release lookup is cached in process (default 6 h), so at
+	// most one GitHub request is made per TTL. 0 disables the check entirely
+	// (air-gapped installs, no egress).
+	CacheTtlSeconds int `json:"cache_ttl_seconds" yaml:"cache_ttl_seconds" mapstructure:"cache_ttl_seconds"`
 
-	// Enabled corresponds to the JSON schema field "enabled".
-	Enabled bool `json:"enabled,omitempty,omitzero" yaml:"enabled,omitempty" mapstructure:"enabled,omitempty"`
+	// Check GitHub for a newer jentic-one release so the web console can show an
+	// "update available" banner. Runs only when ``server.backend`` is ``local``.
+	Enabled bool `json:"enabled" yaml:"enabled" mapstructure:"enabled"`
 
 	// Repo corresponds to the JSON schema field "repo".
-	Repo string `json:"repo,omitempty,omitzero" yaml:"repo,omitempty" mapstructure:"repo,omitempty"`
+	Repo string `json:"repo" yaml:"repo" mapstructure:"repo"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -2063,24 +2625,32 @@ func (j *ReleaseCheckConfig) UnmarshalJSON(value []byte) error {
 // The “RetryRunner“ decorator retries a failed attempt **only** when it is
 // safe to do so: a connect-phase failure (no bytes on the wire) is retryable
 // for any method, while a post-send failure (read timeout, mirrored “429“/
-// “503“) is retried only for idempotent methods or when an
-// “Idempotency-Key“ is present — a blind “POST“ retry is a double-spend.
+// “503“) is retried only for idempotent HTTP methods — “Idempotency-Key“
+// is broker-consumed and stripped from outbound headers, so a post-send
+// “POST“ or “PATCH“ retry would double-spend (#1799).
 // Each attempt still flows through the circuit breaker (retry *outside*,
 // breaker *inside*); the whole loop is bounded by the request deadline.
 type RetryConfig struct {
-	// BaseBackoffS corresponds to the JSON schema field "base_backoff_s".
-	BaseBackoffS float64 `json:"base_backoff_s,omitempty,omitzero" yaml:"base_backoff_s,omitempty" mapstructure:"base_backoff_s,omitempty"`
+	// Base delay (seconds) of the exponential backoff ``base_backoff_s *
+	// 2**(attempt-1)``, capped at ``max_backoff_s``, then fully jittered and clamped
+	// to the request deadline.
+	BaseBackoffS float64 `json:"base_backoff_s" yaml:"base_backoff_s" mapstructure:"base_backoff_s"`
 
-	// Enabled corresponds to the JSON schema field "enabled".
+	// Retry failed upstream attempts when safe: connect failures for any method,
+	// post-send failures (read timeouts, ``retry_statuses``) only for idempotent HTTP
+	// methods. Bounded by the request deadline. Streamed executions are never
+	// retried, and streaming is the default synchronous path while
+	// ``broker.resilience.upstream.stream_passthrough_enabled`` is true.
 	Enabled bool `json:"enabled,omitempty,omitzero" yaml:"enabled,omitempty" mapstructure:"enabled,omitempty"`
 
-	// MaxAttempts corresponds to the JSON schema field "max_attempts".
-	MaxAttempts int `json:"max_attempts,omitempty,omitzero" yaml:"max_attempts,omitempty" mapstructure:"max_attempts,omitempty"`
+	// Total attempts including the first (3 = the initial call plus up to 2 retries).
+	MaxAttempts int `json:"max_attempts" yaml:"max_attempts" mapstructure:"max_attempts"`
 
-	// MaxBackoffS corresponds to the JSON schema field "max_backoff_s".
-	MaxBackoffS float64 `json:"max_backoff_s,omitempty,omitzero" yaml:"max_backoff_s,omitempty" mapstructure:"max_backoff_s,omitempty"`
+	// Cap (seconds) on one retry backoff before jitter.
+	MaxBackoffS float64 `json:"max_backoff_s" yaml:"max_backoff_s" mapstructure:"max_backoff_s"`
 
-	// RetryStatuses corresponds to the JSON schema field "retry_statuses".
+	// Upstream status codes treated as transient and retried; an upstream
+	// ``Retry-After`` on them is honoured, capped at the request deadline.
 	RetryStatuses []int `json:"retry_statuses,omitempty,omitzero" yaml:"retry_statuses,omitempty" mapstructure:"retry_statuses,omitempty"`
 }
 
@@ -2113,11 +2683,13 @@ func (j *RetryConfig) UnmarshalJSON(value []byte) error {
 
 // Hot-reloadable runtime flags.
 type RuntimeConfig struct {
-	// Debug corresponds to the JSON schema field "debug".
+	// Render stdout logs with the human-readable console renderer instead of JSON
+	// lines. For local development.
 	Debug bool `json:"debug,omitempty,omitzero" yaml:"debug,omitempty" mapstructure:"debug,omitempty"`
 
-	// LogLevel corresponds to the JSON schema field "log_level".
-	LogLevel string `json:"log_level,omitempty,omitzero" yaml:"log_level,omitempty" mapstructure:"log_level,omitempty"`
+	// Root log level: an uppercase Python level name such as ``DEBUG``, ``INFO`` or
+	// ``WARNING``.
+	LogLevel string `json:"log_level" yaml:"log_level" mapstructure:"log_level"`
 
 	// MaintenanceMode corresponds to the JSON schema field "maintenance_mode".
 	MaintenanceMode bool `json:"maintenance_mode,omitempty,omitzero" yaml:"maintenance_mode,omitempty" mapstructure:"maintenance_mode,omitempty"`
@@ -2156,14 +2728,18 @@ func (j *RuntimeConfig) UnmarshalJSON(value []byte) error {
 // config load. Additional modes (e.g. "semantic", "vector") can be registered
 // via “register_strategy“ without editing this schema.
 type SearchConfig struct {
-	// Enabled corresponds to the JSON schema field "enabled".
-	Enabled bool `json:"enabled,omitempty,omitzero" yaml:"enabled,omitempty" mapstructure:"enabled,omitempty"`
+	// Build the lexical search text for operations at import time. APIs imported
+	// while this is off are not findable by lexical search until re-imported.
+	Enabled bool `json:"enabled" yaml:"enabled" mapstructure:"enabled"`
 
-	// SearchEnabled corresponds to the JSON schema field "search_enabled".
-	SearchEnabled bool `json:"search_enabled,omitempty,omitzero" yaml:"search_enabled,omitempty" mapstructure:"search_enabled,omitempty"`
+	// Serve search queries. Off, search requests fail with a search-disabled error;
+	// indexing at import is controlled separately by ``enabled``.
+	SearchEnabled bool `json:"search_enabled" yaml:"search_enabled" mapstructure:"search_enabled"`
 
-	// SearchMode corresponds to the JSON schema field "search_mode".
-	SearchMode string `json:"search_mode,omitempty,omitzero" yaml:"search_mode,omitempty" mapstructure:"search_mode,omitempty"`
+	// Search strategy name, resolved per database dialect against the registered
+	// strategies. ``lexical`` (BM25 on SQLite, native full-text on PostgreSQL) is
+	// built in; an unknown mode fails on first use with the available modes listed.
+	SearchMode string `json:"search_mode" yaml:"search_mode" mapstructure:"search_mode"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -2192,29 +2768,33 @@ func (j *SearchConfig) UnmarshalJSON(value []byte) error {
 
 // Platform security event thresholds.
 type SecurityConfig struct {
-	// AuthFailureEventThreshold corresponds to the JSON schema field
-	// "auth_failure_event_threshold".
-	AuthFailureEventThreshold int `json:"auth_failure_event_threshold,omitempty,omitzero" yaml:"auth_failure_event_threshold,omitempty" mapstructure:"auth_failure_event_threshold,omitempty"`
+	// Broker execute requests from one actor refused within a clock minute for
+	// lacking the execute permission before a
+	// ``security.unauthorized_access_attempt`` event is emitted (at most one per
+	// actor per minute).
+	AuthFailureEventThreshold int `json:"auth_failure_event_threshold" yaml:"auth_failure_event_threshold" mapstructure:"auth_failure_event_threshold"`
 
-	// CredentialExpiringSoonWindowH corresponds to the JSON schema field
-	// "credential_expiring_soon_window_h".
-	CredentialExpiringSoonWindowH int `json:"credential_expiring_soon_window_h,omitempty,omitzero" yaml:"credential_expiring_soon_window_h,omitempty" mapstructure:"credential_expiring_soon_window_h,omitempty"`
+	// Hours before an OAuth token's expiry at which ``credential.expiring_soon``
+	// events start; the token stays in that warning state until it expires.
+	CredentialExpiringSoonWindowH int `json:"credential_expiring_soon_window_h" yaml:"credential_expiring_soon_window_h" mapstructure:"credential_expiring_soon_window_h"`
 
-	// CredentialExpirySweepIntervalTicks corresponds to the JSON schema field
-	// "credential_expiry_sweep_interval_ticks".
-	CredentialExpirySweepIntervalTicks int `json:"credential_expiry_sweep_interval_ticks,omitempty,omitzero" yaml:"credential_expiry_sweep_interval_ticks,omitempty" mapstructure:"credential_expiry_sweep_interval_ticks,omitempty"`
+	// Run the credential-expiry scan every Nth worker tick. One tick is about
+	// ``worker.poll_interval_s``, so the default is roughly every 2 minutes.
+	CredentialExpirySweepIntervalTicks int `json:"credential_expiry_sweep_interval_ticks" yaml:"credential_expiry_sweep_interval_ticks" mapstructure:"credential_expiry_sweep_interval_ticks"`
 
-	// ExecutionRepeatedFailureCriticalThreshold corresponds to the JSON schema field
-	// "execution_repeated_failure_critical_threshold".
-	ExecutionRepeatedFailureCriticalThreshold int `json:"execution_repeated_failure_critical_threshold,omitempty,omitzero" yaml:"execution_repeated_failure_critical_threshold,omitempty" mapstructure:"execution_repeated_failure_critical_threshold,omitempty"`
+	// Failure count within the window at or above which the
+	// ``execution.repeated_failure`` event escalates from ``error`` to ``critical``
+	// severity. Keep it above the base threshold.
+	ExecutionRepeatedFailureCriticalThreshold int `json:"execution_repeated_failure_critical_threshold" yaml:"execution_repeated_failure_critical_threshold" mapstructure:"execution_repeated_failure_critical_threshold"`
 
-	// ExecutionRepeatedFailureThreshold corresponds to the JSON schema field
-	// "execution_repeated_failure_threshold".
-	ExecutionRepeatedFailureThreshold int `json:"execution_repeated_failure_threshold,omitempty,omitzero" yaml:"execution_repeated_failure_threshold,omitempty" mapstructure:"execution_repeated_failure_threshold,omitempty"`
+	// Failed executions for one actor, credential and operation within
+	// ``execution_repeated_failure_window_s`` before an
+	// ``execution.repeated_failure`` event is emitted.
+	ExecutionRepeatedFailureThreshold int `json:"execution_repeated_failure_threshold" yaml:"execution_repeated_failure_threshold" mapstructure:"execution_repeated_failure_threshold"`
 
-	// ExecutionRepeatedFailureWindowS corresponds to the JSON schema field
-	// "execution_repeated_failure_window_s".
-	ExecutionRepeatedFailureWindowS int `json:"execution_repeated_failure_window_s,omitempty,omitzero" yaml:"execution_repeated_failure_window_s,omitempty" mapstructure:"execution_repeated_failure_window_s,omitempty"`
+	// Rolling window (seconds) over which repeated failures are counted; at most one
+	// ``execution.repeated_failure`` event is emitted per window.
+	ExecutionRepeatedFailureWindowS int `json:"execution_repeated_failure_window_s" yaml:"execution_repeated_failure_window_s" mapstructure:"execution_repeated_failure_window_s"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -2270,22 +2850,35 @@ func (j *SecurityConfig) UnmarshalJSON(value []byte) error {
 
 // HTTP server settings.
 type ServerConfig struct {
-	// Backend corresponds to the JSON schema field "backend".
-	Backend ServerConfigBackend `json:"backend,omitempty,omitzero" yaml:"backend,omitempty" mapstructure:"backend,omitempty"`
+	// Backend locality reported by ``GET /instance``: ``local`` for a self-hosted
+	// install on the operator's own machine or network, ``remote`` for a hosted
+	// install run elsewhere. A hint for clients, not an authorization signal;
+	// ``remote`` also skips the release check.
+	Backend ServerConfigBackend `json:"backend" yaml:"backend" mapstructure:"backend"`
 
-	// Host corresponds to the JSON schema field "host".
-	Host string `json:"host,omitempty,omitzero" yaml:"host,omitempty" mapstructure:"host,omitempty"`
+	// Interface the HTTP server binds to. ``0.0.0.0`` / ``::`` listen on all
+	// interfaces; a loopback address keeps the app reachable from this machine only.
+	Host string `json:"host" yaml:"host" mapstructure:"host"`
 
 	// Mcp corresponds to the JSON schema field "mcp".
 	Mcp *McpConfig `json:"mcp,omitempty,omitzero" yaml:"mcp,omitempty" mapstructure:"mcp,omitempty"`
 
-	// Port corresponds to the JSON schema field "port".
-	Port int `json:"port,omitempty,omitzero" yaml:"port,omitempty" mapstructure:"port,omitempty"`
+	// TCP port the HTTP server listens on.
+	Port int `json:"port" yaml:"port" mapstructure:"port"`
 
-	// PublicBaseUrl corresponds to the JSON schema field "public_base_url".
+	// The public origin of this deployment (e.g. ``https://jentic.example.com``).
+	// Absolute URLs the app hands to external clients — the OAuth connect
+	// ``redirect_uri``, the OIDC issuer and JWT-Bearer audience, DCR
+	// ``registration_client_uri``, the SPA login callback, approval links — fall back
+	// to it when their own more specific key is unset. Unset, they derive from the
+	// incoming request's origin, or from the bind (``http://{host}:{port}``) when
+	// there is no request; set it when clients reach the app through a reverse proxy,
+	// ingress or port mapping.
 	PublicBaseUrl string `json:"public_base_url,omitempty,omitzero" yaml:"public_base_url,omitempty" mapstructure:"public_base_url,omitempty"`
 
-	// Reload corresponds to the JSON schema field "reload".
+	// Run uvicorn with auto-reload on code changes (development only). Ignored, with
+	// a warning, when the admin database is SQLite or the config comes from a
+	// one-shot source such as a pipe.
 	Reload bool `json:"reload,omitempty,omitzero" yaml:"reload,omitempty" mapstructure:"reload,omitempty"`
 }
 
@@ -2351,14 +2944,20 @@ func (j *ServerConfig) UnmarshalJSON(value []byte) error {
 
 // Service-level settings (immutable after boot).
 type ServicesConfig struct {
+	// On shutdown, how long (seconds) the app waits for work requests handed off
+	// after their response (e.g. streaming execution records) before cancelling what
+	// is still running. Runs before the databases close; each cancelled task is
+	// logged and counted on ``app.background_tasks`` (``outcome=cancelled``).
+	BackgroundTaskDrainTimeoutS float64 `json:"background_task_drain_timeout_s" yaml:"background_task_drain_timeout_s" mapstructure:"background_task_drain_timeout_s"`
+
 	// RequestTimeoutS corresponds to the JSON schema field "request_timeout_s".
-	RequestTimeoutS float64 `json:"request_timeout_s,omitempty,omitzero" yaml:"request_timeout_s,omitempty" mapstructure:"request_timeout_s,omitempty"`
+	RequestTimeoutS float64 `json:"request_timeout_s" yaml:"request_timeout_s" mapstructure:"request_timeout_s"`
 
 	// RetryBackoffS corresponds to the JSON schema field "retry_backoff_s".
-	RetryBackoffS float64 `json:"retry_backoff_s,omitempty,omitzero" yaml:"retry_backoff_s,omitempty" mapstructure:"retry_backoff_s,omitempty"`
+	RetryBackoffS float64 `json:"retry_backoff_s" yaml:"retry_backoff_s" mapstructure:"retry_backoff_s"`
 
 	// RetryMax corresponds to the JSON schema field "retry_max".
-	RetryMax int `json:"retry_max,omitempty,omitzero" yaml:"retry_max,omitempty" mapstructure:"retry_max,omitempty"`
+	RetryMax int `json:"retry_max" yaml:"retry_max" mapstructure:"retry_max"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -2371,6 +2970,12 @@ func (j *ServicesConfig) UnmarshalJSON(value []byte) error {
 	var plain Plain
 	if err := json.Unmarshal(value, &plain); err != nil {
 		return err
+	}
+	if v, ok := raw["background_task_drain_timeout_s"]; !ok || v == nil {
+		plain.BackgroundTaskDrainTimeoutS = 10.0
+	}
+	if 0 > plain.BackgroundTaskDrainTimeoutS {
+		return fmt.Errorf("field %s: must be >= %v", "background_task_drain_timeout_s", 0)
 	}
 	if v, ok := raw["request_timeout_s"]; !ok || v == nil {
 		plain.RequestTimeoutS = 30.0
@@ -2387,10 +2992,11 @@ func (j *ServicesConfig) UnmarshalJSON(value []byte) error {
 
 // A single ES256 signing key for ID token issuance.
 type SigningKeyConfig struct {
-	// Kid corresponds to the JSON schema field "kid".
+	// Key id published in the JWKS and stamped in the ``kid`` header of ID tokens
+	// signed with this key (``[a-zA-Z0-9_-]+``).
 	Kid string `json:"kid" yaml:"kid" mapstructure:"kid"`
 
-	// PrivateKeyPem corresponds to the JSON schema field "private_key_pem".
+	// PEM-encoded EC P-256 private key used for ES256 signing.
 	PrivateKeyPem string `json:"private_key_pem" yaml:"private_key_pem" mapstructure:"private_key_pem"`
 }
 
@@ -2415,17 +3021,39 @@ func (j *SigningKeyConfig) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
-// Configuration for :func:`build_state_backend`.
+// The process's shared-state backend (top-level “state:“ section).
+//
+// One backend per process holds the rate-limit buckets, circuit-breaker
+// counters, “Idempotency-Key“ records, the auth surface's single-use
+// markers, the broker's auth-failure counters and the MCP session-event
+// dedupe of every surface the process serves.
 type StateBackendConfig struct {
-	// Backend corresponds to the JSON schema field "backend".
-	Backend BackendKind `json:"backend,omitempty,omitzero" yaml:"backend,omitempty" mapstructure:"backend,omitempty"`
+	// Name of the shared-state backend to build: ``memory`` (in-process, the
+	// default), ``redis`` (deprecated), or a name an extension registered with
+	// ``register_state_backend``. An unregistered name fails at startup with the list
+	// of registered names.
+	Backend string `json:"backend" yaml:"backend" mapstructure:"backend"`
 
-	// RedisKeyPrefix corresponds to the JSON schema field "redis_key_prefix".
-	RedisKeyPrefix string `json:"redis_key_prefix,omitempty,omitzero" yaml:"redis_key_prefix,omitempty" mapstructure:"redis_key_prefix,omitempty"`
+	// Memory corresponds to the JSON schema field "memory".
+	Memory *MemoryBackendConfig `json:"memory,omitempty,omitzero" yaml:"memory,omitempty" mapstructure:"memory,omitempty"`
 
-	// RedisUrl corresponds to the JSON schema field "redis_url".
+	// Settings for a backend registered by an extension, passed to its builder
+	// unvalidated (the builder validates them). Ignored by the built-in memory and
+	// redis backends.
+	Options StateBackendConfigOptions `json:"options,omitempty,omitzero" yaml:"options,omitempty" mapstructure:"options,omitempty"`
+
+	// Prefix the deprecated ``redis`` backend puts on every key; set a
+	// per-environment value when deployments share one Redis.
+	RedisKeyPrefix string `json:"redis_key_prefix" yaml:"redis_key_prefix" mapstructure:"redis_key_prefix"`
+
+	// Connection URL of the deprecated ``redis`` backend; required by it.
 	RedisUrl interface{} `json:"redis_url,omitempty,omitzero" yaml:"redis_url,omitempty" mapstructure:"redis_url,omitempty"`
 }
+
+// Settings for a backend registered by an extension, passed to its builder
+// unvalidated (the builder validates them). Ignored by the built-in memory and
+// redis backends.
+type StateBackendConfigOptions map[string]interface{}
 
 type StateBackendConfigRedisUrl_0 *string
 
@@ -2443,6 +3071,9 @@ func (j *StateBackendConfig) UnmarshalJSON(value []byte) error {
 	if v, ok := raw["backend"]; !ok || v == nil {
 		plain.Backend = "memory"
 	}
+	if matched, _ := regexp.MatchString(`^[a-z0-9][a-z0-9_-]*$`, string(plain.Backend)); !matched {
+		return fmt.Errorf("field %s pattern match: must match %s", "Backend", `^[a-z0-9][a-z0-9_-]*$`)
+	}
 	if v, ok := raw["redis_key_prefix"]; !ok || v == nil {
 		plain.RedisKeyPrefix = "jentic:broker:"
 	}
@@ -2450,40 +3081,48 @@ func (j *StateBackendConfig) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
-// Anonymous product-telemetry settings.
+// Anonymous product telemetry. Off by default for hand-written configs, but the
+// shipped install paths (such as the quickstarts) may turn it on.
 //
-// Defaults to **OFF**: an instance whose config omits this block (non-onboarded
-// or hand-rolled) sends nothing. The onboarding CLI writes “enabled“
-// explicitly (a yes-default “[Y]/n“ prompt), which is where the
-// on-by-default install experience comes from. “instance_id“ seeds the
-// durable admin-DB identity row on first startup for opted-in instances.
-// “host_os“ is the operator's OS family, stamped by the CLI at install
-// time so a Docker-run instance reports the host's OS rather than the
-// container's; sent once per boot, on the “instance_booted“ event.
+// To opt out, set “telemetry.enabled“ to “false“ in the config, or the
+// environment variable “JENTIC__TELEMETRY__ENABLED=false“ (for example, in a
+// Docker compose file).
+//
+// Events carry only a fixed event name (such as “instance_booted“,
+// “agent_created“ or “broker_execution“), closed-enum tags, the actor type and
+// a timestamp, plus a random instance id and the app version. No credentials,
+// request data or personal data are sent. The full event list is
+// “TelemetryEventName“ in “src/jentic_one/shared/telemetry/events.py“.
 type TelemetryConfig struct {
-	// Enabled corresponds to the JSON schema field "enabled".
+	// Send anonymous product telemetry. Off when unset; the shipped install paths may
+	// set it to true. Set false to opt out.
 	Enabled bool `json:"enabled,omitempty,omitzero" yaml:"enabled,omitempty" mapstructure:"enabled,omitempty"`
 
 	// Endpoint corresponds to the JSON schema field "endpoint".
-	Endpoint string `json:"endpoint,omitempty,omitzero" yaml:"endpoint,omitempty" mapstructure:"endpoint,omitempty"`
+	Endpoint string `json:"endpoint" yaml:"endpoint" mapstructure:"endpoint"`
 
 	// FlushIntervalS corresponds to the JSON schema field "flush_interval_s".
-	FlushIntervalS float64 `json:"flush_interval_s,omitempty,omitzero" yaml:"flush_interval_s,omitempty" mapstructure:"flush_interval_s,omitempty"`
+	FlushIntervalS float64 `json:"flush_interval_s" yaml:"flush_interval_s" mapstructure:"flush_interval_s"`
 
-	// HostOs corresponds to the JSON schema field "host_os".
+	// Host OS family stamped by the onboarding CLI, so an instance running in Docker
+	// reports the operator's OS rather than the container's Linux. Unset falls back
+	// to runtime detection; unrecognised values are reported as ``other``. Sent once
+	// per boot, on the ``instance_booted`` event.
 	HostOs interface{} `json:"host_os,omitempty,omitzero" yaml:"host_os,omitempty" mapstructure:"host_os,omitempty"`
 
-	// InstanceId corresponds to the JSON schema field "instance_id".
+	// Opaque instance id reported with telemetry (at most 64 characters). When set it
+	// is authoritative and overwrites the id stored in the admin database; unset, a
+	// random UUID is generated on first startup and kept.
 	InstanceId interface{} `json:"instance_id,omitempty,omitzero" yaml:"instance_id,omitempty" mapstructure:"instance_id,omitempty"`
 
 	// MaxBatch corresponds to the JSON schema field "max_batch".
-	MaxBatch int `json:"max_batch,omitempty,omitzero" yaml:"max_batch,omitempty" mapstructure:"max_batch,omitempty"`
+	MaxBatch int `json:"max_batch" yaml:"max_batch" mapstructure:"max_batch"`
 
 	// QueueMax corresponds to the JSON schema field "queue_max".
-	QueueMax int `json:"queue_max,omitempty,omitzero" yaml:"queue_max,omitempty" mapstructure:"queue_max,omitempty"`
+	QueueMax int `json:"queue_max" yaml:"queue_max" mapstructure:"queue_max"`
 
 	// RequestTimeoutS corresponds to the JSON schema field "request_timeout_s".
-	RequestTimeoutS float64 `json:"request_timeout_s,omitempty,omitzero" yaml:"request_timeout_s,omitempty" mapstructure:"request_timeout_s,omitempty"`
+	RequestTimeoutS float64 `json:"request_timeout_s" yaml:"request_timeout_s" mapstructure:"request_timeout_s"`
 }
 
 type TelemetryConfigHostOs_0 *string
@@ -2525,8 +3164,22 @@ func (j *TelemetryConfig) UnmarshalJSON(value []byte) error {
 
 // Tracing exporter configuration.
 type TracingConfig struct {
-	// Exporter corresponds to the JSON schema field "exporter".
-	Exporter TracingConfigExporter `json:"exporter,omitempty,omitzero" yaml:"exporter,omitempty" mapstructure:"exporter,omitempty"`
+	// Where spans go. ``none`` records no spans at all (every span is non-recording),
+	// while trace ids are still generated and propagated: an inbound ``traceparent``
+	// is honoured, outbound requests carry ``traceparent``/``tracestate``, and
+	// execution records and logs keep their ``trace_id``. With ``none`` the outbound
+	// ``traceparent`` has the sampled flag unset (``-00``) even when the caller sent
+	// ``-01``, since this process records nothing.
+	Exporter TracingConfigExporter `json:"exporter" yaml:"exporter" mapstructure:"exporter"`
+
+	// Fraction of traces recorded and exported when ``exporter`` is ``otlp`` (1.0
+	// records every trace). It caps every trace entering the process, including
+	// requests that arrive with a sampled ``traceparent`` (the CLI and MCP send one
+	// on every call), so a caller cannot force recording. A caller's unsampled
+	// ``traceparent`` stays unsampled. Ignored with ``exporter: none``, and
+	// overridden by the standard ``OTEL_TRACES_SAMPLER`` environment variable when
+	// that is set (a warning is logged if this field is not 1.0).
+	SampleRatio float64 `json:"sample_ratio" yaml:"sample_ratio" mapstructure:"sample_ratio"`
 }
 
 type TracingConfigExporter string
@@ -2573,6 +3226,15 @@ func (j *TracingConfig) UnmarshalJSON(value []byte) error {
 	if v, ok := raw["exporter"]; !ok || v == nil {
 		plain.Exporter = "otlp"
 	}
+	if v, ok := raw["sample_ratio"]; !ok || v == nil {
+		plain.SampleRatio = 1.0
+	}
+	if 1 < plain.SampleRatio {
+		return fmt.Errorf("field %s: must be <= %v", "sample_ratio", 1)
+	}
+	if 0 > plain.SampleRatio {
+		return fmt.Errorf("field %s: must be >= %v", "sample_ratio", 0)
+	}
 	*j = TracingConfig(plain)
 	return nil
 }
@@ -2584,10 +3246,11 @@ func (j *TracingConfig) UnmarshalJSON(value []byte) error {
 // is the per-issuer asymmetric allowlist — HMAC/“none“ are rejected here so an
 // issuer can't be downgraded to a symmetric/forgeable signature.
 type TrustedIssuerConfig struct {
-	// Algorithms corresponds to the JSON schema field "algorithms".
+	// Signature algorithms accepted from this issuer. Asymmetric only (RS*, ES*, PS*,
+	// EdDSA); HMAC and ``none`` are rejected at load.
 	Algorithms []string `json:"algorithms,omitempty,omitzero" yaml:"algorithms,omitempty" mapstructure:"algorithms,omitempty"`
 
-	// Issuer corresponds to the JSON schema field "issuer".
+	// Expected ``iss`` claim of tokens from this issuer (exact match).
 	Issuer string `json:"issuer" yaml:"issuer" mapstructure:"issuer"`
 
 	// URL of the issuer's published JWKS. Must be https:// when
@@ -2624,51 +3287,69 @@ func (j *TrustedIssuerConfig) UnmarshalJSON(value []byte) error {
 // sending under the limit can hold a pool slot open. The overall transfer
 // deadline is owned by the response-streaming guard, not here.
 type UpstreamClientConfig struct {
-	// ConnectTimeoutS corresponds to the JSON schema field "connect_timeout_s".
-	ConnectTimeoutS float64 `json:"connect_timeout_s,omitempty,omitzero" yaml:"connect_timeout_s,omitempty" mapstructure:"connect_timeout_s,omitempty"`
+	// Timeout (seconds) for establishing an upstream connection.
+	ConnectTimeoutS float64 `json:"connect_timeout_s" yaml:"connect_timeout_s" mapstructure:"connect_timeout_s"`
 
-	// Http2 corresponds to the JSON schema field "http2".
-	Http2 bool `json:"http2,omitempty,omitzero" yaml:"http2,omitempty" mapstructure:"http2,omitempty"`
+	// Negotiate HTTP/2 via ALPN, falling back to HTTP/1.1 when the upstream does not
+	// offer it. Some upstreams (APNs, certain CDNs) refuse 1.1; set false only to pin
+	// HTTP/1.1.
+	Http2 bool `json:"http2" yaml:"http2" mapstructure:"http2"`
 
-	// MaxConnections corresponds to the JSON schema field "max_connections".
-	MaxConnections int `json:"max_connections,omitempty,omitzero" yaml:"max_connections,omitempty" mapstructure:"max_connections,omitempty"`
+	// Maximum open upstream connections in the shared client pool.
+	MaxConnections int `json:"max_connections" yaml:"max_connections" mapstructure:"max_connections"`
 
-	// MaxKeepalive corresponds to the JSON schema field "max_keepalive".
-	MaxKeepalive int `json:"max_keepalive,omitempty,omitzero" yaml:"max_keepalive,omitempty" mapstructure:"max_keepalive,omitempty"`
+	// Maximum idle keep-alive connections the shared pool retains.
+	MaxKeepalive int `json:"max_keepalive" yaml:"max_keepalive" mapstructure:"max_keepalive"`
 
-	// MaxPerHost corresponds to the JSON schema field "max_per_host".
-	MaxPerHost int `json:"max_per_host,omitempty,omitzero" yaml:"max_per_host,omitempty" mapstructure:"max_per_host,omitempty"`
+	// Maximum concurrent calls to one upstream host, so one slow upstream cannot
+	// drain the whole connection pool.
+	MaxPerHost int `json:"max_per_host" yaml:"max_per_host" mapstructure:"max_per_host"`
 
-	// MaxRequestBytes corresponds to the JSON schema field "max_request_bytes".
-	MaxRequestBytes int `json:"max_request_bytes,omitempty,omitzero" yaml:"max_request_bytes,omitempty" mapstructure:"max_request_bytes,omitempty"`
+	// Default cap (bytes) on an execute request body, for content types without an
+	// entry in ``max_request_bytes_by_type``; over it the broker answers 413.
+	MaxRequestBytes int `json:"max_request_bytes" yaml:"max_request_bytes" mapstructure:"max_request_bytes"`
 
-	// MaxRequestBytesByType corresponds to the JSON schema field
-	// "max_request_bytes_by_type".
+	// Per-Content-Type request-body caps (bytes), matched most specific first: exact
+	// type (``application/json``), then wildcard (``audio/*``), then
+	// ``max_request_bytes``. A missing or unknown type gets the default, never
+	// unbounded.
 	MaxRequestBytesByType UpstreamClientConfigMaxRequestBytesByType `json:"max_request_bytes_by_type,omitempty,omitzero" yaml:"max_request_bytes_by_type,omitempty" mapstructure:"max_request_bytes_by_type,omitempty"`
 
-	// MaxResponseBytes corresponds to the JSON schema field "max_response_bytes".
-	MaxResponseBytes int `json:"max_response_bytes,omitempty,omitzero" yaml:"max_response_bytes,omitempty" mapstructure:"max_response_bytes,omitempty"`
+	// Cap (bytes) on an upstream response body, enforced while reading: the
+	// connection is aborted as soon as it is exceeded. 0 disables the cap (unbounded;
+	// not recommended).
+	MaxResponseBytes int `json:"max_response_bytes" yaml:"max_response_bytes" mapstructure:"max_response_bytes"`
 
-	// PoolTimeoutS corresponds to the JSON schema field "pool_timeout_s".
-	PoolTimeoutS float64 `json:"pool_timeout_s,omitempty,omitzero" yaml:"pool_timeout_s,omitempty" mapstructure:"pool_timeout_s,omitempty"`
+	// How long (seconds) a call waits for a free connection from the shared pool
+	// before failing.
+	PoolTimeoutS float64 `json:"pool_timeout_s" yaml:"pool_timeout_s" mapstructure:"pool_timeout_s"`
 
 	// Per-read *between-bytes* gap timeout (seconds, httpx semantics) on upstream
 	// responses — not a whole-stream cap. Pairs with
 	// ``broker.resilience.request_deadline_s``, which must be sized above it so one
 	// healthy slow attempt isn't pre-empted by the envelope deadline.
-	ReadTimeoutS float64 `json:"read_timeout_s,omitempty,omitzero" yaml:"read_timeout_s,omitempty" mapstructure:"read_timeout_s,omitempty"`
+	ReadTimeoutS float64 `json:"read_timeout_s" yaml:"read_timeout_s" mapstructure:"read_timeout_s"`
 
-	// StreamPassthroughEnabled corresponds to the JSON schema field
-	// "stream_passthrough_enabled".
-	StreamPassthroughEnabled bool `json:"stream_passthrough_enabled,omitempty,omitzero" yaml:"stream_passthrough_enabled,omitempty" mapstructure:"stream_passthrough_enabled,omitempty"`
+	// Stream upstream responses straight through to the client instead of buffering
+	// them. Applies to synchronous executions only; async executions always buffer,
+	// and so do executions with an ``Idempotency-Key`` when
+	// ``broker.idempotency.enabled`` is true. Off forces buffering everywhere.
+	StreamPassthroughEnabled bool `json:"stream_passthrough_enabled" yaml:"stream_passthrough_enabled" mapstructure:"stream_passthrough_enabled"`
 
-	// TransferDeadlineS corresponds to the JSON schema field "transfer_deadline_s".
-	TransferDeadlineS float64 `json:"transfer_deadline_s,omitempty,omitzero" yaml:"transfer_deadline_s,omitempty" mapstructure:"transfer_deadline_s,omitempty"`
+	// Total time (seconds) a streamed response body may take to transfer, so a steady
+	// trickle or a slow-draining client cannot hold an upstream connection forever;
+	// the stream is aborted when it is exceeded. Unlike ``read_timeout_s`` this
+	// bounds the whole body. 0 disables the deadline.
+	TransferDeadlineS float64 `json:"transfer_deadline_s" yaml:"transfer_deadline_s" mapstructure:"transfer_deadline_s"`
 
-	// WriteTimeoutS corresponds to the JSON schema field "write_timeout_s".
-	WriteTimeoutS float64 `json:"write_timeout_s,omitempty,omitzero" yaml:"write_timeout_s,omitempty" mapstructure:"write_timeout_s,omitempty"`
+	// Per-write timeout (seconds) while sending a request body upstream.
+	WriteTimeoutS float64 `json:"write_timeout_s" yaml:"write_timeout_s" mapstructure:"write_timeout_s"`
 }
 
+// Per-Content-Type request-body caps (bytes), matched most specific first: exact
+// type (“application/json“), then wildcard (“audio/*“), then
+// “max_request_bytes“. A missing or unknown type gets the default, never
+// unbounded.
 type UpstreamClientConfigMaxRequestBytesByType map[string]int
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -2726,40 +3407,40 @@ func (j *UpstreamClientConfig) UnmarshalJSON(value []byte) error {
 //
 // Keyed in `VendorRegistryConfig.entries` by a short slug (e.g. "github").
 type VendorAuthConfig struct {
-	// DisplayName corresponds to the JSON schema field "display_name".
+	// Vendor name shown in the connect picker.
 	DisplayName string `json:"display_name" yaml:"display_name" mapstructure:"display_name"`
 
-	// Flows corresponds to the JSON schema field "flows".
+	// OAuth flows the vendor supports, selected by ``kind``. The first entry is used
+	// when the caller expresses no preference.
 	Flows []interface{} `json:"flows" yaml:"flows" mapstructure:"flows"`
 
-	// IdentityProbe corresponds to the JSON schema field "identity_probe".
+	// Request that labels the connected account (``connected_as``) after a successful
+	// connect. Unset, the credential is still valid but carries no label.
 	IdentityProbe *VendorAuthConfigIdentityProbe `json:"identity_probe,omitempty,omitzero" yaml:"identity_probe,omitempty" mapstructure:"identity_probe,omitempty"`
 
-	// Scopes corresponds to the JSON schema field "scopes".
+	// The vendor's scope catalog offered on the review page.
 	Scopes []VendorScopeConfig `json:"scopes,omitempty,omitzero" yaml:"scopes,omitempty" mapstructure:"scopes,omitempty"`
 
-	// Vendor corresponds to the JSON schema field "vendor".
+	// Catalog API id of the vendor's API, in ``<domain>/<name>`` form (e.g.
+	// ``github.com/api.github.com``); credentials created through this entry are
+	// scoped to it.
 	Vendor string `json:"vendor" yaml:"vendor" mapstructure:"vendor"`
 }
 
-// Generic identity-echo protocol config for a vendor.
-//
-// After the connect flow completes, the platform calls
-// `{method} {endpoint}` with the freshly minted access token, extracts
-// `identity_field` (dotted JSON path) from the response body, and formats it
-// into `display_template` (Python str.format). The result is stored as
-// `connected_as` and returned to the caller.
+// Request that labels the connected account (“connected_as“) after a successful
+// connect. Unset, the credential is still valid but carries no label.
 type VendorAuthConfigIdentityProbe struct {
-	// DisplayTemplate corresponds to the JSON schema field "display_template".
+	// Python ``str.format`` template for the ``connected_as`` label; it can reference
+	// top-level response fields and ``{value}`` (the extracted identity value).
 	DisplayTemplate string `json:"display_template" yaml:"display_template" mapstructure:"display_template"`
 
-	// Endpoint corresponds to the JSON schema field "endpoint".
+	// URL called with the new access token to identify the connected account.
 	Endpoint string `json:"endpoint" yaml:"endpoint" mapstructure:"endpoint"`
 
-	// IdentityField corresponds to the JSON schema field "identity_field".
+	// Dotted JSON path of the identity value in the probe response (e.g. ``login``).
 	IdentityField string `json:"identity_field" yaml:"identity_field" mapstructure:"identity_field"`
 
-	// Method corresponds to the JSON schema field "method".
+	// HTTP method of the identity probe.
 	Method VendorIdentityProbeConfigMethod `json:"method,omitempty,omitzero" yaml:"method,omitempty" mapstructure:"method,omitempty"`
 }
 
@@ -2817,19 +3498,19 @@ func (j *VendorAuthConfig) UnmarshalJSON(value []byte) error {
 // client) since the redirect-based flow exchanges the code at the token
 // endpoint.
 type VendorAuthorizationCodeFlowConfig struct {
-	// AuthorizeUrl corresponds to the JSON schema field "authorize_url".
+	// The vendor's authorization endpoint URL.
 	AuthorizeUrl string `json:"authorize_url" yaml:"authorize_url" mapstructure:"authorize_url"`
 
-	// ClientId corresponds to the JSON schema field "client_id".
+	// Platform-shipped OAuth application id.
 	ClientId string `json:"client_id" yaml:"client_id" mapstructure:"client_id"`
 
-	// ClientSecret corresponds to the JSON schema field "client_secret".
+	// OAuth application secret used to exchange the code at the token endpoint.
 	ClientSecret string `json:"client_secret" yaml:"client_secret" mapstructure:"client_secret"`
 
 	// Kind corresponds to the JSON schema field "kind".
-	Kind string `json:"kind,omitempty,omitzero" yaml:"kind,omitempty" mapstructure:"kind,omitempty"`
+	Kind string `json:"kind" yaml:"kind" mapstructure:"kind"`
 
-	// TokenUrl corresponds to the JSON schema field "token_url".
+	// The vendor's token endpoint URL.
 	TokenUrl string `json:"token_url" yaml:"token_url" mapstructure:"token_url"`
 }
 
@@ -2872,17 +3553,16 @@ func (j *VendorAuthorizationCodeFlowConfig) UnmarshalJSON(value []byte) error {
 // public-client flow — no secret). Endpoints are the vendor's device
 // authorization + token endpoints.
 type VendorDeviceAuthorizationFlowConfig struct {
-	// AuthorizationEndpoint corresponds to the JSON schema field
-	// "authorization_endpoint".
+	// The vendor's device authorization endpoint URL.
 	AuthorizationEndpoint string `json:"authorization_endpoint" yaml:"authorization_endpoint" mapstructure:"authorization_endpoint"`
 
-	// ClientId corresponds to the JSON schema field "client_id".
+	// Platform-shipped OAuth application id (public client, no secret).
 	ClientId string `json:"client_id" yaml:"client_id" mapstructure:"client_id"`
 
 	// Kind corresponds to the JSON schema field "kind".
-	Kind string `json:"kind,omitempty,omitzero" yaml:"kind,omitempty" mapstructure:"kind,omitempty"`
+	Kind string `json:"kind" yaml:"kind" mapstructure:"kind"`
 
-	// TokenEndpoint corresponds to the JSON schema field "token_endpoint".
+	// The vendor's token endpoint URL.
 	TokenEndpoint string `json:"token_endpoint" yaml:"token_endpoint" mapstructure:"token_endpoint"`
 }
 
@@ -2924,17 +3604,18 @@ func (j *VendorDeviceAuthorizationFlowConfig) UnmarshalJSON(value []byte) error 
 // into `display_template` (Python str.format). The result is stored as
 // `connected_as` and returned to the caller.
 type VendorIdentityProbeConfig struct {
-	// DisplayTemplate corresponds to the JSON schema field "display_template".
+	// Python ``str.format`` template for the ``connected_as`` label; it can reference
+	// top-level response fields and ``{value}`` (the extracted identity value).
 	DisplayTemplate string `json:"display_template" yaml:"display_template" mapstructure:"display_template"`
 
-	// Endpoint corresponds to the JSON schema field "endpoint".
+	// URL called with the new access token to identify the connected account.
 	Endpoint string `json:"endpoint" yaml:"endpoint" mapstructure:"endpoint"`
 
-	// IdentityField corresponds to the JSON schema field "identity_field".
+	// Dotted JSON path of the identity value in the probe response (e.g. ``login``).
 	IdentityField string `json:"identity_field" yaml:"identity_field" mapstructure:"identity_field"`
 
-	// Method corresponds to the JSON schema field "method".
-	Method VendorIdentityProbeConfigMethod `json:"method,omitempty,omitzero" yaml:"method,omitempty" mapstructure:"method,omitempty"`
+	// HTTP method of the identity probe.
+	Method VendorIdentityProbeConfigMethod `json:"method" yaml:"method" mapstructure:"method"`
 }
 
 type VendorIdentityProbeConfigMethod string
@@ -2996,10 +3677,13 @@ func (j *VendorIdentityProbeConfig) UnmarshalJSON(value []byte) error {
 
 // Top-level vendor auth registry.
 type VendorRegistryConfig struct {
-	// Entries corresponds to the JSON schema field "entries".
+	// Verified vendors offered by the agent-driven connect flow, keyed by a short
+	// slug (e.g. ``github``).
 	Entries VendorRegistryConfigEntries `json:"entries,omitempty,omitzero" yaml:"entries,omitempty" mapstructure:"entries,omitempty"`
 }
 
+// Verified vendors offered by the agent-driven connect flow, keyed by a short slug
+// (e.g. “github“).
 type VendorRegistryConfigEntries map[string]VendorAuthConfig
 
 // A single OAuth scope exposed by the vendor.
@@ -3008,16 +3692,16 @@ type VendorRegistryConfigEntries map[string]VendorAuthConfig
 // default; write/admin scopes get a warning flag. `description` is
 // human-facing copy displayed on the review page.
 type VendorScopeConfig struct {
-	// Classification corresponds to the JSON schema field "classification".
-	Classification VendorScopeConfigClassification `json:"classification,omitempty,omitzero" yaml:"classification,omitempty" mapstructure:"classification,omitempty"`
+	// Risk class shown on the review page: write and admin scopes carry a warning.
+	Classification VendorScopeConfigClassification `json:"classification" yaml:"classification" mapstructure:"classification"`
 
-	// Default corresponds to the JSON schema field "default".
+	// Pre-select this scope on the review page.
 	Default bool `json:"default,omitempty,omitzero" yaml:"default,omitempty" mapstructure:"default,omitempty"`
 
-	// Description corresponds to the JSON schema field "description".
+	// Human-facing explanation of the scope, shown on the review page.
 	Description string `json:"description,omitempty,omitzero" yaml:"description,omitempty" mapstructure:"description,omitempty"`
 
-	// Name corresponds to the JSON schema field "name".
+	// Scope string as the vendor expects it on the authorize request.
 	Name string `json:"name" yaml:"name" mapstructure:"name"`
 }
 
@@ -3087,32 +3771,71 @@ func (j *VendorScopeConfig) UnmarshalJSON(value []byte) error {
 // from claim), and processes it. A job left “RUNNING“ past that deadline by a
 // crashed worker/pod is reclaimed on a later poll. A handler failure requeues the
 // job with capped exponential backoff up to “max_attempts“ claims; beyond that
-// it is dead-lettered (poison-message handling) rather than looped forever.
+// it is dead-lettered (poison-message handling) rather than looped forever. A
+// handler that raises “NonRetryableJobError“ (a failure no retry can change,
+// such as an import whose spec fails validation) fails the job on that attempt
+// instead.
+//
+// Each claim is a single atomic “UPDATE“ (“FOR UPDATE SKIP LOCKED“ on
+// Postgres, a serialised write transaction on SQLite), so any number of worker
+// loops — across processes or replicas, each running up to “concurrency“
+// jobs — can poll the same queue without double-claiming a job.
 type WorkerConfig struct {
-	// DrainTimeoutS corresponds to the JSON schema field "drain_timeout_s".
-	DrainTimeoutS float64 `json:"drain_timeout_s,omitempty,omitzero" yaml:"drain_timeout_s,omitempty" mapstructure:"drain_timeout_s,omitempty"`
+	// Maximum jobs one worker process runs at once (1 = serial). Postgres only:
+	// SQLite requires 1, because a job's handler holds the database write lock across
+	// its upstream call, so a second concurrent job's writes would time out. Each
+	// in-flight job holds about 2 admin-DB connections at once (its handler
+	// transaction plus the run-time authorization or credential-audit session it
+	// opens), so ``2 * concurrency`` must stay below ``databases.admin.pool_max``,
+	// leaving the remainder for HTTP requests and other background work in the same
+	// process.
+	Concurrency int `json:"concurrency" yaml:"concurrency" mapstructure:"concurrency"`
 
-	// MaxAttempts corresponds to the JSON schema field "max_attempts".
-	MaxAttempts int `json:"max_attempts,omitempty,omitzero" yaml:"max_attempts,omitempty" mapstructure:"max_attempts,omitempty"`
+	// On graceful shutdown, how long (seconds) the worker waits for in-flight jobs to
+	// finish. Past it the worker stops; a still-``RUNNING`` job is reclaimed via its
+	// visibility timeout after restart, so no work is dropped.
+	DrainTimeoutS float64 `json:"drain_timeout_s" yaml:"drain_timeout_s" mapstructure:"drain_timeout_s"`
+
+	// Total claims of a repeatedly failing job before it is dead-lettered instead of
+	// requeued.
+	MaxAttempts int `json:"max_attempts" yaml:"max_attempts" mapstructure:"max_attempts"`
+
+	// Idle wait (seconds) between job-queue polls when nothing is claimable. A job
+	// enqueued in the same process wakes the worker immediately, so this mainly
+	// bounds pickup latency for jobs enqueued by another process and how quickly
+	// visibility-expired jobs are reclaimed. Every poll is a write transaction (the
+	// claim is an ``UPDATE``) even when the queue is empty — on SQLite it takes the
+	// database write lock that request writes also wait on — so each process issues
+	// about ``1 / poll_interval_s`` of them per second while idle.
+	PollIntervalS float64 `json:"poll_interval_s" yaml:"poll_interval_s" mapstructure:"poll_interval_s"`
 
 	// First delay, in seconds, before the worker retries after losing its database
 	// connection. Doubles on each further failed attempt up to
 	// ``reconnect_backoff_max_s``; each delay is then jittered into the upper half of
 	// its value so workers sharing a database do not retry in lockstep.
-	ReconnectBackoffBaseS float64 `json:"reconnect_backoff_base_s,omitempty,omitzero" yaml:"reconnect_backoff_base_s,omitempty" mapstructure:"reconnect_backoff_base_s,omitempty"`
+	ReconnectBackoffBaseS float64 `json:"reconnect_backoff_base_s" yaml:"reconnect_backoff_base_s" mapstructure:"reconnect_backoff_base_s"`
 
 	// Cap, in seconds, on the worker's reconnect delay while the database is
 	// unreachable — a recovered database is picked up within this long.
-	ReconnectBackoffMaxS float64 `json:"reconnect_backoff_max_s,omitempty,omitzero" yaml:"reconnect_backoff_max_s,omitempty" mapstructure:"reconnect_backoff_max_s,omitempty"`
+	ReconnectBackoffMaxS float64 `json:"reconnect_backoff_max_s" yaml:"reconnect_backoff_max_s" mapstructure:"reconnect_backoff_max_s"`
 
-	// RetryBackoffBaseS corresponds to the JSON schema field "retry_backoff_base_s".
-	RetryBackoffBaseS float64 `json:"retry_backoff_base_s,omitempty,omitzero" yaml:"retry_backoff_base_s,omitempty" mapstructure:"retry_backoff_base_s,omitempty"`
+	// Base delay (seconds) before a failed job becomes claimable again: attempt ``n``
+	// waits ``min(retry_backoff_base_s * 2**(n-1), retry_backoff_max_s)``.
+	RetryBackoffBaseS float64 `json:"retry_backoff_base_s" yaml:"retry_backoff_base_s" mapstructure:"retry_backoff_base_s"`
 
-	// RetryBackoffMaxS corresponds to the JSON schema field "retry_backoff_max_s".
-	RetryBackoffMaxS float64 `json:"retry_backoff_max_s,omitempty,omitzero" yaml:"retry_backoff_max_s,omitempty" mapstructure:"retry_backoff_max_s,omitempty"`
+	// Cap (seconds) on the exponential backoff between attempts of a failed job.
+	RetryBackoffMaxS float64 `json:"retry_backoff_max_s" yaml:"retry_backoff_max_s" mapstructure:"retry_backoff_max_s"`
 
-	// VisibilityTimeoutS corresponds to the JSON schema field "visibility_timeout_s".
-	VisibilityTimeoutS float64 `json:"visibility_timeout_s,omitempty,omitzero" yaml:"visibility_timeout_s,omitempty" mapstructure:"visibility_timeout_s,omitempty"`
+	// Seconds between the worker's retention sweeps, which expire lapsed execution
+	// approvals and delete expired job results and long-expired access/refresh token
+	// rows. Measured in wall time, independent of ``poll_interval_s`` and wake-ups.
+	SweepIntervalS float64 `json:"sweep_interval_s" yaml:"sweep_interval_s" mapstructure:"sweep_interval_s"`
+
+	// Seconds a claimed (``RUNNING``) job stays invisible to other workers; past it
+	// the job is reclaimed and run again. Size it safely above the longest expected
+	// handler runtime (upstream timeout plus slack) so a healthy but slow job is
+	// never reclaimed mid-flight and processed twice.
+	VisibilityTimeoutS float64 `json:"visibility_timeout_s" yaml:"visibility_timeout_s" mapstructure:"visibility_timeout_s"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -3126,11 +3849,29 @@ func (j *WorkerConfig) UnmarshalJSON(value []byte) error {
 	if err := json.Unmarshal(value, &plain); err != nil {
 		return err
 	}
+	if v, ok := raw["concurrency"]; !ok || v == nil {
+		plain.Concurrency = 1
+	}
+	if 64 < plain.Concurrency {
+		return fmt.Errorf("field %s: must be <= %v", "concurrency", 64)
+	}
+	if 1 > plain.Concurrency {
+		return fmt.Errorf("field %s: must be >= %v", "concurrency", 1)
+	}
 	if v, ok := raw["drain_timeout_s"]; !ok || v == nil {
 		plain.DrainTimeoutS = 25.0
 	}
 	if v, ok := raw["max_attempts"]; !ok || v == nil {
 		plain.MaxAttempts = 5
+	}
+	if v, ok := raw["poll_interval_s"]; !ok || v == nil {
+		plain.PollIntervalS = 2.0
+	}
+	if 60 < plain.PollIntervalS {
+		return fmt.Errorf("field %s: must be <= %v", "poll_interval_s", 60)
+	}
+	if 0.25 > plain.PollIntervalS {
+		return fmt.Errorf("field %s: must be >= %v", "poll_interval_s", 0.25)
 	}
 	if v, ok := raw["reconnect_backoff_base_s"]; !ok || v == nil {
 		plain.ReconnectBackoffBaseS = 2.0
@@ -3155,6 +3896,15 @@ func (j *WorkerConfig) UnmarshalJSON(value []byte) error {
 	}
 	if v, ok := raw["retry_backoff_max_s"]; !ok || v == nil {
 		plain.RetryBackoffMaxS = 60.0
+	}
+	if v, ok := raw["sweep_interval_s"]; !ok || v == nil {
+		plain.SweepIntervalS = 120.0
+	}
+	if 86400 < plain.SweepIntervalS {
+		return fmt.Errorf("field %s: must be <= %v", "sweep_interval_s", 86400)
+	}
+	if 1 > plain.SweepIntervalS {
+		return fmt.Errorf("field %s: must be >= %v", "sweep_interval_s", 1)
 	}
 	if v, ok := raw["visibility_timeout_s"]; !ok || v == nil {
 		plain.VisibilityTimeoutS = 120.0

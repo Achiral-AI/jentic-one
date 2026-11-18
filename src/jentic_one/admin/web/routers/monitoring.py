@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 
 from jentic_one.admin.services.monitoring_service import MonitoringService, UsageFilters
 from jentic_one.admin.web.deps import get_monitoring_service
+from jentic_one.admin.web.removed_params import log_ignored_query_params
 from jentic_one.admin.web.schemas.monitoring import (
     DailyExecutionBucket,
     ExecutionStatsResponse,
@@ -23,7 +24,7 @@ from jentic_one.shared.web import openapi_examples as ex
 router = APIRouter()
 
 
-@router.get("/monitoring/executions")
+@router.get("/monitoring/executions", summary="Get execution statistics")
 async def get_execution_stats(
     identity: Identity = get_current_identity(required_permissions=["org:admin"]),
     svc: MonitoringService = Depends(get_monitoring_service),
@@ -62,8 +63,9 @@ async def get_execution_stats(
     )
 
 
-@router.get("/monitoring/usage")
+@router.get("/monitoring/usage", summary="Get usage statistics")
 async def get_usage_stats(
+    request: Request,
     identity: Identity = get_current_identity(required_permissions=["org:admin"]),
     svc: MonitoringService = Depends(get_monitoring_service),
     since: int | None = Query(
@@ -94,11 +96,6 @@ async def get_usage_stats(
         description="Maximum number of `top` rows to return (1-50, default 10).",
         openapi_examples=ex.example(10),
     ),
-    toolkit_id: str | None = Query(
-        default=None,
-        description="Legacy: only count executions mediated by this toolkit.",
-        openapi_examples=ex.example(ex.TOOLKIT_ID),
-    ),
     api_id: str | None = Query(
         default=None,
         description="Only count executions of this API, given as `vendor/name`.",
@@ -116,8 +113,9 @@ async def get_usage_stats(
     ),
 ) -> UsageResponse:
     """Return detailed usage statistics for the monitoring overview."""
+    log_ignored_query_params(request, identity)
     resolved_group_by = group_by if group_by is not None else GroupBy.API
-    filters = UsageFilters(toolkit_id=toolkit_id, api_id=api_id, agent_id=agent_id, status=status)
+    filters = UsageFilters(api_id=api_id, agent_id=agent_id, status=status)
     result = await svc.get_usage_stats(
         since=since, until=until, group_by=resolved_group_by, top_limit=top_limit, filters=filters
     )

@@ -63,35 +63,14 @@ Everything from here down is for code contributions.
 
 ## Getting started
 
-1. Install [uv](https://docs.astral.sh/uv/) — `brew install uv` (or see the uv docs).
-2. Clone the repository.
-3. Install dependencies and git hooks:
-
-   ```bash
-   make install
-   ```
-
-4. Run the checks to confirm your environment is set up:
-
-   ```bash
-   make check
-   ```
-
-   (`make check` ends with `score`, which needs Node/`npx` and network access;
-   the offline gates run first, so a missing Node only fails the last step.)
-
-5. Start the app locally:
-
-   ```bash
-   make start-app
-   ```
-
-   For the full dev loop (backend + UI watch), use `make dev` — see
-   [docs/development/local-setup.md](docs/development/local-setup.md).
+[docs/development/local-setup.md](docs/development/local-setup.md) is the
+on-ramp: prerequisites, `make install`, running the stack (`make dev`,
+`make start-local`, the Docker-free SQLite path), and common failures. Confirm your environment with
+`make check`. Running the tests is [docs/development/testing.md](docs/development/testing.md).
 
 See [deploy/README.md](deploy/README.md) for the build architecture and
-common build tasks, and [docs/development/](docs/development/README.md) for
-the contributor-facing guides (local setup, releasing, product scope).
+[docs/development/](docs/development/README.md) for the other
+contributor-facing guides.
 
 ## Development workflow
 
@@ -149,25 +128,40 @@ By participating, you agree to uphold it.
 | [ruff](https://docs.astral.sh/ruff/) | Linting + formatting (`make lint` / `make fix`) |
 | mypy (strict) | Static type checking (`make typecheck`) |
 | lefthook | Git hooks (pre-commit lint + secrets, commit-msg lint) |
-| detect-secrets | Secrets scanning (`make detect-secrets`) |
+| detect-secrets | Secrets scanning: `make detect-secrets` (CI gate), `make secrets-baseline` (regenerate) |
+
+### Secrets baseline
+
+`.secrets.baseline` allowlists known test-fixture secrets. It is stored in
+slim form (no line numbers, no timestamp), so editing a file that holds a
+known fixture does not change it. Always regenerate it with
+`make secrets-baseline`, never with raw `detect-secrets scan --baseline` (CI
+rejects the non-slim output). For a one-off false positive, prefer an inline
+`# pragma: allowlist secret` comment.
+
+Do not hand-edit the `version`, `plugins_used` or `filters_used` blocks. The
+gate scans with detect-secrets' defaults, never with the settings in the file,
+and fails if the file disagrees with them. Run `make secrets-baseline` when:
+
+- a rebase or merge conflicts on the baseline (it regenerates from a fresh
+  scan, so conflict markers don't matter);
+- you move or rename a file holding a fixture (the pre-commit hook reports the
+  new path as a new finding);
+- detect-secrets is upgraded, including by a Dependabot PR (the gate reports a
+  `version` / `plugins_used` mismatch).
+
+Deleting a fixture file, or removing a fixture from a file, is handled by the
+pre-commit hook: it trims the baseline and exits 3 so you can stage it.
 
 ## Testing
 
-Tests are split into tiers:
-
-```bash
-make test-unit          # logic with no external services
-make test-integration   # database lifecycle against PostgreSQL fixtures
-make test-arch          # layering and convention enforcement
-make test-smoke         # liveness against running services
-```
+[docs/development/testing.md](docs/development/testing.md) lists the Python
+test tiers, what each needs running, and the generated-artifact drift checks.
+In short:
 
 - Unit tests must not require external services.
-- Integration tests run against PostgreSQL fixtures (`make start-fixtures` /
-  `make stop-fixtures`).
-- If 5432 is taken, set `JENTIC_PG_PORT` (e.g. `JENTIC_PG_PORT=55432`) for both
-  `make start-fixtures` and the test run — the fixtures publish Postgres on it
-  and the integration and web harnesses connect to it.
+- Never mock the database — integration tests run against real PostgreSQL
+  fixtures (`make start-fixtures`) or SQLite (`make test-integration-sqlite`).
 - Use synthetic/fabricated data in tests — never real credentials or data.
 
 ## Architecture & conventions

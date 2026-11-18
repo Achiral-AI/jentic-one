@@ -21,6 +21,27 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from jentic.problem_details import ProblemDetailException
 
+from jentic_one.shared.db.connectivity import redact_sql
+from jentic_one.shared.db.errors import DatabaseCommitOutcomeUnknownError, DatabaseUnavailableError
+from jentic_one.shared.state.backend import StateBackendCapacityError
+from jentic_one.shared.web.cache_control import PRIVATE_NO_STORE, request_carries_credential
+
+# The cap keeps the log line short.
+_MAX_LOGGED_DB_DETAIL = 200
+
+#: Client detail for a 503 whose write may already have been applied. It must
+#: not invite a blind retry, which could apply the write twice.
+DB_COMMIT_OUTCOME_UNKNOWN_DETAIL: Final = (
+    "The database connection was lost while saving; check whether the change "
+    "was applied before retrying."
+)
+
+#: Client details for the database errors every surface maps to a 503.
+DB_UNAVAILABLE_SAFE_DETAILS: Final[Mapping[type[Exception], str]] = {
+    DatabaseUnavailableError: "The database is temporarily unavailable; please retry.",
+    DatabaseCommitOutcomeUnknownError: DB_COMMIT_OUTCOME_UNKNOWN_DETAIL,
+}
+
 # ``ctx`` members that describe the *schema constraint* (never the submitted
 # value). Anything else in ``ctx`` — notably ``error``, which carries a custom
 # validator's exception and may quote the input — is dropped.
@@ -66,18 +87,79 @@ def sanitize_validation_errors(errors: Iterable[Any]) -> list[dict[str, Any]]:
     return sanitized
 
 
+#: Adds extension members to a request-validation 422 for the routes it
+#: recognises; returns ``None`` for every other request.
+ValidationEnricher = Callable[
+    [Request, RequestValidationError], Coroutine[Any, Any, dict[str, Any] | None]
+]
+
+_VALIDATION_ENRICHERS: list[ValidationEnricher] = []
+
+
+def register_validation_enricher(enricher: ValidationEnricher) -> None:
+    """Let a surface add members to the 422 its own routes' validation errors produce.
+
+    Idempotent. An enricher must only ever add server data, never echo input.
+    """
+    if enricher not in _VALIDATION_ENRICHERS:
+        _VALIDATION_ENRICHERS.append(enricher)
+
+
 async def request_validation_error_handler(
-    _request: Request, exc: RequestValidationError
+    request: Request, exc: RequestValidationError
 ) -> JSONResponse:
-    """FastAPI's default 422 body (``{"detail": [...]}``) without echoed input."""
-    return JSONResponse(
-        status_code=422,
-        content={"detail": sanitize_validation_errors(exc.errors())},
+    """FastAPI's default 422 body (``{"detail": [...]}``) without echoed input.
+
+    Registered enrichers may add members for routes they own; a failing
+    enricher never turns the 422 into a 500.
+    """
+    content: dict[str, Any] = {"detail": sanitize_validation_errors(exc.errors())}
+    for enricher in _VALIDATION_ENRICHERS:
+        try:
+            extra = await enricher(request, exc)
+        except Exception:
+            structlog.get_logger("jentic_one.shared.web.errors").warning(
+                "validation_enricher_failed", exc_info=True
+            )
+            continue
+        if extra:
+            content.update({k: v for k, v in extra.items() if k not in content})
+    return JSONResponse(status_code=422, content=content)
+
+
+def log_database_unavailable(
+    logger: Any, event: str, exc: DatabaseUnavailableError, **fields: Any
+) -> None:
+    """Log a transient database failure at warning level, without a traceback.
+
+    The chained SQLAlchemy cause renders the SQL statement and its bound
+    parameters, so only the exception and cause type names and the SQL-free
+    detail (capped) are logged.
+    """
+    cause = exc.__cause__
+    logger.warning(
+        event,
+        **fields,
+        error_type=type(exc).__name__,
+        cause=type(cause).__name__ if cause is not None else None,
+        error=redact_sql(exc.detail)[:_MAX_LOGGED_DB_DETAIL],
     )
 
 
 ResponseHook = Callable[[Request, Exception, int, JSONResponse], JSONResponse]
 ServiceErrorHandler = Callable[[Request, Any], Coroutine[Any, Any, JSONResponse]]
+
+
+def _safe_detail_for(
+    exc: Exception, safe_details: Mapping[type[Exception], str] | None
+) -> str | None:
+    """The ``safe_details`` entry for the most specific class in ``exc``'s MRO."""
+    if not safe_details:
+        return None
+    for cls in type(exc).__mro__:
+        if cls in safe_details:
+            return safe_details[cls]
+    return None
 
 
 def make_service_error_handler(
@@ -94,11 +176,15 @@ def make_service_error_handler(
             (e.g. adding custom headers). Signature:
             ``(request, exc, status_code, response) -> response``.
         safe_details: Optional mapping from exception class to a static, generic
-            ``detail`` string to send to the client *instead* of ``str(exc)``. Use
+            ``detail`` string to send to the client *instead* of ``str(exc)``. The
+            most specific class in the exception's MRO wins, so a subclass can
+            override its parent's detail without its own ``error_map`` entry. Use
             this for infrastructure errors whose raw message would leak internals
             (e.g. a wrapped SQLAlchemy ``OperationalError`` carrying the full SQL
             statement, bound parameters, and connection URL — CWE-209). The raw
-            ``str(exc)`` is still logged server-side for diagnosis.
+            ``str(exc)`` is still logged server-side for diagnosis, except for
+            :class:`DatabaseUnavailableError`, which is logged by
+            :func:`log_database_unavailable` (type names and SQL-free detail).
     """
     logger = structlog.get_logger("jentic_one.shared.web.errors")
 
@@ -106,14 +192,31 @@ def make_service_error_handler(
         for error_cls in type(exc).__mro__:
             if error_cls in error_map:
                 status_code, type_slug = error_map[error_cls]
-                safe_detail = safe_details.get(error_cls) if safe_details else None
+                safe_detail = _safe_detail_for(exc, safe_details)
                 problem = ProblemDetailException(
                     status_code=status_code,
                     detail=safe_detail if safe_detail is not None else str(exc),
                     type=type_slug,
                     instance=request.url.path,
                 )
-                if status_code >= 500:
+                if isinstance(exc, DatabaseUnavailableError):
+                    log_database_unavailable(
+                        logger,
+                        "database_unavailable",
+                        exc,
+                        status=status_code,
+                        type=type_slug,
+                        path=request.url.path,
+                    )
+                elif status_code == 503 and hasattr(exc, "retry_after_s"):
+                    logger.warning(
+                        "service_at_capacity",
+                        status=status_code,
+                        type=type_slug,
+                        path=request.url.path,
+                        retry_after_s=exc.retry_after_s,
+                    )
+                elif status_code >= 500:
                     logger.error(
                         "unhandled_service_error",
                         status=status_code,
@@ -136,6 +239,10 @@ def make_service_error_handler(
                     content=problem.detail,
                     media_type="application/problem+json",
                 )
+                if isinstance(exc, DatabaseUnavailableError) and not isinstance(
+                    exc, DatabaseCommitOutcomeUnknownError
+                ):
+                    response.headers.setdefault("Retry-After", str(exc.retry_after_s))
                 if response_hook is not None:
                     response = response_hook(request, exc, status_code, response)
                 return response
@@ -158,6 +265,11 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
     ``500``/``default`` response documents. The body is static (``str(exc)`` may
     carry internals, CWE-209); the exception is logged here, and Starlette still
     re-raises it afterwards so the server's own traceback logging is unchanged.
+
+    The handler runs in ``ServerErrorMiddleware``, outside the user middleware
+    stack, so :class:`~jentic_one.shared.web.cache_control.AuthenticatedResponseCacheMiddleware`
+    never sees this response; a credentialed request's 500 is marked
+    ``private, no-store`` here instead (#1835).
     """
     structlog.get_logger("jentic_one.shared.web.errors").error(
         "unhandled_exception", path=request.url.path, exc_info=exc
@@ -169,6 +281,47 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
         title="Internal Server Error",
         instance=request.url.path,
     )
+    headers = (
+        {"Cache-Control": PRIVATE_NO_STORE}
+        if request_carries_credential(request.scope.get("headers", []))
+        else None
+    )
     return JSONResponse(
-        status_code=500, content=problem.detail, media_type="application/problem+json"
+        status_code=500,
+        content=problem.detail,
+        media_type="application/problem+json",
+        headers=headers,
+    )
+
+
+async def state_backend_capacity_error_handler(
+    request: Request, exc: StateBackendCapacityError
+) -> JSONResponse:
+    """Refuse a request whose shared-state write was refused: 503 + ``Retry-After``.
+
+    The write was a claim, a single-use marker or a nonce the request depends
+    on, so the request cannot proceed safely without it. Registered on every
+    app, so a caller that lets the error propagate fails closed.
+    """
+    structlog.get_logger("jentic_one.shared.web.errors").warning(
+        "shared_state_write_refused",
+        path=request.url.path,
+        namespace=exc.namespace,
+        # Whether one owner's share (not the namespace or the backend) was
+        # full. The owner itself is not logged: for some namespaces it is
+        # derived from the client's address.
+        owner_share=exc.owner is not None,
+    )
+    problem = ProblemDetailException(
+        status_code=503,
+        detail="The service is temporarily at capacity; retry after the indicated delay.",
+        type="state_backend_capacity",
+        title="Service Unavailable",
+        instance=request.url.path,
+    )
+    return JSONResponse(
+        status_code=503,
+        content=problem.detail,
+        media_type="application/problem+json",
+        headers={"Retry-After": str(exc.retry_after_s)},
     )

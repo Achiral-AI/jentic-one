@@ -34,6 +34,10 @@ in order of preference:
    - Set `auth.canonical_base_url` in `jentic-one.yaml` to the public app URL,
      and the `credentials.providers.direct_oauth2.redirect_uri` to
      `<that URL>/credentials/oauth/callback`.
+   - Serve the UI from that same host. A connect only completes in the
+     browser that started it (a short-lived cookie, scoped to the callback
+     path, is set when you click Connect or approve an agent's request), so
+     the callback must land on the host that browser is using.
    - Agents register with **exactly** that URL (`jentic register --url
      https://jentic.example.com --broker-url https://broker.jentic.example.com`).
      The token audience is an exact string match: URL drift = `invalid_grant`.
@@ -84,12 +88,12 @@ exposure vector in past audits.
 - **One identity per agent.** Each machine/agent registers its own identity so
   it can be individually approved, scoped, audited, and revoked (revoke in
   `/app/agents`; the upstream API key is untouched).
-- **Same-host isolation (when separate machines are not possible):**
-  `jentic setup` can create a dedicated Unix user for the coding agent and
-  `jentic run <agent>` launches it confined (macOS `sandbox-exec` / Linux
-  `bwrap`), with the credential store outside the agent's reach. See the
-  [local agent guide](../guides/local-agent.md) and
-  [sandbox design](../security/same-host/README.md).
+- **Same-host isolation (when separate machines are not possible):** run the
+  coding agent in a container or VM (or its built-in sandbox with default-deny
+  egress) so the credential store stays outside its reach. See the
+  [same-host options](../security/same-host/README.md). If an earlier release
+  left a local agent account (`<user>-local-agent`) on the machine, remove it
+  with `jentic reset`.
 - The agent holds a token, never an upstream API credential. If an agent is
   compromised, it can only make the calls it was already allowed to make —
   and every one is in the audit log.

@@ -33,7 +33,7 @@
 # stages stay on the official python/node images — they never ship.
 ARG PYTHON_IMAGE=python:3.12-slim@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36
 ARG NODE_IMAGE=node:22-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436
-ARG UBUNTU_IMAGE=ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
+ARG UBUNTU_IMAGE=ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
 
 # UI build stage — produces ui/dist, bundled into the wheel via the
 # [tool.hatch.build.targets.wheel.force-include] "ui/dist" -> jentic_one/static.
@@ -61,6 +61,20 @@ COPY openapi/ openapi/
 COPY --from=ui-builder /ui/dist ui/dist
 
 RUN uv build --wheel --out-dir /build/dist
+# The wheel's metadata carries only the open ranges from pyproject.toml, so
+# `pip install <wheel>` alone would re-resolve them against PyPI at build time.
+# The app stage installs this hash-pinned export of uv.lock first and the
+# wheel with --no-deps, so the image ships exactly the locked set CI tests
+# (#1819). Universal markers keep it valid for amd64 and arm64 alike.
+# --locked fails the build when uv.lock is out of date with pyproject.toml: a
+# dependency declared there but missing from the lock would otherwise be
+# absent from the image. EXTRAS (space-separated, e.g. `redis`) selects
+# optional extras; the --no-deps wheel install ignores `[extra]`, so extras
+# reach the image only through this export.
+ARG EXTRAS=""
+RUN uv export --locked --no-dev --no-emit-project \
+        $(for e in ${EXTRAS}; do printf -- '--extra %s ' "$e"; done) \
+        -o /build/dist/requirements.txt
 
 FROM ${UBUNTU_IMAGE} AS runtime
 
@@ -86,31 +100,26 @@ RUN groupadd -g 10001 jentic \
 
 EXPOSE 8000
 
-# --- broker stage (Achiral jentic-mini publisher) ------------------------
-FROM runtime AS broker
-
-COPY --from=builder /build/dist/*.whl /tmp/
-RUN python3.12 -m venv /opt/venv && \
-    whl="$(ls /tmp/jentic_one-*.whl)" && \
-    /opt/venv/bin/pip install --no-cache-dir "${whl}" && \
-    rm /tmp/*.whl
-ENV PATH="/opt/venv/bin:${PATH}"
-
-USER jentic
-ENV JENTIC__APPS=broker
-ENV JENTIC__SERVER__PORT=8900
-EXPOSE 8900
-CMD ["python", "-m", "jentic_one"]
-
 # --- app stage (mirrors deploy/docker/app.Dockerfile) ---------------------
 FROM runtime AS app
 
-COPY --from=builder /build/dist/*.whl /tmp/
 # Ubuntu's system python is PEP 668 externally-managed, so the wheel lands in
-# a venv; /opt/venv/bin on PATH keeps the `python` runtime contract.
+# a venv; /opt/venv/bin on PATH keeps the `python` runtime contract. The
+# locked requirements install first, in their own layer so a code-only change
+# reuses it, and the wheel goes in with --no-deps, so pip never re-resolves
+# the dependency ranges (`make check-image-lock` guards). --only-binary keeps
+# pip from building an sdist, whose build backend would come from PyPI
+# without hash checking; `pip check` fails the build when the wheel declares
+# a requirement the locked set doesn't satisfy.
+COPY --from=builder /build/dist/requirements.txt /tmp/
 RUN python3.12 -m venv /opt/venv && \
-    whl="$(ls /tmp/jentic_one-*.whl)" && \
-    /opt/venv/bin/pip install --no-cache-dir "${whl}" && \
+    /opt/venv/bin/pip install --no-cache-dir --require-hashes --only-binary=:all: \
+        -r /tmp/requirements.txt && \
+    rm /tmp/requirements.txt
+COPY --from=builder /build/dist/*.whl /tmp/
+RUN whl="$(ls /tmp/jentic_one-*.whl)" && \
+    /opt/venv/bin/pip install --no-cache-dir --no-deps "${whl}" && \
+    /opt/venv/bin/pip check && \
     rm /tmp/*.whl
 ENV PATH="/opt/venv/bin:${PATH}"
 

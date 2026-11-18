@@ -5,7 +5,7 @@ that need two (Datadog: DD-API-KEY and DD-APPLICATION-KEY). Header name to
 encrypted value; NULL is none.
 
 Revision ID: f54cbd91b63f
-Revises: dd4e5f6a7b8c
+Revises: e9f0a1b2c3d4
 Create Date: 2026-10-16
 
 """
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "f54cbd91b63f"  # pragma: allowlist secret
-down_revision: str | None = "dd4e5f6a7b8c"  # pragma: allowlist secret
+down_revision: str | None = "e9f0a1b2c3d4"  # pragma: allowlist secret
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

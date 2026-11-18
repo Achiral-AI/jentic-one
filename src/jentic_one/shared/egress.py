@@ -28,7 +28,10 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+from types import TracebackType
+from typing import Any
 
+import httpcore
 import httpx
 
 from jentic_one.shared.config import EgressConfig
@@ -38,20 +41,120 @@ from jentic_one.shared.url_validation import assert_ip_allowed
 _IpAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 
 
+class _PinnedOrigin(httpcore.Origin):
+    """Connection-pool origin key that pairs the pinned IP with the logical host.
+
+    HTTPCore's connection pool selects and reuses connections by comparing
+    ``request.url.origin`` via ``Origin.__eq__``, while ``AsyncHTTPConnection``
+    connects its TCP socket to ``self._origin.host`` and negotiates TLS using
+    ``request.extensions["sni_hostname"]``. Including ``logical_host`` in
+    equality keeps connections to distinct logical hostnames that resolve to
+    the same IP and port in separate pool slots while still connecting the
+    socket to the validated pinned IP.
+    """
+
+    def __init__(
+        self,
+        scheme: bytes,
+        host: bytes,
+        port: int,
+        logical_host: str | None,
+    ) -> None:
+        super().__init__(scheme=scheme, host=host, port=port)
+        self.logical_host = logical_host
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, _PinnedOrigin)
+            and super().__eq__(other)
+            and self.logical_host == other.logical_host
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.scheme, self.host, self.port, self.logical_host))
+
+
+class _PinnedURL(httpcore.URL):
+    """HTTPCore URL whose ``origin`` carries the logical hostname for pool isolation."""
+
+    def __init__(self, url: httpcore.URL, *, logical_host: str | None) -> None:
+        super().__init__(
+            scheme=url.scheme,
+            host=url.host,
+            port=url.port,
+            target=url.target,
+        )
+        self._logical_host = logical_host
+
+    @property
+    def origin(self) -> httpcore.Origin:
+        base = super().origin
+        return _PinnedOrigin(
+            scheme=base.scheme,
+            host=base.host,
+            port=base.port,
+            logical_host=self._logical_host,
+        )
+
+
+class _OriginPinningPool:
+    """Wraps an HTTPCore pool so connection reuse keys on logical host and pinned IP."""
+
+    def __init__(self, pool: httpcore.AsyncConnectionPool) -> None:
+        self._pool = pool
+
+    async def handle_async_request(self, request: httpcore.Request) -> httpcore.Response:
+        sni = request.extensions.get("sni_hostname")
+        logical_host = sni.lower() if isinstance(sni, str) and sni else None
+        request.url = _PinnedURL(request.url, logical_host=logical_host)
+        return await self._pool.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._pool.aclose()
+
+    async def __aenter__(self) -> _OriginPinningPool:
+        await self._pool.__aenter__()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None:
+        await self._pool.__aexit__(exc_type, exc_value, traceback)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._pool, name)
+
+
+class UpstreamHostUnresolvedError(ValueError):
+    """The upstream host did not resolve, or resolved to no address, at connect time.
+
+    A ``ValueError`` so ``except ValueError`` callers keep failing closed on it;
+    the broker's runner maps it to a connect failure rather than a policy refusal.
+    """
+
+    def __init__(self, host: str) -> None:
+        self.host = host
+        super().__init__(f"upstream host did not resolve: {host}")
+
+
 def resolve_and_validate(host: str, egress: EgressConfig | None) -> _IpAddress:
     """Resolve *host* and return the first IP that passes the egress policy.
 
     Validates **every** resolved address against ``assert_ip_allowed`` so a
     multi-record answer can't smuggle a blocked IP past the check, then returns
-    the first one to pin the connection to. Raises ``ValueError`` if the host
-    can't be resolved or any resolved IP is blocked (the rebind guard).
+    the first one to pin the connection to. Raises :class:`UpstreamHostUnresolvedError`
+    if the host can't be resolved, or ``ValueError`` if any resolved IP is
+    blocked (the rebind guard).
 
     Blocking; :func:`resolve_and_validate_async` is the event-loop variant.
     """
     try:
         addrs = resolve_host_blocking(host)
     except socket.gaierror as exc:
-        raise ValueError(f"upstream host did not resolve: {host}") from exc
+        raise UpstreamHostUnresolvedError(host) from exc
     return _validated_pin(host, addrs, egress)
 
 
@@ -67,7 +170,7 @@ async def resolve_and_validate_async(host: str, egress: EgressConfig | None) -> 
     try:
         addrs = await resolve_host(host)
     except socket.gaierror as exc:
-        raise ValueError(f"upstream host did not resolve: {host}") from exc
+        raise UpstreamHostUnresolvedError(host) from exc
     return _validated_pin(host, addrs, egress)
 
 
@@ -76,7 +179,7 @@ def _validated_pin(
 ) -> _IpAddress:
     """Validate every address in *addrs* and return the first (the pin target)."""
     if not addrs:
-        raise ValueError(f"upstream host did not resolve: {host}")
+        raise UpstreamHostUnresolvedError(host)
 
     for addr in addrs:
         # A DNS name re-resolved here, so pass the hostname for the suffix
@@ -96,8 +199,23 @@ class DnsPinningTransport(httpx.AsyncBaseTransport):
     """
 
     def __init__(self, inner: httpx.AsyncBaseTransport, egress: EgressConfig | None) -> None:
+        pool = getattr(inner, "_pool", None)
+        if isinstance(pool, httpcore.AsyncConnectionPool):
+            inner._pool = _OriginPinningPool(pool)  # type: ignore[attr-defined]
         self._inner = inner
         self._egress = egress
+
+    async def __aenter__(self) -> DnsPinningTransport:
+        await self._inner.__aenter__()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None:
+        await self._inner.__aexit__(exc_type, exc_value, traceback)
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         host = request.url.host
@@ -143,12 +261,14 @@ def build_pinned_transport(egress: EgressConfig | None) -> httpx.AsyncBaseTransp
     return DnsPinningTransport(httpx.AsyncHTTPTransport(), egress)
 
 
-def build_strict_pinned_transport() -> httpx.AsyncBaseTransport:
-    """Build a DNS-pinning transport under the strict default egress policy.
+def build_always_pinned_transport(egress: EgressConfig | None = None) -> httpx.AsyncBaseTransport:
+    """Build a DNS-pinning transport that always pins, whatever the policy says.
 
-    For outbound calls that have no operator-configurable egress policy (the
-    control plane's OAuth token / device-authorization / identity-probe calls):
-    every private, loopback, and non-global target is refused at connect time,
-    and a host that does not resolve fails closed.
+    For the control plane's OAuth token / device-authorization / identity-probe
+    calls. Every connection is resolved, validated against *egress*, and pinned —
+    ``dns_pinning_enabled`` is not consulted. With no *egress* (the strict
+    default) every private, loopback, and non-global target is refused at
+    connect time; an allowlist exempts only what it names. A host that does not
+    resolve fails closed.
     """
-    return DnsPinningTransport(httpx.AsyncHTTPTransport(), None)
+    return DnsPinningTransport(httpx.AsyncHTTPTransport(), egress)

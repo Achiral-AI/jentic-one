@@ -1,6 +1,7 @@
-"""Central problem+json exception handlers for the broker (the B-004 handler).
+"""Central problem+json exception handlers for the broker.
 
-Maps the domain-exception taxonomy (``broker/core/exceptions.py``) to
+Maps the domain-exception taxonomy (``broker/core/errors.py``) and the
+shared operation-discovery errors (``shared/discovery/errors.py``) to
 ``application/problem+json`` and **also** overrides FastAPI's
 ``RequestValidationError`` and Starlette's ``HTTPException`` (including the
 catch-all ``404``) so no default FastAPI/Starlette ``{"detail": …}`` shape ever
@@ -15,21 +16,33 @@ from __future__ import annotations
 
 from typing import Any
 
+import structlog
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette import exceptions as starlette_exceptions
 
-from jentic_one.broker.core.exceptions import (
-    AgentDirective,
-    BrokerError,
-    ErrorOrigin,
-)
+from jentic_one.broker.core.directives import AgentDirective
+from jentic_one.broker.core.errors import BrokerError
 from jentic_one.broker.core.headers import JenticHeader
-from jentic_one.broker.core.problem import problem_body, status_for_broker_error
-from jentic_one.shared.web.errors import sanitize_validation_errors
+from jentic_one.broker.core.problem import (
+    discovery_error_headers,
+    discovery_error_problem,
+    problem_body,
+    status_for_broker_error,
+)
+from jentic_one.shared.broker.execution import ErrorOrigin
+from jentic_one.shared.db.errors import DatabaseCommitOutcomeUnknownError, DatabaseUnavailableError
+from jentic_one.shared.discovery.errors import DiscoveryError
+from jentic_one.shared.web.errors import (
+    DB_COMMIT_OUTCOME_UNKNOWN_DETAIL,
+    log_database_unavailable,
+    sanitize_validation_errors,
+)
 
 _PROBLEM_JSON = "application/problem+json"
+
+logger = structlog.get_logger(__name__)
 
 
 def problem_response(
@@ -72,6 +85,21 @@ async def handle_broker_error(_request: Request, exc: BrokerError) -> JSONRespon
     )
 
 
+async def handle_discovery_error(request: Request, exc: DiscoveryError) -> JSONResponse:
+    """Map a shared operation-discovery error (e.g. from the registry resolver) to problem+json.
+
+    ``instance`` is the request path only — the query string of an upstream URL
+    can carry secrets — which is the same value a queued execution's denial
+    records (``queued_execution_instance``).
+    """
+    body = discovery_error_problem(exc, instance=request.url.path)
+    hdrs = {
+        **discovery_error_headers(exc),
+        JenticHeader.ERROR_ORIGIN.value: ErrorOrigin.BROKER.value,
+    }
+    return JSONResponse(body, status_code=body["status"], media_type=_PROBLEM_JSON, headers=hdrs)
+
+
 async def handle_validation(_request: Request, exc: RequestValidationError) -> JSONResponse:
     """Override FastAPI's default 422 list with a problem+json envelope.
 
@@ -94,11 +122,48 @@ async def handle_http_exception(
     return problem_response(exc.status_code, str(exc.detail), headers=headers)
 
 
+async def handle_database_unavailable(
+    request: Request, exc: DatabaseUnavailableError
+) -> JSONResponse:
+    """Answer a transient broker-DB failure (e.g. a lost pooled connection) with a 503.
+
+    The client gets a static detail — the wrapped driver message can carry
+    connection internals (CWE-209). The server log carries the error type and
+    the short, SQL-free detail at warning level, without a traceback: the
+    chained SQLAlchemy cause renders the statement and its bound parameters.
+    No retry directive is attached: the failure can land after the upstream
+    call was dispatched (e.g. persisting its record), so blindly re-sending a
+    non-idempotent call could execute it twice. A connection lost at commit
+    gets the shared outcome-unknown detail, which asks the client to check
+    whether the write was applied before retrying.
+    """
+    log_database_unavailable(logger, "broker_database_unavailable", exc, path=request.url.path)
+    outcome_unknown = isinstance(exc, DatabaseCommitOutcomeUnknownError)
+    detail = (
+        DB_COMMIT_OUTCOME_UNKNOWN_DETAIL
+        if outcome_unknown
+        else "The broker's database is temporarily unavailable"
+    )
+    headers = None if outcome_unknown else {"Retry-After": str(exc.retry_after_s)}
+    return problem_response(
+        503,
+        detail,
+        type="database_unavailable",
+        headers=headers,
+        instance=request.url.path,
+    )
+
+
 def install_broker_error_handlers(app: FastAPI) -> None:
-    """Register the three problem+json handlers on the broker app."""
+    """Register the problem+json handlers on the broker app."""
     app.add_exception_handler(BrokerError, handle_broker_error)  # type: ignore[arg-type]
+    app.add_exception_handler(DiscoveryError, handle_discovery_error)  # type: ignore[arg-type]
     app.add_exception_handler(RequestValidationError, handle_validation)  # type: ignore[arg-type]
     app.add_exception_handler(
         starlette_exceptions.HTTPException,
         handle_http_exception,  # type: ignore[arg-type]
+    )
+    app.add_exception_handler(
+        DatabaseUnavailableError,
+        handle_database_unavailable,  # type: ignore[arg-type]
     )

@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import base64
+import builtins
+import copy
+import errno
+import importlib.util
+import io
 import os
 import threading
 import time
@@ -19,13 +24,16 @@ from pydantic import SecretStr, ValidationError
 from jentic_one.shared import config as config_module
 from jentic_one.shared.config import (
     _ONESHOT_CONFIG_CACHE,
+    DEFAULT_LATENCY_BUCKETS_MS,
     AdminAuthConfig,
     AdminInviteConfig,
     AppConfig,
     AuthConfig,
+    BrokerResilienceConfig,
     CatalogConfig,
     ConfigError,
     ConnectConfig,
+    ControlEgressConfig,
     CredentialsConfig,
     DirectOAuth2ProviderConfig,
     EgressConfig,
@@ -33,10 +41,15 @@ from jentic_one.shared.config import (
     EncryptionKey,
     EntitlementConfig,
     HeldExecutionsConfig,
+    IdempotencyConfig,
+    IngestConfig,
+    MetricsConfig,
+    OAuthRateLimitConfig,
     RuntimeConfig,
     SigningKeyConfig,
     TelemetryConfig,
     TrustedIssuerConfig,
+    WorkerConfig,
     _apps_for_secret_guard,
     _csv_to_list,
     _deep_merge,
@@ -50,6 +63,19 @@ from jentic_one.shared.config import (
     has_spa_platform_client,
     load_config,
     resolved_auth_base_url,
+    resolved_control_egress,
+)
+from jentic_one.shared.config import _state_compat as state_compat_module
+from jentic_one.shared.config import auth as auth_config_module
+from jentic_one.shared.config import broker as broker_config_module
+from jentic_one.shared.config import loader as loader_module
+from jentic_one.shared.config import runtime as runtime_config_module
+from jentic_one.shared.state import (
+    MemoryBackendConfig,
+    MemoryStateBackend,
+    NamespaceBudget,
+    StateBackendConfig,
+    build_state_backend,
 )
 
 
@@ -121,11 +147,91 @@ def test_env_coerces_int(config_file: Path):
     assert config.databases.registry.port == 9999
 
 
+@pytest.mark.parametrize("seconds", ["0", "-1"])
+def test_events_stream_recheck_seconds_default_env_and_bounds(config_file: Path, seconds: str):
+    assert load_config(config_file).admin.events.stream_recheck_seconds == 5.0
+
+    env = {"JENTIC__ADMIN__EVENTS__STREAM_RECHECK_SECONDS": "2.5"}
+    with patch.dict(os.environ, env, clear=False):
+        assert load_config(config_file).admin.events.stream_recheck_seconds == 2.5
+
+    env = {"JENTIC__ADMIN__EVENTS__STREAM_RECHECK_SECONDS": seconds}
+    with (
+        patch.dict(os.environ, env, clear=False),
+        pytest.raises(ConfigError, match="stream_recheck_seconds"),
+    ):
+        load_config(config_file)
+
+
+def test_latency_buckets_default_yaml_and_env(
+    config_file: Path, sample_config_dict: dict[str, Any], tmp_path: Path
+):
+    """Default, YAML override, and comma-separated env override of latency_buckets_ms."""
+    assert load_config(config_file).observability.metrics.latency_buckets_ms == list(
+        DEFAULT_LATENCY_BUCKETS_MS
+    )
+
+    path = tmp_path / "buckets.yaml"
+    path.write_text(
+        yaml.dump(
+            {
+                **sample_config_dict,
+                "observability": {"metrics": {"latency_buckets_ms": [0.5, 3, 40]}},
+            }
+        )
+    )
+    assert load_config(path).observability.metrics.latency_buckets_ms == [0.5, 3.0, 40.0]
+
+    env = {"JENTIC__OBSERVABILITY__METRICS__LATENCY_BUCKETS_MS": "2, 4.5,90"}
+    with patch.dict(os.environ, env, clear=False):
+        config = load_config(config_file)
+    assert config.observability.metrics.latency_buckets_ms == [2.0, 4.5, 90.0]
+
+
+@pytest.mark.parametrize(
+    ("buckets", "match"),
+    [
+        ([], "at least 1 item"),
+        ([5, 2, 10], "strictly increasing"),
+        ([1, 1, 2], "strictly increasing"),
+        ([0, 1, 2], "greater than 0"),
+        ([-1, 1], "greater than 0"),
+        ([1, float("inf")], "finite number"),
+        ([1, float("nan")], "finite number"),
+        ([float(i) for i in range(1, 66)], "at most 64 items"),
+    ],
+)
+def test_latency_buckets_validation(buckets: list[float], match: str):
+    with pytest.raises(ValidationError, match=match):
+        MetricsConfig(latency_buckets_ms=buckets)
+
+
 def test_http_wire_trace_defaults_off_and_env_enables(config_file: Path):
     assert load_config(config_file).logging.http_wire_trace is False
     with patch.dict(os.environ, {"JENTIC__LOGGING__HTTP_WIRE_TRACE": "true"}, clear=False):
         config = load_config(config_file)
     assert config.logging.http_wire_trace is True
+
+
+@pytest.mark.parametrize("ratio", ["-0.1", "1.5"])
+def test_tracing_sample_ratio_default_yaml_env_and_bounds(
+    config_file: Path, tmp_path: Path, sample_config_dict: dict[str, Any], ratio: str
+):
+    assert load_config(config_file).observability.tracing.sample_ratio == 1.0
+
+    from_yaml = tmp_path / "ratio.yaml"
+    from_yaml.write_text(
+        yaml.dump({**sample_config_dict, "observability": {"tracing": {"sample_ratio": 0.25}}})
+    )
+    assert load_config(from_yaml).observability.tracing.sample_ratio == 0.25
+
+    env = {"JENTIC__OBSERVABILITY__TRACING__SAMPLE_RATIO": "0.1"}
+    with patch.dict(os.environ, env, clear=False):
+        assert load_config(config_file).observability.tracing.sample_ratio == 0.1
+
+    env = {"JENTIC__OBSERVABILITY__TRACING__SAMPLE_RATIO": ratio}
+    with patch.dict(os.environ, env, clear=False), pytest.raises(ConfigError, match="sample_ratio"):
+        load_config(config_file)
 
 
 def test_control_connect_manual_flows_default_on_and_env_overrides(
@@ -155,6 +261,43 @@ def test_control_connect_manual_flows_default_on_and_env_overrides(
         yaml.dump({**sample_config_dict, "control": {"connect": {"manual_flows_ttl_hours": 0}}})
     )
     with pytest.raises(ConfigError, match="manual_flows_ttl_hours"):
+        load_config(bad)
+
+
+def test_import_request_and_preview_cache_limits(
+    config_file: Path, tmp_path: Path, sample_config_dict: dict[str, Any]
+):
+    config = load_config(config_file)
+    assert config.ingest.max_import_request_bytes is None
+    assert config.ingest.import_request_cap_bytes == 2 * config.ingest.max_spec_bytes
+    assert config.catalog.preview_cache_ttl_seconds == 300
+    assert config.catalog.preview_cache_max_entries == 16
+    assert config.catalog.preview_cache_failure_ttl_seconds == 30
+    # The default import cap tracks a raised per-spec cap.
+    assert IngestConfig(max_spec_bytes=1000).import_request_cap_bytes == 2000
+
+    env = {
+        "JENTIC__INGEST__MAX_IMPORT_REQUEST_BYTES": "1500",
+        "JENTIC__CATALOG__PREVIEW_CACHE_TTL_SECONDS": "0",
+        "JENTIC__CATALOG__PREVIEW_CACHE_MAX_ENTRIES": "4",
+        "JENTIC__CATALOG__PREVIEW_CACHE_FAILURE_TTL_SECONDS": "0",
+    }
+    with patch.dict(os.environ, env, clear=False):
+        config = load_config(config_file)
+    assert config.ingest.import_request_cap_bytes == 1500
+    assert config.catalog.preview_cache_ttl_seconds == 0
+    assert config.catalog.preview_cache_max_entries == 4
+    assert config.catalog.preview_cache_failure_ttl_seconds == 0
+
+    from_yaml = tmp_path / "limits.yaml"
+    from_yaml.write_text(
+        yaml.dump({**sample_config_dict, "ingest": {"max_import_request_bytes": 4096}})
+    )
+    assert load_config(from_yaml).ingest.import_request_cap_bytes == 4096
+
+    bad = tmp_path / "bad-limits.yaml"
+    bad.write_text(yaml.dump({**sample_config_dict, "ingest": {"max_import_request_bytes": 0}}))
+    with pytest.raises(ConfigError, match="max_import_request_bytes"):
         load_config(bad)
 
 
@@ -783,6 +926,78 @@ def test_oauth_approval_status_rate_limit_env_overrides(config_file: Path):
     assert config.auth.oauth_rate_limit.approval_status_burst == 3
 
 
+def test_oauth_trusted_proxies_default_empty(config_file: Path):
+    config = load_config(config_file)
+    assert config.auth.oauth_rate_limit.trusted_proxies == []
+    assert config.auth.oauth_rate_limit.trusted_networks == ()
+
+
+def test_oauth_trusted_proxies_env_comma_separated(config_file: Path):
+    """The env var takes a comma-separated list of IPs and CIDRs (#1880)."""
+    env = {"JENTIC__AUTH__OAUTH_RATE_LIMIT__TRUSTED_PROXIES": "10.0.0.0/8, 172.17.0.1,fd00::/8"}
+    with patch.dict(os.environ, env, clear=False):
+        config = load_config(config_file)
+    rl = config.auth.oauth_rate_limit
+    assert rl.trusted_proxies == ["10.0.0.0/8", "172.17.0.1", "fd00::/8"]
+    assert [str(n) for n in rl.trusted_networks] == ["10.0.0.0/8", "172.17.0.1/32", "fd00::/8"]
+
+
+def test_oauth_trusted_proxies_yaml_list(tmp_path: Path):
+    config = _load(
+        tmp_path,
+        {"auth": {"oauth_rate_limit": {"trusted_proxies": [" 10.0.0.0/8 ", "2001:db8::1"]}}},
+    )
+    rl = config.auth.oauth_rate_limit
+    assert rl.trusted_proxies == ["10.0.0.0/8", "2001:db8::1"]
+    assert [str(n) for n in rl.trusted_networks] == ["10.0.0.0/8", "2001:db8::1/128"]
+
+
+@pytest.mark.parametrize(
+    "entry", ["10.0.0.0/33", "10.0.0.256", "proxy.internal", "", "fe80::1%eth0"]
+)
+def test_oauth_trusted_proxies_invalid_entry_fails_load(tmp_path: Path, entry: str):
+    with pytest.raises(ConfigError, match=r"trusted_proxies entry"):
+        _load(tmp_path, {"auth": {"oauth_rate_limit": {"trusted_proxies": [entry]}}})
+
+
+@pytest.mark.parametrize(
+    ("entry", "warned"),
+    [
+        ("10.0.0.0/8", False),
+        ("172.17.0.1", False),
+        ("fd00::/8", False),
+        ("::ffff:192.168.0.0/112", False),
+        ("0.0.0.0/0", True),
+        ("::/0", True),
+        ("203.0.113.7", True),
+        ("8.0.0.0/7", True),
+    ],
+)
+def test_oauth_trusted_proxies_warns_on_public_network(
+    entry: str, warned: bool, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(auth_config_module, "_warned_public_trusted_proxies", set())
+    with structlog.testing.capture_logs() as logs:
+        OAuthRateLimitConfig(trusted_proxies=[entry])
+        OAuthRateLimitConfig(trusted_proxies=[entry])
+    events = [e for e in logs if e["event"] == "trusted_proxies_network_includes_public_addresses"]
+    # Config is validated more than once per process: warn once per network.
+    assert len(events) == (1 if warned else 0)
+    if warned:
+        assert events[0]["entry"] == entry
+
+
+def test_oauth_trusted_networks_follow_later_changes():
+    """The parsed cache is keyed on the entries, so it never goes stale."""
+    cfg = OAuthRateLimitConfig(trusted_proxies=["10.0.0.0/8"])
+    assert [str(n) for n in cfg.trusted_networks] == ["10.0.0.0/8"]
+    copied = cfg.model_copy(update={"trusted_proxies": ["192.168.0.0/16"]})
+    assert [str(n) for n in copied.trusted_networks] == ["192.168.0.0/16"]
+    cfg.trusted_proxies = ["172.16.0.0/12"]
+    assert [str(n) for n in cfg.trusted_networks] == ["172.16.0.0/12"]
+    assert cfg.trusted_networks is cfg.trusted_networks
+
+
 def test_encryption_config_defaults():
     cfg = EncryptionConfig()
     assert cfg.active_id == "v1"
@@ -1128,52 +1343,385 @@ def test_oneshot_cache_entry_with_recycled_inode_is_not_served(
         _ONESHOT_CONFIG_CACHE.clear()
 
 
-def test_oneshot_cache_survives_writes_after_open(sample_config_dict: dict[str, Any]):
+def test_oneshot_cache_survives_writes_after_open(
+    sample_config_dict: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+):
     """Every pipe write bumps its ctime, so a supervisor still streaming the
     document after the loaders opened the fd must not leave any of them keyed
     on a pre-drain identity: a concurrent loader waiting on the drain, and a
     repeat load after it, must both take the cached document instead of
-    hitting EOF on the drained pipe."""
+    hitting EOF on the drained pipe.
+
+    The test couples to _read_config_text at three seams, and each failure
+    message names the seam it depends on:
+
+    - open: every open of the pipe path goes through io.open or builtins.open
+      (Path.open included); the opened file is where a loader parks.
+    - lock: _ONESHOT_CACHE_LOCK is looked up at call time, so a loader that
+      would block on it parks too.
+    - read gate: the writer holds its first write until a loader starts
+      draining the opened file through read(), readline(), readlines(), or
+      iteration. The drainer's in-lock fstat runs before that, which pins it
+      to the pre-write identity. A drain that bypasses the file object (e.g.
+      os.read on its fileno) never opens the gate, and the writer reports
+      that it is still waiting for a loader to start reading."""
+    # One deadline bounds every wait and join in the test, and all threads are
+    # daemons, so a wedged loader fails the test without holding the process.
+    timeout_s = 10.0
+    # The writer's read gate expires this long before the shared deadline.
+    gate_margin_s = 1.0
+    deadline = time.monotonic() + timeout_s
+
+    def remaining() -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    # Each write lands on a later timestamp tick so it moves the ctime: a Linux
+    # tick is one jiffy (at most 10 ms), and macOS pipe timestamps are finer.
+    ctime_tick_s = 0.05
     doc = yaml.dump(sample_config_dict).encode()
     read_fd, write_fd = os.pipe()
-
-    def stream() -> None:
-        # The first delay lets both loaders open and stat the fd before any
-        # data arrives; each delay outlasts a Linux timestamp tick, so every
-        # write moves the ctime.
-        for chunk in (doc[: len(doc) // 2], doc[len(doc) // 2 :]):
-            time.sleep(0.1)
-            os.write(write_fd, chunk)
-        os.close(write_fd)
-
-    pipe_path = Path(f"/dev/fd/{read_fd}")
+    pipe_path = f"/dev/fd/{read_fd}"
     loaded: list[AppConfig] = []
     errors: list[BaseException] = []
 
+    # The writer and both loaders meet at one barrier before any byte is
+    # written. A loader parks right after it opens the pipe (it has stat'ed the
+    # pre-write identity and holds the fd), or when it would block on the cache
+    # lock, so an implementation that opens under the lock parks too. The hooks
+    # see every open of the pipe through io.open or builtins.open (Path.open
+    # included) and every acquire of _ONESHOT_CACHE_LOCK.
+    released = threading.Event()
+    rendezvous = threading.Barrier(3, action=released.set, timeout=timeout_s)
+    parked = {name: threading.Event() for name in ("loader-0", "loader-1")}
+    read_started = threading.Event()
+    # Set on teardown so the writer stops waiting on the read gate.
+    stop = threading.Event()
+
+    def park() -> None:
+        signal = parked.get(threading.current_thread().name)
+        if signal is None or signal.is_set() or released.is_set():
+            return
+        signal.set()
+        rendezvous.wait(remaining())
+
+    class _ReadGateFile:
+        """Wraps the opened pipe so any read-style call or iteration opens the gate."""
+
+        def __init__(self, f: Any) -> None:
+            self._f = f
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._f, name)
+
+        def __enter__(self) -> _ReadGateFile:
+            self._f.__enter__()
+            return self
+
+        def __exit__(self, *exc_info: Any) -> Any:
+            return self._f.__exit__(*exc_info)
+
+        def read(self, *args: Any) -> Any:
+            read_started.set()
+            return self._f.read(*args)
+
+        def readline(self, *args: Any) -> Any:
+            read_started.set()
+            return self._f.readline(*args)
+
+        def readlines(self, *args: Any) -> Any:
+            read_started.set()
+            return self._f.readlines(*args)
+
+        def __iter__(self) -> _ReadGateFile:
+            return self
+
+        def __next__(self) -> Any:
+            read_started.set()
+            return next(self._f)
+
+    real_open = io.open
+
+    def hooked_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        f: Any = real_open(file, *args, **kwargs)
+        if not isinstance(file, str | os.PathLike) or os.fspath(file) != pipe_path:
+            return f
+        try:
+            park()
+        except BaseException:
+            f.close()
+            raise
+        return _ReadGateFile(f)
+
+    class _ParkingLock:
+        """Stands in for _ONESHOT_CACHE_LOCK; a loader that would block parks first."""
+
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+
+        def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+            if self._lock.acquire(blocking=False):
+                return True
+            if not blocking:
+                return False
+            park()
+            return self._lock.acquire(timeout=timeout)
+
+        def release(self) -> None:
+            self._lock.release()
+
+        def __enter__(self) -> bool:
+            return self.acquire()
+
+        def __exit__(self, *exc_info: object) -> None:
+            self.release()
+
+    monkeypatch.setattr(loader_module, "_ONESHOT_CACHE_LOCK", _ParkingLock())
+    monkeypatch.setattr(io, "open", hooked_open)
+    monkeypatch.setattr(builtins, "open", hooked_open)
+
+    def stream() -> None:
+        try:
+            rendezvous.wait(remaining())
+            # The drainer takes its in-lock fstat before it reads, so holding
+            # the first write until a read starts pins that fstat to the
+            # pre-write identity: a key taken there must never be what gets
+            # stored. The gate gives up a margin before the shared deadline so
+            # its error is recorded before the main thread's joins expire.
+            while not read_started.wait(0.05):
+                if stop.is_set():
+                    return
+                if remaining() <= gate_margin_s:
+                    errors.append(
+                        AssertionError(
+                            f"writer still waiting for a loader to start reading {pipe_path}: "
+                            "the read gate needs _read_config_text to drain the opened file "
+                            "through read(), readline(), readlines(), or iteration"
+                        )
+                    )
+                    return
+            for chunk in (doc[: len(doc) // 2], doc[len(doc) // 2 :]):
+                time.sleep(ctime_tick_s)
+                os.write(write_fd, chunk)
+        except threading.BrokenBarrierError:
+            return
+        finally:
+            # Closing even on a failed handshake lets a blocked loader see EOF.
+            os.close(write_fd)
+
     def load() -> None:
         try:
-            loaded.append(load_config(pipe_path))
+            loaded.append(load_config(Path(pipe_path)))
         except BaseException as exc:  # surfaced via the assertion below
             errors.append(exc)
+            # A loader that dies before the rendezvous breaks it, so the writer
+            # and the other loader stop waiting for a party that never arrives.
+            rendezvous.abort()
 
-    threads = [threading.Thread(target=stream)] + [threading.Thread(target=load) for _ in range(2)]
+    writer = threading.Thread(target=stream, name="writer", daemon=True)
+    loaders = [threading.Thread(target=load, name=name, daemon=True) for name in parked]
+    threads = [writer, *loaders]
     try:
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        writer.start()
+        # Start the second loader only once the first has parked: on macOS,
+        # stat() of /dev/fd/N can fail with EBADF while another thread opens the
+        # same /dev/fd/N (#1803), a platform race and not the one under test.
+        for loader in loaders:
+            loader.start()
+            while not parked[loader.name].wait(0.05) and loader.is_alive() and remaining():
+                pass
+            assert parked[loader.name].is_set(), (
+                f"{loader.name} never parked: the rendezvous needs _read_config_text to "
+                f"open {pipe_path} through io.open or builtins.open (Path.open included), "
+                f"or to block on _ONESHOT_CACHE_LOCK; errors={errors!r}"
+            )
+        # Loaders first: a hung loader is the thread the failure names.
+        for loader in loaders:
+            loader.join(remaining())
+            if loader.is_alive():
+                stage = (
+                    "wedged in read (a read started; the loader is stuck in it or "
+                    "behind the cache lock)"
+                    if read_started.is_set()
+                    else "and the writer is still waiting for a loader to start reading"
+                )
+                raise AssertionError(
+                    f"{loader.name} still running after {timeout_s}s, {stage}; {errors=!r}"
+                )
+        writer.join(remaining())
+        assert not writer.is_alive(), f"writer still running after {timeout_s}s; {errors=!r}"
         assert errors == []
-        loaded.append(load_config(pipe_path))
+        loaded.append(load_config(Path(pipe_path)))
         assert {c.databases.registry.name for c in loaded} == {
             sample_config_dict["databases"]["registry"]["name"]
         }
         assert len(loaded) == 3
     finally:
+        rendezvous.abort()
+        stop.set()
         for t in threads:
             if t.is_alive():
-                t.join()
-        os.close(read_fd)
+                t.join(remaining())
+        # A thread still running may be reading read_fd; closing it under that
+        # thread could hand the fd number to an unrelated file, so it leaks.
+        if not any(t.is_alive() for t in threads):
+            os.close(read_fd)
         _ONESHOT_CONFIG_CACHE.clear()
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("fcntl") is None
+    or not hasattr(os, "O_NONBLOCK")
+    or not Path("/dev/fd").is_dir(),
+    reason="requires POSIX fcntl, O_NONBLOCK, and /dev/fd",
+)
+def test_load_config_concurrent_dev_fd_opens_do_not_race(
+    sample_config_dict: dict[str, Any],
+) -> None:
+    """Pins #1803: unsynchronised concurrent loads of /dev/fd/N must not fail with
+    EBADF or a misleading 'Config file not found' error on macOS."""
+    doc = yaml.dump(sample_config_dict).encode()
+    workers = 4
+    rounds = 60
+    timeout_s = 10.0
+
+    def open_fd_count() -> int:
+        return len(os.listdir("/dev/fd"))
+
+    baseline_fds = open_fd_count()
+
+    for _ in range(rounds):
+        read_fd, write_fd = os.pipe()
+        pipe_path = Path(f"/dev/fd/{read_fd}")
+        os.write(write_fd, doc)
+        os.close(write_fd)
+
+        start_barrier = threading.Barrier(workers, timeout=timeout_s)
+        results: list[AppConfig] = []
+        errors: list[BaseException] = []
+        results_lock = threading.Lock()
+
+        def worker(
+            p: Path = pipe_path,
+            b: threading.Barrier = start_barrier,
+            lock: threading.Lock = results_lock,
+            out: list[AppConfig] = results,
+            errs: list[BaseException] = errors,
+        ) -> None:
+            try:
+                b.wait()
+                cfg = load_config(p)
+                with lock:
+                    out.append(cfg)
+            except BaseException as exc:
+                with lock:
+                    errs.append(exc)
+
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(workers)]
+        try:
+            for t in threads:
+                t.start()
+            deadline = time.monotonic() + timeout_s
+            for t in threads:
+                t.join(max(0.0, deadline - time.monotonic()))
+                assert not t.is_alive(), f"concurrent load_config timed out on {pipe_path}"
+            assert errors == [], f"concurrent load_config failed: {errors!r}"
+            assert len(results) == workers
+            assert {cfg.databases.registry.name for cfg in results} == {
+                sample_config_dict["databases"]["registry"]["name"]
+            }
+        finally:
+            if not any(t.is_alive() for t in threads):
+                os.close(read_fd)
+            _ONESHOT_CONFIG_CACHE.clear()
+
+    assert open_fd_count() == baseline_fds
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("fcntl") is None
+    or not hasattr(os, "mkfifo")
+    or not hasattr(os, "O_NONBLOCK"),
+    reason="requires POSIX fcntl, mkfifo, and O_NONBLOCK",
+)
+def test_load_config_named_fifo_does_not_hang_without_writer(
+    tmp_path: Path, sample_config_dict: dict[str, Any]
+) -> None:
+    """Pins #1803: opening a named FIFO never hangs when no writer is attached,
+    and a cached FIFO hit returns without blocking after its writer has closed."""
+
+    def call_bounded(target_path: Path, timeout_s: float = 2.0) -> AppConfig:
+        out: list[AppConfig] = []
+        err: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                out.append(load_config(target_path))
+            except BaseException as exc:
+                err.append(exc)
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(timeout_s)
+        assert not t.is_alive(), f"load_config({target_path}) blocked for >{timeout_s}s"
+        if err:
+            raise err[0]
+        return out[0]
+
+    empty_fifo = tmp_path / "empty.fifo"
+    os.mkfifo(empty_fifo)
+    with pytest.raises(ConfigError, match="yielded no content"):
+        call_bounded(empty_fifo)
+
+    seeded_fifo = tmp_path / "seeded.fifo"
+    os.mkfifo(seeded_fifo)
+    doc = yaml.dump(sample_config_dict).encode()
+
+    def write_once() -> None:
+        wfd = os.open(seeded_fifo, os.O_WRONLY)
+        try:
+            os.write(wfd, doc)
+        finally:
+            os.close(wfd)
+
+    writer = threading.Thread(target=write_once, daemon=True)
+    writer.start()
+    try:
+        first = call_bounded(seeded_fifo, timeout_s=5.0)
+        writer.join(5.0)
+        assert not writer.is_alive()
+        # Writer is gone; repeat load must hit the one-shot cache without blocking.
+        second = call_bounded(seeded_fifo)
+        assert first.databases.registry.name == second.databases.registry.name
+    finally:
+        writer.join(1.0)
+        _ONESHOT_CONFIG_CACHE.clear()
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        PermissionError(errno.EACCES, "Permission denied"),
+        OSError(errno.EBADF, "Bad file descriptor"),
+    ],
+)
+def test_load_config_propagates_non_missing_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exc: OSError
+) -> None:
+    """Pins #1803: non-FileNotFoundError OSErrors (including EBADF) must surface with
+    their real cause instead of being collapsed into 'Config file not found'."""
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text("databases: {}\n")
+    real_os_open = os.open
+
+    def fail_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(file, str | os.PathLike) and os.fspath(file) == str(cfg):
+            raise exc
+        return real_os_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", fail_open)
+    with pytest.raises(type(exc)) as caught:
+        load_config(cfg)
+    assert caught.value.errno == exc.errno
 
 
 def test_broker_jobs_api_base_url_defaults_to_none(config_file: Path):
@@ -1194,6 +1742,65 @@ def test_broker_jobs_api_base_url_env_override(config_file: Path):
     with patch.dict(os.environ, env, clear=False):
         config = load_config(config_file)
     assert config.broker.jobs_api_base_url == "https://env.example.com"
+
+
+def test_broker_streaming_persist_max_concurrency_default(config_file: Path) -> None:
+    assert load_config(config_file).broker.streaming_persist_max_concurrency == 5
+
+
+def test_broker_streaming_persist_max_concurrency_from_yaml(
+    tmp_path: Path, sample_config_dict: dict[str, Any]
+) -> None:
+    sample_config_dict["broker"] = {"streaming_persist_max_concurrency": 3}
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.dump(sample_config_dict))
+    assert load_config(path).broker.streaming_persist_max_concurrency == 3
+
+
+def test_broker_streaming_persist_max_concurrency_env_override(config_file: Path) -> None:
+    env = {"JENTIC__BROKER__STREAMING_PERSIST_MAX_CONCURRENCY": "7"}
+    with patch.dict(os.environ, env, clear=False):
+        config = load_config(config_file)
+    assert config.broker.streaming_persist_max_concurrency == 7
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_broker_streaming_persist_max_concurrency_must_be_positive(
+    config_file: Path, value: str
+) -> None:
+    env = {"JENTIC__BROKER__STREAMING_PERSIST_MAX_CONCURRENCY": value}
+    with (
+        patch.dict(os.environ, env, clear=False),
+        pytest.raises(ConfigError, match="streaming_persist_max_concurrency"),
+    ):
+        load_config(config_file)
+
+
+def test_broker_streaming_persist_acquire_timeout_default_and_overrides(
+    tmp_path: Path, sample_config_dict: dict[str, Any], config_file: Path
+) -> None:
+    assert load_config(config_file).broker.streaming_persist_acquire_timeout_s == 5.0
+
+    sample_config_dict["broker"] = {"streaming_persist_acquire_timeout_s": 2.5}
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.dump(sample_config_dict))
+    assert load_config(path).broker.streaming_persist_acquire_timeout_s == 2.5
+
+    env = {"JENTIC__BROKER__STREAMING_PERSIST_ACQUIRE_TIMEOUT_S": "0.75"}
+    with patch.dict(os.environ, env, clear=False):
+        assert load_config(config_file).broker.streaming_persist_acquire_timeout_s == 0.75
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_broker_streaming_persist_acquire_timeout_must_be_positive(
+    config_file: Path, value: str
+) -> None:
+    env = {"JENTIC__BROKER__STREAMING_PERSIST_ACQUIRE_TIMEOUT_S": value}
+    with (
+        patch.dict(os.environ, env, clear=False),
+        pytest.raises(ConfigError, match="streaming_persist_acquire_timeout_s"),
+    ):
+        load_config(config_file)
 
 
 @pytest.mark.parametrize("value", [False, "false"])
@@ -1224,7 +1831,9 @@ def test_broker_retired_direct_bindings_flag_true_is_ignored(
     sample_config_dict["broker"] = {"direct_bindings_enabled": True}
     path = tmp_path / "cfg.yaml"
     path.write_text(yaml.dump(sample_config_dict))
-    monkeypatch.setattr(config_module, "_retired_direct_bindings_flag_warned", threading.Event())
+    monkeypatch.setattr(
+        broker_config_module, "_retired_direct_bindings_flag_warned", threading.Event()
+    )
     with structlog.testing.capture_logs() as logs:
         config = load_config(path)
         load_config(path)
@@ -1245,7 +1854,7 @@ def test_broker_retired_account_linking_base_url_is_ignored(
     }
     path = tmp_path / "cfg.yaml"
     path.write_text(yaml.dump(sample_config_dict))
-    monkeypatch.setattr(config_module, "_retired_account_linking_warned", threading.Event())
+    monkeypatch.setattr(broker_config_module, "_retired_account_linking_warned", threading.Event())
     with structlog.testing.capture_logs() as logs:
         config = load_config(path)
         load_config(path)
@@ -1260,7 +1869,7 @@ def test_broker_retired_account_linking_base_url_is_ignored(
 def test_broker_retired_account_linking_base_url_env_is_ignored(
     config_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(config_module, "_retired_account_linking_warned", threading.Event())
+    monkeypatch.setattr(broker_config_module, "_retired_account_linking_warned", threading.Event())
     env = {"JENTIC__BROKER__ACCOUNT_LINKING_BASE_URL": "https://console.example.com"}
     with patch.dict(os.environ, env, clear=False), structlog.testing.capture_logs() as logs:
         load_config(config_file)
@@ -1290,7 +1899,7 @@ def test_services_retired_sa_sweep_age_is_ignored(
     }
     path = tmp_path / "cfg.yaml"
     path.write_text(yaml.dump(sample_config_dict))
-    monkeypatch.setattr(config_module, "_retired_sa_sweep_age_warned", threading.Event())
+    monkeypatch.setattr(runtime_config_module, "_retired_sa_sweep_age_warned", threading.Event())
     with structlog.testing.capture_logs() as logs:
         config = load_config(path)
         load_config(path)
@@ -1305,7 +1914,7 @@ def test_services_retired_sa_sweep_age_is_ignored(
 def test_services_retired_sa_sweep_age_env_is_ignored(
     config_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(config_module, "_retired_sa_sweep_age_warned", threading.Event())
+    monkeypatch.setattr(runtime_config_module, "_retired_sa_sweep_age_warned", threading.Event())
     env = {"JENTIC__SERVICES__SERVICE_ACCOUNT_SWEEP_MIN_STAMP_AGE_HOURS": "48"}
     with patch.dict(os.environ, env, clear=False), structlog.testing.capture_logs() as logs:
         load_config(config_file)
@@ -1410,6 +2019,167 @@ def test_egress_allowed_internal_domains_comma_separated():
 def test_egress_empty_string_produces_empty_list():
     cfg = EgressConfig(allowed_private_subnets="")  # type: ignore[arg-type]
     assert cfg.allowed_private_subnets == []
+
+
+def _config_with(**sections: Any) -> AppConfig:
+    return AppConfig.model_validate(
+        {
+            "databases": {
+                "registry": {"name": "reg"},
+                "admin": {"name": "admin"},
+                "control": {"name": "ctrl"},
+            },
+            **sections,
+        }
+    )
+
+
+def test_control_egress_defaults_to_strict_broker_policy():
+    config = _config_with()
+    assert config.control.egress == ControlEgressConfig()
+    assert config.control.egress.allowed_private_subnets is None
+    assert config.control.egress.allowed_internal_domains is None
+    assert resolved_control_egress(config) == EgressConfig()
+
+
+def test_control_egress_inherits_broker_egress_when_unset():
+    config = _config_with(
+        broker={
+            "egress": {
+                "allowed_private_subnets": ["10.50.0.0/16"],
+                "allowed_internal_domains": [".corp.internal"],
+                "dns_pinning_enabled": False,
+            }
+        }
+    )
+    assert resolved_control_egress(config) == config.broker.egress
+
+
+def test_control_egress_override_differs_from_broker():
+    config = _config_with(
+        broker={"egress": {"allowed_private_subnets": ["10.50.0.0/16"]}},
+        control={"egress": {"allowed_private_subnets": ["10.60.0.0/16"]}},
+    )
+    assert resolved_control_egress(config).allowed_private_subnets == ["10.60.0.0/16"]
+    # The broker's own policy is untouched.
+    assert config.broker.egress.allowed_private_subnets == ["10.50.0.0/16"]
+
+
+def test_control_egress_unset_fields_fall_back_per_field():
+    config = _config_with(
+        broker={
+            "egress": {
+                "allowed_private_subnets": ["10.50.0.0/16"],
+                "allowed_internal_domains": [".corp.internal"],
+            }
+        },
+        control={"egress": {"allowed_internal_domains": [".svc.cluster.local"]}},
+    )
+    resolved = resolved_control_egress(config)
+    assert resolved.allowed_private_subnets == ["10.50.0.0/16"]
+    assert resolved.allowed_internal_domains == [".svc.cluster.local"]
+
+
+def test_control_egress_explicit_empty_list_is_stricter_than_broker():
+    config = _config_with(
+        broker={"egress": {"allowed_private_subnets": ["10.50.0.0/16"]}},
+        control={"egress": {"allowed_private_subnets": []}},
+    )
+    assert resolved_control_egress(config).allowed_private_subnets == []
+
+
+def test_control_egress_from_env_vars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        yaml.dump(
+            {
+                "databases": {
+                    "registry": {"name": "reg"},
+                    "admin": {"name": "admin"},
+                    "control": {"name": "ctrl"},
+                },
+                "broker": {"egress": {"allowed_internal_domains": [".corp.internal"]}},
+            }
+        )
+    )
+    monkeypatch.setenv(
+        "JENTIC__CONTROL__EGRESS__ALLOWED_PRIVATE_SUBNETS", "10.50.0.0/16,10.51.0.0/16"
+    )
+    config = load_config(path)
+    assert config.control.egress.allowed_internal_domains is None
+    resolved = resolved_control_egress(config)
+    assert resolved.allowed_private_subnets == ["10.50.0.0/16", "10.51.0.0/16"]
+    # Not set for control, so inherited from broker.egress.
+    assert resolved.allowed_internal_domains == [".corp.internal"]
+    assert config.broker.egress.allowed_private_subnets == []
+
+
+def test_control_egress_empty_env_string_is_an_explicit_empty_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        yaml.dump(
+            {
+                "databases": {
+                    "registry": {"name": "reg"},
+                    "admin": {"name": "admin"},
+                    "control": {"name": "ctrl"},
+                },
+                "broker": {"egress": {"allowed_private_subnets": ["10.50.0.0/16"]}},
+            }
+        )
+    )
+    monkeypatch.setenv("JENTIC__CONTROL__EGRESS__ALLOWED_PRIVATE_SUBNETS", "")
+    config = load_config(path)
+    assert resolved_control_egress(config).allowed_private_subnets == []
+
+
+@pytest.mark.parametrize(
+    "key", ["dns_pinning_enabled", "allowed_private_subnet", "unknown"], ids=str
+)
+def test_control_egress_rejects_keys_outside_the_allowlist(key: str):
+    # Control-plane calls always pin DNS, so a pinning toggle here would be a
+    # silent no-op; it and any other unknown key fail validation instead.
+    with pytest.raises(ValidationError, match=key):
+        _config_with(control={"egress": {key: False}})
+
+
+def test_control_egress_dns_pinning_env_var_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        yaml.dump(
+            {
+                "databases": {
+                    "registry": {"name": "reg"},
+                    "admin": {"name": "admin"},
+                    "control": {"name": "ctrl"},
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("JENTIC__CONTROL__EGRESS__DNS_PINNING_ENABLED", "false")
+    with pytest.raises(ConfigError, match="dns_pinning_enabled"):
+        load_config(path)
+
+
+def test_control_egress_round_trips_through_dump_and_validate():
+    # "Unset" is an explicit None in the model, so a dump/re-validate round trip
+    # keeps inheritance intact.
+    config = _config_with(
+        broker={"egress": {"allowed_private_subnets": ["10.50.0.0/16"]}},
+        control={"egress": {"allowed_internal_domains": [".corp.internal"]}},
+    )
+    again = AppConfig.model_validate(config.model_dump(mode="python"))
+    assert resolved_control_egress(again) == resolved_control_egress(config)
+    assert resolved_control_egress(again).allowed_private_subnets == ["10.50.0.0/16"]
+
+
+def test_control_egress_invalid_cidr_rejected():
+    with pytest.raises(ValidationError, match="invalid CIDR"):
+        _config_with(control={"egress": {"allowed_private_subnets": ["not-a-cidr"]}})
 
 
 def test_csv_to_list_rejects_non_string_non_list():
@@ -1852,34 +2622,61 @@ def test_entitlement_env_override_round_trip(config_file: Path):
     assert config.entitlement.refresh_interval_seconds == 600
 
 
-def test_db_connection_tunables_default_and_env_override(config_file: Path):
-    """Pool recycle and TCP keepalive are per-database ``databases.*`` settings."""
+def test_db_connection_tunables_default_and_env_override(
+    config_file: Path, tmp_path: Path, sample_config_dict: dict[str, Any]
+):
+    """Pre-ping, pool recycle and TCP keepalive are per-database ``databases.*`` settings."""
     default = load_config(config_file).databases.registry
+    assert default.pool_pre_ping is True
+    assert default.pool_pre_ping_idle_s == config_module.POOL_PRE_PING_IDLE_S == 1.0
     assert default.pool_recycle_s == config_module.POOL_RECYCLE_S == 1800
     assert default.tcp_keepalive is True
     assert default.tcp_keepalive_idle_s == config_module.TCP_KEEPALIVE_IDLE_S == 60
     assert default.tcp_keepalive_interval_s == config_module.TCP_KEEPALIVE_INTERVAL_S == 10
     assert default.tcp_keepalive_count == config_module.TCP_KEEPALIVE_COUNT == 5
     env = {
+        "JENTIC__DATABASES__REGISTRY__POOL_PRE_PING": "false",
+        "JENTIC__DATABASES__REGISTRY__POOL_PRE_PING_IDLE_S": "0",
         "JENTIC__DATABASES__REGISTRY__POOL_RECYCLE_S": "0",
         "JENTIC__DATABASES__REGISTRY__TCP_KEEPALIVE": "false",
+        "JENTIC__DATABASES__CONTROL__POOL_PRE_PING_IDLE_S": "2.5",
         "JENTIC__DATABASES__CONTROL__TCP_KEEPALIVE_IDLE_S": "30",
         "JENTIC__DATABASES__CONTROL__TCP_KEEPALIVE_INTERVAL_S": "3",
         "JENTIC__DATABASES__CONTROL__TCP_KEEPALIVE_COUNT": "9",
     }
     with patch.dict(os.environ, env, clear=False):
         config = load_config(config_file)
+    assert config.databases.registry.pool_pre_ping is False
+    assert config.databases.registry.pool_pre_ping_idle_s == 0.0
     assert config.databases.registry.pool_recycle_s == 0
     assert config.databases.registry.tcp_keepalive is False
     control = config.databases.control
+    assert control.pool_pre_ping is True
+    assert control.pool_pre_ping_idle_s == 2.5
     assert (control.tcp_keepalive_idle_s, control.tcp_keepalive_interval_s) == (30, 3)
     assert control.tcp_keepalive_count == 9
+    assert config.databases.admin.pool_pre_ping_idle_s == 1.0
     assert config.databases.admin.tcp_keepalive_idle_s == 60
+
+    doc = copy.deepcopy(sample_config_dict)
+    doc["databases"]["admin"]["pool_pre_ping"] = False
+    doc["databases"]["admin"]["pool_pre_ping_idle_s"] = 4.0
+    from_yaml = tmp_path / "no-pre-ping.yaml"
+    from_yaml.write_text(yaml.dump(doc))
+    databases = load_config(from_yaml).databases
+    assert databases.admin.pool_pre_ping is False
+    assert databases.admin.pool_pre_ping_idle_s == 4.0
+    assert databases.registry.pool_pre_ping is True
+    assert databases.registry.pool_pre_ping_idle_s == 1.0
 
 
 @pytest.mark.parametrize(
     ("key", "value"),
     [
+        ("POOL_PRE_PING_IDLE_S", "-0.1"),
+        ("POOL_PRE_PING_IDLE_S", "inf"),
+        ("POOL_PRE_PING_IDLE_S", "-inf"),
+        ("POOL_PRE_PING_IDLE_S", "nan"),
         ("POOL_RECYCLE_S", "-1"),
         ("TCP_KEEPALIVE_IDLE_S", "0"),
         ("TCP_KEEPALIVE_IDLE_S", "32768"),
@@ -1922,6 +2719,23 @@ def test_worker_reconnect_backoff_out_of_bounds_rejected(config_file: Path, key:
         pytest.raises(ConfigError, match=key.lower()),
     ):
         load_config(config_file)
+
+
+def test_broker_server_timing_defaults_off(config_file: Path) -> None:
+    """Server-Timing exposes stage latencies, so it is opt-in (#1717)."""
+    assert load_config(config_file).broker.server_timing is False
+
+
+def test_broker_server_timing_from_yaml_and_env(
+    tmp_path: Path, sample_config_dict: dict[str, Any]
+) -> None:
+    sample_config_dict["broker"] = {"server_timing": True}
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.dump(sample_config_dict))
+    assert load_config(path).broker.server_timing is True
+
+    with patch.dict(os.environ, {"JENTIC__BROKER__SERVER_TIMING": "false"}, clear=False):
+        assert load_config(path).broker.server_timing is False
 
 
 # --- trusted-issuer jwks_url scheme (#1723) -----------------------------------
@@ -2021,3 +2835,446 @@ def test_http_jwks_url_env_override_rejected_in_production(config_file: Path):
         pytest.raises(ConfigError, match=r"jwks_url must be https:// in production"),
     ):
         load_config(config_file)
+
+
+def test_streaming_persist_and_drain_budgets_default(tmp_path: Path):
+    config = _load(tmp_path, {})
+    assert config.broker.streaming_persist_timeout_s == 10.0
+    assert config.services.background_task_drain_timeout_s == 10.0
+
+
+def test_streaming_persist_and_drain_budgets_from_yaml_and_env(tmp_path: Path):
+    config = _load(
+        tmp_path,
+        {
+            "broker": {"streaming_persist_timeout_s": 2.5},
+            "services": {"background_task_drain_timeout_s": 0},
+        },
+    )
+    assert config.broker.streaming_persist_timeout_s == 2.5
+    assert config.services.background_task_drain_timeout_s == 0
+    env = {
+        "JENTIC__BROKER__STREAMING_PERSIST_TIMEOUT_S": "4",
+        "JENTIC__SERVICES__BACKGROUND_TASK_DRAIN_TIMEOUT_S": "7.5",
+    }
+    with patch.dict(os.environ, env, clear=False):
+        config = _load(tmp_path, {})
+    assert config.broker.streaming_persist_timeout_s == 4.0
+    assert config.services.background_task_drain_timeout_s == 7.5
+
+
+def test_admin_auth_argon2_bounds_default(tmp_path: Path):
+    config = _load(tmp_path, {})
+    assert config.admin.auth.argon2_max_concurrency == 4
+    assert config.admin.auth.argon2_acquire_timeout_s == 5.0
+
+
+def test_admin_auth_argon2_bounds_from_yaml_and_env(tmp_path: Path):
+    config = _load(
+        tmp_path,
+        {
+            "admin": {
+                "auth": {
+                    "argon2_max_concurrency": 6,
+                    "argon2_acquire_timeout_s": 2.5,
+                }
+            }
+        },
+    )
+    assert config.admin.auth.argon2_max_concurrency == 6
+    assert config.admin.auth.argon2_acquire_timeout_s == 2.5
+
+    env = {
+        "JENTIC__ADMIN__AUTH__ARGON2_MAX_CONCURRENCY": "8",
+        "JENTIC__ADMIN__AUTH__ARGON2_ACQUIRE_TIMEOUT_S": "1.25",
+    }
+    with patch.dict(os.environ, env, clear=False):
+        config = _load(tmp_path, {})
+    assert config.admin.auth.argon2_max_concurrency == 8
+    assert config.admin.auth.argon2_acquire_timeout_s == 1.25
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"argon2_max_concurrency": 0},
+        {"argon2_max_concurrency": -1},
+        {"argon2_max_concurrency": 65},
+        {"argon2_acquire_timeout_s": 0},
+        {"argon2_acquire_timeout_s": -0.5},
+        {"argon2_acquire_timeout_s": 61.0},
+        {"argon2_acquire_timeout_s": float("inf")},
+        {"argon2_acquire_timeout_s": float("nan")},
+    ],
+)
+def test_admin_auth_argon2_bounds_validation(tmp_path: Path, overrides: dict[str, Any]):
+    with pytest.raises(ConfigError):
+        _load(tmp_path, {"admin": {"auth": overrides}})
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"broker": {"streaming_persist_timeout_s": 0}},
+        {"services": {"background_task_drain_timeout_s": -1}},
+    ],
+)
+def test_streaming_persist_and_drain_budgets_reject_invalid(tmp_path: Path, extra: dict[str, Any]):
+    with pytest.raises(ConfigError):
+        _load(tmp_path, extra)
+
+
+def test_worker_poll_and_concurrency_defaults_keep_serial_2s_poll():
+    cfg = WorkerConfig()
+    assert cfg.poll_interval_s == 2.0
+    assert cfg.concurrency == 1
+
+
+def test_worker_poll_and_concurrency_from_yaml(tmp_path: Path):
+    config = _load(tmp_path, {"worker": {"poll_interval_s": 0.25, "concurrency": 4}})
+    assert config.worker.poll_interval_s == 0.25
+    assert config.worker.concurrency == 4
+
+
+def test_worker_poll_and_concurrency_from_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("JENTIC__WORKER__POLL_INTERVAL_S", "0.5")
+    monkeypatch.setenv("JENTIC__WORKER__CONCURRENCY", "4")
+    config = _load(tmp_path, {})
+    assert config.worker.poll_interval_s == 0.5
+    assert config.worker.concurrency == 4
+
+
+@pytest.mark.parametrize("value", [0.25, 60.0])
+def test_worker_poll_interval_accepts_bounds(value: float):
+    assert WorkerConfig(poll_interval_s=value).poll_interval_s == value
+
+
+@pytest.mark.parametrize("value", [0.0, 0.05, 0.249, 60.01, -1.0])
+def test_worker_poll_interval_rejects_out_of_bounds(value: float):
+    with pytest.raises(ValidationError):
+        WorkerConfig(poll_interval_s=value)
+
+
+@pytest.mark.parametrize("value", [0, -1, 65])
+def test_worker_concurrency_rejects_out_of_bounds(value: int):
+    with pytest.raises(ValidationError):
+        WorkerConfig(concurrency=value)
+
+
+def _with_admin(tmp_path: Path, admin: dict[str, Any], concurrency: int) -> AppConfig:
+    dbs = {**_min_dbs(), "admin": admin}
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.safe_dump({"databases": dbs, "worker": {"concurrency": concurrency}}))
+    return load_config(path)
+
+
+def test_worker_concurrency_above_one_is_refused_on_sqlite(tmp_path: Path):
+    """The handler's SQLite write lock spans the upstream call: only serial is safe."""
+    sqlite_admin = {"backend": "sqlite", "path": str(tmp_path / "admin.db")}
+    assert _with_admin(tmp_path, sqlite_admin, 1).worker.concurrency == 1
+    with pytest.raises(ConfigError, match=r"worker.concurrency=2 is not supported with a sqlite"):
+        _with_admin(tmp_path, sqlite_admin, 2)
+
+
+def test_worker_concurrency_above_one_is_refused_on_sqlite_via_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("JENTIC__WORKER__CONCURRENCY", "3")
+    sqlite_admin = {"backend": "sqlite", "path": str(tmp_path / "admin.db")}
+    with pytest.raises(ConfigError, match=r"not supported with a sqlite admin database"):
+        _with_admin(tmp_path, sqlite_admin, 1)
+
+
+@pytest.mark.parametrize(
+    ("pool_max", "concurrency", "ok"),
+    [
+        (10, 4, True),  # 8 connections < 10
+        (10, 5, False),  # 10 connections: no headroom
+        (10, 6, False),
+        (9, 4, True),
+        (8, 4, False),
+        (2, 1, True),  # serial is never refused
+        (129, 64, True),
+    ],
+)
+def test_worker_concurrency_must_fit_the_admin_pool_on_postgres(
+    tmp_path: Path, pool_max: int, concurrency: int, ok: bool
+):
+    """Each in-flight job holds ~2 admin connections; 2 x concurrency must stay below pool_max."""
+    admin = {"name": "admin", "pool_max": pool_max}
+    if ok:
+        assert _with_admin(tmp_path, admin, concurrency).worker.concurrency == concurrency
+    else:
+        with pytest.raises(ConfigError, match=r"2 per in-flight job.*pool_max"):
+            _with_admin(tmp_path, admin, concurrency)
+
+
+def test_worker_concurrency_pool_error_suggests_a_fitting_value(tmp_path: Path):
+    with pytest.raises(ConfigError, match=r"lower worker.concurrency to 4"):
+        _with_admin(tmp_path, {"name": "admin", "pool_max": 10}, 8)
+
+
+def test_worker_sweep_interval_default_yaml_and_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    assert WorkerConfig().sweep_interval_s == 120.0
+    assert _load(tmp_path, {"worker": {"sweep_interval_s": 30}}).worker.sweep_interval_s == 30.0
+    monkeypatch.setenv("JENTIC__WORKER__SWEEP_INTERVAL_S", "600")
+    assert _load(tmp_path, {}).worker.sweep_interval_s == 600.0
+
+
+@pytest.mark.parametrize("value", [1.0, 86_400.0])
+def test_worker_sweep_interval_accepts_bounds(value: float):
+    assert WorkerConfig(sweep_interval_s=value).sweep_interval_s == value
+
+
+@pytest.mark.parametrize("value", [0.0, 0.99, 86_400.1, -5.0])
+def test_worker_sweep_interval_rejects_out_of_bounds(value: float):
+    with pytest.raises(ValidationError):
+        WorkerConfig(sweep_interval_s=value)
+
+
+# --- memory shared-state backend budgets --------------------------------------
+
+
+def test_memory_backend_namespace_budgets_are_configurable(config_file: Path):
+    env = {
+        "JENTIC__STATE__MEMORY__MAX_ENTRIES_PER_NAMESPACE": "500",
+        "JENTIC__STATE__MEMORY__MAX_BYTES_PER_NAMESPACE": "1000000",
+    }
+    with patch.dict(os.environ, env, clear=False):
+        memory = load_config(config_file).state.memory
+    assert memory.max_entries_per_namespace == 500
+    assert memory.max_bytes_per_namespace == 1_000_000
+    assert memory.budgets()["idem"].max_entries == 250_000
+
+
+def test_memory_backend_total_cap_defaults_and_is_configurable(config_file: Path):
+    default = load_config(config_file).state.memory
+    assert default.max_total_bytes == 192 * 1024 * 1024
+    assert default.max_bytes_per_namespace == 16 * 1024 * 1024
+    assert default.budgets()["idem"].max_bytes == 128 * 1024 * 1024
+    assert default.budgets()["idem-body"].max_bytes == 32 * 1024 * 1024
+    # The broker's repeated-failure counter is budgeted by entry count: every
+    # key is a short fixed-shape bucket or marker.
+    repeated_failure = default.budgets()["repeated_failure"]
+    assert repeated_failure.max_entries == 10_000
+    assert repeated_failure.max_bytes == 10_000 * (750 + 128)
+    assert repeated_failure.max_owner_share is None
+    env = {"JENTIC__STATE__MEMORY__MAX_TOTAL_BYTES": "5000"}
+    with patch.dict(os.environ, env, clear=False):
+        memory = load_config(config_file).state.memory
+    assert memory.max_total_bytes == 5_000
+    backend = build_state_backend(StateBackendConfig(memory=memory))
+    assert isinstance(backend, MemoryStateBackend)
+    assert backend._max_total_bytes == 5_000
+    with pytest.raises(ValidationError):
+        MemoryBackendConfig(max_total_bytes=0)
+
+
+# --- top-level ``state`` and the deprecated broker.resilience.backend alias ----
+
+
+@pytest.fixture()
+def _fresh_state_deprecation_latch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(state_compat_module, "_deprecated_state_section_warned", threading.Event())
+
+
+def _write(tmp_path: Path, data: dict[str, Any]) -> Path:
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.dump(data))
+    return path
+
+
+def test_state_defaults_to_memory(config_file: Path):
+    config = load_config(config_file)
+    assert config.state == StateBackendConfig()
+    assert config.state.backend == "memory"
+    assert "backend" not in BrokerResilienceConfig.model_fields
+
+
+def test_state_section_from_yaml_and_env(tmp_path: Path, sample_config_dict: dict[str, Any]):
+    sample_config_dict["state"] = {"backend": "custom", "options": {"url": "x://y"}}
+    path = _write(tmp_path, sample_config_dict)
+    assert load_config(path).state.options == {"url": "x://y"}
+    with patch.dict(os.environ, {"JENTIC__STATE__BACKEND": "other"}, clear=False):
+        assert load_config(path).state.backend == "other"
+
+
+@pytest.mark.usefixtures("_fresh_state_deprecation_latch")
+def test_the_deprecated_yaml_section_is_read_into_state(
+    tmp_path: Path, sample_config_dict: dict[str, Any]
+):
+    sample_config_dict["broker"] = {
+        "resilience": {
+            "max_in_flight": 7,
+            "backend": {"backend": "memory", "memory": {"max_total_bytes": 4096}},
+        }
+    }
+    path = _write(tmp_path, sample_config_dict)
+    with structlog.testing.capture_logs() as logs:
+        config = load_config(path)
+        load_config(path)
+    assert config.state.memory.max_total_bytes == 4096
+    assert config.broker.resilience.max_in_flight == 7
+    warnings = [e for e in logs if e["event"] == "config_deprecated_setting"]
+    assert len(warnings) == 1, "the deprecation warning is logged once per process"
+    assert warnings[0]["log_level"] == "warning"
+    assert warnings[0]["setting"] == "broker.resilience.backend"
+    assert warnings[0]["replacement"] == "state"
+
+
+@pytest.mark.usefixtures("_fresh_state_deprecation_latch")
+def test_the_deprecated_env_vars_are_read_into_state(config_file: Path):
+    env = {
+        "JENTIC__BROKER__RESILIENCE__BACKEND__BACKEND": "redis",
+        "JENTIC__BROKER__RESILIENCE__BACKEND__REDIS_URL": "redis://r:6379/0",
+        "JENTIC__BROKER__RESILIENCE__BACKEND__MEMORY__MAX_TOTAL_BYTES": "5000",
+    }
+    with patch.dict(os.environ, env, clear=False):
+        state = load_config(config_file).state
+    assert state.backend == "redis"
+    assert state.redis_url is not None
+    assert state.redis_url.get_secret_value() == "redis://r:6379/0"
+    assert state.memory.max_total_bytes == 5000
+
+
+@pytest.mark.usefixtures("_fresh_state_deprecation_latch")
+def test_old_and_new_sections_merge_when_they_set_different_keys(
+    tmp_path: Path, sample_config_dict: dict[str, Any]
+):
+    sample_config_dict["state"] = {"memory": {"max_total_bytes": 4096}}
+    path = _write(tmp_path, sample_config_dict)
+    env = {"JENTIC__BROKER__RESILIENCE__BACKEND__MEMORY__MAX_ENTRIES_PER_NAMESPACE": "9"}
+    with patch.dict(os.environ, env, clear=False):
+        state = load_config(path).state
+    assert state.memory.max_total_bytes == 4096
+    assert state.memory.max_entries_per_namespace == 9
+
+
+@pytest.mark.usefixtures("_fresh_state_deprecation_latch")
+def test_old_and_new_sections_may_set_the_same_value(
+    tmp_path: Path, sample_config_dict: dict[str, Any]
+):
+    """An env-var string and a YAML int for the same value are not a conflict."""
+    sample_config_dict["state"] = {"memory": {"max_total_bytes": 4096}}
+    path = _write(tmp_path, sample_config_dict)
+    env = {"JENTIC__BROKER__RESILIENCE__BACKEND__MEMORY__MAX_TOTAL_BYTES": "4096"}
+    with patch.dict(os.environ, env, clear=False):
+        assert load_config(path).state.memory.max_total_bytes == 4096
+
+
+@pytest.mark.usefixtures("_fresh_state_deprecation_latch")
+@pytest.mark.parametrize(
+    ("new", "old_env", "field"),
+    [
+        (
+            {"backend": "memory"},
+            {"JENTIC__BROKER__RESILIENCE__BACKEND__BACKEND": "redis"},
+            "backend",
+        ),
+        (
+            {"memory": {"max_total_bytes": 4096}},
+            {"JENTIC__BROKER__RESILIENCE__BACKEND__MEMORY__MAX_TOTAL_BYTES": "5000"},
+            "memory",
+        ),
+    ],
+)
+def test_conflicting_old_and_new_sections_fail_to_load(
+    tmp_path: Path,
+    sample_config_dict: dict[str, Any],
+    new: dict[str, Any],
+    old_env: dict[str, str],
+    field: str,
+):
+    sample_config_dict["state"] = new
+    path = _write(tmp_path, sample_config_dict)
+    with (
+        patch.dict(os.environ, old_env, clear=False),
+        pytest.raises(ConfigError, match=r"broker\.resilience\.backend both set") as exc,
+    ):
+        load_config(path)
+    assert field in str(exc.value)
+
+
+@pytest.mark.usefixtures("_fresh_state_deprecation_latch")
+def test_an_invalid_deprecated_value_under_a_valid_state_value_is_a_conflict(
+    tmp_path: Path, sample_config_dict: dict[str, Any]
+):
+    """A key set under both, valid only under ``state``, must not be silently dropped."""
+    sample_config_dict["state"] = {"memory": {"max_total_bytes": 4096}}
+    path = _write(tmp_path, sample_config_dict)
+    env = {"JENTIC__BROKER__RESILIENCE__BACKEND__MEMORY__MAX_TOTAL_BYTES": "0"}
+    with (
+        patch.dict(os.environ, env, clear=False),
+        pytest.raises(ConfigError, match=r"broker\.resilience\.backend both set memory"),
+    ):
+        load_config(path)
+
+
+@pytest.mark.usefixtures("_fresh_state_deprecation_latch")
+def test_the_deprecated_section_may_be_a_model_instance(sample_config_dict: dict[str, Any]):
+    """A programmatic caller passing a StateBackendConfig keeps working."""
+    sample_config_dict["broker"] = {
+        **sample_config_dict.get("broker", {}),
+        "resilience": {
+            "backend": StateBackendConfig.model_validate({"memory": {"max_total_bytes": 4096}})
+        },
+    }
+    config = AppConfig.model_validate(sample_config_dict)
+    assert config.state.memory.max_total_bytes == 4096
+
+
+def test_a_backend_name_must_be_well_formed(tmp_path: Path, sample_config_dict: dict[str, Any]):
+    sample_config_dict["state"] = {"backend": "Not A Name"}
+    with pytest.raises(ConfigError, match=r"state\.backend"):
+        load_config(_write(tmp_path, sample_config_dict))
+
+
+def test_an_idem_override_keeps_the_per_caller_share_unless_set():
+    memory = MemoryBackendConfig.model_validate(
+        {
+            "namespaces": {
+                "idem": {"max_entries": 10, "max_bytes": 10_000},
+                "idem-body": {"max_entries": 10, "max_bytes": 10_000, "max_owner_share": 1.0},
+                "cb": {"max_entries": 10, "max_bytes": 10_000},
+            }
+        }
+    )
+    budgets = memory.budgets()
+    assert budgets["idem"].max_owner_share == 0.1
+    assert budgets["idem-body"].max_owner_share == 1.0
+    assert budgets["cb"].max_owner_share is None
+
+
+def test_login_csrf_has_a_per_client_share_sized_like_other_namespaces():
+    default = MemoryBackendConfig().budgets()["login-csrf"]
+    assert default.max_owner_share == 0.02
+    assert default.max_entries == 100_000
+    assert default.max_bytes == 16 * 1024 * 1024
+
+    # It follows the per-namespace defaults, and an override keeps the share.
+    resized = MemoryBackendConfig(max_entries_per_namespace=7, max_bytes_per_namespace=9_000)
+    assert resized.budgets()["login-csrf"] == NamespaceBudget(
+        max_entries=7, max_bytes=9_000, max_owner_share=0.02
+    )
+    overridden = MemoryBackendConfig.model_validate(
+        {"namespaces": {"login-csrf": {"max_entries": 10, "max_bytes": 10_000}}}
+    )
+    assert overridden.budgets()["login-csrf"].max_owner_share == 0.02
+
+
+@pytest.mark.parametrize(
+    ("backend", "configured", "expected"),
+    [
+        ("memory", None, 3_600.0),
+        ("redis", None, 86_400.0),
+        ("redis-cluster", None, 86_400.0),
+        ("memory", 120.0, 120.0),
+        ("redis", 120.0, 120.0),
+    ],
+)
+def test_idempotency_replay_ttl_defaults_by_backend(
+    backend: str, configured: float | None, expected: float
+):
+    assert IdempotencyConfig(ttl_s=configured).replay_ttl_s(backend) == expected

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
 
@@ -103,16 +104,39 @@ async def test_record_failed_login(admin_db: DatabaseSession, test_user: str) ->
         await session.commit()
 
     async with admin_db.session() as session:
-        secret = await UserSecretRepository.record_failed_login(session, test_user)
+        assert await UserSecretRepository.record_failed_login(session, test_user) == 1
         await session.commit()
-        assert secret is not None
-        assert secret.failed_login_count == 1
 
     async with admin_db.session() as session:
-        secret = await UserSecretRepository.record_failed_login(session, test_user)
+        assert await UserSecretRepository.record_failed_login(session, test_user) == 2
         await session.commit()
+
+    async with admin_db.session() as session:
+        secret = await UserSecretRepository.get_by_user_id(session, test_user)
         assert secret is not None
         assert secret.failed_login_count == 2
+
+
+async def test_record_failed_login_concurrent_increments_are_not_lost(
+    admin_db: DatabaseSession, test_user: str
+) -> None:
+    """Concurrent increments over separate transactions each see a distinct count."""
+    async with admin_db.session() as session:
+        await UserSecretRepository.create(session, user_id=test_user, created_by="usr_test")
+        await session.commit()
+
+    async def _fail_once() -> int | None:
+        async with admin_db.transaction() as session:
+            return await UserSecretRepository.record_failed_login(session, test_user)
+
+    attempts = 8
+    counts = await asyncio.gather(*(_fail_once() for _ in range(attempts)))
+
+    assert sorted(c for c in counts if c is not None) == list(range(1, attempts + 1))
+    async with admin_db.session() as session:
+        secret = await UserSecretRepository.get_by_user_id(session, test_user)
+        assert secret is not None
+        assert secret.failed_login_count == attempts
 
 
 async def test_reset_failed_logins(admin_db: DatabaseSession, test_user: str) -> None:
@@ -146,11 +170,32 @@ async def test_lock_until(admin_db: DatabaseSession, test_user: str) -> None:
         assert abs((secret.locked_until - lock_time).total_seconds()) < 1
 
 
+async def test_clear_password_hash(admin_db: DatabaseSession, test_user: str) -> None:
+    async with admin_db.session() as session:
+        await UserSecretRepository.create(
+            session, user_id=test_user, password_hash="$argon2id$to_clear", created_by="usr_test"
+        )
+        await session.commit()
+
+    async with admin_db.session() as session:
+        cleared = await UserSecretRepository.clear_password_hash(session, test_user)
+        await session.commit()
+        assert cleared is not None
+        assert cleared.password_hash is None
+        assert cleared.password_changed_at is not None
+
+    async with admin_db.session() as session:
+        loaded = await UserSecretRepository.get_by_user_id(session, test_user)
+        assert loaded is not None
+        assert loaded.password_hash is None
+
+
 async def test_operations_on_nonexistent_user(
     admin_db: DatabaseSession, clean_secrets: None
 ) -> None:
     async with admin_db.session() as session:
         assert await UserSecretRepository.get_by_user_id(session, "usr_noone") is None
+        assert await UserSecretRepository.clear_password_hash(session, "usr_noone") is None
         assert await UserSecretRepository.record_failed_login(session, "usr_noone") is None
         assert await UserSecretRepository.reset_failed_logins(session, "usr_noone") is None
         assert (

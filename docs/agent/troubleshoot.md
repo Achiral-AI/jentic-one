@@ -111,6 +111,34 @@ control-plane URL. Re-register with both URLs.
 The database must live on a named volume, not a host bind mount — Docker
 Desktop's file sharing lacks the locking semantics SQLite needs.
 
+## `credential_binding_suspended` (403) on execute
+
+The agent is bound to a credential that covers this API, but an operator
+suspended that binding. This is the operator's decision, so the agent can't
+fix it. Don't try a new connect: while the suspension stands,
+`jentic connect` / `request_connection` for the same agent and API returns
+409 `connect_session_binding_suspended`. Ask the operator whether they'll
+resume it. They can do that from the agent's page in the dashboard, or with
+`POST /agents/{agent_id}/credentials/{credential_id}:resume`
+(`agents:write`). The binding works again on the next call; nothing needs to
+restart.
+
+## Import fails: server URL can't be made absolute
+
+The import job error starts with `relative server URL has no base`,
+`spec host serves files`, `server URL looks like a host; add https://`, or
+another `server URL …` reason; or `execute` refuses an imported operation with
+`RESOLVE_FAILED` ("has no upstream host"). Each error, its cause, and its fix
+are in the [import troubleshooting table](../guides/importing-apis.md#import-fails-server-url-cant-be-made-absolute).
+Before binding a credential, check the host the import resolved
+(`server_url_changes` on the job result). Promoting a revision whose hosts
+changed on a credential-bound API needs `org:admin` — report to the human
+rather than retrying.
+
+**"has no upstream host".** The API is stored with host-relative servers.
+Re-import it from its URL (`jentic apis import <url>`), then promote the new
+draft (`jentic apis promote <vendor/name/version> <revision_id>`).
+
 ## `credential_undecryptable` (424) on execute
 
 The stored data is intact; the key is wrong. A credential row is decrypted

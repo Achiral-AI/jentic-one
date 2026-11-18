@@ -13,50 +13,73 @@ from __future__ import annotations
 
 import math
 import secrets
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import structlog
 from pydantic import SecretStr
 
+from jentic_one.control.core.schema.agent_permission_rules import AgentPermissionRule
 from jentic_one.control.core.schema.connect_session_outcomes import (
+    OUTCOME_APPLIED,
     OUTCOME_CANCELLED,
     OUTCOME_CONNECTED,
     OUTCOME_REJECTED,
     ConnectSessionOutcome,
 )
+from jentic_one.control.core.schema.connect_session_revisions import ConnectSessionRevision
 from jentic_one.control.core.schema.connect_sessions import (
+    INTENT_CREATE,
+    INTENT_EDIT,
     TARGET_KIND_API,
     TARGET_KIND_VENDOR,
     ConnectSession,
 )
 from jentic_one.control.core.schema.credentials import Credential
 from jentic_one.control.core.schema.oauth_app_registrations import OAuthAppRegistration
+from jentic_one.control.core.schema.permission_rule_sets import PermissionRuleSetRule
 from jentic_one.control.repos import (
     AgentPermissionRuleRepository,
+    ConnectNonceRepository,
     CredentialRepository,
+    OAuthAppRegistrationRepository,
     OAuthTokenRepository,
+    PermissionRuleSetRepository,
 )
 from jentic_one.control.repos.connect_session_outcome_repo import (
     ConnectSessionOutcomeRepository,
 )
 from jentic_one.control.repos.connect_session_repo import LIVE_STATES, ConnectSessionRepository
+from jentic_one.control.repos.connect_session_revision_repo import (
+    ConnectSessionRevisionRepository,
+)
+from jentic_one.control.repos.device_authorization_credential_repo import (
+    DeviceAuthorizationCredentialRepository,
+)
 from jentic_one.control.repos.effects_repo import AgentOwnerRow, EffectsRepository
 from jentic_one.control.repos.oauth_client_credential_repo import (
     OAuthClientCredentialRepository,
 )
-from jentic_one.control.repos.prerequisite_repo import PrerequisiteRepository
-from jentic_one.control.scoping.filters import build_access_filters
-from jentic_one.control.services.credentials.connect_service import ConnectService
-from jentic_one.control.services.credentials.mapping import to_wire
-from jentic_one.control.services.credentials.schemas.connect import (
-    AuthCodeChallenge,
-    ConnectRequest,
+from jentic_one.control.repos.prerequisite_repo import (
+    AgentCredentialBindingRow,
+    AgentVisibility,
+    CredentialBoundAgentRow,
+    PrerequisiteRepository,
 )
-from jentic_one.control.services.credentials.state import consume_callback_state, decode_state
+from jentic_one.control.scoping.filters import bound_agent_visibility, build_access_filters
+from jentic_one.control.services.credentials.mapping import to_wire
+from jentic_one.control.services.credentials.state import (
+    BrowserBindingClaim,
+    consume_callback_state,
+)
+from jentic_one.control.services.credentials.token_endpoint import (
+    may_carry_refresh_token,
+    minted_at_current_origin,
+)
 from jentic_one.control.services.integrations import identity_echo
 from jentic_one.control.services.integrations.api_targets import (
     SCHEME_OAUTH2,
@@ -67,16 +90,37 @@ from jentic_one.control.services.integrations.api_targets import (
     oauth_scopes_of,
     require_pinnable_hosts,
     review_digest,
+    scheme_kind,
     scheme_still_declared,
     select_scheme,
 )
 from jentic_one.control.services.integrations.dedupe import oauth_dedupe_key
+from jentic_one.control.services.integrations.edit_result import normalize_edit_result
+from jentic_one.control.services.integrations.edits import (
+    EditRequest,
+    added_scopes,
+    baseline_matches,
+    require_change,
+    resolve_edit,
+    rule_content,
+    rule_to_write,
+    scopes_changed,
+    target_rules,
+    widens_access,
+)
 from jentic_one.control.services.integrations.errors import (
     AgentInactiveError,
     AgentNotFoundError,
+    AmendFieldsMismatchError,
+    BaselineChangedError,
+    BindingSuspendedError,
     ConfirmationForbiddenError,
     ConfirmKindMismatchError,
+    ConnectOpenError,
     CredentialMissingCreatorError,
+    EditBindingNotFoundError,
+    EditConflictedError,
+    EditOpenError,
     ExistingCredentialNotFoundError,
     InsufficientGrantedScopesError,
     InvalidOAuthAppRegistrationError,
@@ -84,19 +128,28 @@ from jentic_one.control.services.integrations.errors import (
     InvalidStateTransitionError,
     ManualFlowsDisabledError,
     NoOpForFlowError,
+    NothingToChangeError,
     OAuthAppChangedError,
     OwnClientInvalidError,
-    ReauthorizeUnavailableError,
     RecentlyRejectedError,
     ReviewStaleError,
+    RevisionChangedError,
+    RevisionRequiredError,
+    RuleSetConfirmForbiddenError,
     RulesRequiredError,
     SchemeChangedError,
+    ScopeChangeForbiddenError,
+    ScopesNotSupportedError,
     ScopeValidationError,
     SecuritySchemesLookupUnavailableError,
     ServersChangedError,
+    SessionClosedError,
     SessionNotFoundError,
+    TokenEndpointMovedError,
     TooManyOpenSessionsError,
+    TooManyRevisionsError,
     UnknownApiError,
+    UnknownRuleError,
     UnsupportedTargetKindError,
 )
 from jentic_one.control.services.integrations.flow_handlers import (
@@ -107,7 +160,6 @@ from jentic_one.control.services.integrations.flow_handlers import (
 )
 from jentic_one.control.services.integrations.flow_handlers.auth_code import (
     RegistrationInactiveError,
-    platform_redirect_uri,
 )
 from jentic_one.control.services.integrations.flow_handlers.base import (
     AuthCodeBeginResult,
@@ -119,6 +171,7 @@ from jentic_one.control.services.integrations.flow_handlers.manual import (
     manual_handler_for_scheme,
 )
 from jentic_one.control.services.integrations.flow_handlers.session_app import SessionApp
+from jentic_one.control.services.integrations.revisions import create_revision, revision_digest
 from jentic_one.control.services.vendors.service import (
     AmbiguousVendorError,
     ResolvedScope,
@@ -142,10 +195,17 @@ from jentic_one.shared.catalog import (
     CatalogAutoImportProtocol,
     SecuritySchemesLookupProtocol,
 )
-from jentic_one.shared.config import connect_approval_url
+from jentic_one.shared.config import (
+    VendorAuthConfig,
+    VendorScopeConfig,
+    connect_approval_url,
+    resolved_control_egress,
+)
 from jentic_one.shared.context import Context
 from jentic_one.shared.crypto import hash_secret
 from jentic_one.shared.db.errors import DatabaseIntegrityError
+from jentic_one.shared.db.ids import generate_ksuid
+from jentic_one.shared.db.locks import lock_credential_identity_repair
 from jentic_one.shared.events import emit_event_best_effort, summary_label
 from jentic_one.shared.metrics import get_meter
 from jentic_one.shared.models import ActorStatus, ActorType
@@ -157,8 +217,9 @@ from jentic_one.shared.models.api_identity import (
 )
 from jentic_one.shared.models.credentials import StoredCredentialType
 from jentic_one.shared.models.events import EventSeverity, EventType
-from jentic_one.shared.pagination import decode_cursor_str, encode_cursor
-from jentic_one.shared.url_validation import validate_upstream_url
+from jentic_one.shared.pagination import InvalidCursorError, decode_cursor, encode_cursor
+from jentic_one.shared.redaction import redact_value
+from jentic_one.shared.url_validation import validate_upstream_url_async
 from jentic_one.shared.vendor_domain import vendor_from_api_id
 
 _logger = structlog.get_logger(__name__)
@@ -210,6 +271,152 @@ class CreatedSession:
     approval_url: str
     poll_token: str
     resolved_flow: str
+    # Revision 1, which a confirm names until the session is amended.
+    revision_id: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ScopeOptions:
+    """How an edit can change a credential's scopes.
+
+    ``supported`` is False when the credential's scopes can't change here.
+    ``catalog`` is the vendor's scope list when its client has one; ``None``
+    means any scope name is passed to the vendor as asked.
+    """
+
+    supported: bool
+    catalog: list[VendorScopeConfig] | None
+
+
+@dataclass(slots=True, frozen=True)
+class ConnectScopeOption:
+    """One scope a connection to an API could ask for.
+
+    ``requestable`` is whether a request may name it here: the connect
+    source's catalog decides when there is one; without one, the spec's.
+    """
+
+    name: str
+    description: str
+    classification: str | None
+    default: bool
+    requestable: bool
+
+
+@dataclass(slots=True, frozen=True)
+class ConnectSchemeOption:
+    """How a connection would collect one declared security scheme.
+
+    ``kind`` is the connect-session kind (``oauth2``, ``api_key``,
+    ``bearer``, ``basic``), or ``None`` for a scheme connections can't serve.
+    ``flow`` is what a session would run: an OAuth flow, a ``manual_*``
+    entry, or ``awaiting_app`` while no OAuth app covers the API. An OAuth
+    scheme's ``vendor_key`` and ``registration_id`` name the app.
+    """
+
+    name: str
+    type: str
+    kind: str | None
+    flow: str | None
+    vendor_key: str | None
+    registration_id: str | None
+    scopes: list[ConnectScopeOption]
+
+
+@dataclass(slots=True, frozen=True)
+class ConnectOptions:
+    """How a connection to one registry API would be made, scheme by scheme."""
+
+    vendor: str
+    name: str
+    version: str
+    display_name: str | None
+    #: Whether ``:connect`` takes this API as a target (``manual_flows_enabled``).
+    api_target_supported: bool
+    schemes: list[ConnectSchemeOption]
+
+
+@dataclass(slots=True, frozen=True)
+class CreatedEditSession:
+    """An opened edit session: what the initiator relays and polls with."""
+
+    session_id: str
+    approval_url: str
+    poll_token: str
+    revision_id: str
+    resolved_flow: str = "edit"
+    # ``apply``: True once the change is written; the vendor consent it
+    # started instead, when it adds scopes.
+    applied: bool = False
+    challenge: ConfirmResult | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ConsentSource:
+    """How a credential is re-consented with more scopes.
+
+    ``app`` is the client the credential was connected through (a shared
+    registration, or its own stored client); ``key`` / ``entry`` are its
+    vendor-registry source when it has one, for scope validation and the
+    identity echo.
+    """
+
+    handler_cls: type[AuthFlowHandler]
+    app: SessionApp
+    key: str | None
+    entry: VendorAuthConfig | None
+
+
+@dataclass(slots=True, frozen=True)
+class SessionAmend:
+    """What an amend changes; ``fields`` names the parts it carries.
+
+    ``rules``, ``resume`` and ``scopes`` (a request whose scope change is
+    read) apply to edit sessions;
+    ``requested_permission_rules`` and ``requested_scopes`` to create
+    sessions; ``reason`` to both.
+    """
+
+    fields: frozenset[str]
+    rules: EditRequest | None = None
+    resume: bool = False
+    reason: str | None = None
+    requested_permission_rules: list[dict[str, object]] | None = None
+    requested_scopes: list[str] | None = None
+    scopes: EditRequest | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AmendedSession:
+    session_id: str
+    revision_id: str
+    revision_number: int
+
+
+@dataclass(slots=True, frozen=True)
+class EditReview:
+    """What an edit session's reviewer decides on.
+
+    ``current`` is the binding as the session's baseline recorded it,
+    ``result`` what confirming the current revision would leave in place.
+    """
+
+    agent_id: str
+    credential_id: str
+    credential_name: str | None
+    revision_id: str
+    revision_number: int
+    current: dict[str, Any]
+    result: dict[str, Any]
+    widens_access: bool
+    other_bound_agents: list[AgentView]
+    # The change reaches more agents than ``other_bound_agents`` names: the
+    # list is capped, and nothing pages past it.
+    other_bound_agents_truncated: bool = False
+    # The result adds scopes: confirming starts a vendor consent.
+    needs_vendor_consent: bool = False
+    # What the request can't follow since the binding changed under it.
+    conflicts: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass(slots=True, frozen=True)
@@ -255,6 +462,15 @@ class ReviewData:
     # Credentials the viewer already holds for the target, with the
     # granted-scope comparison.
     existing_credentials: list[ExistingCredentialView] = field(default_factory=list)
+    # The session's current revision; ``:confirm`` names it.
+    revision_id: str | None = None
+    revision_number: int | None = None
+    # Edit sessions only: the binding change under review.
+    edit: EditReview | None = None
+    # When a human last rejected this agent's ask for the same target (or binding).
+    last_rejected_at: datetime | None = None
+    # An open edit whose binding moved since: ``:rebase`` brings it current.
+    stale: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -297,8 +513,12 @@ class ExistingCredentialView:
 
     ``granted_scopes`` / ``missing_scopes`` are set for OAuth credentials
     only (``None`` for static ones, whose upstream permissions the platform
-    cannot see). ``other_bound_agent_ids`` are the agents other than the
-    session's that are bound to it — re-authorizing would widen theirs too.
+    cannot see). ``other_bound_agents`` are the agents other than the
+    session's that are bound to it: granting the missing scopes widens
+    their access too. ``needs_vendor_consent`` is set when binding it runs a
+    vendor consent for ``missing_scopes`` first, and ``can_bind`` says
+    whether this viewer may use it (widening a credential others use is
+    its owner's or an org admin's call).
     """
 
     credential_id: str
@@ -307,9 +527,11 @@ class ExistingCredentialView:
     type: str
     granted_scopes: list[str] | None
     missing_scopes: list[str] | None
-    other_bound_agent_ids: list[str]
+    other_bound_agents: list[AgentView]
+    #: More agents are bound than ``other_bound_agents`` names (it is capped).
+    other_bound_agents_truncated: bool
     can_bind: bool
-    can_reauthorize: bool
+    needs_vendor_consent: bool
 
 
 @dataclass(slots=True, frozen=True)
@@ -327,6 +549,8 @@ class SessionSummary:
     error_code: str | None
     created_at: datetime
     credential_id: str
+    #: ``create`` connects a new credential; ``edit`` changes an existing binding.
+    intent: str = INTENT_CREATE
 
 
 @dataclass(slots=True, frozen=True)
@@ -371,21 +595,7 @@ class ConnectedConfirmResult:
     kind: str = "connected"
 
 
-@dataclass(slots=True, frozen=True)
-class ReauthorizeConfirmResult:
-    """The agent is bound to ``credential_id``; the approver re-consents at ``authorize_url``."""
-
-    credential_id: str
-    authorize_url: str
-    kind: str = "reauthorize"
-
-
-ConfirmResult = (
-    DeviceAuthorizationConfirmResult
-    | AuthCodeConfirmResult
-    | ConnectedConfirmResult
-    | ReauthorizeConfirmResult
-)
+ConfirmResult = DeviceAuthorizationConfirmResult | AuthCodeConfirmResult | ConnectedConfirmResult
 
 
 @dataclass(slots=True, frozen=True)
@@ -396,6 +606,7 @@ class ConfirmChecks:
     expected_agent_id: str | None
     digest: str | None
     agent_id: str | None = None
+    revision_id: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -426,10 +637,9 @@ class OwnClientConfirm:
 
 @dataclass(slots=True, frozen=True)
 class ExistingCredentialConfirm:
-    """Bind a credential the approver already holds, or re-authorize it with more scopes."""
+    """Bind a credential the approver already holds (consenting to any missing scopes)."""
 
     credential_id: str
-    reauthorize: bool
     checks: ConfirmChecks
 
 
@@ -439,16 +649,19 @@ ConfirmVariant = SecretConfirm | OwnClientConfirm | ExistingCredentialConfirm
 CONFIRM_KIND_OAUTH = "oauth"
 CONFIRM_KIND_OWN_CLIENT = "own_oauth_client"
 CONFIRM_KIND_EXISTING = "existing_credential"
-CONFIRM_KIND_REAUTHORIZE = "reauthorize"
+CONFIRM_KIND_EDIT = "edit"
 
 
 @dataclass(slots=True, frozen=True)
 class StatusResult:
-    status: str  # "pending" | "polling" | "connected" | "failed" | "expired"
+    status: str  # "pending" | "polling" | "connected" | "applied" | "failed" | "expired"
     connected_as: str | None = None
     credential_id: str | None = None
     bound_scopes: list[str] | None = None
     error_code: str | None = None
+    # An open edit whose binding moved since it was opened: it is resolved
+    # against the binding as it is now by ``:rebase``, or by acting on it.
+    stale: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +671,19 @@ class StatusResult:
 # Overall hard TTL for a vendor OAuth session — clamps stale rows even if
 # flow-level device_code_expires_at hasn't been reached.
 _SESSION_TTL_SECONDS = 30 * 60
+# Slack past the signed callback state's TTL before the sweep expires an
+# auth-code session still waiting on its callback (clock skew, a callback
+# already in flight).
+_CALLBACK_STATE_GRACE = timedelta(seconds=60)
+
+
+class _SessionEndedError(Exception):
+    """The session left its live states before its finalise write (nothing written)."""
+
+
+class _DeviceFlowSupersededError(Exception):
+    """A newer device challenge replaced the generation being finalised."""
+
 
 # Flows that live for ``_SESSION_TTL_SECONDS``. Every other flow (a session a
 # human completes by entering a credential, or one waiting for an OAuth app)
@@ -467,8 +693,38 @@ _OAUTH_FLOWS: tuple[str, ...] = (DeviceAuthorizationHandler.kind, AuthCodeFlowHa
 # How long a session's terminal outcome is kept once the session has ended.
 _OUTCOME_RETENTION = timedelta(days=30)
 
+#: Revisions one session may hold. An ask that has been rewritten this often
+#: is better restated than amended again, and the chain is read whole.
+_MAX_SESSION_REVISIONS = 50
+
 #: ``resolved_flow`` / ``state`` of an OAuth API target with no OAuth app yet.
 AWAITING_APP = "awaiting_app"
+
+#: Amend fields that apply only to one intent.
+_CREATE_AMEND_FIELDS = frozenset({"requested_permission_rules", "requested_scopes"})
+_EDIT_AMEND_FIELDS = frozenset({"rules", "resume", "scopes"})
+
+#: ``resolved_flow`` of an edit session: no vendor conversation.
+EDIT_FLOW = "edit"
+
+
+def _edit_conflicts(dropped: list[str]) -> list[dict[str, str]]:
+    """What an edit's request can't follow on its binding now: the rules it names that are gone.
+
+    Everything else in it applies to the binding as it is, whatever moved since.
+    """
+    return [{"kind": "missing_rule", "rule_id": rule_id} for rule_id in dict.fromkeys(dropped)]
+
+
+def _require_rules_present(baseline: Mapping[str, Any], rules: Sequence[Any]) -> None:
+    """Refuse an empty rule list where the binding has rules today.
+
+    Stripping every rule is default deny: the agent could call nothing. A
+    binding that already has none stays editable (its scopes, its resume).
+    """
+    if not rules and target_rules(baseline)[1]:
+        raise RulesRequiredError()
+
 
 #: ``error_code`` of a session a human explicitly rejected.
 ERROR_REJECTED = "rejected"
@@ -489,10 +745,6 @@ class _CapScope:
     agent_id: str | None
     owner_id: str | None
     owned_agent_ids: list[str]
-
-
-def _state_secret(ctx: Context) -> str:
-    return ctx.config.credentials.connect.state_secret.get_secret_value()
 
 
 def _session_app_from_registration(ctx: Context, registration: OAuthAppRegistration) -> SessionApp:
@@ -645,17 +897,19 @@ def _variant_kind(variant: ConfirmVariant) -> str:
         return variant.kind
     if isinstance(variant, OwnClientConfirm):
         return CONFIRM_KIND_OWN_CLIENT
-    return CONFIRM_KIND_REAUTHORIZE if variant.reauthorize else CONFIRM_KIND_EXISTING
+    return CONFIRM_KIND_EXISTING
 
 
 def _allowed_confirm_kinds(row: ConnectSession) -> list[str]:
     """Confirm ``kind`` values that apply to the session's state and flow."""
+    if row.intent == INTENT_EDIT:
+        return [CONFIRM_KIND_EDIT]
     if row.state == AWAITING_APP:
         primary = CONFIRM_KIND_OWN_CLIENT
     else:
         manual = manual_handler_for(row.resolved_flow)
         primary = manual.scheme_kind if manual is not None else CONFIRM_KIND_OAUTH
-    return [primary, CONFIRM_KIND_EXISTING, CONFIRM_KIND_REAUTHORIZE]
+    return [primary, CONFIRM_KIND_EXISTING]
 
 
 def _require_confirm_kind(row: ConnectSession, kind: str) -> None:
@@ -730,6 +984,30 @@ def _require_api_own_client(row: ConnectSession) -> None:
         raise UnsupportedTargetKindError(row.id, row.target_kind, "finalise")
 
 
+def _rule_snapshot(rule: AgentPermissionRule | PermissionRuleSetRule) -> dict[str, Any]:
+    """A stored rule as an edit baseline records it: its id plus its content."""
+    return {
+        "id": rule.id,
+        "effect": rule.effect,
+        "methods": rule.methods,
+        "path": rule.path,
+        "match_mode": rule.match_mode,
+        "operations": rule.operations,
+        "comment": rule.comment,
+    }
+
+
+def _consent_handler_for(credential: Credential) -> type[AuthFlowHandler] | None:
+    """The session flow that can re-consent ``credential`` with more scopes, if any."""
+    for handler_cls in (AuthCodeFlowHandler, DeviceAuthorizationHandler):
+        if (
+            credential.type == handler_cls.stored_type.value
+            and credential.provider == handler_cls.provider_id
+        ):
+            return handler_cls
+    return None
+
+
 def _is_oauth_type(credential_type: str) -> bool:
     return credential_type.startswith("OAUTH2_")
 
@@ -737,6 +1015,30 @@ def _is_oauth_type(credential_type: str) -> bool:
 def _require_state(row: ConnectSession, *, expected: str, action: str) -> None:
     if row.state != expected:
         raise InvalidStateTransitionError(row.id, row.state, action)
+
+
+async def _revision_changed(
+    session: Any, session_id: str, current_revision_id: str | None
+) -> RevisionChangedError:
+    """:class:`RevisionChangedError` naming the current revision by its number too."""
+    current = (
+        await ConnectSessionRevisionRepository.get_by_id(
+            session, current_revision_id, session_id=session_id
+        )
+        if current_revision_id is not None
+        else None
+    )
+    return RevisionChangedError(
+        session_id, current_revision_id, current.number if current is not None else None
+    )
+
+
+def _session_closed(row: ConnectSession) -> SessionClosedError:
+    """The refusal of an amend on a closed session; an edit's points at the binding."""
+    error = SessionClosedError(row.id)
+    if row.intent == INTENT_EDIT:
+        error.point_at(row.credential_id, row.agent_id)
+    return error
 
 
 def _forbid_agent_confirm(caller_actor_type: ActorType) -> None:
@@ -876,12 +1178,9 @@ class ConnectSessionService:
         connecting a credential without granting any agent access to it,
         and can bind an agent later through the credentials API.
 
-        A repeat ask from an agent that already has an open session it
-        started for the same request returns that session (same id and
-        ``approval_url``) with a fresh ``poll_token``; the old token stops
-        working. A session started by someone else — a user naming the
-        agent, or the agent when a user asks — is never reused: each
-        initiator keeps its own session, poll token and request. An agent
+        A repeat ask from an agent that already has an open session for the
+        same target is :class:`ConnectOpenError` naming that session: the
+        agent amends it (``amend_session``) instead. An agent
         whose ask for the same target a human rejected within the cooldown
         gets :class:`RecentlyRejectedError`.
         """
@@ -921,8 +1220,13 @@ class ConnectSessionService:
             raise NoOpForFlowError(flow.kind) from exc
         handler = handler_cls(self._ctx)
 
+        api_scope = await self._vendor_api_scope(entry.vendor)
+        await self._refuse_suspended_binding(agent_id, api_scope)
+        # The hold is on the agent asking again; a person can still connect for it.
         await self._check_rejection_cooldown(
-            agent_id, target_kind=TARGET_KIND_VENDOR, vendor=vendor_key
+            agent_id if agent_id == initiator_actor_id else None,
+            target_kind=TARGET_KIND_VENDOR,
+            vendor=vendor_key,
         )
         # One open session per agent-started OAuth request: the same agent
         # asking again for the same vendor, app and scopes gets the open one.
@@ -943,16 +1247,20 @@ class ConnectSessionService:
             )
 
         if dedupe_key is not None:
-            reused = await self._reuse_open_session(_find_open)
-            if reused is not None:
-                return reused
+            assert agent_id is not None
+
+            async def _find_open_for_vendor(db: Any) -> ConnectSession | None:
+                assert agent_id is not None
+                return await ConnectSessionRepository.get_open_vendor_create(
+                    db, agent_id=agent_id, vendor=vendor_key
+                )
+
+            await self._refuse_open_session(_find_open_for_vendor)
         cap_scope = await self._check_open_session_caps(agent_id, identity, agent)
 
         session_app = self._session_app_for(resolved)
 
         poll_token = secrets.token_urlsafe(32)
-
-        api_scope = await self._vendor_api_scope(entry.vendor)
 
         try:
             async with self._ctx.control_db.transaction() as session:
@@ -995,14 +1303,13 @@ class ConnectSessionService:
                     reason=reason,
                     created_by=initiator_actor_id,
                 )
+                await self._record_first_revision(session, row)
         except DatabaseIntegrityError:
-            # A concurrent identical ask won the dedupe index: hand out its session.
+            # A concurrent identical ask won the dedupe index: point at its session.
             if dedupe_key is None:
                 raise
-            reused = await self._reuse_open_session(_find_open)
-            if reused is None:
-                raise
-            return reused
+            await self._refuse_open_session(_find_open)
+            raise
 
         approval_url = self._approval_url_for(row.id)
         _logger.info(
@@ -1048,6 +1355,7 @@ class ConnectSessionService:
             approval_url=approval_url,
             poll_token=poll_token,
             resolved_flow=flow.kind,
+            revision_id=row.current_revision_id,
         )
 
     async def _create_api_session(
@@ -1081,14 +1389,20 @@ class ConnectSessionService:
         can rotate the other's poll token or swap the other's request.
         """
         initiator_actor_id = identity.sub
-        view = await self._lookup_api(target.vendor, target.name, target.version)
-        if view is None:
+        initial_view = await self._lookup_api(target.vendor, target.name, target.version)
+        if initial_view is None:
             raise UnknownApiError(target.vendor, target.name, target.version)
+        view = initial_view
         scheme = select_scheme(view, auth_type)
         require_pinnable_hosts(view)
 
+        # Name and version pinned: the credential covers exactly this API.
+        api_scope = canonical_credential_scope(
+            vendor=view.vendor, name=view.name, version=view.version
+        )
+        await self._refuse_suspended_binding(agent_id, api_scope)
         await self._check_rejection_cooldown(
-            agent_id,
+            agent_id if agent_id == initiator_actor_id else None,
             target_kind=TARGET_KIND_API,
             vendor=view.vendor,
             api_name=view.name,
@@ -1108,9 +1422,7 @@ class ConnectSessionService:
             )
 
         if agent_started:
-            reused = await self._reuse_open_session(_find_open)
-            if reused is not None:
-                return reused
+            await self._refuse_open_session(_find_open)
         cap_scope = await self._check_open_session_caps(agent_id, identity, agent)
 
         manual = manual_handler_for_scheme(scheme.kind)
@@ -1158,13 +1470,14 @@ class ConnectSessionService:
                 AWAITING_APP,
             )
 
-        # Name and version pinned: the credential covers exactly this API.
-        api_scope = canonical_credential_scope(
-            vendor=view.vendor, name=view.name, version=view.version
-        )
         poll_token = secrets.token_urlsafe(32)
         try:
             async with self._ctx.control_db.transaction() as session:
+                await lock_credential_identity_repair(session)
+                current_view = await self._lookup_api(target.vendor, target.name, target.version)
+                if current_view is None or current_view != view:
+                    raise UnknownApiError(target.vendor, target.name, target.version)
+                view = current_view
                 await self._enforce_open_session_caps(session, cap_scope)
                 credential = await CredentialRepository.create(
                     session,
@@ -1211,14 +1524,13 @@ class ConnectSessionService:
                     reason=reason,
                     created_by=initiator_actor_id,
                 )
+                await self._record_first_revision(session, row)
         except DatabaseIntegrityError:
             # A concurrent identical agent ask won the dedupe index.
             if not agent_started:
                 raise
-            reused = await self._reuse_open_session(_find_open)
-            if reused is None:
-                raise
-            return reused
+            await self._refuse_open_session(_find_open)
+            raise
 
         _logger.info(
             "connect_session.created",
@@ -1258,7 +1570,27 @@ class ConnectSessionService:
             approval_url=self._approval_url_for(row.id),
             poll_token=poll_token,
             resolved_flow=resolved_flow,
+            revision_id=row.current_revision_id,
         )
+
+    @staticmethod
+    async def _record_first_revision(session: Any, row: ConnectSession) -> None:
+        """Write revision 1 of a new create session: its full ask."""
+        payload = create_revision(
+            permission_rules=row.requested_permission_rules or [],
+            scopes=row.requested_scopes or [],
+            reason=row.reason,
+            actor=row.initiator_actor_id,
+        )
+        revision = await ConnectSessionRevisionRepository.append(
+            session,
+            session_id=row.id,
+            proposal=payload.proposal,
+            result=payload.result,
+            digest=payload.digest,
+            created_by=row.initiator_actor_id,
+        )
+        row.current_revision_id = revision.id
 
     async def _lookup_api(self, vendor: str, name: str, version: str) -> ApiSecurityView | None:
         """The API's live revision through the registry seam (identity canonicalised)."""
@@ -1268,37 +1600,85 @@ class ConnectSessionService:
             vendor=slugify_api_field(vendor), name=slugify_api_field(name), version=version.strip()
         )
 
-    async def _reuse_open_session(
+    async def _refuse_open_session(
         self, find_open: Callable[[Any], Awaitable[ConnectSession | None]]
-    ) -> CreatedSession | None:
-        """Hand a repeat ask the open session ``find_open`` finds, with a fresh poll token.
+    ) -> None:
+        """Refuse a repeat ask while the session ``find_open`` finds is still open.
 
-        The rotation is a compare-and-swap on the session still being open,
-        so a session that ends between the read and the write is not reused.
-        Reason, rules and scheme are not replaced — the review digest would
-        change under the approver. The previous token stops working.
+        The ask is not reused or frozen: the initiator amends the open session
+        (``:amend``) instead, so the reviewer sees one request with its
+        history. :class:`ConnectOpenError` names that session and its
+        approval URL.
         """
-        poll_token = secrets.token_urlsafe(32)
-        async with self._ctx.control_db.transaction() as session:
+        async with self._ctx.control_db.session() as session:
             row = await find_open(session)
-            if row is None:
-                return None
-            rotated = await ConnectSessionRepository.rotate_poll_token(
-                session, row.id, poll_token_hash=hash_secret(poll_token)
-            )
-        if not rotated:
-            return None
+        if row is None:
+            return
         _logger.info(
-            "connect_session.reused",
+            "connect_session.repeat_refused",
             session_id=row.id,
             vendor=row.vendor,
             agent_id=row.agent_id,
         )
-        return CreatedSession(
-            session_id=row.id,
-            approval_url=self._approval_url_for(row.id),
-            poll_token=poll_token,
-            resolved_flow=row.resolved_flow,
+        raise ConnectOpenError(row.id, self._approval_url_for(row.id))
+
+    async def _refuse_suspended_binding(self, agent_id: str | None, scope: CredentialScope) -> None:
+        """Refuse a connect for an agent whose suspended binding covers the requested API.
+
+        A suspended binding is the operator's cut-off for that agent and
+        credential; a new connect for an API the suspended credential covers
+        would hand the agent that access again, so only the operator may lift
+        it (resume or remove the binding). Coverage is the bind-time rule: a
+        NULL credential axis is a wildcard, and an unscoped requested axis
+        matches any credential value. Called only after the caller's right to
+        name the agent is settled, so it says nothing about another owner's
+        agent.
+
+        Accepted semantics:
+
+        - Any suspended binding covering the API refuses the connect, even
+          when another, active binding already covers the same API. The
+          suspension stands until the operator resumes or removes it.
+        - The check reads in its own sessions before the bind transaction,
+          so a suspension that lands in the milliseconds between this check
+          and a ``confirm`` bind is not caught here. A suspension made after
+          the bind is outside this check by design; the broker enforces it
+          per call.
+        """
+        if agent_id is None:
+            return
+        async with self._ctx.admin_db.session() as admin_session:
+            suspended = await EffectsRepository.list_suspended_credential_ids(
+                admin_session, agent_id
+            )
+        if not suspended:
+            return
+        async with self._ctx.control_db.session() as session:
+            covered = await CredentialRepository.any_covering(
+                session,
+                credential_ids=suspended,
+                vendor=scope.vendor,
+                name=scope.name,
+                version=scope.version,
+            )
+        if covered:
+            raise BindingSuspendedError(agent_id)
+
+    async def _refuse_suspended_binding_for_session(
+        self, row: ConnectSession, agent_id: str
+    ) -> None:
+        """:meth:`_refuse_suspended_binding` for the API a session's pending credential targets."""
+        async with self._ctx.control_db.session() as session:
+            credential = await CredentialRepository.get_by_id(session, row.credential_id)
+        if credential is None:
+            return
+        await self._refuse_suspended_binding(
+            agent_id,
+            canonical_credential_scope(
+                vendor=credential.api_vendor,
+                name=credential.api_name,
+                version=credential.api_version,
+            ),
         )
 
     async def _check_rejection_cooldown(
@@ -1309,30 +1689,88 @@ class ConnectSessionService:
         vendor: str,
         api_name: str | None = None,
         api_version: str | None = None,
+        credential_id: str | None = None,
     ) -> None:
-        """Refuse an agent's repeat ask for a target a human rejected within the cooldown."""
+        """Refuse an agent's repeat ask for a target a human rejected within the cooldown.
+
+        With ``credential_id`` the ask is an edit, and the target is that
+        binding: a rejected edit of it holds back the next one.
+        """
         hours = self._ctx.config.control.connect.rejection_cooldown_hours
         if agent_id is None or hours <= 0:
             return
         now = datetime.now(UTC)
         cooldown = timedelta(hours=hours)
-        async with self._ctx.control_db.session() as session:
-            ended = await ConnectSessionOutcomeRepository.latest_ended_at(
-                session,
-                agent_id=agent_id,
-                outcome=OUTCOME_REJECTED,
-                target_kind=target_kind,
-                vendor=vendor,
-                api_name=api_name,
-                api_version=api_version,
-                since=now - cooldown,
-            )
+        ended = await self._last_rejected_at(
+            agent_id,
+            target_kind=target_kind,
+            vendor=vendor,
+            api_name=api_name,
+            api_version=api_version,
+            credential_id=credential_id,
+            since=now - cooldown,
+        )
         if ended is None:
             return
-        if ended.tzinfo is None:
-            ended = ended.replace(tzinfo=UTC)
         retry_after = max(1, math.ceil((ended + cooldown - now).total_seconds()))
         raise RecentlyRejectedError(retry_after)
+
+    async def _last_rejected_at(
+        self,
+        agent_id: str,
+        *,
+        target_kind: str,
+        vendor: str,
+        api_name: str | None,
+        api_version: str | None,
+        credential_id: str | None,
+        since: datetime,
+    ) -> datetime | None:
+        """When a human last rejected the agent's ask for this target, if after ``since``.
+
+        With ``credential_id`` the ask is an edit, and the target is that binding.
+        """
+        async with self._ctx.control_db.session() as session:
+            if credential_id is not None:
+                ended = await ConnectSessionOutcomeRepository.latest_edit_ended_at(
+                    session,
+                    agent_id=agent_id,
+                    credential_id=credential_id,
+                    outcome=OUTCOME_REJECTED,
+                    since=since,
+                )
+            else:
+                ended = await ConnectSessionOutcomeRepository.latest_ended_at(
+                    session,
+                    agent_id=agent_id,
+                    outcome=OUTCOME_REJECTED,
+                    target_kind=target_kind,
+                    vendor=vendor,
+                    api_name=api_name,
+                    api_version=api_version,
+                    since=since,
+                )
+        if ended is not None and ended.tzinfo is None:
+            ended = ended.replace(tzinfo=UTC)
+        return ended
+
+    async def _review_last_rejected_at(self, row: ConnectSession) -> datetime | None:
+        """When a human last rejected this agent's ask for the session's target.
+
+        Shown on the review so a repeat of a rejected request reads as one.
+        Outcomes are kept for :data:`_OUTCOME_RETENTION`, so that bounds it.
+        """
+        if row.agent_id is None or row.agent_id != row.initiator_actor_id:
+            return None
+        return await self._last_rejected_at(
+            row.agent_id,
+            target_kind=row.target_kind,
+            vendor=row.vendor,
+            api_name=row.api_name,
+            api_version=row.api_version,
+            credential_id=row.credential_id if row.intent == INTENT_EDIT else None,
+            since=datetime.now(UTC) - _OUTCOME_RETENTION,
+        )
 
     async def _check_open_session_caps(
         self, agent_id: str | None, identity: Identity, agent: AgentOwnerRow | None
@@ -1474,6 +1912,1665 @@ class ConnectSessionService:
         """
         return connect_approval_url(self._ctx.config, session_id)
 
+    # ---- amend ------------------------------------------------------------
+
+    async def amend_session(
+        self, session_id: str, *, identity: Identity, amend: SessionAmend
+    ) -> AmendedSession:
+        """Change what an open session asks for, as a new revision.
+
+        The session's initiator, or a human who may confirm it (its reviewer
+        editing the request: the revision records who made it), and only
+        while it is open: a create
+        session before it is confirmed (``created`` or ``awaiting_app``), an
+        edit session in ``created``. A confirmed or ended session is
+        :class:`SessionClosedError`. Anyone else gets the uniform 403.
+
+        The fields ``amend`` carries replace those parts of the ask; the rest
+        stay as the current revision has them. An edit's rule change and
+        ``resume`` resolve against the session's baseline like the ask it
+        opened with; a create session's ``requested_permission_rules``,
+        ``requested_scopes`` and ``reason`` replace its ask outright. The
+        target, flow and agent never change. An amend that would leave the
+        same in place on approval writes nothing and returns the current
+        revision.
+        """
+        async with self._ctx.control_db.session() as read_session:
+            row = await ConnectSessionRepository.get_by_id(read_session, session_id)
+            outcome = (
+                await ConnectSessionOutcomeRepository.get_by_session_id(read_session, session_id)
+                if row is None
+                else None
+            )
+        if row is None:
+            if outcome is not None and outcome.created_by == identity.sub:
+                closed = SessionClosedError(session_id)
+                closed.point_at(outcome.credential_id, outcome.agent_id)
+                raise closed
+            raise InvalidPollTokenError("invalid poll_token")
+        if row.initiator_actor_id != identity.sub and not await self._is_session_approver(
+            row, identity
+        ):
+            raise InvalidPollTokenError("invalid poll_token")
+        open_states: tuple[str, ...] = (
+            ("created",) if row.intent == INTENT_EDIT else ("created", AWAITING_APP)
+        )
+        if row.state not in open_states:
+            raise _session_closed(row)
+        # Before the rebase, and with room for it: resolving onto a moved
+        # binding appends a revision of its own, so an amend that has to
+        # rebase needs two. Asked for one, the rebase would land and the amend
+        # be refused, which is a refusal that has written something.
+        await self._require_revision_room(
+            row, needed=2 if row.intent == INTENT_EDIT and await self._edit_is_stale(row) else 1
+        )
+        row, _ = await self._refresh_edit(row)
+        current = await self._current_revision(row)
+        if current is None:
+            raise _session_closed(row)
+        await self._require_revision_room(row, current=current)
+
+        fields: dict[str, Any]
+        if row.intent == INTENT_EDIT:
+            foreign = sorted(amend.fields & _CREATE_AMEND_FIELDS)
+            if foreign:
+                raise AmendFieldsMismatchError(INTENT_EDIT, foreign)
+            assert row.baseline is not None
+            previous = EditRequest.from_proposal(current.proposal)
+            rules = amend.rules if "rules" in amend.fields else previous
+            scope_ask = amend.scopes if "scopes" in amend.fields else previous
+            assert rules is not None and scope_ask is not None
+            request = EditRequest(
+                add=rules.add,
+                remove=rules.remove,
+                set_rules=rules.set_rules,
+                add_scopes=scope_ask.add_scopes,
+                remove_scopes=scope_ask.remove_scopes,
+                set_scopes=scope_ask.set_scopes,
+                scope_comments=scope_ask.scope_comments,
+                resume=amend.resume if "resume" in amend.fields else previous.resume,
+                reason=amend.reason if "reason" in amend.fields else previous.reason,
+            )
+            try:
+                result, _ = resolve_edit(
+                    row.baseline, request, previous=current.result, actor=identity.sub
+                )
+                require_change(row.baseline, result)
+            except (UnknownRuleError, NothingToChangeError) as exc:
+                exc.point_at(row.credential_id, row.agent_id)
+                raise
+            if scopes_changed(row.baseline, result):
+                async with self._ctx.control_db.session() as session:
+                    credential = await CredentialRepository.get_by_id(session, row.credential_id)
+                consent = await self._consent_source(credential) if credential else None
+                self._require_scope_change(consent, row.baseline, result)
+            proposal = request.as_proposal()
+            digest = revision_digest(baseline=row.baseline, result=result, reason=request.reason)
+            fields = {"reason": request.reason}
+        else:
+            foreign = sorted(amend.fields & _EDIT_AMEND_FIELDS)
+            if foreign:
+                raise AmendFieldsMismatchError(INTENT_CREATE, foreign)
+            permission_rules = (
+                amend.requested_permission_rules
+                if "requested_permission_rules" in amend.fields
+                else row.requested_permission_rules
+            ) or []
+            scopes = (
+                amend.requested_scopes
+                if "requested_scopes" in amend.fields
+                else row.requested_scopes
+            ) or []
+            reason = amend.reason if "reason" in amend.fields else row.reason
+            payload = create_revision(
+                permission_rules=permission_rules,
+                scopes=scopes,
+                reason=reason,
+                previous=current.result,
+                actor=identity.sub,
+            )
+            proposal, result, digest = payload.proposal, payload.result, payload.digest
+            fields = {
+                "requested_permission_rules": list(permission_rules),
+                "requested_scopes": list(scopes),
+                "reason": reason,
+            }
+            if row.dedupe_key is not None:
+                fields["dedupe_key"] = await self._amended_dedupe_key(row, scopes)
+
+        if digest == current.digest and not current.proposal.get("conflicts"):
+            # Approving it would leave the same in place: the current revision stands.
+            return AmendedSession(
+                session_id=row.id, revision_id=current.id, revision_number=current.number
+            )
+        revision = ConnectSessionRevision(
+            id=generate_ksuid("csr"),
+            session_id=row.id,
+            number=current.number + 1,
+            proposal=proposal,
+            result=result,
+            digest=digest,
+            created_by=identity.sub,
+        )
+        try:
+            async with self._ctx.control_db.transaction() as session:
+                await ConnectSessionRepository.acquire_revision_lock(session, row.id)
+                won = await ConnectSessionRepository.advance_revision(
+                    session,
+                    row.id,
+                    open_states=open_states,
+                    from_revision_id=current.id,
+                    to_revision_id=revision.id,
+                    **fields,
+                )
+                if not won:
+                    latest = await ConnectSessionRepository.get_by_id(session, row.id)
+                    if latest is None or latest.state not in open_states:
+                        raise _session_closed(row)
+                    raise await _revision_changed(session, row.id, latest.current_revision_id)
+                await ConnectSessionRevisionRepository.insert(session, revision)
+        except DatabaseIntegrityError:
+            if row.agent_id is None or "dedupe_key" not in fields:
+                # An edit's ``fields`` never carries a dedupe key, so this is
+                # the revision index. Both writers of the chain number under
+                # the same lock, so this is defensive: a writer added without
+                # it would report a moved ask rather than a 500, which
+                # asserting the key here would make it.
+                async with self._ctx.control_db.session() as session:
+                    latest = await ConnectSessionRepository.get_by_id(session, row.id)
+                    raise await _revision_changed(
+                        session, row.id, latest.current_revision_id if latest else None
+                    ) from None
+            # The amended scopes now match another open session of the agent's.
+            agent_id, dedupe_key = row.agent_id, fields["dedupe_key"]
+
+            async def _find_open(db: Any) -> ConnectSession | None:
+                return await ConnectSessionRepository.get_open_vendor_target(
+                    db, agent_id=agent_id, vendor=row.vendor, dedupe_key=dedupe_key
+                )
+
+            await self._refuse_open_session(_find_open)
+            raise
+
+        _logger.info(
+            "connect_session.amended",
+            session_id=row.id,
+            revision_id=revision.id,
+            number=revision.number,
+        )
+        await record_audit_best_effort(
+            self._ctx,
+            action=AuditAction.UPDATE,
+            target_type=AuditTargetType.SESSION,
+            target_id=row.id,
+            actor_type=identity.actor_type.value,
+            actor_id=identity.sub,
+            origin=identity.origin.value,
+            before={"revision_id": current.id},
+            after={"revision_id": revision.id, "number": revision.number},
+        )
+        await self._emit_amended(row, revision)
+        return AmendedSession(
+            session_id=row.id, revision_id=revision.id, revision_number=revision.number
+        )
+
+    async def _amended_dedupe_key(self, row: ConnectSession, scopes: list[str]) -> str:
+        """The dedupe key of an agent-started vendor session once its scopes change."""
+        async with self._ctx.control_db.session() as session:
+            credential = await CredentialRepository.get_by_id(session, row.credential_id)
+        return oauth_dedupe_key(
+            resolved_flow=row.resolved_flow,
+            registration_id=credential.oauth_app_registration_id if credential else None,
+            requested_scopes=scopes,
+        )
+
+    async def _emit_amended(
+        self,
+        row: ConnectSession,
+        revision: ConnectSessionRevision,
+        *,
+        actor_id: str | None = None,
+    ) -> None:
+        """Emit ``connect_session.amended`` so the reviewer knows the ask changed.
+
+        A session with no agent is a person's own request, and it emits too:
+        the change belongs on their rail rather than nowhere. ``actor_id`` names who moved
+        the request where the revision itself records no author — a rebase is
+        nobody's ask, but somebody asked for it.
+        """
+        actor = actor_id or revision.created_by or row.initiator_actor_id
+        try:
+            async with self._ctx.admin_db.transaction() as session:
+                await emit_event_best_effort(
+                    session,
+                    type=EventType.CONNECT_SESSION_AMENDED,
+                    severity=EventSeverity.INFO,
+                    summary=(
+                        f"A connect request for agent {row.agent_id} changed "
+                        f"(revision {revision.number})"
+                        if row.agent_id is not None
+                        else f"A connect request changed (revision {revision.number})"
+                    ),
+                    requires_action=False,
+                    data={
+                        "session_id": row.id,
+                        "agent_id": row.agent_id,
+                        "revision_id": revision.id,
+                        "number": revision.number,
+                    },
+                    created_by=row.agent_id or row.initiator_actor_id,
+                    actor_id=actor,
+                    actor_type=actor_type_label_from_id(actor),
+                )
+        except Exception:
+            _logger.warning(
+                "telemetry_emit_failed",
+                event_type=EventType.CONNECT_SESSION_AMENDED,
+                session_id=row.id,
+                exc_info=True,
+            )
+
+    # ---- edit sessions ----------------------------------------------------
+
+    async def create_edit_session(
+        self,
+        *,
+        credential_id: str,
+        agent_id: str,
+        identity: Identity,
+        request: EditRequest,
+        apply: bool = False,
+        browser_binding: BrowserBindingClaim | None = None,
+    ) -> CreatedEditSession:
+        """Open a session that edits an existing ``(agent, credential)`` binding.
+
+        An agent edits its own binding (the router injects its id); a human
+        names the agent and must be its approver (``org:admin``, or its owner
+        with ``credentials:write`` and ``agents:write``). A binding that does
+        not exist, one the caller may not edit, and an agent's suspended
+        binding all answer :class:`EditBindingNotFoundError`.
+
+        The binding is snapshot as the session's baseline and the request is
+        resolved against it as revision 1. A request that changes nothing is
+        :class:`NothingToChangeError`; one naming a rule the binding does not
+        hold is :class:`UnknownRuleError`. A binding can have any number of
+        open edits; each follows the binding as other changes land. An agent
+        asking again while its own edit is open gets :class:`EditOpenError`
+        naming it, to amend instead. Nothing is written to the binding until
+        a human confirms.
+
+        ``apply`` is a human approving their own change as they make it: it is
+        written at once, with no review. A change that adds scopes starts the
+        vendor consent instead (``challenge``) and lands when it completes. An
+        agent never applies its own change (:class:`ConfirmationForbiddenError`).
+        Open edits of the binding are rebased onto it when next read.
+        """
+        if apply and identity.actor_type == ActorType.AGENT:
+            raise ConfirmationForbiddenError("an agent's change is approved by a human")
+        binding = await self._require_editable_binding(credential_id, agent_id, identity)
+        async with self._ctx.control_db.session() as session:
+            credential = await CredentialRepository.get_by_id(session, credential_id)
+            own_open = (
+                await ConnectSessionRepository.get_open_edit(
+                    session,
+                    agent_id=agent_id,
+                    credential_id=credential_id,
+                    initiator_actor_id=identity.sub,
+                )
+                if identity.actor_type == ActorType.AGENT
+                else None
+            )
+        if credential is None or credential.state == "pending":
+            raise EditBindingNotFoundError(credential_id)
+        if own_open is not None:
+            error = EditOpenError(own_open.id)
+            error.point_at(credential_id, agent_id)
+            raise error
+        # The hold is on the agent asking again; its owner can still make the change.
+        if identity.actor_type == ActorType.AGENT:
+            await self._check_rejection_cooldown(
+                agent_id, target_kind=TARGET_KIND_VENDOR, vendor="", credential_id=credential_id
+            )
+        baseline = await self._binding_snapshot(agent_id, credential_id, binding.rule_set_id)
+        baseline["suspended"] = binding.suspended
+        try:
+            result, _ = resolve_edit(baseline, request, actor=identity.sub)
+            require_change(baseline, result)
+        except (UnknownRuleError, NothingToChangeError) as exc:
+            exc.point_at(credential_id, agent_id)
+            raise
+        # The vendor-registry key a consent for added scopes re-opens, kept
+        # on the session like a vendor connect's; ``None`` when the
+        # credential cannot be re-consented here.
+        consent = await self._consent_source(credential)
+        new_scopes = scopes_changed(baseline, result)
+        self._require_scope_change(consent, baseline, result)
+        # What the apply path's pre-check validated, handed to the consent it
+        # then starts rather than resolved again.
+        allowed: ConsentSource | None = None
+        if apply:
+            await self._require_agent_binding_allowed(agent_id, identity, late_bound=False)
+            if new_scopes:
+                # Everything this apply can be refused for, before the session
+                # exists: a refusal that leaves an open session behind spends
+                # the agent's quota, and a handful of them stop it asking at
+                # all. The widening branch writes the session before it builds
+                # the change, so each of these runs here too.
+                self._require_rule_set_change_allowed(baseline, identity)
+                _require_rules_present(baseline, result["rules"])
+                allowed = await self._require_consent_allowed(
+                    credential,
+                    agent_id,
+                    identity,
+                    scopes=result["scopes"],
+                    granted=set(baseline.get("granted_scopes") or []),
+                    resolved=consent,
+                )
+            else:
+                return await self._apply_edit_now(
+                    credential=credential,
+                    agent_id=agent_id,
+                    identity=identity,
+                    request=request,
+                    baseline=baseline,
+                    result=result,
+                    vendor=(consent.key if consent is not None else None)
+                    or credential.api_vendor
+                    or credential.catalog_api_id
+                    or credential.name,
+                )
+
+        async with self._ctx.admin_db.session() as admin_session:
+            agent = await EffectsRepository.get_agent_owner(admin_session, agent_id)
+        cap_scope = await self._check_open_session_caps(agent_id, identity, agent)
+        poll_token = secrets.token_urlsafe(32)
+        async with self._ctx.control_db.transaction() as session:
+            await self._enforce_open_session_caps(session, cap_scope)
+            row = await ConnectSessionRepository.create(
+                session,
+                intent=INTENT_EDIT,
+                baseline=baseline,
+                credential_id=credential_id,
+                vendor=(
+                    (consent.key if consent is not None else None)
+                    or credential.api_vendor
+                    or credential.catalog_api_id
+                    or credential.name
+                ),
+                agent_id=agent_id,
+                initiator_actor_id=identity.sub,
+                state="created",
+                resolved_flow=EDIT_FLOW,
+                poll_token_hash=hash_secret(poll_token),
+                reason=request.reason,
+                created_by=identity.sub,
+            )
+            revision = await ConnectSessionRevisionRepository.append(
+                session,
+                session_id=row.id,
+                proposal=request.as_proposal(),
+                result=result,
+                digest=revision_digest(baseline=baseline, result=result, reason=request.reason),
+                created_by=identity.sub,
+            )
+
+        _logger.info(
+            "connect_session.edit_created",
+            session_id=row.id,
+            agent_id=agent_id,
+            credential_id=credential_id,
+            initiator_actor_id=identity.sub,
+        )
+        _sessions_created.add(1, {"vendor": row.vendor, "flow": EDIT_FLOW})
+        await record_audit_best_effort(
+            self._ctx,
+            action=AuditAction.CREATE,
+            target_type=AuditTargetType.SESSION,
+            target_id=row.id,
+            actor_type=identity.actor_type.value,
+            actor_id=identity.sub,
+            origin=identity.origin.value,
+            after={
+                "intent": INTENT_EDIT,
+                "agent_id": agent_id,
+                "credential_id": credential_id,
+                "revision_id": revision.id,
+                "widens_access": widens_access(baseline, result),
+            },
+        )
+        await self._emit_edit_requested(row, credential_name=credential.name)
+        challenge: ConfirmResult | None = None
+        if apply:
+            change = self._edit_change(
+                baseline,
+                identity,
+                revision_id=revision.id,
+                permission_rules=result["rules"],
+                resume=request.resume,
+                confirmed_scopes=result["scopes"],
+            )
+            challenge = await self._begin_edit_consent(
+                row,
+                change,
+                identity=identity,
+                browser_binding=browser_binding,
+                credential=credential,
+                consent=allowed,
+            )
+        return CreatedEditSession(
+            session_id=row.id,
+            approval_url=self._approval_url_for(row.id),
+            poll_token=poll_token,
+            revision_id=revision.id,
+            resolved_flow=(
+                consent.handler_cls.kind if consent is not None and new_scopes else EDIT_FLOW
+            ),
+            challenge=challenge,
+        )
+
+    async def _apply_edit_now(
+        self,
+        *,
+        credential: Credential,
+        agent_id: str,
+        identity: Identity,
+        request: EditRequest,
+        baseline: dict[str, Any],
+        result: dict[str, Any],
+        vendor: str,
+    ) -> CreatedEditSession:
+        """Open, approve and write a human's own change in one transaction."""
+        poll_token = secrets.token_urlsafe(32)
+        async with self._ctx.control_db.transaction() as session:
+            row = await ConnectSessionRepository.create(
+                session,
+                intent=INTENT_EDIT,
+                baseline=baseline,
+                credential_id=credential.id,
+                vendor=vendor,
+                agent_id=agent_id,
+                initiator_actor_id=identity.sub,
+                state="created",
+                resolved_flow=EDIT_FLOW,
+                poll_token_hash=hash_secret(poll_token),
+                reason=request.reason,
+                created_by=identity.sub,
+            )
+            revision = await ConnectSessionRevisionRepository.append(
+                session,
+                session_id=row.id,
+                proposal=request.as_proposal(),
+                result=result,
+                digest=revision_digest(baseline=baseline, result=result, reason=request.reason),
+                created_by=identity.sub,
+            )
+            change = self._edit_change(
+                baseline,
+                identity,
+                revision_id=revision.id,
+                permission_rules=result["rules"],
+                resume=request.resume,
+                confirmed_scopes=None,
+            )
+            change, _ = await self._write_change(session, row, change)
+        await self._apply_admin_change(row, change)
+        await self._record_change_applied(row, change, origin=identity.origin.value)
+        _logger.info(
+            "connect_session.edit_applied_directly",
+            session_id=row.id,
+            agent_id=agent_id,
+            credential_id=credential.id,
+            actor_id=identity.sub,
+        )
+        return CreatedEditSession(
+            session_id=row.id,
+            approval_url=self._approval_url_for(row.id),
+            poll_token=poll_token,
+            revision_id=revision.id,
+            applied=True,
+        )
+
+    async def confirm_edit(
+        self,
+        session_id: str,
+        *,
+        poll_token: str | None,
+        identity: Identity,
+        revision_id: str,
+        permission_rules: list[dict[str, object]],
+        resume: bool,
+        confirmed_scopes: list[str] | None = None,
+        resolve_conflicts: bool = False,
+        browser_binding: BrowserBindingClaim | None = None,
+    ) -> ConfirmResult:
+        """Apply an edit session's change as the reviewer submitted it.
+
+        ``revision_id`` must be the session's current revision
+        (:class:`RevisionChangedError` otherwise), and the binding must still
+        match the session's baseline: when it changed since the session
+        opened, the session is rebased onto it as a new revision and the
+        confirm is :class:`BaselineChangedError`. The reviewer's
+        ``permission_rules``, ``resume`` and ``confirmed_scopes`` are what
+        gets applied, never the initiator's proposal.
+
+        While the binding points at a shared rule set, the rules replace that
+        set's rules, and only the set's owner or an org admin may confirm. A
+        curated set is never changed: the rules become the binding's own and
+        the set is detached from this binding only.
+
+        ``confirmed_scopes`` beyond the credential's grant start a vendor
+        consent on the credential's own flow (authorization code or device
+        authorization). The session goes ``polling``, the approved change is
+        held on it, and rules and scopes land together when the grant
+        arrives; until then the binding keeps its rules and token. Widening a
+        credential other agents use needs its owner or an org admin.
+
+        A revision rebased onto a binding change it can't follow carries
+        conflicts: confirming it is :class:`EditConflictedError` unless
+        ``resolve_conflicts`` says the reviewer's rules settle them.
+        """
+        async with self._ctx.control_db.session() as read_session:
+            row = await ConnectSessionRepository.get_by_id(read_session, session_id)
+        row = await self._require_session_access(row, poll_token=poll_token, identity=identity)
+        _require_confirm_kind(row, CONFIRM_KIND_EDIT)
+        if identity.actor_type == ActorType.AGENT:
+            raise ConfirmationForbiddenError("edit sessions are confirmed by a human")
+        _require_state(row, expected="created", action="confirm")
+        assert row.agent_id is not None and row.baseline is not None
+        await self._require_agent_binding_allowed(row.agent_id, identity, late_bound=False)
+        if not await self._owns_credential(row.credential_id, identity):
+            raise EditBindingNotFoundError(row.credential_id)
+        if row.current_revision_id != revision_id:
+            async with self._ctx.control_db.session() as session:
+                raise await _revision_changed(session, row.id, row.current_revision_id)
+
+        live = await self._live_binding_snapshot(row)
+        if live is None:
+            await self._mark_terminal(
+                row.id, "failed", "binding removed during edit", error_code="binding_removed"
+            )
+            raise EditBindingNotFoundError(row.credential_id)
+        if not baseline_matches(row.baseline, live):
+            # Following the binding costs a revision, so at the cap say that,
+            # rather than pointing the approver at a rebase that will refuse:
+            # the request cannot be brought up to date and has to be asked
+            # again.
+            await self._require_revision_room(row)
+            rebased, _ = await self._rebase_edit(row, live)
+            async with self._ctx.control_db.session() as session:
+                revision = await ConnectSessionRevisionRepository.get_by_id(
+                    session, rebased, session_id=row.id
+                )
+            raise BaselineChangedError(
+                row.id, rebased, revision.number if revision is not None else None
+            )
+
+        conflicts = await self._revision_conflicts(row)
+        if conflicts and not resolve_conflicts:
+            raise EditConflictedError(row.id, conflicts)
+        change = self._edit_change(
+            row.baseline,
+            identity,
+            revision_id=revision_id,
+            permission_rules=permission_rules,
+            resume=resume,
+            confirmed_scopes=confirmed_scopes,
+        )
+        granted = list(row.baseline.get("granted_scopes") or [])
+        if set(change["scopes"]) != set(granted):
+            return await self._begin_edit_consent(
+                row, change, identity=identity, browser_binding=browser_binding
+            )
+
+        async with self._ctx.control_db.transaction() as session:
+            won = await ConnectSessionRepository.transition_edit(
+                session, row.id, revision_id=revision_id, to_state=OUTCOME_APPLIED
+            )
+            if not won:
+                current = await ConnectSessionRepository.get_by_id(session, row.id)
+                if current is not None and current.state == "created":
+                    raise await _revision_changed(session, row.id, current.current_revision_id)
+                raise InvalidStateTransitionError(row.id, row.state, "confirm")
+            change, _ = await self._write_change(session, row, change)
+        await self._apply_admin_change(row, change)
+        await self._record_change_applied(row, change, origin=identity.origin.value)
+        return ConnectedConfirmResult(credential_id=row.credential_id)
+
+    async def _begin_edit_consent(
+        self,
+        row: ConnectSession,
+        change: dict[str, Any],
+        *,
+        identity: Identity,
+        browser_binding: BrowserBindingClaim | None = None,
+        credential: Credential | None = None,
+        consent: ConsentSource | None = None,
+    ) -> ConfirmResult:
+        """Hold ``change`` on the session and start the vendor consent for its scopes.
+
+        ``credential`` and ``consent`` come from the apply path, which read and
+        validated both before the session existed; a confirm arrives with
+        neither and resolves them here.
+        """
+        assert row.agent_id is not None
+        if credential is None:
+            async with self._ctx.control_db.session() as session:
+                credential = await CredentialRepository.get_by_id(session, row.credential_id)
+        granted = set((row.baseline or {}).get("granted_scopes") or [])
+        # Only what the change adds is validated, as the open path does: a
+        # scope the grant already holds is not re-checked, so a credential
+        # carrying one the catalog dropped stays editable instead of wedging.
+        if consent is None:
+            consent = await self._require_consent_allowed(
+                credential, row.agent_id, identity, scopes=change["scopes"], granted=granted
+            )
+        assert credential is not None  # _require_consent_allowed refuses a missing one
+        handler_cls = consent.handler_cls
+        # The agents the approver saw the widening reach: one that binds while
+        # the grant is out does not get it without another review.
+        change = {
+            **change,
+            "shared_with": (await self._other_bound_agent_ids(credential.id, row.agent_id))[0],
+        }
+
+        async with self._ctx.control_db.transaction() as session:
+            won = await ConnectSessionRepository.transition_edit(
+                session,
+                row.id,
+                revision_id=change["revision_id"],
+                to_state="polling",
+                resolved_flow=handler_cls.kind,
+                approved_change=change,
+            )
+            if not won:
+                current = await ConnectSessionRepository.get_by_id(session, row.id)
+                if current is not None and current.state == "created":
+                    raise await _revision_changed(session, row.id, current.current_revision_id)
+                raise InvalidStateTransitionError(row.id, row.state, "confirm")
+            polling = await ConnectSessionRepository.get_by_id(session, row.id)
+        assert polling is not None
+        challenge = await self._begin_consent(
+            polling, consent, change["scopes"], browser_binding=browser_binding
+        )
+        _logger.info(
+            "connect_session.edit_consent_started",
+            session_id=row.id,
+            credential_id=row.credential_id,
+            flow=handler_cls.kind,
+            scopes=change["scopes"],
+        )
+        await record_audit_best_effort(
+            self._ctx,
+            action=AuditAction.CONFIRM,
+            target_type=AuditTargetType.SESSION,
+            target_id=row.id,
+            actor_type=identity.actor_type.value,
+            actor_id=identity.sub,
+            origin=identity.origin.value,
+            after={
+                "intent": INTENT_EDIT,
+                "agent_id": row.agent_id,
+                "credential_id": row.credential_id,
+                "revision_id": change["revision_id"],
+                "confirmed_scopes": change["scopes"],
+                "awaiting": "vendor_consent",
+            },
+        )
+        return challenge
+
+    async def _begin_consent(
+        self,
+        row: ConnectSession,
+        consent: ConsentSource,
+        scopes: list[str],
+        *,
+        retryable: bool = True,
+        browser_binding: BrowserBindingClaim | None = None,
+    ) -> ConfirmResult:
+        """Start the vendor consent for a polling edit session; undo the confirm on failure.
+
+        A vendor-side failure puts the session back to ``created`` so the
+        reviewer can retry; nothing on the credential has changed. A session
+        moved onto an existing credential cannot go back (its own pending
+        credential is gone), so it ends instead (``retryable=False``).
+        """
+        handler = consent.handler_cls(self._ctx)
+        try:
+            challenge = await handler.begin(
+                row, app=consent.app, confirmed_scopes=scopes, browser_binding=browser_binding
+            )
+        except Exception:
+            if not retryable:
+                await self._mark_terminal(
+                    row.id, "failed", "vendor consent could not start", error_code="consent_failed"
+                )
+                raise
+            async with self._ctx.control_db.transaction() as session:
+                await ConnectSessionRepository.transition_state(
+                    session,
+                    row.id,
+                    to_state="created",
+                    from_states=("polling",),
+                    resolved_flow=EDIT_FLOW,
+                    approved_change=None,
+                )
+            raise
+        if challenge.kind == "device_authorization":
+            return DeviceAuthorizationConfirmResult(
+                user_code=challenge.user_code,
+                verification_uri=challenge.verification_uri,
+                verification_uri_complete=challenge.verification_uri_complete,
+                poll_interval_seconds=challenge.poll_interval_seconds,
+            )
+        return AuthCodeConfirmResult(authorize_url=challenge.authorize_url)
+
+    async def _require_scope_change_allowed(
+        self, credential: Credential, agent_id: str, identity: Identity
+    ) -> None:
+        """Changing a credential other agents use is its owner's or an org admin's call."""
+        others, _ = await self._other_bound_agent_ids(credential.id, agent_id)
+        if not others or ORG_ADMIN in identity.permissions:
+            return
+        if credential.created_by != identity.sub:
+            raise ScopeChangeForbiddenError(credential.id)
+
+    def _require_scope_change(
+        self,
+        consent: ConsentSource | None,
+        baseline: Mapping[str, Any],
+        result: Mapping[str, Any],
+    ) -> None:
+        """Refuse a scope change the credential can't take, or adding a scope its vendor lacks."""
+        if not scopes_changed(baseline, result):
+            return
+        if consent is None:
+            raise ScopesNotSupportedError()
+        if consent.entry is not None:
+            unknown = self._vendors.validate_scopes(consent.entry, added_scopes(baseline, result))
+            if unknown:
+                raise ScopeValidationError(unknown)
+
+    async def connect_options(
+        self, target: ApiTarget, *, registration_id: str | None = None
+    ) -> ConnectOptions:
+        """How ``:connect`` would connect ``target``: each declared scheme and its scopes.
+
+        Resolved the way ``:connect`` resolves an API target (the pinned
+        ``registration_id``, else the config entry covering the API, else its
+        one active shared app), so a scope listed ``requestable`` is one a
+        request may name. An API the registry doesn't hold is
+        :class:`UnknownApiError`.
+        """
+        view = await self._lookup_api(target.vendor, target.name, target.version)
+        if view is None:
+            raise UnknownApiError(target.vendor, target.name, target.version)
+        oauth: tuple[str, ResolvedVendorSource] | None = None
+        ambiguous = False
+        if any(scheme_kind(s) == SCHEME_OAUTH2 for s in view.schemes):
+            try:
+                oauth = await self._vendors.resolve_api_source(
+                    _api_covers(view.vendor, view.name, view.version),
+                    registration_id=registration_id,
+                )
+            except AmbiguousVendorError:
+                ambiguous = True
+        schemes: list[ConnectSchemeOption] = []
+        for scheme in sorted(view.schemes, key=lambda s: s.name):
+            kind = scheme_kind(scheme)
+            declared = dict(scheme.oauth_scope_descriptions)
+            if kind == SCHEME_OAUTH2 and oauth is not None:
+                key, source = oauth
+                offered = {c.name: c for c in source.entry.scopes}
+                scopes = [
+                    ConnectScopeOption(
+                        name=c.name,
+                        description=c.description or declared.get(c.name, ""),
+                        classification=c.classification,
+                        default=c.default,
+                        requestable=True,
+                    )
+                    for c in source.entry.scopes
+                ] + [
+                    ConnectScopeOption(
+                        name=name,
+                        description=declared.get(name, ""),
+                        classification=classify_spec_scope(name),
+                        default=False,
+                        requestable=False,
+                    )
+                    for name in scheme.oauth_scopes
+                    if name not in offered
+                ]
+                flow: str | None = source.flow.kind
+                vendor_key: str | None = key
+                reg_id = source.registration.id if source.registration is not None else None
+            else:
+                scopes = [
+                    ConnectScopeOption(
+                        name=name,
+                        description=declared.get(name, ""),
+                        classification=classify_spec_scope(name),
+                        default=False,
+                        requestable=True,
+                    )
+                    for name in scheme.oauth_scopes
+                ]
+                manual = manual_handler_for_scheme(kind) if kind is not None else None
+                flow = (
+                    manual.kind
+                    if manual is not None
+                    else (None if kind is None or ambiguous else AWAITING_APP)
+                )
+                vendor_key, reg_id = None, None
+            schemes.append(
+                ConnectSchemeOption(
+                    name=scheme.name,
+                    type=scheme.type,
+                    kind=kind,
+                    flow=flow,
+                    vendor_key=vendor_key,
+                    registration_id=reg_id,
+                    scopes=scopes,
+                )
+            )
+        return ConnectOptions(
+            vendor=view.vendor,
+            name=view.name,
+            version=view.version,
+            display_name=view.display_name,
+            api_target_supported=self._manual_flows_enabled,
+            schemes=schemes,
+        )
+
+    async def scope_options(self, credential_id: str) -> ScopeOptions:
+        """How an edit of a binding to ``credential_id`` can change its scopes."""
+        async with self._ctx.control_db.session() as session:
+            credential = await CredentialRepository.get_by_id(session, credential_id)
+        consent = await self._consent_source(credential) if credential is not None else None
+        if consent is None:
+            return ScopeOptions(supported=False, catalog=None)
+        return ScopeOptions(
+            supported=True,
+            catalog=list(consent.entry.scopes) if consent.entry is not None else None,
+        )
+
+    async def _consent_source(self, credential: Credential) -> ConsentSource | None:
+        """How ``credential`` is re-consented with more scopes, or ``None`` if it can't be.
+
+        Only OAuth credentials connected through an authorization-code or
+        device-authorization flow qualify. The consent runs through the
+        client the credential already uses: its shared registration (which
+        must be active), else the client stored on it.
+        """
+        handler_cls = _consent_handler_for(credential)
+        if handler_cls is None:
+            return None
+        key: str | None = None
+        entry: VendorAuthConfig | None = None
+        app: SessionApp | None = None
+        async with self._ctx.control_db.session() as session:
+            if credential.oauth_app_registration_id is not None:
+                registration = await OAuthAppRegistrationRepository.get_by_id(
+                    session, credential.oauth_app_registration_id
+                )
+                if registration is None or not registration.is_active:
+                    return None
+                if registration.flow_kind != handler_cls.kind:
+                    return None
+                app = _session_app_from_registration(self._ctx, registration)
+                key = registration.api_vendor
+            elif handler_cls is AuthCodeFlowHandler:
+                occ = await OAuthClientCredentialRepository.get_by_credential(
+                    session, credential.id
+                )
+                if occ is not None and occ.authorize_url:
+                    app = SessionApp(
+                        flow_kind="authorization_code",
+                        client_id=occ.client_id,
+                        client_secret_provider=None,
+                        default_scopes=[],
+                        registration_id=None,
+                        authorize_url=occ.authorize_url,
+                        token_url=occ.token_url,
+                    )
+            else:
+                dac = await DeviceAuthorizationCredentialRepository.get_by_credential(
+                    session, credential.id
+                )
+                if dac is not None:
+                    app = SessionApp(
+                        flow_kind="device_authorization",
+                        client_id=dac.client_id,
+                        client_secret_provider=None,
+                        default_scopes=[],
+                        registration_id=None,
+                        authorization_endpoint=dac.authorization_endpoint,
+                        token_endpoint=dac.token_url,
+                    )
+        if app is None:
+            return None
+        if key is None:
+            key = next(
+                (
+                    k
+                    for k, cfg in self._ctx.config.vendors.entries.items()
+                    if cfg.vendor == credential.catalog_api_id
+                ),
+                None,
+            )
+        if key is not None:
+            try:
+                entry = (
+                    await self._vendors.resolve_session_source(
+                        key,
+                        registration_id=credential.oauth_app_registration_id,
+                        flow_kind=handler_cls.kind,
+                    )
+                ).entry
+            except (
+                InvalidOAuthAppRegistrationError,
+                UnknownVendorError,
+                UnsupportedFlowError,
+                VendorNotConfiguredError,
+            ):
+                entry = None
+        return ConsentSource(handler_cls=handler_cls, app=app, key=key, entry=entry)
+
+    async def _write_change(
+        self,
+        session: Any,
+        row: ConnectSession,
+        change: dict[str, Any],
+        *,
+        on_rules_moved: Literal["refuse", "reopen"] = "refuse",
+    ) -> tuple[dict[str, Any], bool]:
+        """Write an approved change's rules, record its outcome and close the session.
+
+        ``keep_rules`` leaves the rules as they are (the approved ones were for
+        rules that moved since). Returns the change as written, which the
+        caller's admin-DB half and audit entry must use, and whether the
+        session was reopened instead of closed.
+
+        The rules are replaced by a delete and re-insert, and whether they may
+        be replaced was decided by a read before this transaction. So what the
+        write touches is locked here and the rules are read again inside it:
+        two landings would otherwise both pass their own check and the later
+        one would revert the earlier, with both recording success. A write to a
+        shared set takes the set's lock, not the binding's: the bindings are
+        different rows, the set is the one they share.
+
+        ``on_rules_moved`` says what to do when they have moved. A confirm
+        refuses, so its approver re-reads. A landing grant keeps the rules it
+        found, since its own vendor step has to land, and reopens the session
+        when that discards a rule change its approver made: dropping the
+        decision and recording the change as applied would lose it for good.
+        """
+        assert row.agent_id is not None
+        writes_rules = not change.get("keep_rules")
+        if writes_rules:
+            await self._lock_rule_targets(session, row, change)
+            if row.baseline is not None and await self._rules_moved_in(session, row):
+                if on_rules_moved == "refuse":
+                    raise BaselineChangedError(row.id, row.current_revision_id or "", None)
+                _, approved_from = target_rules(row.baseline)
+                reopen = change["rules"] != [rule_to_write(r) for r in approved_from]
+                _logger.info(
+                    "connect_session.edit_rules_kept_moved_under_write",
+                    session_id=row.id,
+                    credential_id=row.credential_id,
+                    reopened=reopen,
+                )
+                change = {**change, "keep_rules": True, "detach_rule_set": False}
+                writes_rules = False
+                if reopen:
+                    # The rules the approver chose cannot be written and are
+                    # not theirs to drop: the session goes back to its review
+                    # with the grant in place, rather than reporting a change
+                    # it never made.
+                    await ConnectSessionRepository.update_fields(
+                        session,
+                        row.id,
+                        state="created",
+                        approved_change=None,
+                        resolved_flow=EDIT_FLOW,
+                    )
+                    return change, True
+        if not writes_rules:
+            pass  # rewriting them would also re-id them under other open edits
+        elif change["rule_set_id"] is not None:
+            await PermissionRuleSetRepository.replace_user_rules(
+                session, change["rule_set_id"], change["rules"], created_by=change["approved_by"]
+            )
+        else:
+            await AgentPermissionRuleRepository.replace_user_rules(
+                session,
+                row.agent_id,
+                row.credential_id,
+                change["rules"],
+                created_by=change["approved_by"],
+            )
+        await ConnectSessionOutcomeRepository.record(
+            session,
+            row=row,
+            outcome=change["outcome"],
+            error_code=change.get("error_code"),
+            ended_at=datetime.now(UTC),
+            credential_id=row.credential_id,
+        )
+        await ConnectSessionRepository.delete(session, row.id)
+        return change, False
+
+    async def _lock_rule_targets(
+        self, session: Any, row: ConnectSession, change: dict[str, Any]
+    ) -> None:
+        """Lock what the rules read and the rules write both touch.
+
+        The two can differ: copying a curated set onto the binding reads the
+        set (to see whether it moved) and writes the binding's own rows. Sets
+        are taken before bindings, and sets among themselves in id order, so
+        every caller takes them in one order.
+        """
+        assert row.agent_id is not None
+        baseline_set = (row.baseline or {}).get("rule_set") or {}
+        read_set_id = baseline_set.get("id")
+        write_set_id = change["rule_set_id"]
+        for rule_set_id in sorted({read_set_id, write_set_id} - {None}):
+            await PermissionRuleSetRepository.acquire_rules_lock(session, rule_set_id)
+        if read_set_id is None or write_set_id is None:
+            await AgentPermissionRuleRepository.acquire_binding_lock(
+                session, row.agent_id, row.credential_id
+            )
+
+    async def _apply_admin_change(self, row: ConnectSession, change: dict[str, Any]) -> None:
+        """The admin-DB half of an approved change: bind, detach a curated set, resume."""
+        assert row.agent_id is not None
+        if not (change["bind"] or change["detach_rule_set"] or change["resume"]):
+            return
+        async with self._ctx.admin_db.transaction() as admin_session:
+            if change["bind"]:
+                await EffectsRepository.bind_agent_to_credential(
+                    admin_session,
+                    agent_id=row.agent_id,
+                    credential_id=row.credential_id,
+                    rule_set_id=None,
+                    created_by=change["approved_by"],
+                )
+            if change["detach_rule_set"]:
+                await PrerequisiteRepository.set_binding_rule_set(
+                    admin_session,
+                    agent_id=row.agent_id,
+                    credential_id=row.credential_id,
+                    rule_set_id=None,
+                )
+            if change["resume"]:
+                await PrerequisiteRepository.resume_binding(
+                    admin_session, agent_id=row.agent_id, credential_id=row.credential_id
+                )
+
+    async def _record_change_applied(
+        self, row: ConnectSession, change: dict[str, Any], *, origin: str
+    ) -> None:
+        """Log, audit and emit events for an approved change that has landed.
+
+        ``origin`` is the confirming request's, or ``system`` when the change
+        landed with a vendor grant after the confirm.
+        """
+        assert row.agent_id is not None
+        before: list[dict[str, Any]] = []
+        if row.baseline is not None:
+            _, before = target_rules(row.baseline)
+        before_content = [rule_content(r) for r in before]
+        after_content = (
+            before_content
+            if change.get("keep_rules")
+            else [rule_content(r) for r in change["rules"]]
+        )
+        # The broker caches the binding, its rules and the token. An edit that
+        # narrows access must take effect at once, not when a TTL lapses, so
+        # every landing path evicts here (this is the one sink for all of
+        # them: apply, confirm, the vendor grant and the reopen).
+        self._ctx.invalidate_broker_caches(
+            agent_id=row.agent_id,
+            credential_id=row.credential_id,
+            rule_set_id=change["rule_set_id"],
+        )
+        _logger.info(
+            "connect_session.edit_applied",
+            session_id=row.id,
+            agent_id=row.agent_id,
+            credential_id=row.credential_id,
+            revision_id=change["revision_id"],
+        )
+        approver = change["approved_by"]
+        await record_audit_best_effort(
+            self._ctx,
+            action=AuditAction.UPDATE,
+            target_type=AuditTargetType.CREDENTIAL_BINDING,
+            target_id=row.credential_id,
+            target_parent_id=row.agent_id,
+            actor_type=actor_type_label_from_id(approver),
+            actor_id=approver,
+            origin=origin,
+            reason="connect session approved",
+            after={
+                "session_id": row.id,
+                "revision_id": change["revision_id"],
+                "rule_set_id": change["rule_set_id"],
+                "rules_added": sum(1 for r in after_content if r not in before_content),
+                "rules_removed": sum(1 for r in before_content if r not in after_content),
+                "scopes": change["scopes"],
+                "resumed": change["resume"],
+                "bound": change["bind"],
+            },
+        )
+        await self._emit_edit_applied(row, approver, bound=change["bind"] or change["resume"])
+
+    @staticmethod
+    def _may_change_rule_set(baseline: Mapping[str, Any], identity: Identity) -> bool:
+        """Whether the caller may change the shared set the baseline points at, if any."""
+        rule_set = baseline.get("rule_set")
+        if rule_set is None or bool(rule_set["curated"]):
+            return True
+        return ORG_ADMIN in identity.permissions or rule_set.get("created_by") == identity.sub
+
+    @staticmethod
+    def _require_rule_set_change_allowed(baseline: Mapping[str, Any], identity: Identity) -> None:
+        """A shared set is its owner's (or an admin's) to change; a curated one is copied."""
+        rule_set = baseline.get("rule_set")
+        if rule_set is not None and not ConnectSessionService._may_change_rule_set(
+            baseline, identity
+        ):
+            raise RuleSetConfirmForbiddenError(rule_set["id"])
+
+    async def _require_consent_allowed(
+        self,
+        credential: Credential | None,
+        agent_id: str,
+        identity: Identity,
+        *,
+        scopes: list[str],
+        granted: set[str],
+        resolved: ConsentSource | None = None,
+    ) -> ConsentSource:
+        """Everything a scope change can be refused for, before anything is written.
+
+        Shared by the consent itself and by the apply path's pre-check, so a
+        refused request never leaves an open session behind. ``resolved`` is
+        the source the caller already has: resolving it reads the credential's
+        registration and the vendor entry, and the apply path would otherwise
+        do that three times for one request.
+        """
+        consent = resolved
+        if consent is None and credential is not None:
+            consent = await self._consent_source(credential)
+        if credential is None or consent is None:
+            raise ScopesNotSupportedError()
+        if consent.entry is not None:
+            unknown = self._vendors.validate_scopes(consent.entry, sorted(set(scopes) - granted))
+            if unknown:
+                raise ScopeValidationError(unknown)
+        await self._require_scope_change_allowed(credential, agent_id, identity)
+        return consent
+
+    def _edit_change(
+        self,
+        baseline: Mapping[str, Any],
+        identity: Identity,
+        *,
+        revision_id: str,
+        permission_rules: list[dict[str, object]] | list[dict[str, Any]],
+        resume: bool,
+        confirmed_scopes: list[str] | None,
+    ) -> dict[str, Any]:
+        """The change an approver writes, from the rules, resume and scopes they chose.
+
+        While the binding points at a shared rule set, only its owner or an
+        org admin changes it; a curated set is copied onto the binding instead.
+        """
+        rule_set = baseline.get("rule_set")
+        copy_curated = rule_set is not None and bool(rule_set["curated"])
+        self._require_rule_set_change_allowed(baseline, identity)
+        rules = [rule_to_write(r) for r in permission_rules]
+        _require_rules_present(baseline, rules)
+        granted = list(baseline.get("granted_scopes") or [])
+        # The approved scopes exactly, so a removal narrows the grant; none
+        # approved keeps it as it is.
+        scopes = sorted(set(confirmed_scopes) if confirmed_scopes is not None else set(granted))
+        return {
+            "rules": rules,
+            "rule_set_id": rule_set["id"] if rule_set is not None and not copy_curated else None,
+            "detach_rule_set": copy_curated,
+            "resume": resume and bool(baseline["suspended"]),
+            "bind": False,
+            "scopes": scopes,
+            "outcome": OUTCOME_APPLIED,
+            "approved_by": identity.sub,
+            "revision_id": revision_id,
+        }
+
+    async def _rules_moved_in(self, session: Any, row: ConnectSession) -> bool:
+        """Whether the rules an edit changes have moved, read in ``session``.
+
+        Read inside the caller's transaction, under the lock the write takes,
+        so the answer cannot go stale between the check and the write it
+        guards.
+        """
+        assert row.baseline is not None and row.agent_id is not None
+        rule_set = row.baseline.get("rule_set")
+        live_rules: Sequence[Any]
+        if rule_set is not None:
+            live_rules = await PermissionRuleSetRepository.list_rules(session, rule_set["id"])
+        else:
+            live_rules = await AgentPermissionRuleRepository.list_rules(
+                session, row.agent_id, row.credential_id
+            )
+        was = [rule_content(r) for r in target_rules(row.baseline)[1]]
+        now = [
+            rule_content(
+                {
+                    "effect": r.effect,
+                    "methods": r.methods,
+                    "path": r.path,
+                    "match_mode": r.match_mode,
+                    "operations": r.operations,
+                    "comment": r.comment,
+                }
+            )
+            for r in live_rules
+            if not r.is_system
+        ]
+        return was != now
+
+    async def _revision_conflicts(self, row: ConnectSession) -> list[dict[str, str]]:
+        """The conflicts the session's current revision carries (none for a clean one)."""
+        async with self._ctx.control_db.session() as session:
+            current = await ConnectSessionRevisionRepository.get_by_id(
+                session, row.current_revision_id or "", session_id=row.id
+            )
+        return list((current.proposal.get("conflicts") or []) if current is not None else [])
+
+    async def _edit_is_stale(self, row: ConnectSession) -> bool:
+        """Whether an open edit's binding has moved since the edit was opened.
+
+        A comparison only: reads report it and write nothing, so a GET never
+        appends a revision. ``:rebase`` (or acting on the session) resolves
+        the ask against the binding as it is now.
+        """
+        if row.intent != INTENT_EDIT or row.state != "created" or row.baseline is None:
+            return False
+        live = await self._live_binding_snapshot(row)
+        return live is not None and not baseline_matches(row.baseline, live)
+
+    async def _require_revision_room(
+        self, row: ConnectSession, *, current: ConnectSessionRevision | None = None, needed: int = 1
+    ) -> None:
+        """Refuse unless the session can still hold ``needed`` more revisions.
+
+        An amend that has to resolve onto a moved binding first writes two:
+        the rebase, then its own. Asked for one, the rebase lands and the
+        amend is then refused, so the refusal would be reporting that nothing
+        was written while a revision had been.
+        """
+        head = current if current is not None else await self._current_revision(row)
+        if head is not None and head.number + needed > _MAX_SESSION_REVISIONS:
+            raise TooManyRevisionsError(row.id, _MAX_SESSION_REVISIONS)
+
+    async def rebase_session(
+        self, session_id: str, *, poll_token: str | None, identity: Identity
+    ) -> AmendedSession:
+        """Resolve an open edit against its binding as it is now.
+
+        What a reader asks for once a read reports the session stale: the
+        request is re-resolved onto the live binding as a new revision, which
+        carries any part of the ask the binding no longer fits as a conflict.
+        Idempotent — a session already current comes back unchanged. Its
+        initiator or a human who may confirm it, as an amend takes.
+
+        The revision it appends is nobody's ask, so it records no author (the
+        review renders it as the rebase it is). Who asked for it is recorded
+        where the question belongs: the audit entry and the event, as an amend
+        records them.
+        """
+        async with self._ctx.control_db.session() as read_session:
+            row = await ConnectSessionRepository.get_by_id(read_session, session_id)
+        row = await self._require_session_access(row, poll_token=poll_token, identity=identity)
+        _require_confirm_kind(row, CONFIRM_KIND_EDIT)
+        if row.state != "created":
+            raise _session_closed(row)
+        await self._require_revision_room(row)
+        before = await self._current_revision(row)
+        row, rebased = await self._refresh_edit(row)
+        current = await self._current_revision(row)
+        if current is None:
+            raise _session_closed(row)
+        # Only what this call did: an amend landing in the gap moves the chain
+        # too, and recording that as this caller's rebase names the wrong
+        # actor for the one question the entry exists to answer.
+        if rebased and (before is None or before.id != current.id):
+            _logger.info(
+                "connect_session.rebased",
+                session_id=row.id,
+                revision_id=current.id,
+                number=current.number,
+                actor_id=identity.sub,
+            )
+            await record_audit_best_effort(
+                self._ctx,
+                action=AuditAction.UPDATE,
+                target_type=AuditTargetType.SESSION,
+                target_id=row.id,
+                actor_type=identity.actor_type.value,
+                actor_id=identity.sub,
+                origin=identity.origin.value,
+                before={"revision_id": before.id if before is not None else None},
+                after={"revision_id": current.id, "number": current.number},
+            )
+            await self._emit_amended(row, current, actor_id=identity.sub)
+        return AmendedSession(
+            session_id=row.id, revision_id=current.id, revision_number=current.number
+        )
+
+    async def _refresh_edit(self, row: ConnectSession) -> tuple[ConnectSession, bool]:
+        """An open edit rebased onto its binding when the binding moved since.
+
+        Called where the caller acts on the session (an amend, a rebase it
+        asked for), never from a read: a GET reports ``stale`` instead, so it
+        appends nothing. Returns the session as it stands and whether this
+        call appended the revision it now points at.
+        """
+        if row.intent != INTENT_EDIT or row.state != "created" or row.baseline is None:
+            return row, False
+        live = await self._live_binding_snapshot(row)
+        if live is None or baseline_matches(row.baseline, live):
+            return row, False
+        _, rebased = await self._rebase_edit(row, live)
+        async with self._ctx.control_db.session() as session:
+            fresh = await ConnectSessionRepository.get_by_id(session, row.id)
+        return (fresh if fresh is not None else row), rebased
+
+    async def _rebase_edit(self, row: ConnectSession, live: dict[str, Any]) -> tuple[str, bool]:
+        """Re-resolve the edit's latest ask onto the binding as it is now.
+
+        The live binding becomes the baseline and the current revision's
+        proposal is resolved against it as a new revision. What follows
+        cleanly merges without anyone acting. A rule it names (to remove, or
+        to add before) that no longer exists is listed in the proposal's
+        ``conflicts``.
+
+        Returns the current revision id and whether this call is what appended
+        it: at the cap, or when another writer won the race, the chain moved
+        for someone else and a caller must not be recorded as having moved it.
+        """
+        try:
+            async with self._ctx.control_db.transaction() as session:
+                await ConnectSessionRepository.acquire_revision_lock(session, row.id)
+                # Under the lock, from the row as it is now: the pointer this
+                # call arrived with predates the lock, so resolving it would
+                # rebase the ask an amend has since replaced and leave the
+                # chain headed by a revision that caller never sent.
+                locked = await ConnectSessionRepository.get_by_id(session, row.id)
+                if locked is None:
+                    raise SessionNotFoundError(row.id)
+                current = await ConnectSessionRevisionRepository.get_by_id(
+                    session, locked.current_revision_id or "", session_id=row.id
+                )
+                if current is None:
+                    raise SessionNotFoundError(row.id)
+                if current.number >= _MAX_SESSION_REVISIONS:
+                    # The chain is full: leave it as it stands rather than
+                    # growing it past the ceiling on a reader's behalf.
+                    _logger.info(
+                        "connect_session.edit_rebase_skipped_at_cap",
+                        session_id=row.id,
+                        revision_id=current.id,
+                    )
+                    return current.id, False
+                request = EditRequest.from_proposal(current.proposal)
+                result, dropped = resolve_edit(live, request, lenient=True, previous=current.result)
+                proposal = {
+                    **request.as_proposal(),
+                    "rebased_from": current.number,
+                    "dropped": dropped,
+                    "conflicts": _edit_conflicts(dropped),
+                }
+                revision = await ConnectSessionRevisionRepository.append(
+                    session,
+                    session_id=row.id,
+                    proposal=proposal,
+                    result=result,
+                    digest=revision_digest(baseline=live, result=result, reason=request.reason),
+                    created_by=None,
+                )
+                await ConnectSessionRepository.update_fields(session, row.id, baseline=live)
+        except DatabaseIntegrityError:
+            # Defensive: both writers of this chain now number inside the
+            # same lock, so the unique ``(session_id, number)`` index has
+            # nothing left to refuse. Were a writer ever added that does not
+            # take it, the rebase is the same either way and the one that
+            # landed stands, rather than raising out of a read.
+            async with self._ctx.control_db.session() as session:
+                fresh = await ConnectSessionRepository.get_by_id(session, row.id)
+            if fresh is None or fresh.current_revision_id is None:
+                raise SessionNotFoundError(row.id) from None
+            _logger.info(
+                "connect_session.edit_rebase_raced",
+                session_id=row.id,
+                revision_id=fresh.current_revision_id,
+            )
+            return fresh.current_revision_id, False
+        _logger.info(
+            "connect_session.edit_rebased",
+            session_id=row.id,
+            revision_id=revision.id,
+            dropped=len(dropped),
+            conflicts=len(proposal["conflicts"]),
+        )
+        return revision.id, True
+
+    async def _emit_edit_applied(self, row: ConnectSession, actor_id: str, *, bound: bool) -> None:
+        """``credential.permission_rule_set`` (and ``credential.bound_to_agent`` when bound)."""
+        assert row.agent_id is not None
+        events = [EventType.CREDENTIAL_PERMISSION_RULE_SET]
+        if bound:
+            events.append(EventType.CREDENTIAL_BOUND_TO_AGENT)
+        for event_type in events:
+            try:
+                async with self._ctx.admin_db.transaction() as session:
+                    await emit_event_best_effort(
+                        session,
+                        type=event_type,
+                        severity=EventSeverity.INFO,
+                        summary=(
+                            f"Access of agent {row.agent_id} to credential {row.credential_id} "
+                            "changed by an approved connect request"
+                        ),
+                        data={
+                            "agent_id": row.agent_id,
+                            "credential_id": row.credential_id,
+                            "session_id": row.id,
+                        },
+                        created_by=row.agent_id,
+                        actor_id=actor_id,
+                        actor_type=actor_type_label_from_id(actor_id),
+                    )
+            except Exception:
+                _logger.warning("telemetry_emit_failed", event_type=event_type, exc_info=True)
+
+    async def _require_editable_binding(
+        self, credential_id: str, agent_id: str, identity: Identity
+    ) -> AgentCredentialBindingRow:
+        """The binding an edit opens on, refusing callers who may not edit it.
+
+        An agent may edit only its own active binding. A human must be the
+        agent's approver *and* the credential's owner, as the direct rule
+        write and the direct resume both require: the rules bound what the
+        agent does with someone else's secret, and a suspension is that
+        owner's cut-off. Every refusal is the same not-found error.
+        """
+        if identity.actor_type == ActorType.AGENT:
+            if agent_id != identity.sub:
+                raise EditBindingNotFoundError(credential_id)
+        elif not await self._is_approver_for_agent(
+            agent_id, identity
+        ) or not await self._owns_credential(credential_id, identity):
+            raise EditBindingNotFoundError(credential_id)
+        async with self._ctx.admin_db.session() as admin_session:
+            binding = await PrerequisiteRepository.get_agent_credential_binding(
+                admin_session, agent_id=agent_id, credential_id=credential_id
+            )
+        if binding is None or (binding.suspended and identity.actor_type == ActorType.AGENT):
+            raise EditBindingNotFoundError(credential_id)
+        return binding
+
+    async def _binding_snapshot(
+        self, agent_id: str, credential_id: str, rule_set_id: str | None
+    ) -> dict[str, Any]:
+        """The binding's rules, rule set and granted scopes (``suspended`` is the caller's).
+
+        System rules are left out: an edit never touches them.
+        """
+        async with self._ctx.control_db.session() as session:
+            rules = await AgentPermissionRuleRepository.list_rules(session, agent_id, credential_id)
+            rule_set: dict[str, Any] | None = None
+            if rule_set_id is not None:
+                found = await PermissionRuleSetRepository.get_by_id(session, rule_set_id)
+                if found is not None:
+                    set_rules = await PermissionRuleSetRepository.list_rules(session, rule_set_id)
+                    rule_set = {
+                        "id": found.id,
+                        "name": found.name,
+                        "curated": found.curated,
+                        "created_by": found.created_by,
+                        "rules": [_rule_snapshot(r) for r in set_rules if not r.is_system],
+                    }
+            token = await OAuthTokenRepository.get_by_credential(session, credential_id)
+        return {
+            "rules": [_rule_snapshot(r) for r in rules if not r.is_system],
+            "rule_set": rule_set,
+            "suspended": False,
+            "granted_scopes": token.scope.split() if token is not None and token.scope else None,
+        }
+
+    async def _live_binding_snapshot(self, row: ConnectSession) -> dict[str, Any] | None:
+        """The edit session's binding as it is now; ``None`` when it is gone."""
+        assert row.agent_id is not None
+        async with self._ctx.admin_db.session() as admin_session:
+            binding = await PrerequisiteRepository.get_agent_credential_binding(
+                admin_session, agent_id=row.agent_id, credential_id=row.credential_id
+            )
+        if binding is None:
+            return None
+        snapshot = await self._binding_snapshot(
+            row.agent_id, row.credential_id, binding.rule_set_id
+        )
+        snapshot["suspended"] = binding.suspended
+        return snapshot
+
+    async def _edit_review(
+        self, row: ConnectSession, identity: Identity
+    ) -> tuple[EditReview, Credential | None, ConnectSessionRevision]:
+        """The review block of an edit session: baseline, current revision and reach.
+
+        The credential and revision it read come back with it, so the caller
+        building the review around it reads neither again.
+        """
+        assert row.agent_id is not None and row.baseline is not None
+        async with self._ctx.control_db.session() as session:
+            revision = (
+                await ConnectSessionRevisionRepository.get_by_id(
+                    session, row.current_revision_id, session_id=row.id
+                )
+                if row.current_revision_id is not None
+                else None
+            )
+            credential = await CredentialRepository.get_by_id(session, row.credential_id)
+        if revision is None:
+            raise SessionNotFoundError(row.id)
+        others, more_others = await self._affected_agents(row, row.baseline, credential, identity)
+        normalized_result = normalize_edit_result(row.baseline, revision.result)
+        review = EditReview(
+            agent_id=row.agent_id,
+            credential_id=row.credential_id,
+            credential_name=credential.name if credential is not None else None,
+            revision_id=revision.id,
+            revision_number=revision.number,
+            current=dict(row.baseline),
+            result=normalized_result,
+            widens_access=widens_access(row.baseline, normalized_result),
+            other_bound_agents=others,
+            other_bound_agents_truncated=more_others,
+            needs_vendor_consent=scopes_changed(row.baseline, normalized_result),
+            conflicts=list(revision.proposal.get("conflicts") or []),
+        )
+        return review, credential, revision
+
+    async def _edit_review_data(self, row: ConnectSession, identity: Identity) -> ReviewData:
+        """``get_review_data`` for an edit session."""
+        edit, credential, revision = await self._edit_review(row, identity)
+        agent = await self._agent_view(row.agent_id)
+        return ReviewData(
+            session_id=row.id,
+            state=row.state,
+            vendor_key=row.vendor,
+            vendor_display_name=(credential.name if credential is not None else None) or row.vendor,
+            resolved_flow=row.resolved_flow,
+            reason=row.reason,
+            requested_by_actor_id=row.initiator_actor_id,
+            scopes=[],
+            requested_permission_rules=[],
+            api_vendor=(credential.api_vendor or "") if credential is not None else "",
+            api_name=credential.api_name if credential is not None else None,
+            api_version=credential.api_version if credential is not None else None,
+            agent=agent,
+            digest=revision.digest,
+            can_confirm=await self._can_confirm(row, identity, agent),
+            revision_id=revision.id,
+            revision_number=revision.number,
+            edit=edit,
+            last_rejected_at=await self._review_last_rejected_at(row),
+            stale=await self._edit_is_stale(row),
+        )
+
+    async def _emit_edit_requested(self, row: ConnectSession, *, credential_name: str) -> None:
+        """Emit the ``connect_session.edit_requested`` rail event for an agent's edit.
+
+        Like ``connect_session.created``: only when the agent itself asked,
+        ``created_by`` is the agent so its owner sees the row, and the data
+        never carries the poll token.
+        """
+        if row.agent_id is None or row.initiator_actor_id != row.agent_id:
+            return
+        try:
+            async with self._ctx.admin_db.session() as admin_session:
+                agent = await EffectsRepository.get_agent_owner(admin_session, row.agent_id)
+            agent_name = agent.name if agent is not None else None
+            async with self._ctx.admin_db.transaction() as session:
+                await emit_event_best_effort(
+                    session,
+                    type=EventType.CONNECT_SESSION_EDIT_REQUESTED,
+                    severity=EventSeverity.INFO,
+                    summary=(
+                        f"Agent {summary_label(agent_name, row.agent_id)} asked to change its "
+                        f"access to {summary_label(credential_name, row.credential_id)}"
+                    ),
+                    requires_action=False,
+                    data={
+                        "session_id": row.id,
+                        "agent_id": row.agent_id,
+                        "credential_id": row.credential_id,
+                    },
+                    created_by=row.agent_id,
+                    actor_id=row.initiator_actor_id,
+                    actor_type=ActorType.AGENT.value,
+                )
+        except Exception:
+            _logger.warning(
+                "telemetry_emit_failed",
+                event_type=EventType.CONNECT_SESSION_EDIT_REQUESTED,
+                session_id=row.id,
+                exc_info=True,
+            )
+
     # ---- review data ------------------------------------------------------
 
     async def get_review_data(
@@ -1506,6 +3603,8 @@ class ConnectSessionService:
         async with self._ctx.control_db.session() as session:
             row = await ConnectSessionRepository.get_by_id(session, session_id)
         row = await self._require_session_access(row, poll_token=poll_token, identity=identity)
+        if row.intent == INTENT_EDIT and row.baseline is not None:
+            return await self._edit_review_data(row, identity)
         if row.state == AWAITING_APP:
             row = await self._try_leave_awaiting_app(row)
         async with self._ctx.control_db.session() as session:
@@ -1573,6 +3672,7 @@ class ConnectSessionService:
 
         agent = await self._agent_view(row.agent_id)
         endpoints = catalog_oauth_endpoints(view) if row.scheme_type == SCHEME_OAUTH2 else None
+        revision = await self._current_revision(row)
         return ReviewData(
             session_id=row.id,
             state=row.state,
@@ -1604,8 +3704,69 @@ class ConnectSessionService:
             pinned_hosts=list(row.pinned_hosts) if row.pinned_hosts is not None else None,
             digest=_review_digest(row, agent, view),
             can_confirm=await self._can_confirm(row, identity, agent),
-            existing_credentials=await self._existing_candidates(row, identity, credential),
+            existing_credentials=await self._existing_candidates(
+                row, identity, credential, agent=agent
+            ),
+            revision_id=revision.id if revision is not None else None,
+            revision_number=revision.number if revision is not None else None,
+            last_rejected_at=await self._review_last_rejected_at(row),
         )
+
+    async def _require_revision(self, row: ConnectSession, revision_id: str | None) -> None:
+        """A confirm must name the session's current revision, the one its reviewer saw."""
+        if revision_id is None:
+            raise RevisionRequiredError()
+        if revision_id != row.current_revision_id:
+            async with self._ctx.control_db.session() as session:
+                raise await _revision_changed(session, row.id, row.current_revision_id)
+
+    async def _current_revision(self, row: ConnectSession) -> ConnectSessionRevision | None:
+        if row.current_revision_id is None:
+            return None
+        async with self._ctx.control_db.session() as session:
+            return await ConnectSessionRevisionRepository.get_by_id(
+                session, row.current_revision_id, session_id=row.id
+            )
+
+    async def list_revisions(
+        self,
+        session_id: str,
+        *,
+        poll_token: str | None,
+        identity: Identity,
+        limit: int,
+        cursor: str | None = None,
+    ) -> tuple[list[ConnectSessionRevision], bool, str | None]:
+        """One page of a session's revisions, oldest first, and how to continue.
+
+        Gated like the review read, and paginated like the session list in the
+        same router: a chain longer than one page is read page by page rather
+        than whole.
+        """
+        async with self._ctx.control_db.session() as session:
+            row = await ConnectSessionRepository.get_by_id(session, session_id)
+        row = await self._require_session_access(row, poll_token=poll_token, identity=identity)
+        # The cursor names the revision the caller already has; the page
+        # continues after its number, which is what the chain is ordered on.
+        after = decode_cursor(cursor, id_kind="str").id if cursor is not None else None
+        async with self._ctx.control_db.session() as session:
+            if after is not None and not await ConnectSessionRevisionRepository.belongs_to(
+                session, after, session_id=row.id
+            ):
+                # A cursor from another session decodes cleanly and then
+                # matches nothing, so the page would come back empty and read
+                # as a session with no history at all.
+                raise InvalidCursorError("Invalid pagination cursor")
+            page = await ConnectSessionRevisionRepository.list_for_session(
+                session, row.id, limit=limit + 1, after_revision_id=after
+            )
+        has_more = len(page) > limit
+        page = page[:limit]
+        # The shared cursor shape carries a timestamp beside the id; only the
+        # id is read here, since the chain is paged on the number that id
+        # resolves to rather than on a clock.
+        next_cursor = encode_cursor(page[-1].created_at, page[-1].id) if has_more and page else None
+        return page, has_more, next_cursor
 
     async def _agent_view(self, agent_id: str | None) -> AgentView | None:
         if agent_id is None:
@@ -1621,10 +3782,20 @@ class ConnectSessionService:
     async def _can_confirm(
         self, row: ConnectSession, identity: Identity, agent: AgentView | None
     ) -> bool:
-        """Whether ``identity`` may confirm the session as it stands (no side effects)."""
+        """Whether ``identity`` may confirm the session as it stands (no side effects).
+
+        Every refusal the confirm itself applies, or the review offers an
+        approval that then 403s: an edit needs the credential and, when the
+        change rewrites a shared rule set, that set as well.
+        """
         if row.state not in ("created", AWAITING_APP):
             return False
         if identity.actor_type == ActorType.AGENT:
+            return False
+        if row.intent == INTENT_EDIT and not (
+            await self._owns_credential(row.credential_id, identity)
+            and self._may_change_rule_set(row.baseline or {}, identity)
+        ):
             return False
         if row.agent_id is None:
             return True
@@ -1639,9 +3810,19 @@ class ConnectSessionService:
         )
 
     async def _existing_candidates(
-        self, row: ConnectSession, identity: Identity, pending: Credential | None
+        self,
+        row: ConnectSession,
+        identity: Identity,
+        pending: Credential | None,
+        *,
+        agent: AgentView | AgentOwnerRow | None = None,
     ) -> list[ExistingCredentialView]:
         """The viewer's connected credentials covering the session's target.
+
+        For ``org:admin`` (whose access filter is unrestricted), candidates are
+        scoped to credentials owned by the target agent's owner or by the
+        confirming admin (#1838), so a third user's credential is never listed
+        or bindable through the review page.
 
         For OAuth credentials the granted scopes (``oauth_tokens.scope``) are
         compared with the session's requested scopes: a narrower grant cannot
@@ -1655,6 +3836,12 @@ class ConnectSessionService:
         else:
             name, version = pending.api_name, pending.api_version
         filters = build_access_filters(identity, Credential)
+        created_by_in: list[str] | None = None
+        if _is_org_admin(identity):
+            allowed_owners = {identity.sub}
+            if agent is not None and agent.owner_id is not None:
+                allowed_owners.add(agent.owner_id)
+            created_by_in = sorted(allowed_owners)
         async with self._ctx.control_db.session() as session:
             candidates = await CredentialRepository.list_connected_covering(
                 session,
@@ -1662,59 +3849,250 @@ class ConnectSessionService:
                 name=name,
                 version=version,
                 exclude_ids=[row.credential_id],
+                created_by_in=created_by_in,
                 filters=filters,
+                account_ref_providers=self._ctx.providers.account_ref_provider_names(),
             )
-            tokens = {
-                c.id: await OAuthTokenRepository.get_by_credential(session, c.id)
-                for c in candidates
-                if _is_oauth_type(c.type)
-            }
+            tokens = await OAuthTokenRepository.get_by_credentials(
+                session, [c.id for c in candidates if _is_oauth_type(c.type)]
+            )
         requested = list(row.requested_scopes or [])
         views: list[ExistingCredentialView] = []
         for credential in candidates:
-            others = await self._other_bound_agent_ids(credential.id, row.agent_id)
-            if _is_oauth_type(credential.type):
-                token = tokens.get(credential.id)
-                granted = token.scope.split() if token is not None and token.scope else []
-                missing = missing_scopes(requested, granted)
-                reauthorizable = (
-                    credential.type == StoredCredentialType.OAUTH2_AUTHORIZATION_CODE.value
-                    and credential.provider == AuthCodeFlowHandler.provider_id
-                    and not others
-                )
+            others, more_others = await self._other_bound_agents(
+                credential.id,
+                row.agent_id,
+                visible_to=bound_agent_visibility(credential.created_by, identity),
+            )
+            wire_type = to_wire(StoredCredentialType(credential.type)).value
+            if not _is_oauth_type(credential.type):
                 views.append(
                     ExistingCredentialView(
                         credential_id=credential.id,
                         name=credential.name,
-                        type=to_wire(StoredCredentialType(credential.type)).value,
-                        granted_scopes=granted,
-                        missing_scopes=missing,
-                        other_bound_agent_ids=others,
-                        can_bind=not missing,
-                        can_reauthorize=reauthorizable,
-                    )
-                )
-            else:
-                views.append(
-                    ExistingCredentialView(
-                        credential_id=credential.id,
-                        name=credential.name,
-                        type=to_wire(StoredCredentialType(credential.type)).value,
+                        type=wire_type,
                         granted_scopes=None,
                         missing_scopes=None,
-                        other_bound_agent_ids=others,
+                        other_bound_agents=others,
+                        other_bound_agents_truncated=more_others,
                         can_bind=True,
-                        can_reauthorize=False,
+                        needs_vendor_consent=False,
                     )
                 )
+                continue
+            token = tokens.get(credential.id)
+            granted = token.scope.split() if token is not None and token.scope else []
+            missing = missing_scopes(requested, granted)
+            consentable = bool(missing) and _consent_handler_for(credential) is not None
+            may_widen = (
+                not others
+                or ORG_ADMIN in identity.permissions
+                or credential.created_by == identity.sub
+            )
+            views.append(
+                ExistingCredentialView(
+                    credential_id=credential.id,
+                    name=credential.name,
+                    type=wire_type,
+                    granted_scopes=granted,
+                    missing_scopes=missing,
+                    other_bound_agents=others,
+                    other_bound_agents_truncated=more_others,
+                    can_bind=not missing or (consentable and may_widen),
+                    needs_vendor_consent=consentable,
+                )
+            )
         return views
 
-    async def _other_bound_agent_ids(self, credential_id: str, agent_id: str | None) -> list[str]:
+    async def _affected_agents(
+        self,
+        row: ConnectSession,
+        baseline: Mapping[str, Any],
+        credential: Credential | None,
+        identity: Identity,
+    ) -> tuple[list[AgentView], bool]:
+        """Every agent the change reaches besides the session's own, named.
+
+        The credential's other bound agents, plus — when the change rewrites a
+        shared rule set rather than copying it — every agent bound through
+        that set on any credential: one write reaches all of them. Narrowed to
+        the agents the caller may enumerate, as the credential's own bound-agent
+        list is, so a review never names a stranger's agent. Returned with
+        whether either source hit its cap, so the review can say the reach is
+        wider than the names it shows.
+        """
+        visible_to = bound_agent_visibility(
+            credential.created_by if credential is not None else None, identity
+        )
+        bound_rows, truncated = await self._other_bound_agent_rows(
+            row.credential_id, row.agent_id, visible_to=visible_to
+        )
+        bound = {
+            r.agent_id: AgentView(
+                agent_id=r.agent_id,
+                name=r.agent_name,
+                owner_id=r.agent_owner_id,
+                status=r.agent_status,
+            )
+            for r in bound_rows
+        }
+        rule_set = baseline.get("rule_set")
+        reached: dict[str, AgentView] = {}
+        if rule_set is not None and not rule_set.get("curated"):
+            # Unfiltered: the set reaches bindings on other credentials, and
+            # which agents on those this caller may be told about depends on
+            # its relationship to each credential, which one SQL predicate
+            # over all of them cannot express. The rows are judged below.
+            async with self._ctx.admin_db.session() as admin_session:
+                rows = await PrerequisiteRepository.list_agents_for_rule_set(
+                    admin_session,
+                    rule_set_id=rule_set["id"],
+                    limit=_BOUND_AGENTS_LIMIT + 2,
+                )
+            creators = await self._readable_credential_creators(
+                {r.credential_id for r in rows if r.agent_id != row.agent_id}, identity
+            )
+            for r in rows:
+                if r.agent_id == row.agent_id or r.credential_id not in creators:
+                    continue
+                # The credential's own rule, as its bound-agent list applies
+                # it: its creator sees every binding on it, any other reader
+                # only the agents it may enumerate. Owning the credential the
+                # edit was opened on says nothing about the others.
+                allowed = bound_agent_visibility(creators[r.credential_id], identity)
+                if allowed is not None and not (
+                    r.agent_id == allowed.self_id or r.agent_owner_id in allowed.owner_ids
+                ):
+                    continue
+                reached[r.agent_id] = AgentView(
+                    agent_id=r.agent_id,
+                    name=r.agent_name,
+                    owner_id=None,
+                    status=r.agent_status,
+                )
+            # Two questions, and the window answers only one of them. Whether
+            # the list is complete is whether the window saturated: the rows
+            # beyond it are unread, so whether any of them is readable is
+            # unknown, and a window filled by unreadable rows would otherwise
+            # report "reaches no other agent" exactly.
+            if len(rows) >= _BOUND_AGENTS_LIMIT + 2 or len(reached) > _BOUND_AGENTS_LIMIT:
+                truncated = True
+            if len(reached) > _BOUND_AGENTS_LIMIT:
+                reached = {
+                    agent_id: reached[agent_id]
+                    for agent_id in sorted(reached)[:_BOUND_AGENTS_LIMIT]
+                }
+        merged = {**bound, **reached}
+        views = [merged[other_id] for other_id in sorted(merged)]
+        return views, truncated
+
+    async def _readable_credential_creators(
+        self, credential_ids: set[str], identity: Identity
+    ) -> dict[str, str | None]:
+        """Who created each of ``credential_ids`` the caller may read.
+
+        Absent means unreadable, so a caller is told nothing about the agents
+        bound on it. The access filters are the ones the credential service's
+        own rule-set count passes, including the agent and shared-read terms:
+        without them an agent caller, or a reader under a shared-read grant,
+        is told less than it may see.
+        """
+        if not credential_ids:
+            return {}
+        async with self._ctx.admin_db.session() as admin_session:
+            bound_credential_ids = (
+                await PrerequisiteRepository.list_credential_ids_for_agent(
+                    admin_session, agent_id=identity.sub
+                )
+                if identity.actor_type == ActorType.AGENT and identity.sub
+                else []
+            )
+            owned_agent_ids = (
+                await PrerequisiteRepository.list_agent_ids_owned_by(
+                    admin_session, owner_id=identity.sub
+                )
+                if identity.actor_type == ActorType.USER and identity.sub
+                else []
+            )
+        filters = build_access_filters(
+            identity,
+            Credential,
+            bound_credential_ids=bound_credential_ids,
+            owned_agent_ids=owned_agent_ids,
+            include_shared=True,
+        )
+        async with self._ctx.control_db.session() as session:
+            return await CredentialRepository.get_creators_by_ids(
+                session, sorted(credential_ids), filters=filters
+            )
+
+    async def _other_bound_agents(
+        self,
+        credential_id: str,
+        agent_id: str | None,
+        *,
+        visible_to: AgentVisibility | None = None,
+    ) -> tuple[list[AgentView], bool]:
+        """The agents other than ``agent_id`` bound to the credential, with their names.
+
+        With whether the cap cut the list, as :meth:`_other_bound_agent_rows`
+        reports it.
+        """
+        rows, truncated = await self._other_bound_agent_rows(
+            credential_id, agent_id, visible_to=visible_to
+        )
+        views = [
+            AgentView(
+                agent_id=r.agent_id,
+                name=r.agent_name,
+                owner_id=r.agent_owner_id,
+                status=r.agent_status,
+            )
+            for r in rows
+        ]
+        return views, truncated
+
+    async def _other_bound_agent_rows(
+        self,
+        credential_id: str,
+        agent_id: str | None,
+        *,
+        visible_to: AgentVisibility | None = None,
+    ) -> tuple[list[CredentialBoundAgentRow], bool]:
+        """The other agents bound to the credential, and whether the cap cut the list.
+
+        Past the cap a caller can say the reach is wider than the names it
+        holds, rather than reporting the cap as the whole of it. No cursor
+        continues the list: the screens that show it state reach, they do not
+        page through it.
+
+        Two rows beyond the cap are read, not one: ``agent_id``'s own binding
+        is among them and is dropped here, so a window of exactly one more
+        would answer differently depending on where that row landed in it.
+        """
         async with self._ctx.admin_db.session() as admin_session:
             rows = await PrerequisiteRepository.list_agents_for_credential(
-                admin_session, credential_id=credential_id, limit=_BOUND_AGENTS_LIMIT
+                admin_session,
+                credential_id=credential_id,
+                limit=_BOUND_AGENTS_LIMIT + 2,
+                visible_to=visible_to,
             )
-        return sorted({r.agent_id for r in rows if r.agent_id != agent_id})
+        by_agent = {r.agent_id: r for r in rows if r.agent_id != agent_id}
+        ordered = [by_agent[aid] for aid in sorted(by_agent)]
+        return ordered[:_BOUND_AGENTS_LIMIT], len(ordered) > _BOUND_AGENTS_LIMIT
+
+    async def _other_bound_agent_ids(
+        self,
+        credential_id: str,
+        agent_id: str | None,
+        *,
+        visible_to: AgentVisibility | None = None,
+    ) -> tuple[list[str], bool]:
+        """The other agents bound to the credential, and whether the cap cut the list."""
+        rows, truncated = await self._other_bound_agent_rows(
+            credential_id, agent_id, visible_to=visible_to
+        )
+        return [r.agent_id for r in rows], truncated
 
     async def _try_leave_awaiting_app(self, row: ConnectSession) -> ConnectSession:
         """:meth:`_leave_awaiting_app`, returning the session as it stands afterwards."""
@@ -1833,10 +4211,7 @@ class ConnectSessionService:
         own. Rows are slim summaries — the ``poll_token``
         capability never leaves the service on this path.
         """
-        decoded_cursor = None
-        if cursor is not None:
-            ts, sid = decode_cursor_str(cursor)
-            decoded_cursor = (ts, sid)
+        decoded_cursor = decode_cursor(cursor, id_kind="str") if cursor is not None else None
 
         access_filters = build_access_filters(
             identity,
@@ -1882,6 +4257,7 @@ class ConnectSessionService:
             error_code=row.error_code,
             created_at=row.created_at,
             credential_id=row.credential_id,
+            intent=row.intent,
         )
 
     def _vendor_display_name(self, row: ConnectSession, registration_name: str | None) -> str:
@@ -1925,6 +4301,11 @@ class ConnectSessionService:
         # whenever given; required for an ``api`` target.
         expected_agent_id: str | None = None,
         digest: str | None = None,
+        # The revision the approver reviewed; required, and it must be current.
+        revision_id: str | None = None,
+        # The approver's browser: an authorization-code flow binds its
+        # callback to it, since the approver is the one who goes to the vendor.
+        browser_binding: BrowserBindingClaim | None = None,
     ) -> ConfirmResult:
         """Confirm scopes + permissions and kick off the vendor-side flow.
 
@@ -1934,9 +4315,9 @@ class ConnectSessionService:
         approval URLs) and bind an arbitrary agent. Missing session, token
         mismatch and a caller who is neither surface identically.
 
-        The credential is attributed to the approver (``created_by``),
-        whoever initiated the session; the initiator stays recorded on the
-        session and in the audit entry.
+        The credential is attributed to the target agent's owner when the
+        session binds an owned agent, or to the approver otherwise (#1838);
+        the approver and the initiator stay recorded in the audit entry.
         """
         async with self._ctx.control_db.session() as read_session:
             row = await ConnectSessionRepository.get_by_id(read_session, session_id)
@@ -1961,6 +4342,7 @@ class ConnectSessionService:
         # Friendly pre-check for the common stale-page case; the CAS below
         # is the authoritative guard against a concurrent confirm.
         _require_state(row, expected="created", action="confirm")
+        await self._require_revision(row, revision_id)
 
         # Re-open the session's own source at confirm time: the pinned
         # registration, or the config entry when the FK is NULL. If that
@@ -1994,8 +4376,19 @@ class ConnectSessionService:
         # payload (late-bind) has never been validated — it must exist
         # and be governable by the confirming caller before any binding
         # or rule write happens in its name.
+        target_agent: AgentOwnerRow | None = None
         if effective_agent_id is not None:
-            await self._require_agent_binding_allowed(effective_agent_id, identity)
+            target_agent = await self._require_agent_binding_allowed(
+                effective_agent_id, identity, late_bound=late_bound
+            )
+            # A late-bound agent was never checked at create, and a binding
+            # may have been suspended since the session opened.
+            await self._refuse_suspended_binding_for_session(row, effective_agent_id)
+        credential_owner_id = (
+            target_agent.owner_id
+            if target_agent is not None and target_agent.owner_id is not None
+            else identity.sub
+        )
         api_target = row.target_kind == TARGET_KIND_API
         await self._verify_review(
             row,
@@ -2011,13 +4404,14 @@ class ConnectSessionService:
         # it, two concurrent confirms both pass the stale read above and
         # both fire the vendor's ``begin`` (TOCTOU). The loser sees
         # rowcount 0 and gets the same 409 as the stale-page case.
-        cas_fields: dict[str, object] = {"agent_id": effective_agent_id} if late_bound else {}
+        cas_fields: dict[str, Any] = {"agent_id": effective_agent_id} if late_bound else {}
         async with self._ctx.control_db.transaction() as cas_session:
             won = await ConnectSessionRepository.transition_state(
                 cas_session,
                 row.id,
                 to_state="polling",
                 from_states=("created",),
+                revision_id=revision_id,
                 **cas_fields,
             )
         if not won:
@@ -2032,12 +4426,17 @@ class ConnectSessionService:
         # signed state token for auth-code). We only own the flow-agnostic
         # state machine + permission-rule capture below.
         try:
-            challenge = await handler.begin(row, app=session_app, confirmed_scopes=confirmed_scopes)
+            challenge = await handler.begin(
+                row,
+                app=session_app,
+                confirmed_scopes=confirmed_scopes,
+                browser_binding=browser_binding,
+            )
         except Exception:
             # A vendor-side ``begin`` failure must leave the session
             # retryable — roll the CAS back to ``created`` (undoing a
             # late-bound agent too, so a retry can pick a different one).
-            revert_fields: dict[str, object] = {"agent_id": None} if late_bound else {}
+            revert_fields: dict[str, Any] = {"agent_id": None} if late_bound else {}
             async with self._ctx.control_db.transaction() as revert_session:
                 await ConnectSessionRepository.transition_state(
                     revert_session,
@@ -2050,7 +4449,7 @@ class ConnectSessionService:
 
         async with self._ctx.control_db.transaction() as session:
             await CredentialRepository.set_created_by(
-                session, row.credential_id, created_by=identity.sub
+                session, row.credential_id, created_by=credential_owner_id
             )
             # Persist the approved rules as direct agent-credential binding
             # rules (theme 5): ``agent_permission_rules`` is the list the
@@ -2120,7 +4519,7 @@ class ConnectSessionService:
                 "agent_id": effective_agent_id,
                 "confirmed_scopes": list(confirmed_scopes),
                 "rules_count": len(permission_rules),
-                "credential_created_by": identity.sub,
+                "credential_created_by": credential_owner_id,
             },
         )
         if challenge.kind == "device_authorization":
@@ -2139,6 +4538,7 @@ class ConnectSessionService:
         poll_token: str | None,
         variant: ConfirmVariant,
         identity: Identity,
+        browser_binding: BrowserBindingClaim | None = None,
     ) -> ConfirmResult:
         """Confirm with an entered secret, an own OAuth client or an existing credential.
 
@@ -2153,10 +4553,11 @@ class ConnectSessionService:
           session to ``connected`` and writes the typed secret, the
           credential's state and the rules.
         * :class:`ExistingCredentialConfirm` binds a credential the approver
-          already holds (OAuth only when its granted scopes cover the
-          request) and ends the session ``connected``; with ``reauthorize``
-          it also starts a consent for more scopes on that credential, which
-          is allowed only when no other agent is bound to it.
+          already holds and ends the session ``connected``. When its OAuth
+          grant lacks scopes the session asks for, it runs a vendor consent
+          for them first and the bind, rules and scopes land with the grant;
+          widening a credential other agents use needs its owner or an org
+          admin.
         * :class:`OwnClientConfirm` (``awaiting_app``) stores the approver's
           OAuth client on the pending credential and continues as an
           authorization-code connect.
@@ -2175,13 +4576,25 @@ class ConnectSessionService:
         kind = _variant_kind(variant)
         _require_confirm_kind(row, kind)
         checks = variant.checks
+        await self._require_revision(row, checks.revision_id)
         late_bound = row.agent_id is None and checks.agent_id is not None
         effective_agent_id = row.agent_id if row.agent_id is not None else checks.agent_id
         if isinstance(variant, ExistingCredentialConfirm) and effective_agent_id is None:
             # Binding an existing credential needs an agent to bind it to.
             raise ConfirmKindMismatchError(kind, [_allowed_confirm_kinds(row)[0]])
+        target_agent: AgentOwnerRow | None = None
         if effective_agent_id is not None:
-            await self._require_agent_binding_allowed(effective_agent_id, identity)
+            target_agent = await self._require_agent_binding_allowed(
+                effective_agent_id, identity, late_bound=late_bound
+            )
+            # A late-bound agent was never checked at create, and a binding
+            # may have been suspended since the session opened.
+            await self._refuse_suspended_binding_for_session(row, effective_agent_id)
+        credential_owner_id = (
+            target_agent.owner_id
+            if target_agent is not None and target_agent.owner_id is not None
+            else identity.sub
+        )
         await self._verify_review(
             row,
             effective_agent_id=effective_agent_id,
@@ -2194,16 +4607,33 @@ class ConnectSessionService:
 
         if isinstance(variant, SecretConfirm):
             result: ConfirmResult = await self._confirm_secret(
-                row, variant, effective_agent_id, late_bound=late_bound, identity=identity
+                row,
+                variant,
+                effective_agent_id,
+                late_bound=late_bound,
+                identity=identity,
+                credential_owner_id=credential_owner_id,
             )
         elif isinstance(variant, ExistingCredentialConfirm):
             assert effective_agent_id is not None
             result = await self._confirm_existing(
-                row, variant, effective_agent_id, late_bound=late_bound, identity=identity
+                row,
+                variant,
+                effective_agent_id,
+                late_bound=late_bound,
+                identity=identity,
+                browser_binding=browser_binding,
+                agent=target_agent,
             )
         else:
             result = await self._confirm_own_client(
-                row, variant, effective_agent_id, late_bound=late_bound, identity=identity
+                row,
+                variant,
+                effective_agent_id,
+                late_bound=late_bound,
+                identity=identity,
+                browser_binding=browser_binding,
+                credential_owner_id=credential_owner_id,
             )
 
         await record_audit_best_effort(
@@ -2225,6 +4655,11 @@ class ConnectSessionService:
                 "credential_id": getattr(result, "credential_id", row.credential_id),
                 "agent_id": effective_agent_id,
                 "rules_count": len(checks.permission_rules),
+                **(
+                    {}
+                    if isinstance(variant, ExistingCredentialConfirm)
+                    else {"credential_created_by": credential_owner_id}
+                ),
             },
         )
         return result
@@ -2365,6 +4800,7 @@ class ConnectSessionService:
         *,
         late_bound: bool,
         identity: Identity,
+        credential_owner_id: str,
     ) -> ConnectedConfirmResult:
         handler = manual_handler_for(row.resolved_flow)
         assert handler is not None
@@ -2373,11 +4809,16 @@ class ConnectSessionService:
             newly_bound = await self._bind_for_confirm(
                 agent_id, row.credential_id, created_by=identity.sub
             )
-        cas_fields: dict[str, object] = {"agent_id": agent_id} if late_bound else {}
+        cas_fields: dict[str, Any] = {"agent_id": agent_id} if late_bound else {}
         try:
             async with self._ctx.control_db.transaction() as session:
                 won = await ConnectSessionRepository.transition_state(
-                    session, row.id, to_state="connected", from_states=("created",), **cas_fields
+                    session,
+                    row.id,
+                    to_state="connected",
+                    from_states=("created",),
+                    revision_id=variant.checks.revision_id,
+                    **cas_fields,
                 )
                 if won:
                     await handler.write_secret(
@@ -2385,11 +4826,11 @@ class ConnectSessionService:
                         self._ctx.encryption,
                         row=row,
                         secret=variant.secret,
-                        created_by=identity.sub,
+                        created_by=credential_owner_id,
                     )
                     await CredentialRepository.set_state(session, row.credential_id, "connected")
                     await CredentialRepository.set_created_by(
-                        session, row.credential_id, created_by=identity.sub
+                        session, row.credential_id, created_by=credential_owner_id
                     )
                     if agent_id is not None:
                         await AgentPermissionRuleRepository.replace_user_rules(
@@ -2428,51 +4869,32 @@ class ConnectSessionService:
         *,
         late_bound: bool,
         identity: Identity,
-    ) -> ConnectedConfirmResult | ReauthorizeConfirmResult:
+        browser_binding: BrowserBindingClaim | None,
+        agent: AgentOwnerRow | None = None,
+    ) -> ConfirmResult:
         async with self._ctx.control_db.session() as session:
             pending = await CredentialRepository.get_by_id(session, row.credential_id)
-        candidates = await self._existing_candidates(row, identity, pending)
+        candidates = await self._existing_candidates(row, identity, pending, agent=agent)
         chosen = next((c for c in candidates if c.credential_id == variant.credential_id), None)
         if chosen is None:
             raise ExistingCredentialNotFoundError(variant.credential_id)
-
-        authorize_url: str | None = None
-        if variant.reauthorize:
-            if not chosen.can_reauthorize:
-                reason = (
-                    "other agents are bound to it"
-                    if chosen.other_bound_agent_ids
-                    else "it is not an OAuth authorization-code credential"
-                )
-                raise ReauthorizeUnavailableError(chosen.credential_id, reason)
-            scopes = sorted(set(chosen.granted_scopes or []) | set(row.requested_scopes or []))
-            # The callback re-checks that this agent is still the only one bound
-            # (``sole_agent_id`` rides the signed state), so a binding made while
-            # the approver is at the vendor's consent screen cannot widen.
-            challenge = await ConnectService(self._ctx).begin(
-                chosen.credential_id,
-                ConnectRequest(scopes=scopes),
+        if chosen.missing_scopes:
+            if not chosen.needs_vendor_consent:
+                raise InsufficientGrantedScopesError(chosen.credential_id, chosen.missing_scopes)
+            return await self._confirm_existing_with_consent(
+                row,
+                variant,
+                chosen,
+                agent_id,
+                late_bound=late_bound,
                 identity=identity,
-                redirect_uri=platform_redirect_uri(self._ctx),
-                sole_agent_id=agent_id,
+                browser_binding=browser_binding,
             )
-            if not isinstance(challenge, AuthCodeChallenge):
-                raise ReauthorizeUnavailableError(
-                    chosen.credential_id, "it is not an OAuth authorization-code credential"
-                )
-            if decode_state(_state_secret(self._ctx), challenge.state).sole_agent_id != agent_id:
-                # Fail closed on a provider whose state cannot carry the re-check.
-                raise ReauthorizeUnavailableError(
-                    chosen.credential_id, "its provider cannot re-check the bound agents"
-                )
-            authorize_url = challenge.authorize_url
-        elif not chosen.can_bind:
-            raise InsufficientGrantedScopesError(chosen.credential_id, chosen.missing_scopes or [])
 
         newly_bound = await self._bind_for_confirm(
             agent_id, chosen.credential_id, created_by=identity.sub
         )
-        cas_fields: dict[str, object] = {"agent_id": agent_id} if late_bound else {}
+        cas_fields: dict[str, Any] = {"agent_id": agent_id} if late_bound else {}
         try:
             async with self._ctx.control_db.transaction() as session:
                 won = await ConnectSessionRepository.transition_state(
@@ -2480,6 +4902,7 @@ class ConnectSessionService:
                     row.id,
                     to_state="connected",
                     from_states=(row.state,),
+                    revision_id=variant.checks.revision_id,
                     **cas_fields,
                 )
                 if won:
@@ -2512,11 +4935,89 @@ class ConnectSessionService:
                 row, agent_id=agent_id, credential_id=chosen.credential_id, newly_bound=newly_bound
             )
         self._record_connected(row)
-        if authorize_url is not None:
-            return ReauthorizeConfirmResult(
-                credential_id=chosen.credential_id, authorize_url=authorize_url
-            )
         return ConnectedConfirmResult(credential_id=chosen.credential_id)
+
+    async def _confirm_existing_with_consent(
+        self,
+        row: ConnectSession,
+        variant: ExistingCredentialConfirm,
+        chosen: ExistingCredentialView,
+        agent_id: str,
+        *,
+        late_bound: bool,
+        identity: Identity,
+        browser_binding: BrowserBindingClaim | None,
+    ) -> ConfirmResult:
+        """Use an existing credential that lacks scopes the session asks for, in one step.
+
+        The session moves onto that credential as an edit of the agent's
+        future binding: the approved rules and the bind are held on it, a
+        vendor consent for the missing scopes runs on the credential's own
+        flow, and the bind, rules and new scopes land together with the
+        grant. The session's own pending credential is dropped. Until the
+        grant lands nothing changes for the credential or the agents already
+        bound to it; a failed consent only ends the session.
+        """
+        async with self._ctx.control_db.session() as session:
+            credential = await CredentialRepository.get_by_id(session, chosen.credential_id)
+        consent = await self._consent_source(credential) if credential is not None else None
+        if credential is None or consent is None:
+            raise InsufficientGrantedScopesError(chosen.credential_id, chosen.missing_scopes or [])
+        scopes = sorted(set(chosen.granted_scopes or []) | set(row.requested_scopes or []))
+        if consent.entry is not None:
+            unknown = self._vendors.validate_scopes(consent.entry, scopes)
+            if unknown:
+                raise ScopeValidationError(unknown)
+        await self._require_scope_change_allowed(credential, agent_id, identity)
+        change: dict[str, Any] = {
+            "shared_with": (await self._other_bound_agent_ids(credential.id, agent_id))[0],
+            "rules": [rule_to_write(r) for r in variant.checks.permission_rules],
+            "rule_set_id": None,
+            "detach_rule_set": False,
+            "resume": False,
+            "bind": True,
+            "scopes": scopes,
+            "outcome": OUTCOME_CONNECTED,
+            "approved_by": identity.sub,
+            "revision_id": variant.checks.revision_id,
+        }
+        cas_fields: dict[str, Any] = {"agent_id": agent_id} if late_bound else {}
+        # Taking the edit intent means the review reads this session as an
+        # edit, which is derived from a baseline. Without one the read raised
+        # out of the app for the whole window the session awaits its vendor
+        # callback, so the binding-to-be is snapshot here: no rules and no
+        # rule set yet, with the chosen credential's grant as it stands.
+        baseline = await self._binding_snapshot(agent_id, credential.id, None)
+        async with self._ctx.control_db.transaction() as session:
+            won = await ConnectSessionRepository.transition_state(
+                session,
+                row.id,
+                to_state="polling",
+                from_states=(row.state,),
+                revision_id=variant.checks.revision_id,
+                intent=INTENT_EDIT,
+                baseline=baseline,
+                credential_id=credential.id,
+                target_kind=TARGET_KIND_VENDOR,
+                vendor=consent.key or credential.api_vendor,
+                vendor_key=None,
+                dedupe_key=None,
+                resolved_flow=consent.handler_cls.kind,
+                approved_change=change,
+                **cas_fields,
+            )
+            if won:
+                # The session now points at the chosen credential, so its
+                # own pending one goes alone.
+                await CredentialRepository.delete(session, row.credential_id)
+        if not won:
+            raise InvalidStateTransitionError(row.id, row.state, "confirm")
+        async with self._ctx.control_db.session() as session:
+            polling = await ConnectSessionRepository.get_by_id(session, row.id)
+        assert polling is not None
+        return await self._begin_consent(
+            polling, consent, scopes, retryable=False, browser_binding=browser_binding
+        )
 
     async def _confirm_own_client(
         self,
@@ -2526,6 +5027,8 @@ class ConnectSessionService:
         *,
         late_bound: bool,
         identity: Identity,
+        browser_binding: BrowserBindingClaim | None,
+        credential_owner_id: str,
     ) -> AuthCodeConfirmResult:
         if not variant.authorize_url.strip() or not variant.token_url.strip():
             raise OwnClientInvalidError("authorize_url and token_url are required")
@@ -2536,20 +5039,25 @@ class ConnectSessionService:
             for url in (variant.authorize_url, variant.token_url)
         ):
             raise OwnClientInvalidError("authorize_url and token_url must be https URLs")
+        # Same policy as ``POST /credentials`` (same permission): the
+        # control-plane egress allowlist, so the endpoints confirmed here match
+        # the ones the token exchange, refresh and later edits accept.
+        egress = resolved_control_egress(self._ctx.config)
         try:
-            authorize_url = validate_upstream_url(variant.authorize_url)
-            token_url = validate_upstream_url(variant.token_url)
+            authorize_url = await validate_upstream_url_async(variant.authorize_url, egress)
+            token_url = await validate_upstream_url_async(variant.token_url, egress)
         except ValueError as exc:
             raise OwnClientInvalidError(str(exc)) from exc
 
         handler = AuthCodeFlowHandler(self._ctx)
-        cas_fields: dict[str, object] = {"agent_id": agent_id} if late_bound else {}
+        cas_fields: dict[str, Any] = {"agent_id": agent_id} if late_bound else {}
         async with self._ctx.control_db.transaction() as session:
             won = await ConnectSessionRepository.transition_state(
                 session,
                 row.id,
                 to_state="polling",
                 from_states=(AWAITING_APP,),
+                revision_id=variant.checks.revision_id,
                 resolved_flow=AuthCodeFlowHandler.kind,
                 **cas_fields,
             )
@@ -2564,7 +5072,7 @@ class ConnectSessionService:
                     ),
                     authorize_url=authorize_url,
                     scope=" ".join(variant.confirmed_scopes) if variant.confirmed_scopes else None,
-                    created_by=identity.sub,
+                    created_by=credential_owner_id,
                 )
             current = await ConnectSessionRepository.get_by_id(session, row.id)
         if not won or current is None:
@@ -2588,11 +5096,14 @@ class ConnectSessionService:
         )
         try:
             challenge = await handler.begin(
-                current, app=app, confirmed_scopes=variant.confirmed_scopes
+                current,
+                app=app,
+                confirmed_scopes=variant.confirmed_scopes,
+                browser_binding=browser_binding,
             )
         except Exception:
             # Leave the session as it was so the approver can retry.
-            revert_fields: dict[str, object] = {"agent_id": None} if late_bound else {}
+            revert_fields: dict[str, Any] = {"agent_id": None} if late_bound else {}
             async with self._ctx.control_db.transaction() as revert_session:
                 reverted = await ConnectSessionRepository.transition_state(
                     revert_session,
@@ -2611,7 +5122,7 @@ class ConnectSessionService:
 
         async with self._ctx.control_db.transaction() as session:
             await CredentialRepository.set_created_by(
-                session, row.credential_id, created_by=identity.sub
+                session, row.credential_id, created_by=credential_owner_id
             )
             if agent_id is not None:
                 await AgentPermissionRuleRepository.replace_user_rules(
@@ -2681,7 +5192,9 @@ class ConnectSessionService:
             raise AgentInactiveError(agent_id, agent.status)
         return agent
 
-    async def _require_agent_binding_allowed(self, agent_id: str, identity: Identity) -> None:
+    async def _require_agent_binding_allowed(
+        self, agent_id: str, identity: Identity, *, late_bound: bool
+    ) -> AgentOwnerRow:
         """The target agent must exist, be governable by the caller, and be usable.
 
         Cross-DB read (agents live in the admin DB) through the
@@ -2691,7 +5204,17 @@ class ConnectSessionService:
         holding both ``credentials:write`` and ``agents:write`` (the bind
         route's own gate). An archived, disabled or rejected agent is
         refused — it can no longer use the credential, and archive revokes
-        its bindings.
+        its bindings. Returns the loaded agent row so callers can attribute
+        the confirmed credential to the agent's owner (#1838).
+
+        A missing agent raises :class:`AgentNotFoundError`. When the agent is
+        ``late_bound`` (the session had none and the confirm names it), one
+        the caller does not govern (owned by someone else, or by nobody)
+        raises the same :class:`AgentNotFoundError` as
+        :meth:`_require_session_agent_allowed`, so it answers exactly like an
+        agent named at create time. An agent already named on the session is
+        shown in its review, so a caller who does not govern it gets
+        :class:`ConfirmationForbiddenError`.
         """
         async with self._ctx.admin_db.session() as admin_session:
             agent = await EffectsRepository.get_agent_owner(admin_session, agent_id)
@@ -2701,6 +5224,8 @@ class ConnectSessionService:
             # An ownerless agent (nullable ``owner_id``) has no owner to
             # match — only ``org:admin`` may bind in its name. Fail closed.
             if agent.owner_id is None or identity.sub != agent.owner_id:
+                if late_bound:
+                    raise AgentNotFoundError(agent_id)
                 raise ConfirmationForbiddenError(f"agent {agent_id!r} is not owned by the caller")
             if not _is_owner_approver(identity):
                 raise ConfirmationForbiddenError(
@@ -2708,6 +5233,7 @@ class ConnectSessionService:
                 )
         if agent.status in _UNUSABLE_AGENT_STATUSES:
             raise AgentInactiveError(agent_id, agent.status)
+        return agent
 
     async def _require_session_access(
         self,
@@ -2733,6 +5259,25 @@ class ConnectSessionService:
         if await self._is_session_approver(row, identity):
             return row
         raise InvalidPollTokenError("invalid poll_token")
+
+    async def _owns_credential(self, credential_id: str, identity: Identity) -> bool:
+        """``org:admin``, or the identity that created the credential.
+
+        The owner axis the direct binding writes take
+        (``CredentialService._may_write_binding_rules``,
+        ``AgentService.resume_credential``): read visibility is deliberately
+        not enough, so an agent's approver who does not own the secret cannot
+        widen what the agent does with it.
+        """
+        if _is_org_admin(identity):
+            return True
+        async with self._ctx.control_db.session() as session:
+            credential = await CredentialRepository.get_by_id(session, credential_id)
+        return (
+            credential is not None
+            and credential.created_by is not None
+            and credential.created_by == identity.sub
+        )
 
     async def _is_session_approver(self, row: ConnectSession, identity: Identity) -> bool:
         """Whether a human may act on the session without its ``poll_token``."""
@@ -2809,7 +5354,13 @@ class ConnectSessionService:
 
         # ``created`` = confirm not called yet; ``awaiting_app`` = no OAuth
         # app resolved yet; ``polling`` = advancement in flight (scanner or
-        # callback route). All surface as pending.
+        # callback route). All surface as pending; an edit its binding moved
+        # under in a way it can't follow says so, for its initiator to amend.
+        if row.intent == INTENT_EDIT:
+            if await self._revision_conflicts(row):
+                return StatusResult(status="pending", error_code="conflicted")
+            if await self._edit_is_stale(row):
+                return StatusResult(status="pending", stale=True)
         return StatusResult(status="pending")
 
     async def _outcome_status(
@@ -2825,6 +5376,13 @@ class ConnectSessionService:
         )
         if not token_ok and not await self._is_approver_for_agent(outcome.agent_id, identity):
             raise InvalidPollTokenError("invalid poll_token")
+        if outcome.outcome == OUTCOME_APPLIED:
+            # ``scopes_not_removed``: applied, but the vendor kept a removed scope.
+            return StatusResult(
+                status=OUTCOME_APPLIED,
+                credential_id=outcome.credential_id,
+                error_code=outcome.error_code,
+            )
         if outcome.outcome == OUTCOME_CONNECTED:
             bound: list[str] | None = None
             if outcome.credential_id is not None:
@@ -2929,7 +5487,13 @@ class ConnectSessionService:
         )
 
     def _ttl_seconds(self, row: ConnectSession) -> float:
-        if row.target_kind == TARGET_KIND_VENDOR and row.resolved_flow in _OAUTH_FLOWS:
+        # An edit waits for a human before its consent starts, so it keeps
+        # the human-approval TTL throughout (the device code has its own).
+        if (
+            row.intent != INTENT_EDIT
+            and row.target_kind == TARGET_KIND_VENDOR
+            and row.resolved_flow in _OAUTH_FLOWS
+        ):
             return _SESSION_TTL_SECONDS
         return self._ctx.config.control.connect.manual_flows_ttl_hours * 3600.0
 
@@ -2962,30 +5526,44 @@ class ConnectSessionService:
         report = await handler.advance(credential.id)
         if report.kind == "pending":
             return
-        if report.kind == "success":
-            assert report.tokens is not None
-            await self._finalise_credential_connected(credential, handler, report.tokens)
+        try:
+            if report.kind == "success":
+                assert report.tokens is not None
+                await self._finalise_credential_connected(
+                    credential, handler, report.tokens, flow_nonce=report.flow_nonce
+                )
+                return
+            # Terminal (failed / expired) — flip the credential row and clear
+            # the aux row so the scanner stops picking it up.
+            await self._mark_credential_terminal(
+                credential.id,
+                report.terminal_detail or report.error_code or report.kind,
+                flow_nonce=report.flow_nonce,
+            )
+        except _DeviceFlowSupersededError:
+            # A reconnect committed a newer challenge after this poll. Its
+            # transient state and eventual outcome belong to that flow.
             return
-        # Terminal (failed / expired) — flip the credential row and clear
-        # the aux row so the scanner stops picking it up.
-        await self._mark_credential_terminal(
-            credential.id,
-            report.terminal_detail or report.error_code or report.kind,
-        )
 
     async def _mark_credential_terminal(
         self,
         credential_id: str,
         detail: str,
+        flow_nonce: str | None = None,
     ) -> None:
         """Move a standalone device-flow credential to ``failed`` + clear aux.
 
-        Clears the aux row's transient state regardless of the specific
-        terminal cause so the scanner stops picking it up on the next
-        tick. ``credentials`` has no ``error_detail`` column today, so
-        detail is logged and lost after this call.
+        A polled generation must still be current before its terminal outcome
+        can clear the challenge. ``credentials`` has no ``error_detail``
+        column today, so detail is logged and lost after this call.
         """
         async with self._ctx.control_db.transaction() as session:
+            if flow_nonce is not None:
+                claimed = await DeviceAuthorizationCredentialRepository.claim_finalisation(
+                    session, credential_id, flow_nonce=flow_nonce
+                )
+                if not claimed:
+                    raise _DeviceFlowSupersededError(credential_id)
             credential = await CredentialRepository.get_by_id(session, credential_id)
             if credential is None:
                 return
@@ -3044,19 +5622,26 @@ class ConnectSessionService:
         failed echo marks the session ``failed`` (no vaulting) so we don't
         strand a credential we can't tie back to a human.
         """
+        if row.intent == INTENT_EDIT:
+            return await self._finalise_edit(row, handler, tokens)
         key = _source_key(row)
         if key is None:
             # An API target on the approver's own OAuth client: no registry
             # entry, so no identity probe, and the API is already registered.
             _require_api_own_client(row)
-            await self._write_finalise(
-                credential_id=row.credential_id,
-                handler=handler,
-                tokens=tokens,
-                connected_as=None,
-                created_by=row.initiator_actor_id,
-                close_session_id=row.id,
-            )
+            try:
+                await self._write_finalise(
+                    credential_id=row.credential_id,
+                    handler=handler,
+                    tokens=tokens,
+                    connected_as=None,
+                    created_by=row.initiator_actor_id,
+                    close_session_id=row.id,
+                )
+            except TokenEndpointMovedError as exc:
+                return await self._fail_token_endpoint_moved(row, exc)
+            except _SessionEndedError:
+                return self._ended_during_finalise(row)
             self._record_connected(row)
             return StatusResult(
                 status="connected",
@@ -3067,6 +5652,11 @@ class ConnectSessionService:
             credential = await CredentialRepository.get_by_id(session, row.credential_id)
         pinned_registration_id = (
             credential.oauth_app_registration_id if credential is not None else None
+        )
+        token_creator = (
+            credential.created_by
+            if credential is not None and credential.created_by is not None
+            else row.initiator_actor_id
         )
         try:
             source = await self._vendors.resolve_session_source(
@@ -3097,6 +5687,7 @@ class ConnectSessionService:
                 echo = await identity_echo.echo_identity(
                     probe=entry.identity_probe,
                     access_token=tokens.access_token,
+                    egress=resolved_control_egress(self._ctx.config),
                 )
                 connected_as = echo.display
             except identity_echo.IdentityEchoError as exc:
@@ -3110,14 +5701,19 @@ class ConnectSessionService:
                 )
                 return StatusResult(status="failed", error_code="identity_echo_failed")
 
-        await self._write_finalise(
-            credential_id=row.credential_id,
-            handler=handler,
-            tokens=tokens,
-            connected_as=connected_as,
-            created_by=row.initiator_actor_id,
-            close_session_id=row.id,
-        )
+        try:
+            await self._write_finalise(
+                credential_id=row.credential_id,
+                handler=handler,
+                tokens=tokens,
+                connected_as=connected_as,
+                created_by=token_creator,
+                close_session_id=row.id,
+            )
+        except TokenEndpointMovedError as exc:
+            return await self._fail_token_endpoint_moved(row, exc)
+        except _SessionEndedError:
+            return self._ended_during_finalise(row)
 
         self._record_connected(row, connected_as=connected_as)
         await self._maybe_import_catalog(
@@ -3129,6 +5725,193 @@ class ConnectSessionService:
             credential_id=row.credential_id,
             bound_scopes=tokens.granted_scopes,
         )
+
+    async def _finalise_edit(
+        self,
+        row: ConnectSession,
+        handler: AuthFlowHandler,
+        tokens: SuccessTokens,
+    ) -> StatusResult:
+        """The vendor grant for an edit's added scopes landed: apply the held change.
+
+        The new token replaces the credential's, then the approved rules (and
+        any bind or resume) land and the session closes with its outcome. A
+        grant for a different vendor account than the credential's is
+        refused: re-consenting must never swap whose account the agent uses.
+        """
+        change = row.approved_change
+        if change is None:
+            await self._mark_terminal(
+                row.id, "failed", "no approved change held", error_code="approval_missing"
+            )
+            return StatusResult(status="failed", error_code="approval_missing")
+        async with self._ctx.control_db.session() as session:
+            credential = await CredentialRepository.get_by_id(session, row.credential_id)
+        consent = await self._consent_source(credential) if credential is not None else None
+        connected_as: str | None = None
+        if consent is not None and consent.entry is not None and consent.entry.identity_probe:
+            # Identity echo — outside the DB transaction (external HTTP).
+            try:
+                echo = await identity_echo.echo_identity(
+                    probe=consent.entry.identity_probe,
+                    access_token=tokens.access_token,
+                    egress=resolved_control_egress(self._ctx.config),
+                )
+                connected_as = echo.display
+            except identity_echo.IdentityEchoError as exc:
+                await self._mark_terminal(
+                    row.id, "failed", str(exc), error_code="identity_echo_failed"
+                )
+                return StatusResult(status="failed", error_code="identity_echo_failed")
+        previous = credential.provider_account_ref if credential is not None else None
+        if previous is not None and connected_as is not None and previous != connected_as:
+            _logger.warning(
+                "connect_session.edit_account_changed",
+                session_id=row.id,
+                credential_id=row.credential_id,
+            )
+            await self._mark_terminal(
+                row.id, "failed", "consented as another account", error_code="account_changed"
+            )
+            return StatusResult(status="failed", error_code="account_changed")
+        granted = set((row.baseline or {}).get("granted_scopes") or [])
+        approved_shared = change.get("shared_with")
+        widens = bool(set(change["scopes"]) - granted)
+        if approved_shared is not None and row.agent_id is not None and widens:
+            # A wider grant reaches every agent bound to the credential. The
+            # approver saw the ones bound at the time; one that bound since has
+            # to be reviewed, so the grant is not stored.
+            bound_now, _ = await self._other_bound_agent_ids(row.credential_id, row.agent_id)
+            appeared = sorted(set(bound_now) - set(approved_shared))
+            if appeared:
+                _logger.warning(
+                    "connect_session.edit_binding_now_shared",
+                    session_id=row.id,
+                    credential_id=row.credential_id,
+                    agents=appeared,
+                )
+                await self._mark_terminal(
+                    row.id,
+                    "failed",
+                    "another agent was bound to the credential while the grant was out",
+                    error_code="binding_now_shared",
+                )
+                return StatusResult(status="failed", error_code="binding_now_shared")
+
+        # Some vendors carry earlier scopes into a new grant. One that kept a
+        # scope the change removes isn't written: the credential keeps its
+        # token, and the scope has to be revoked at the vendor. The rest of
+        # the change (rules, resume) still lands, flagged ``scopes_not_removed``;
+        # with nothing else in it, the change fails. Only a scope the change
+        # removes counts, so scopes a vendor adds of its own (``openid``) do
+        # not read as one it kept.
+        kept = sorted((granted - set(change["scopes"])) & set(tokens.granted_scopes or []))
+        scopes_kept = row.baseline is not None and bool(kept)
+        if scopes_kept:
+            assert row.baseline is not None
+            _logger.warning(
+                "connect_session.edit_scopes_not_removed",
+                session_id=row.id,
+                credential_id=row.credential_id,
+                kept=kept,
+            )
+            _, before = target_rules(row.baseline)
+            only_scopes = (
+                change["rules"] == [rule_to_write(r) for r in before]
+                and not change["resume"]
+                and not change["detach_rule_set"]
+            )
+            if only_scopes:
+                await self._mark_terminal(
+                    row.id,
+                    "failed",
+                    f"the vendor kept scopes the change removes: {', '.join(kept)}",
+                    error_code="scopes_not_removed",
+                )
+                return StatusResult(status="failed", error_code="scopes_not_removed")
+            change = {
+                **change,
+                "scopes": sorted(row.baseline.get("granted_scopes") or []),
+                "error_code": "scopes_not_removed",
+            }
+
+        # The grant, the state swap and the rules commit together. Written
+        # before the swap, a grant outlived a session cancelled or expired
+        # while the exchange was in flight: the callback reported failure and
+        # the wider token stayed, reaching every agent bound to the credential.
+        #
+        # Whether the rules moved while the grant was out is decided inside
+        # that transaction, under the lock the write takes: read before it, the
+        # answer could change under the write, and the session would either
+        # revert a direct change or close having silently dropped the one its
+        # approver made.
+        reopen = False
+        try:
+            async with self._ctx.control_db.transaction() as session:
+                won = await ConnectSessionRepository.transition_state(
+                    session,
+                    row.id,
+                    to_state=change["outcome"],
+                    from_states=("polling",),
+                )
+                if won:
+                    if not scopes_kept:
+                        await self._write_finalise(
+                            credential_id=row.credential_id,
+                            handler=handler,
+                            tokens=tokens,
+                            connected_as=connected_as,
+                            created_by=change["approved_by"],
+                            close_session_id=None,
+                            in_session=session,
+                        )
+                    change, reopen = await self._write_change(
+                        session, row, change, on_rules_moved="reopen"
+                    )
+        except TokenEndpointMovedError as exc:
+            return await self._fail_token_endpoint_moved(row, exc)
+        if not won:
+            return StatusResult(status="failed", error_code="session_closed")
+        if reopen:
+            return await self._after_reopen(row, change)
+        await self._apply_admin_change(row, change)
+        await self._record_change_applied(row, change, origin=Origin.SYSTEM.value)
+        return StatusResult(
+            status=change["outcome"],
+            connected_as=connected_as,
+            credential_id=row.credential_id,
+            bound_scopes=change["scopes"] if scopes_kept else tokens.granted_scopes,
+            error_code=change.get("error_code"),
+        )
+
+    async def _after_reopen(self, row: ConnectSession, change: dict[str, Any]) -> StatusResult:
+        """The grant landed but the rules moved since approval: reopen the rule change.
+
+        The scopes are in (unless the vendor kept one the change removes), and
+        so is a resume; the caller has already reopened the session in the
+        same commit as the grant. The request is rebased onto the binding as
+        it is now and waits on its review again, without a vendor step this
+        time.
+        """
+        await self._apply_admin_change(row, change)
+        # The grant (and a resume) landed, so it is audited like any applied
+        # change; ``keep_rules`` keeps the rules out of it, as none were written.
+        await self._record_change_applied(row, change, origin=Origin.SYSTEM.value)
+        live = await self._live_binding_snapshot(row)
+        if live is not None:
+            await self._rebase_edit(row, live)
+        _logger.info(
+            "connect_session.edit_reopened",
+            session_id=row.id,
+            credential_id=row.credential_id,
+        )
+        return StatusResult(status="pending")
+
+    @staticmethod
+    def _ended_during_finalise(row: ConnectSession) -> StatusResult:
+        """The session ended while its tokens were being fetched; nothing was kept."""
+        _logger.warning("connect_session.ended_before_finalise", session_id=row.id)
+        return StatusResult(status="failed", error_code="session_ended")
 
     @staticmethod
     def _record_connected(row: ConnectSession, *, connected_as: str | None = None) -> None:
@@ -3146,11 +5929,28 @@ class ConnectSessionService:
         _sessions_terminal.add(1, {**attrs, "outcome": "connected"})
         _time_to_connected.record((datetime.now(UTC) - row.created_at).total_seconds(), attrs)
 
+    @asynccontextmanager
+    async def _write_transaction(self, in_session: Any | None) -> AsyncIterator[Any]:
+        """The caller's transaction when it supplied one, else a new one."""
+        if in_session is not None:
+            yield in_session
+            return
+        async with self._ctx.control_db.transaction() as owned:
+            yield owned
+
+    async def _fail_token_endpoint_moved(
+        self, row: ConnectSession, exc: TokenEndpointMovedError
+    ) -> StatusResult:
+        """Fail a session whose grant was discarded by ``_write_finalise``."""
+        await self._mark_terminal(row.id, "failed", str(exc), error_code="token_url_moved")
+        return StatusResult(status="failed", error_code="token_url_moved")
+
     async def _finalise_credential_connected(
         self,
         credential: Credential,
         handler: AuthFlowHandler,
         tokens: SuccessTokens,
+        flow_nonce: str | None = None,
     ) -> StatusResult:
         """Credential-mode finalise: shared write, no session row to close.
 
@@ -3178,6 +5978,7 @@ class ConnectSessionService:
             connected_as=None,
             created_by=credential.created_by,
             close_session_id=None,
+            flow_nonce=flow_nonce,
         )
 
         _logger.info(
@@ -3204,6 +6005,8 @@ class ConnectSessionService:
         connected_as: str | None,
         created_by: str,
         close_session_id: str | None,
+        in_session: Any | None = None,
+        flow_nonce: str | None = None,
     ) -> None:
         """Shared finalise write — vault token, cleanup aux, flip credential.
 
@@ -3213,9 +6016,20 @@ class ConnectSessionService:
         onto ``credential.provider_account_ref`` when non-None (session
         mode after identity echo); credential-mode passes ``None`` and the
         column stays unset.
+
+        Raises ``_SessionEndedError`` (nothing written) when
+        ``close_session_id`` is no longer live, and ``TokenEndpointMovedError``
+        (nothing written) when the credential's token endpoint no longer has
+        the origin ``tokens.token_url`` was exchanged at.
+
+        ``in_session`` runs the writes in the caller's transaction instead of
+        a new one, so a caller that compare-and-swaps the session itself keeps
+        the grant and that swap in one commit.
         """
         expires_at = (
-            datetime.now(UTC) + timedelta(seconds=tokens.expires_in) if tokens.expires_in else None
+            datetime.now(UTC) + timedelta(seconds=tokens.expires_in)
+            if tokens.expires_in is not None
+            else None
         )
         encrypted_access = self._ctx.encryption.encrypt(tokens.access_token)
         encrypted_refresh = (
@@ -3231,23 +6045,64 @@ class ConnectSessionService:
             " ".join(tokens.granted_scopes) if tokens.granted_scopes else tokens.scope
         )
 
-        async with self._ctx.control_db.transaction() as session:
+        async with self._write_transaction(in_session) as session:
+            if flow_nonce is not None:
+                claimed = await DeviceAuthorizationCredentialRepository.claim_finalisation(
+                    session, credential_id, flow_nonce=flow_nonce
+                )
+                if not claimed:
+                    raise _DeviceFlowSupersededError(credential_id)
+            # Same lock as the broker refresh and a token_url edit. A
+            # cross-origin edit that committed while the code was being
+            # exchanged has moved the credential off the origin this grant
+            # was minted at; storing it would hand its refresh token to the
+            # new origin, so it is discarded and the write rolls back.
+            await OAuthTokenRepository.acquire_refresh_lock(session, credential_id)
+            if close_session_id is not None:
+                # Close the session first, compare-and-swap from a live state:
+                # if it was ended meanwhile (the TTL sweep, a cancel), roll the
+                # whole write back so the grant is not kept on a credential
+                # that is being torn down. Taking the row first also makes a
+                # concurrent ``_mark_terminal`` wait for this commit and lose.
+                won = await ConnectSessionRepository.transition_state(
+                    session,
+                    close_session_id,
+                    to_state="connected",
+                    from_states=LIVE_STATES,
+                    connected_as=connected_as,
+                )
+                if not won:
+                    raise _SessionEndedError(close_session_id)
             # Look up the credential once so we can stamp the oauth_tokens
             # row with the shared-registration provenance. Nullable — legacy
             # embedded credentials just leave it NULL.
             credential_for_stamp = await CredentialRepository.get_by_id(session, credential_id)
             registration_id_stamp: str | None = None
             if credential_for_stamp is not None:
+                current_token_url = await OAuthClientCredentialRepository.current_token_url(
+                    session, credential_for_stamp
+                )
+                if not minted_at_current_origin(tokens.token_url, current_token_url):
+                    _logger.warning(
+                        "connect_session.finalise_discarded_token_url_moved",
+                        credential_id=credential_id,
+                    )
+                    raise TokenEndpointMovedError(credential_id)
                 registration_id_stamp = credential_for_stamp.oauth_app_registration_id
 
             # Upsert: a re-connect over an existing token row (same
-            # credential, fresh grant) MUST update in place rather than
+            # credential, fresh grant) MUST replace in place rather than
             # INSERT — ``oauth_tokens.credential_id`` is uniquely
             # indexed, and a plain create would trip the constraint on
-            # the second successful poll. ``update_tokens`` also clears
+            # the second successful poll. ``replace_grant`` also clears
             # ``revoked_at``, so a re-connect over a revoked row yields
             # a live token (the derived ``connected`` flag reads that
             # column).
+            token_created_by = (
+                credential_for_stamp.created_by
+                if credential_for_stamp is not None and credential_for_stamp.created_by is not None
+                else created_by
+            )
             existing = await OAuthTokenRepository.get_by_credential(session, credential_id)
             if existing is None:
                 await OAuthTokenRepository.create(
@@ -3258,45 +6113,55 @@ class ConnectSessionService:
                     expires_at=expires_at,
                     scope=scope_to_persist,
                     app_registration_id=registration_id_stamp,
-                    created_by=created_by,
+                    created_by=token_created_by,
                 )
             else:
-                await OAuthTokenRepository.update_tokens(
+                stored_account_ref = (
+                    credential_for_stamp.provider_account_ref
+                    if credential_for_stamp is not None
+                    else None
+                )
+                if encrypted_refresh is None and existing.encrypted_refresh_token is not None:
+                    if may_carry_refresh_token(
+                        existing,
+                        new_registration_id=registration_id_stamp,
+                        connected_as=connected_as,
+                        stored_account_ref=stored_account_ref,
+                    ):
+                        encrypted_refresh = existing.encrypted_refresh_token
+                    else:
+                        _logger.info(
+                            "oauth_reconnect_dropped_prior_refresh_token",
+                            credential_id=credential_id,
+                        )
+                await OAuthTokenRepository.replace_grant(
                     session,
                     credential_id,
                     encrypted_access_token=encrypted_access,
                     encrypted_refresh_token=encrypted_refresh,
                     expires_at=expires_at,
                     scope=scope_to_persist,
+                    app_registration_id=registration_id_stamp,
                 )
-                # Refresh the provenance columns on the existing row too so
-                # a re-connect that starts going through a shared registration
-                # (or migrates off one) is reflected on the token row.
-                if registration_id_stamp is not None:
-                    existing.app_registration_id = registration_id_stamp
-                    await session.flush()
+            if flow_nonce is not None:
+                await ConnectNonceRepository.mark_completed(
+                    session,
+                    nonce=flow_nonce,
+                    credential_id=credential_id,
+                )
             await handler.on_finalise(session, credential_id=credential_id)
             credential = await CredentialRepository.get_by_id(session, credential_id)
             if credential is not None:
                 credential.state = "connected"
                 if connected_as is not None:
                     credential.provider_account_ref = connected_as
-                # Force an ``updated_at`` bump so client-side pollers
-                # detect the transition even on a re-connect where the
-                # state was already ``"connected"``. Without this,
-                # SQLAlchemy may short-circuit the UPDATE when every
-                # assigned column matches its stored value, leaving
-                # ``updated_at`` unchanged and ``runConnectFlow`` /
-                # ``get_credential``-based watchers polling forever.
+                # Keep ordinary credential detail readers fresh on a
+                # re-connect whose state was already ``"connected"``. Exact
+                # flow completion is recorded on its nonce above.
                 credential.updated_at = datetime.now(UTC)
                 await session.flush()
             if close_session_id is not None:
-                closed = await ConnectSessionRepository.update_fields(
-                    session,
-                    close_session_id,
-                    state="connected",
-                    connected_as=connected_as,
-                )
+                closed = await ConnectSessionRepository.get_by_id(session, close_session_id)
                 if closed is not None:
                     await ConnectSessionOutcomeRepository.record(
                         session,
@@ -3356,8 +6221,12 @@ class ConnectSessionService:
         detail: str,
         *,
         error_code: str | None = None,
+        actor: Identity | None = None,
     ) -> bool:
         """Log the terminal outcome, then delete the credential + session.
+
+        An edit session never touches its credential or binding: only the
+        session row is deleted, and its outcome recorded.
 
         A failed / expired / cancelled session leaves an unusable
         ``pending`` credential behind, which shows up in the credentials
@@ -3380,7 +6249,17 @@ class ConnectSessionService:
 
         The winner records the session's outcome in the same transaction, so
         how it ended outlives the cascade-deleted session row.
+
+        ``actor`` is the caller who ended the session (a cancel or reject
+        request); the REVOKE audit entry names it, with the session's
+        initiator in ``after``. Without it (scanner, callback and expiry
+        paths) the entry is attributed to the initiator with
+        ``origin=system``. A session that ``confirm`` ends because the
+        platform detected drift (``scheme_changed``, ``servers_changed``,
+        ``oauth_app_changed``) is deliberately left system-attributed too:
+        ending it is the platform's decision, not the confirming caller's.
         """
+        detail = redact_value(detail)
         async with self._ctx.control_db.session() as read_session:
             row = await ConnectSessionRepository.get_by_id(read_session, session_id)
         if row is None:
@@ -3400,8 +6279,22 @@ class ConnectSessionService:
                     outcome=_outcome_for(state, error_code),
                     error_code=error_code,
                     ended_at=datetime.now(UTC),
+                    # An edit's outcome names its binding's credential (the
+                    # rejection cooldown keys on it); a create's has none.
+                    credential_id=row.credential_id if row.intent == INTENT_EDIT else None,
                 )
-                await CredentialRepository.delete(session, row.credential_id)
+                if row.intent == INTENT_EDIT:
+                    # An edit's credential is the live one the binding uses:
+                    # only the session goes, its outcome stays. A device
+                    # consent in flight leaves the credential's token alone;
+                    # only its transient device code is cleared.
+                    if row.resolved_flow == DeviceAuthorizationHandler.kind:
+                        await DeviceAuthorizationHandler(self._ctx).on_finalise(
+                            session, credential_id=row.credential_id
+                        )
+                    await ConnectSessionRepository.delete(session, row.id)
+                else:
+                    await CredentialRepository.delete(session, row.credential_id)
         if not won:
             _logger.info(
                 "connect_session.terminal_skipped",
@@ -3422,32 +6315,46 @@ class ConnectSessionService:
         # rows, so they're the most consequential mutation on the
         # lifecycle — an operator needs to be able to say "who / what
         # tore this session down" (scanner-TTL sweep, vendor rejection,
-        # callback error, or user-driven cancel). ``_mark_terminal`` is
-        # called from scanner / callback contexts without a caller
-        # ``Identity``, so attribute the revoke to the session's
-        # ``initiator_actor_id`` — the real actor whose session is
-        # being torn down. The ``reason`` field (``detail``) captures
+        # callback error, or user-driven cancel). A cancel or reject
+        # passes the caller as ``actor``, and the entry names that caller
+        # with the request's origin. The scanner and callback contexts
+        # have no caller ``Identity``, so they attribute the revoke to the
+        # session's ``initiator_actor_id`` — the real actor whose session
+        # is being torn down. The ``reason`` field (``detail``) captures
         # *why* (TTL vs. callback vs. user cancel); the actor field
         # names *whose* session it was, without inventing a "system"
         # sentinel that no longer exists in ``ActorType``.
-        # Tolerant of residual ``sva_`` initiators (theme-8 L4).
-        initiator_actor_type = actor_type_label_from_id(row.initiator_actor_id)
+        after: dict[str, Any] = {
+            "state": state,
+            "error_code": error_code,
+            "credential_id": row.credential_id,
+        }
+        if actor is not None:
+            after["initiator_actor_id"] = row.initiator_actor_id
+            actor_type, actor_id, origin = (
+                actor.actor_type.value,
+                actor.sub,
+                actor.origin.value,
+            )
+        else:
+            # Expiry or a failed poll tears the session down on the
+            # platform's side, attributed to its initiator. Tolerant of
+            # residual ``sva_`` initiators (theme-8 L4).
+            actor_type, actor_id, origin = (
+                actor_type_label_from_id(row.initiator_actor_id),
+                row.initiator_actor_id,
+                Origin.SYSTEM.value,
+            )
         await record_audit_best_effort(
             self._ctx,
             action=AuditAction.REVOKE,
             target_type=AuditTargetType.SESSION,
             target_id=session_id,
-            actor_type=initiator_actor_type,
-            actor_id=row.initiator_actor_id,
-            # Expiry, a failed poll or a cancel tears the session down on the
-            # platform's side, attributed to its initiator.
-            origin=Origin.SYSTEM.value,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            origin=origin,
             before={"state": row.state},
-            after={
-                "state": state,
-                "error_code": error_code,
-                "credential_id": row.credential_id,
-            },
+            after=after,
             reason=detail,
         )
         # Metrics: per-vendor + per-flow + per-outcome unhappy-terminal
@@ -3462,7 +6369,7 @@ class ConnectSessionService:
                 "outcome": state,
             },
         )
-        if row.agent_id is not None:
+        if row.agent_id is not None and row.intent != INTENT_EDIT:
             # The control-side ``agent_permission_rules`` rows cascade with
             # the credential; the admin-DB binding row is cross-DB (no FK)
             # and must be swept explicitly so no ghost binding outlives the
@@ -3490,7 +6397,11 @@ class ConnectSessionService:
         ``_mark_terminal`` (CAS-guarded), so a session that completes
         between the read and the sweep is left alone. Vendor OAuth flows
         expire after ``_SESSION_TTL_SECONDS``; every other flow after
-        ``control.connect.manual_flows_ttl_hours``.
+        ``control.connect.manual_flows_ttl_hours``. An auth-code session
+        waiting on its callback (``polling``) also expires once its signed
+        callback state has (``credentials.connect.state_ttl_seconds`` after
+        confirm, plus a minute's grace): no callback can complete it after
+        that, so the agent waiting on it learns at once.
 
         The same tick drops outcomes older than the retention window.
         Returns the number of sessions actually expired.
@@ -3510,9 +6421,19 @@ class ConnectSessionService:
                 limit=limit,
                 flows=_OAUTH_FLOWS,
                 target_kind=TARGET_KIND_VENDOR,
+                intent=INTENT_CREATE,
             )
             stale_ids += await ConnectSessionRepository.list_stale_live_ids(
                 read_session, older_than=manual_cutoff, limit=limit, exclude_flows=_OAUTH_FLOWS
+            )
+            # An edit keeps the human-approval TTL even once its consent runs
+            # on an OAuth flow.
+            stale_ids += await ConnectSessionRepository.list_stale_live_ids(
+                read_session,
+                older_than=manual_cutoff,
+                limit=limit,
+                flows=_OAUTH_FLOWS,
+                intent=INTENT_EDIT,
             )
             # An API target that resolved to an OAuth flow keeps the
             # human-approval TTL it was opened with.
@@ -3523,9 +6444,25 @@ class ConnectSessionService:
                 flows=_OAUTH_FLOWS,
                 exclude_target_kind=TARGET_KIND_VENDOR,
             )
+            lapsed_ids = await ConnectSessionRepository.list_lapsed_ids(
+                read_session,
+                state="polling",
+                flow=AuthCodeFlowHandler.kind,
+                updated_before=now
+                - timedelta(seconds=self._ctx.config.credentials.connect.state_ttl_seconds)
+                - _CALLBACK_STATE_GRACE,
+                limit=limit,
+            )
         expired = 0
         for session_id in stale_ids:
             if await self._mark_terminal(session_id, "expired", "session TTL exceeded"):
+                expired += 1
+        for session_id in lapsed_ids:
+            if session_id in stale_ids:
+                continue
+            if await self._mark_terminal(
+                session_id, "expired", "authorization not completed in time"
+            ):
                 expired += 1
         async with self._ctx.control_db.transaction() as session:
             await ConnectSessionOutcomeRepository.delete_ended_before(
@@ -3535,7 +6472,9 @@ class ConnectSessionService:
 
     # ---- redirect-based (auth-code / MCP) completion ----------------------
 
-    async def mark_terminal_from_callback(self, *, raw_state: str, error: str) -> str:
+    async def mark_terminal_from_callback(
+        self, *, raw_state: str, error: str, browser_binding: str | None
+    ) -> str:
         """Mark a session ``failed`` from a callback landing that carried no
         usable code (vendor returned ``error`` or dropped ``code`` entirely).
 
@@ -3545,10 +6484,12 @@ class ConnectSessionService:
         one-shot nonce too, or a captured callback URL with
         ``error=access_denied`` could be replayed after a successful
         connect (``_mark_terminal``'s CAS is the second line of defence).
-        Raises ``StateError`` subclasses on decode / replay failures.
+        Raises ``StateError`` subclasses on decode / replay failures, and
+        when ``browser_binding`` (the callback's binding cookie) does not
+        match — then nothing is written and the session stays live.
         Returns the session id for the router's log line.
         """
-        state = await consume_callback_state(self._ctx, raw_state)
+        state = await consume_callback_state(self._ctx, raw_state, browser_binding=browser_binding)
         if state.session_id is None:
             raise NoOpForFlowError("callback state missing session id")
         await self._mark_terminal(state.session_id, "failed", error, error_code="callback_error")
@@ -3575,7 +6516,9 @@ class ConnectSessionService:
         row = await self._require_session_access(row, poll_token=poll_token, identity=identity)
         if row.state in ("connected", "failed", "expired"):
             return
-        await self._mark_terminal(session_id, "failed", "user cancelled", error_code="cancelled")
+        await self._mark_terminal(
+            session_id, "failed", "user cancelled", error_code="cancelled", actor=identity
+        )
 
     async def reject_session(self, session_id: str, *, identity: Identity) -> None:
         """A human explicitly turns the agent's request down (the approve dialog's Reject).
@@ -3594,7 +6537,11 @@ class ConnectSessionService:
         if row.state not in LIVE_STATES:
             return
         won = await self._mark_terminal(
-            session_id, "failed", "rejected by approver", error_code=ERROR_REJECTED
+            session_id,
+            "failed",
+            "rejected by approver",
+            error_code=ERROR_REJECTED,
+            actor=identity,
         )
         if won:
             await record_audit_best_effort(
@@ -3620,6 +6567,7 @@ class ConnectSessionService:
         *,
         raw_state: str,
         code: str,
+        browser_binding: str | None,
     ) -> StatusResult:
         """Complete a connect session from an OAuth callback landing.
 
@@ -3635,17 +6583,35 @@ class ConnectSessionService:
         doesn't support a callback path (device flow) — a defensive
         guard the router should never trip, since only auth-code state
         JWTs carry a ``sid``.
+
+        ``browser_binding`` is the binding cookie the callback carried; a
+        missing or mismatched one is refused before the nonce is consumed,
+        leaving the session live for the approver's own browser.
         """
-        state = await consume_callback_state(self._ctx, raw_state)
+        state = await consume_callback_state(self._ctx, raw_state, browser_binding=browser_binding)
         if state.session_id is None:
             # State without ``sid`` doesn't belong on this path — router
             # dispatches to the standalone-credential handler for those.
             raise NoOpForFlowError("callback state missing session id")
 
-        async with self._ctx.control_db.session() as read_session:
-            row = await ConnectSessionRepository.get_by_id(read_session, state.session_id)
+        # The callback has arrived: bump ``updated_at`` on a live session so
+        # the TTL sweep (which expires a ``polling`` auth-code session once
+        # its callback state lapses) is unlikely to pick it up during a slow
+        # exchange. This only narrows the window — a sweep that listed the id
+        # before this touch can still expire it. The guarantee is the
+        # ``from_states`` CAS in ``_write_finalise``: a session that ended
+        # meanwhile is never marked connected and its grant is rolled back.
+        # A terminal session is left untouched.
+        async with self._ctx.control_db.transaction() as touch_session:
+            row = await ConnectSessionRepository.get_by_id(touch_session, state.session_id)
             if row is None:
                 raise SessionNotFoundError(state.session_id)
+            if row.state in LIVE_STATES:
+                row = await ConnectSessionRepository.update_fields(
+                    touch_session, state.session_id, updated_at=datetime.now(UTC)
+                )
+                if row is None:  # pragma: no cover - fetched in this transaction
+                    raise SessionNotFoundError(state.session_id)
 
         # Callback-only handler concretely by construction — the state JWT
         # that carries ``sid`` is signed by the auth-code path, so any

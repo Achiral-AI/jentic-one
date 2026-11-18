@@ -22,25 +22,25 @@ Agents are the only machine identity. Headless integrations (CI jobs, cron
 runners, scripts) register as an agent and authenticate with its `jak_` API
 key.
 
-Two former actor kinds are retired (see the
-[release runbook](../development/releasing.md)):
+Two former actor kinds are retired (upgrade steps: the
+[0.41 upgrade notes](../operations/upgrade-notes.md#0410)):
 
-- **`service_account`** — removed in theme 8. The migration converted each
+- **`service_account`** — retired in 0.40. The migration converted each
   service account into a successor agent, carrying over its grants and
-  bindings. In 0.41 (theme-8 Phase 4) the service-account tables are dropped
-  and **`sak_` keys stop working**: every surface answers a `sak_` key with a
+  bindings. From 0.41 the service-account tables are dropped and **`sak_`
+  keys are refused**: every surface answers a `sak_` key with a
   401 whose detail says service-account keys were retired and to mint a
   `jak_` key for the successor agent (an INFO `retired_service_account_key_refused`
   log line names that agent). No new `sak_` keys are issued; the
   `/service-accounts` API, `POST /oauth/mint`, and the `client_credentials`
-  grant are gone. `service_account` is no longer an `ActorType` value.
+  grant do not exist. `service_account` is not an `ActorType` value.
   Leftover `service_account` token rows fail closed on every path, and
   historical `sva_` ids in audit and event rows are labelled, never
   resolved.
 - **`toolkit`** — on 0.40.x a startup migration turned each `jntc_live_`
-  toolkit key into a successor agent (it minted a service account before
-  theme 8, and those service accounts migrate like any other). The toolkit
-  tables are dropped in 0.41 (theme-5 Phase 6b); a retired plaintext keeps
+  toolkit key into a successor agent (older releases minted a service
+  account instead, and those service accounts migrate like any other). The
+  toolkit tables are dropped from 0.41; a retired plaintext keeps
   authenticating as its successor agent through the migrated digest, until
   no earlier than 2026-12-01.
 
@@ -106,12 +106,17 @@ sequenceDiagram
    agent signs a short-lived assertion (≤ 5 minutes, single-use `jti`) with
    its private key; the auth surface verifies it against the registered
    JWKS and mints an opaque access/refresh token pair, recorded in the
-   admin DB. Two scope caveats: the `jti` replay cache is **process-local**
-   (an in-memory dict, not the shared-state backend), so with multiple auth
-   replicas an assertion is single-use per replica, not per instance; and
-   the `exp`/`iat` checks run with **zero clock leeway**, so a client clock
-   more than a few seconds fast produces `iat` rejections — keep both ends
-   on NTP.
+   admin DB. The `jti` is single-use per issuing agent across the whole
+   instance: the exchange records it in the admin DB's `assertion_jtis`
+   table (a SHA-256 digest of the claim, never the claim or the assertion),
+   in the same transaction that verifies it, and a second exchange with the
+   same `(agent, jti)` is refused by any auth replica. A record lives until
+   the assertion's `exp` plus a 120-second grace on the database clock, so
+   an auth host whose clock lags the database by up to that much still
+   refuses a replay; expired records are pruned in small batches on each
+   accepted exchange. The `exp`/`iat` checks run with **zero clock
+   leeway**, so a client clock more than a few seconds fast produces `iat`
+   rejections — keep agents, auth hosts and the database on NTP.
 
 Operators and the SPA use session JWTs minted at login; agent API
 keys (`jak_`, plus legacy `jntc_live_` plaintexts that resolve as their
@@ -120,7 +125,12 @@ long-lived alternative,
 dispatched by prefix and matched by digest against
 the admin DB ([`shared/auth/api_key_resolver.py`](../../src/jentic_one/shared/auth/api_key_resolver.py)). JWT verification for
 asymmetric tokens allows only asymmetric algorithms — `alg: none` and all
-HMAC algorithms are rejected ([`shared/auth/jwt_verification.py`](../../src/jentic_one/shared/auth/jwt_verification.py)).
+HMAC algorithms are rejected ([`shared/auth/jwt_verification.py`](../../src/jentic_one/shared/auth/jwt_verification.py)). A
+signed agent JWT presented to the broker is also checked against the agent's
+row once its signature and claims pass: an agent that is not `active`, is
+unknown, or whose owner is disabled or deleted is refused with the same 401.
+The verdict is cached for `broker.resolve_cache_ttl_seconds`, as on the
+opaque-token path.
 
 ## Permissions
 

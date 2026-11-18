@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
 from jentic_one.admin.services.errors import (
     AccountLockedError,
     AuditEntryNotFoundError,
@@ -9,7 +12,6 @@ from jentic_one.admin.services.errors import (
     EmailAlreadyExistsError,
     EventNotFoundError,
     ExecutionNotFoundError,
-    ExecutionRetentionElapsedError,
     HeldExecutionAlreadyDecidedError,
     HeldExecutionForbiddenError,
     HeldExecutionJobNotHeldError,
@@ -29,6 +31,7 @@ from jentic_one.admin.services.errors import (
     LastActiveAdminError,
     NotFoundError,
     OrgAdminGrantForbiddenError,
+    PasswordHasherBusyError,
     PermissionNotGrantableError,
     SessionExpiredError,
     SetupAlreadyCompleteError,
@@ -38,13 +41,12 @@ from jentic_one.admin.services.errors import (
 )
 from jentic_one.shared.db.errors import DatabaseIntegrityError, DatabaseUnavailableError
 from jentic_one.shared.pagination import InvalidCursorError
-from jentic_one.shared.web.errors import make_service_error_handler
+from jentic_one.shared.web.errors import DB_UNAVAILABLE_SAFE_DETAILS, make_service_error_handler
 
 _ERROR_MAP: dict[type[Exception], tuple[int, str]] = {
     UserNotFoundError: (404, "user_not_found"),
     JobNotFoundError: (404, "job_not_found"),
     EventNotFoundError: (404, "event_not_found"),
-    ExecutionRetentionElapsedError: (404, "execution_retention_elapsed"),
     ExecutionNotFoundError: (404, "execution_not_found"),
     HeldExecutionNotFoundError: (404, "held_execution_not_found"),
     HeldExecutionAlreadyDecidedError: (409, "held_execution_already_settled"),
@@ -79,6 +81,7 @@ _ERROR_MAP: dict[type[Exception], tuple[int, str]] = {
     UserManagementForbiddenError: (403, "user_management_forbidden"),
     InvalidInputError: (400, "invalid_input"),
     InvalidCursorError: (400, "invalid_cursor"),
+    PasswordHasherBusyError: (503, "password_hasher_busy"),
 }
 
 # ``str(AccountLockedError)`` names the user id; the client gets the same
@@ -87,7 +90,24 @@ _SERVICE_SAFE_DETAILS: dict[type[Exception], str] = {
     AccountLockedError: str(InvalidCredentialsError()),
 }
 
-service_error_handler = make_service_error_handler(_ERROR_MAP, safe_details=_SERVICE_SAFE_DETAILS)
+
+def _response_hook(
+    _request: Request,
+    exc: Exception,
+    _status_code: int,
+    response: JSONResponse,
+) -> JSONResponse:
+    """Attach Retry-After when an argon2 operation times out waiting for a slot."""
+    if isinstance(exc, PasswordHasherBusyError):
+        response.headers["Retry-After"] = str(exc.retry_after_s)
+    return response
+
+
+service_error_handler = make_service_error_handler(
+    _ERROR_MAP,
+    response_hook=_response_hook,
+    safe_details=_SERVICE_SAFE_DETAILS,
+)
 
 # A DB constraint violation that escapes a service unmapped (e.g. a unique-index
 # collision the service didn't anticipate) is a conflict, not a server fault.
@@ -108,7 +128,7 @@ _DB_ERROR_MAP: dict[type[Exception], tuple[int, str]] = {
 # detail while the raw message is logged server-side (handled by the factory).
 _DB_SAFE_DETAILS: dict[type[Exception], str] = {
     DatabaseIntegrityError: "The request conflicts with the current state of the resource.",
-    DatabaseUnavailableError: "The database is temporarily unavailable; please retry.",
+    **DB_UNAVAILABLE_SAFE_DETAILS,
 }
 
 database_error_handler = make_service_error_handler(_DB_ERROR_MAP, safe_details=_DB_SAFE_DETAILS)

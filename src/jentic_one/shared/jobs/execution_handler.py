@@ -3,9 +3,11 @@
 The handler is the async half of "one pipeline, two callers": it does **not**
 issue its own ``httpx`` calls. It resolves credentials
 (via the injected ``CredentialInjector``), applies them to the outbound
-URL/headers exactly like the sync router's ``_apply_injection`` (headers **and**
-query **and** cookies — an ``apiKey in: query``/``cookie`` credential is never
-dropped), then dispatches through the injected ``UpstreamExecutor`` — the broker
+URL/headers through the same ``shared.http.injection.apply_injection`` the sync
+router uses (headers **and** query **and** cookies — an ``apiKey in: query``/
+``cookie`` credential is never dropped, and origin-scoped upstream cookies captured
+at enqueue are kept when the worker retains their scope evidence), then dispatches
+through the injected ``UpstreamExecutor`` — the broker
 adapter over the **same** composed runner the sync path uses (circuit breaker +
 per-host bulkhead + response-size cap + error-origin enrichment), with the
 ``executions`` row persisted by the pipeline. The handler keeps only the
@@ -15,56 +17,124 @@ Before any credential is resolved the job is **re-authorized** through the
 injected ``ExecutionAuthorizer`` — the sync route's policy (actor still active
 and holding the execute scope, binding still present and not suspended,
 permission rules still allow),
-evaluated at run time rather than trusted from enqueue time. A denied job
-completes with a ``failed`` result carrying the problem body the sync route
-would have returned; no credential is injected and no upstream call is made.
+evaluated at run time rather than trusted from enqueue time. The identity
+credentials are then resolved for is built from one fresh read of the actor's
+rows through the injected ``ActorStatusReader`` (liveness and the execute
+permission together), taken after those authorization reads and immediately
+before injection and dispatch: an actor that is no longer active (or no longer
+exists), or that has lost the execute permission, is denied there too. A
+denied job completes with a ``failed`` result carrying the problem body the
+sync route would have returned; no credential is injected and no upstream
+call is made.
 
 ``shared/jobs/`` must not import ``broker/`` (arch boundary): the
-``ExecutionAuthorizer``, ``CredentialInjector`` and ``UpstreamExecutor`` are
-protocols satisfied by broker-side implementations injected at worker startup.
+``ExecutionAuthorizer``, ``ActorStatusReader``, ``CredentialInjector`` and
+``UpstreamExecutor`` are protocols satisfied by broker-side implementations
+injected at worker startup.
 """
 
 from __future__ import annotations
 
 import base64
 import json
-from dataclasses import dataclass
-from typing import Any
-from urllib.parse import urlencode, urlparse, urlunparse
+from collections.abc import Callable
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from jentic_one.shared.auth.identity import Identity
+from jentic_one.shared.auth.permission_catalog import BROKER_EXECUTE_PERMISSION
 from jentic_one.shared.config import SecurityConfig
-from jentic_one.shared.crypto.encryption import EncryptionService
-from jentic_one.shared.db.connectivity import redact_sql
+from jentic_one.shared.crypto.encryption import DecryptionError, EncryptionService
+from jentic_one.shared.db.connectivity import involves_database_error, redact_sql
+from jentic_one.shared.db.protocols import TransactionalDatabase
 from jentic_one.shared.events import (
     MAX_EVENT_SUMMARY_FIELD_LEN,
     emit_event,
     valid_trace_id_or_minted,
     valid_trace_id_or_none,
 )
-from jentic_one.shared.events.repeated_failure import maybe_emit_repeated_failure
+from jentic_one.shared.events.repeated_failure import (
+    RepeatedFailureCounter,
+    maybe_emit_repeated_failure,
+)
+from jentic_one.shared.http.injection import apply_injection, get_current_reflection_guard
 from jentic_one.shared.jobs.handlers import JobResultPayload
-from jentic_one.shared.jobs.hold import ENCRYPTED_PAYLOAD_KEY
+from jentic_one.shared.jobs.hold import ENCRYPTED_PAYLOAD_KEY, INBOUND_COOKIE_PAYLOAD_KEY
 from jentic_one.shared.jobs.operation_payload import operation_from_job_payload
 from jentic_one.shared.jobs.protocols import (
+    ActorStatusReader,
     CredentialInjector,
     ExecutionAuthorizer,
+    ExecutionRecordNotPersistedError,
     InjectedAuth,
     QueuedExecutionRequest,
+    QueuedExecutionVerdict,
     UpstreamExecRequest,
     UpstreamExecutor,
+    auth_lineage_is_current,
 )
+from jentic_one.shared.jobs.queued_denials import (
+    inactive_actor_problem,
+    insufficient_scope_problem,
+    queued_execution_instance,
+)
+from jentic_one.shared.metrics import get_meter
 from jentic_one.shared.models import ActorType as ActorTypeEnum
 from jentic_one.shared.models import ExecutionStatus
 from jentic_one.shared.models.actors import origin_or_none
-from jentic_one.shared.models.events import EventSeverity, EventTag, EventType
+from jentic_one.shared.models.events import (
+    EventSeverity,
+    EventTag,
+    EventType,
+    thirdparty_auth_error_tag,
+)
 from jentic_one.shared.schemas import OperationInfo
-from jentic_one.shared.url import apply_server_variables
 from jentic_one.shared.url_validation import validate_upstream_url_async
 
+if TYPE_CHECKING:
+    from opentelemetry.metrics import Counter
+
 logger = structlog.get_logger(__name__)
+
+#: Suffix that marks a job result whose ``executions`` record was not written.
+_RECORD_NOT_PERSISTED = "execution record not persisted"
+
+# Created once on first increment, so the instrument identity is stable.
+_write_failures: Counter | None = None
+
+
+def _record_write_failure(write: str) -> None:
+    """Count a post-dispatch failure that left a queued execution's rows unwritten.
+
+    ``write`` is ``record`` (the ``executions`` record was not written),
+    ``lifecycle`` (the lifecycle events were not written), or ``runner`` (the
+    dispatched call itself crashed, so no record write was attempted).
+    """
+    global _write_failures
+    if _write_failures is None:
+        _write_failures = get_meter("jentic_one.jobs").create_counter(
+            "jentic_one.jobs.execution_write_failed",
+            description=(
+                "Queued-execution post-dispatch failures that left the executions "
+                "record (write=record) or lifecycle events (write=lifecycle) "
+                "unwritten, or a dispatched call that crashed before any record "
+                "write (write=runner); the job still completed with its real result."
+            ),
+        )
+    _write_failures.add(1, {"write": write})
+
+
+def _traceback_if_safe(exc: BaseException) -> BaseException | bool:
+    """``exc_info`` for a swallowed post-dispatch error: its traceback, unless unsafe.
+
+    A bug swallowed here is otherwise untraceable, so it is logged with its
+    traceback. A database error anywhere in the chain is not: its message can
+    carry the SQL statement and bound parameters.
+    """
+    return False if involves_database_error(exc) else exc
+
 
 #: Result problem of a held payload this worker has no keyset to decrypt.
 _HELD_PAYLOAD_UNDECRYPTABLE_PROBLEM: dict[str, Any] = {
@@ -78,10 +148,23 @@ _HELD_PAYLOAD_UNDECRYPTABLE_PROBLEM: dict[str, Any] = {
     "error_origin": "broker",
 }
 
-# The resolved-identity dataclass needs an ``active`` flag; the worker only
-# injects after the job passed the run-time ``ExecutionAuthorizer`` re-check
-# (which includes the actor-still-active check), so it is always True here.
-_WORKER_IDENTITY_ACTIVE = True
+#: Result problem of a queued payload whose captured Cookie cannot be decrypted.
+_COOKIE_UNDECRYPTABLE_PROBLEM: dict[str, Any] = {
+    "type": "queued_cookie_undecryptable",
+    "title": "Queued execution cookie could not be decrypted",
+    "status": 503,
+    "detail": (
+        "The worker could not decrypt the caller's Cookie captured for this execution; "
+        "it was not run"
+    ),
+    "error_origin": "broker",
+}
+
+#: What a run with no credential injector applies: nothing but the caller's cookies.
+_NO_INJECTION = InjectedAuth(headers={}, query_params={}, cookies={})
+
+#: A pre-injection refusal: the log ``reason`` and the problem-body builder.
+_PreInjectionDenial = tuple[str, Callable[[str], dict[str, object]]]
 
 
 class ExecutionHandler:
@@ -97,30 +180,80 @@ class ExecutionHandler:
         security_config: SecurityConfig | None = None,
         execution_authorizer: ExecutionAuthorizer | None = None,
         encryption: EncryptionService | None = None,
+        actor_status: ActorStatusReader | None = None,
+        repeated_failure_counter: RepeatedFailureCounter | None = None,
     ) -> None:
         if credential_injector is not None and execution_authorizer is None:
             # Fail closed at wiring time: injecting credentials for a queued
             # job without re-checking its authorization would honour an
             # enqueue-time decision the actor/binding/rules may have revoked.
             raise ValueError("credential_injector requires an execution_authorizer")
+        if credential_injector is not None and actor_status is None:
+            # Same reason: without a live actor read, the identity used for
+            # injection could not reflect a disable that lands after enqueue.
+            raise ValueError("credential_injector requires an actor_status reader")
+        if actor_status is not None and execution_authorizer is None:
+            # The live actor read runs only after the run-time authorizer
+            # allows the job; a reader on its own would never be consulted.
+            raise ValueError("actor_status requires an execution_authorizer")
         self._executor = executor
         self._authorizer = execution_authorizer
+        self._actor_status = actor_status
         self._timeout = upstream_timeout_s
         self._credential_injector = credential_injector
         self._egress = egress
         self._security_config = security_config or SecurityConfig()
         self._encryption = encryption
+        self._repeated_failure_counter = repeated_failure_counter
+
+    def _inbound_cookie(self, payload: dict[str, Any], *, job_id: str) -> tuple[str | None, bool]:
+        """The caller's ``Cookie`` the broker captured at enqueue, decrypted.
+
+        Returns ``(cookie, ok)``. A payload without a cookie yields ``(None, True)``.
+        When a cookie ciphertext is present and cannot be decrypted (no keyset,
+        a rotated-out key id, or a corrupt blob), logs the error and returns
+        ``(None, False)`` so the caller fails the job closed without dispatching.
+        """
+        blob = payload.get(INBOUND_COOKIE_PAYLOAD_KEY)
+        if not isinstance(blob, str) or not blob:
+            return None, True
+        if self._encryption is None:
+            logger.error(
+                "queued_execution_cookie_undecryptable",
+                job_id=job_id,
+                reason="no_encryption_keyset",
+            )
+            return None, False
+        try:
+            return self._encryption.decrypt(blob), True
+        except DecryptionError:
+            logger.error(
+                "queued_execution_cookie_undecryptable", job_id=job_id, reason="decryption_failed"
+            )
+            return None, False
 
     async def execute(
         self,
         job_id: str,
-        session: Any,
+        db: TransactionalDatabase,
         *,
         payload: dict[str, Any] | None = None,
         created_by: str | None = None,
         actor_type: str | None = None,
     ) -> JobResultPayload:
-        """Resolve creds, dispatch through the pipeline, persist the result."""
+        """Resolve creds, dispatch through the pipeline, persist the result.
+
+        ``db`` is the worker's database. Each write opens its own short
+        transaction on it, after the upstream call, so the call is never awaited
+        while an admin connection (or, on SQLite, the write lock) is held.
+
+        Once the upstream call is dispatched nothing raises: a raise would
+        requeue the job and send the upstream request again. The executor
+        reports a lost record with the real upstream result, the lifecycle
+        write is best-effort, and either failure is logged and counted.
+        Failures before dispatch (credential resolution and its audit write)
+        propagate, so the job is retried with nothing sent.
+        """
         if not created_by or not actor_type:
             raise ValueError("created_by and actor_type are required for execution jobs")
         if payload is None:
@@ -141,7 +274,24 @@ class ExecutionHandler:
                         "problem": _HELD_PAYLOAD_UNDECRYPTABLE_PROBLEM,
                     }
                 )
-            payload = json.loads(self._encryption.decrypt(str(payload[ENCRYPTED_PAYLOAD_KEY])))
+            try:
+                decrypted = json.loads(
+                    self._encryption.decrypt(str(payload[ENCRYPTED_PAYLOAD_KEY]))
+                )
+                if not isinstance(decrypted, dict):
+                    raise ValueError("held payload is not a JSON object")
+                payload = decrypted
+            except (DecryptionError, ValueError):
+                logger.error("held_payload_undecryptable", job_id=job_id)
+                return JobResultPayload(
+                    body={
+                        "execution_id": f"exec_{job_id}",
+                        "status": ExecutionStatus.FAILED,
+                        "http_status": 503,
+                        "duration_ms": 0,
+                        "problem": _HELD_PAYLOAD_UNDECRYPTABLE_PROBLEM,
+                    }
+                )
 
         upstream_url = payload.get("upstream_url", "")
         method = payload.get("method", "GET")
@@ -160,6 +310,20 @@ class ExecutionHandler:
         server_variables = _str_map(payload.get("server_variables"))
         server_variable_defaults = _str_map(payload.get("server_variable_defaults"))
         server_variables_unresolved = payload.get("server_variables_unresolved") is True
+        auth_token_sha256 = _optional_str(payload.get("auth_token_sha256"))
+        auth_method = _optional_str(payload.get("auth_method"))
+        oauth_client_id = _optional_str(payload.get("oauth_client_id"))
+        oauth_grant_id = _optional_str(payload.get("oauth_grant_id"))
+        session_generation = _optional_int(payload.get("session_generation"))
+        raw_auth_expires_at = _optional_str(payload.get("auth_expires_at"))
+        try:
+            auth_expires_at = (
+                datetime.fromisoformat(raw_auth_expires_at)
+                if raw_auth_expires_at is not None
+                else None
+            )
+        except ValueError:
+            auth_expires_at = None
 
         body: bytes | None = None
         body_b64 = payload.get("body_b64")
@@ -168,11 +332,25 @@ class ExecutionHandler:
 
         upstream_url = await validate_upstream_url_async(upstream_url, self._egress)
 
+        inbound_cookie, cookie_ok = self._inbound_cookie(payload, job_id=job_id)
+        if not cookie_ok:
+            return await self._deny(
+                db,
+                job_id=job_id,
+                execution_id=execution_id,
+                trace_id=trace_id,
+                problem=dict(_COOKIE_UNDECRYPTABLE_PROBLEM),
+                created_by=created_by,
+                actor_type=actor_type,
+                payload=payload,
+            )
+
         # Run-time re-authorization (before any credential is touched). The
         # enqueue-time selection rides along only as the disambiguation input;
         # the boundary injection uses is the one re-derived *now*.
         allowed: tuple[str, ...] = ()
         pinned_credential_id: str | None = None
+        identity: Identity | None = None
         if self._authorizer is not None:
             verdict = await self._authorizer.authorize(
                 QueuedExecutionRequest(
@@ -184,16 +362,47 @@ class ExecutionHandler:
                     api_name=api_name or "",
                     api_version=api_version or "",
                     operation_id=operation.id if operation else None,
+                    spec_operation_id=operation.operation_id if operation else None,
                     relative_path=operation.relative_path if operation else None,
+                    operation_path=operation.path if operation else None,
+                    trace_id=trace_id,
                     credential_id=payload.get("credential_id"),
                     server_variables=server_variables,
                     server_variables_unresolved=server_variables_unresolved,
                     job_id=job_id,
+                    auth_token_sha256=auth_token_sha256,
+                    auth_method=auth_method,
+                    oauth_client_id=oauth_client_id,
+                    oauth_grant_id=oauth_grant_id,
+                    session_generation=session_generation,
+                    auth_expires_at=auth_expires_at,
                 )
             )
+            # One live read of the actor's rows (liveness + the execute
+            # permission), after the authorization reads and right before any
+            # credential is decrypted or the upstream is called, so a disable
+            # or revocation that commits while the job is being re-authorized
+            # still stops it. A refusal comes back as a denied verdict and is
+            # recorded below like any other run-time denial.
+            if verdict.allowed and self._actor_status is not None:
+                identity, verdict = await self._recheck_actor(
+                    self._actor_status,
+                    verdict,
+                    job_id=job_id,
+                    execution_id=execution_id,
+                    created_by=created_by,
+                    actor_type=actor_type,
+                    upstream_url=upstream_url,
+                    auth_token_sha256=auth_token_sha256,
+                    auth_method=auth_method,
+                    oauth_client_id=oauth_client_id,
+                    oauth_grant_id=oauth_grant_id,
+                    session_generation=session_generation,
+                    auth_expires_at=auth_expires_at,
+                )
             if not verdict.allowed:
                 return await self._deny(
-                    session,
+                    db,
                     job_id=job_id,
                     execution_id=execution_id,
                     trace_id=trace_id,
@@ -206,12 +415,17 @@ class ExecutionHandler:
             pinned_credential_id = verdict.credential_id
 
         # The request headers the broker kept for the run (Content-Type and
-        # friends); injected credentials are applied over them.
+        # friends) and the caller's own cookies; injected credentials are
+        # applied over them.
         headers: dict[str, str] = _str_map(payload.get("headers")) or {}
-        credential_id: str | None = None
-        credential_name: str | None = None
-        signing = None
+        injection = _NO_INJECTION
+        injected_defaults: dict[str, str] | None = None
         if self._credential_injector is not None and api_vendor:
+            if identity is None:
+                # Unreachable while the constructor's wiring invariant holds
+                # (an injector implies an authorizer and an actor_status
+                # reader); refuse loudly rather than send the call unchecked.
+                raise RuntimeError("credential injection reached without a live actor identity")
             # The injection boundary is the one the run-time re-authorization
             # just derived (the caller's currently bound credentials) — never
             # the enqueue-time snapshot in the payload. An empty boundary
@@ -220,21 +434,28 @@ class ExecutionHandler:
                 api_vendor=api_vendor,
                 api_name=api_name or "",
                 api_version=api_version or "",
-                identity=_worker_identity(created_by, actor_type),
+                identity=identity,
                 credential_id=pinned_credential_id,
                 allowed_credential_ids=list(allowed),
                 trace_id=trace_id,
                 request_server_variables=server_variables,
                 server_variables_unresolved=server_variables_unresolved,
             )
-            applied = _apply_injection(upstream_url, injection, server_variable_defaults)
-            upstream_url = applied.url
-            headers = _merge_headers(headers, applied.headers)
-            credential_id = injection.credential_id
-            credential_name = injection.credential_name
-            signing = injection.signing
-            if injection.server_variables or server_variable_defaults:
-                upstream_url = await validate_upstream_url_async(upstream_url, self._egress)
+            injected_defaults = server_variable_defaults
+        upstream_url, headers = apply_injection(
+            headers,
+            upstream_url,
+            injection,
+            inbound_cookie=inbound_cookie,
+            inbound_cookie_scoped=bool(payload.get("inbound_cookie_scoped"))
+            and not server_variables_unresolved,
+            server_variable_defaults=injected_defaults,
+        )
+        credential_id = injection.credential_id
+        credential_name = injection.credential_name
+        signing = injection.signing
+        if injection.server_variables or injected_defaults:
+            upstream_url = await validate_upstream_url_async(upstream_url, self._egress)
 
         status = ExecutionStatus.COMPLETED
         http_status: int | None = None
@@ -274,7 +495,7 @@ class ExecutionHandler:
                         "credential_name": credential_name,
                     },
                 ),
-                session=session,
+                db=db,
             )
             http_status = exec_result.status_code
             response_body = exec_result.body
@@ -283,6 +504,32 @@ class ExecutionHandler:
             if http_status >= 400:
                 status = ExecutionStatus.FAILED
                 error_msg = f"Upstream returned {http_status}"
+        except ExecutionRecordNotPersistedError as exc:
+            cause = exc.__cause__
+            _record_write_failure("runner" if exc.runner_failed else "record")
+            logger.error(
+                "queued_execution_record_not_persisted",
+                job_id=job_id,
+                execution_id=execution_id,
+                error_type=type(cause).__name__ if cause is not None else None,
+                http_status=exc.result.status_code if exc.result is not None else None,
+                exc_info=_traceback_if_safe(exc),
+            )
+            if exc.result is None:
+                status = ExecutionStatus.FAILED
+                error_msg = (
+                    f"{exc.upstream_error} ({_RECORD_NOT_PERSISTED})"
+                    if exc.upstream_error
+                    else _RECORD_NOT_PERSISTED.capitalize()
+                )[:MAX_EVENT_SUMMARY_FIELD_LEN]
+            else:
+                http_status = exc.result.status_code
+                response_body = exc.result.body
+                content_type = exc.result.content_type
+                duration_ms = exc.result.duration_ms
+                if http_status >= 400:
+                    status = ExecutionStatus.FAILED
+                    error_msg = f"Upstream returned {http_status} ({_RECORD_NOT_PERSISTED})"
         except (OSError, TimeoutError) as exc:
             status = ExecutionStatus.FAILED
             error_msg = str(exc)[:MAX_EVENT_SUMMARY_FIELD_LEN]
@@ -304,8 +551,21 @@ class ExecutionHandler:
             status = ExecutionStatus.FAILED
             error_msg = safe_error[:MAX_EVENT_SUMMARY_FIELD_LEN]
 
-        await self._emit_lifecycle(
-            session,
+        guard = get_current_reflection_guard()
+        if (
+            http_status is not None
+            and 300 <= http_status < 400
+            and guard is not None
+            and guard.secrets
+        ):
+            response_body = b""
+            content_type = None
+
+        thirdparty_tag = thirdparty_auth_error_tag(http_status, api_vendor)
+        error_tags: set[EventTag] | None = {thirdparty_tag} if thirdparty_tag is not None else None
+
+        await self._write_lifecycle(
+            db,
             job_id=job_id,
             execution_id=execution_id,
             trace_id=trace_id,
@@ -313,9 +573,9 @@ class ExecutionHandler:
             error_msg=error_msg,
             created_by=created_by,
             actor_type=actor_type,
-            toolkit_id=payload.get("toolkit_id"),
             credential_id=credential_id,
             operation=operation,
+            error_tags=error_tags,
             origin=origin,
         )
 
@@ -330,9 +590,111 @@ class ExecutionHandler:
 
         return JobResultPayload(body=result_body, content_type=content_type)
 
+    async def _recheck_actor(
+        self,
+        actor_status: ActorStatusReader,
+        verdict: QueuedExecutionVerdict,
+        *,
+        job_id: str,
+        execution_id: str,
+        created_by: str,
+        actor_type: str,
+        upstream_url: str,
+        auth_token_sha256: str | None = None,
+        auth_method: str | None = None,
+        oauth_client_id: str | None = None,
+        oauth_grant_id: str | None = None,
+        session_generation: int | None = None,
+        auth_expires_at: datetime | None = None,
+    ) -> tuple[Identity | None, QueuedExecutionVerdict]:
+        """Re-read the actor right before injection: the identity to inject for, or a denial.
+
+        Called only once the authorizer has allowed the job. Returns
+        ``(identity, verdict)`` with the verdict unchanged when the actor is
+        still active and still holds the execute permission, else
+        ``(None, denied verdict)`` carrying the sync edge's problem body, so
+        the caller records it like any other run-time denial. An actor type
+        that is no longer issued (a retired ``toolkit`` / ``service_account``
+        job) is refused before any read.
+
+        The worker holds no token for the actor, so it resolves the credential
+        by the actor's id and type, mirroring the sync path's ``identity``
+        argument to ``CredentialInjector.inject``. ``permissions`` is
+        intentionally empty: the injector only uses ``sub`` + ``actor_type``.
+        """
+        denial = await self._actor_denial(
+            actor_status,
+            created_by,
+            actor_type,
+            auth_token_sha256=auth_token_sha256,
+            auth_method=auth_method,
+            oauth_client_id=oauth_client_id,
+            oauth_grant_id=oauth_grant_id,
+            session_generation=session_generation,
+            auth_expires_at=auth_expires_at,
+        )
+        if denial is None:
+            identity = Identity(
+                sub=created_by,
+                actor_type=ActorTypeEnum(actor_type),
+                permissions=[],
+                expires_at=None,
+                active=True,
+            )
+            return identity, verdict
+        reason, problem_for = denial
+        logger.info(
+            "queued_execution_denied",
+            reason=reason,
+            stage="pre_injection",
+            job_id=job_id,
+            execution_id=execution_id,
+            actor_id=created_by,
+            actor_type=actor_type,
+        )
+        return None, QueuedExecutionVerdict(
+            allowed=False, problem=problem_for(queued_execution_instance(upstream_url))
+        )
+
+    @staticmethod
+    async def _actor_denial(
+        actor_status: ActorStatusReader,
+        created_by: str,
+        actor_type: str,
+        *,
+        auth_token_sha256: str | None = None,
+        auth_method: str | None = None,
+        oauth_client_id: str | None = None,
+        oauth_grant_id: str | None = None,
+        session_generation: int | None = None,
+        auth_expires_at: datetime | None = None,
+    ) -> _PreInjectionDenial | None:
+        """Why the live read refuses the actor, or ``None`` when it may still execute."""
+        try:
+            ActorTypeEnum(actor_type)
+        except ValueError:
+            return "actor_type_retired", inactive_actor_problem
+        if not auth_lineage_is_current(auth_token_sha256, auth_method, auth_expires_at):
+            return "auth_lineage_missing_or_expired", inactive_actor_problem
+        authority = await actor_status.authority(
+            actor_id=created_by,
+            actor_type=actor_type,
+            permission=BROKER_EXECUTE_PERMISSION,
+            auth_token_sha256=auth_token_sha256,
+            auth_method=auth_method,
+            oauth_client_id=oauth_client_id,
+            oauth_grant_id=oauth_grant_id,
+            session_generation=session_generation,
+        )
+        if not authority.active:
+            return "actor_inactive", inactive_actor_problem
+        if not authority.holds_permission:
+            return "insufficient_scope", insufficient_scope_problem
+        return None
+
     async def _deny(
         self,
-        session: Any,
+        db: TransactionalDatabase,
         *,
         job_id: str,
         execution_id: str,
@@ -351,8 +713,8 @@ class ExecutionHandler:
         """
         problem_type = str(problem.get("type") or "about:blank")
         logger.info("queued_execution_denied", job_id=job_id, problem_type=problem_type)
-        await self._emit_lifecycle(
-            session,
+        await self._write_lifecycle(
+            db,
             job_id=job_id,
             execution_id=execution_id,
             trace_id=trace_id,
@@ -360,7 +722,6 @@ class ExecutionHandler:
             error_msg=f"Authorization denied ({problem_type})",
             created_by=created_by,
             actor_type=actor_type,
-            toolkit_id=payload.get("toolkit_id"),
             credential_id=payload.get("credential_id"),
             operation=operation_from_job_payload(payload),
             origin=payload.get("origin"),
@@ -376,6 +737,57 @@ class ExecutionHandler:
             }
         )
 
+    async def _write_lifecycle(
+        self,
+        db: TransactionalDatabase,
+        *,
+        job_id: str,
+        execution_id: str,
+        trace_id: str,
+        status: ExecutionStatus,
+        error_msg: str | None,
+        created_by: str,
+        actor_type: str,
+        credential_id: str | None,
+        operation: OperationInfo | None,
+        error_tags: set[EventTag] | None = None,
+        origin: str | None,
+    ) -> None:
+        """Write the lifecycle events in their own transaction, best-effort.
+
+        They are written after the job's outcome is settled (the upstream call
+        was dispatched, or the job was denied). Whatever the write fails with
+        (a mapped database error, a pool checkout timeout, a lost connection,
+        a driver error, or a bug), the failure is logged and counted, and the
+        job still completes with its real result: a raise would requeue the
+        job and re-send the upstream request.
+        """
+        try:
+            async with db.transaction() as session:
+                await self._emit_lifecycle(
+                    session,
+                    job_id=job_id,
+                    execution_id=execution_id,
+                    trace_id=trace_id,
+                    status=status,
+                    error_msg=error_msg,
+                    created_by=created_by,
+                    actor_type=actor_type,
+                    credential_id=credential_id,
+                    operation=operation,
+                    error_tags=error_tags,
+                    origin=origin,
+                )
+        except Exception as exc:
+            _record_write_failure("lifecycle")
+            logger.warning(
+                "queued_execution_lifecycle_write_failed",
+                job_id=job_id,
+                execution_id=execution_id,
+                error_type=type(exc).__name__,
+                exc_info=_traceback_if_safe(exc),
+            )
+
     async def _emit_lifecycle(
         self,
         session: Any,
@@ -387,9 +799,9 @@ class ExecutionHandler:
         error_msg: str | None,
         created_by: str,
         actor_type: str,
-        toolkit_id: str | None = None,
         credential_id: str | None = None,
         operation: OperationInfo | None = None,
+        error_tags: set[EventTag] | None = None,
         origin: str | None = None,
     ) -> None:
         # The enqueue path persisted the request-derived Origin string in the
@@ -415,6 +827,9 @@ class ExecutionHandler:
                 )
             else:
                 sanitized = (error_msg or "unknown")[:MAX_EVENT_SUMMARY_FIELD_LEN]
+                failed_tags: set[EventTag] = set(error_tags or ())
+                if origin_tag is not None:
+                    failed_tags.add(origin_tag)
                 await emit_event(
                     session,
                     type=EventType.EXECUTION_FAILED,
@@ -427,7 +842,7 @@ class ExecutionHandler:
                     created_by=created_by,
                     actor_id=created_by,
                     actor_type=actor_type,
-                    tags=origin_tags,
+                    tags=failed_tags or None,
                 )
         except Exception:
             logger.warning("emit_event_failed", job_id=job_id, execution_id=execution_id)
@@ -437,40 +852,12 @@ class ExecutionHandler:
                 session,
                 actor_id=created_by,
                 actor_type=actor_type,
-                toolkit_id=toolkit_id,
                 credential_id=credential_id,
                 operation=operation,
                 trace_id=event_trace_id,
                 config=self._security_config,
+                failure_counter=self._repeated_failure_counter,
             )
-
-
-def _worker_identity(created_by: str, actor_type: str) -> Identity:
-    """A minimal resolved identity for credential resolution by the worker.
-
-    The inbound token was validated at enqueue time; the worker resolves the
-    credential by the enqueuing actor's identity, mirroring the sync path's
-    ``identity`` argument to ``CredentialInjector.inject``.
-
-    ``permissions`` is intentionally empty: the credential injector only uses
-    ``sub`` + ``actor_type`` to resolve the credential row — RBAC permissions
-    were already enforced at enqueue time (execute:write gate on the API route).
-    """
-    return Identity(
-        sub=created_by,
-        actor_type=ActorTypeEnum(actor_type),
-        permissions=[],
-        expires_at=None,
-        active=_WORKER_IDENTITY_ACTIVE,
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class AppliedAuth:
-    """Result of applying injected credentials to an outbound request."""
-
-    url: str
-    headers: dict[str, str]
 
 
 def _str_map(value: Any) -> dict[str, str] | None:
@@ -480,39 +867,13 @@ def _str_map(value: Any) -> dict[str, str] | None:
     return {str(k): str(v) for k, v in value.items()} or None
 
 
-def _merge_headers(replayed: dict[str, str], injected: dict[str, str]) -> dict[str, str]:
-    """``replayed`` overlaid by ``injected``; an injected name wins in any case."""
-    injected_names = {name.lower() for name in injected}
-    merged = {k: v for k, v in replayed.items() if k.lower() not in injected_names}
-    merged.update(injected)
-    return merged
+def _optional_str(value: Any) -> str | None:
+    """Return a non-empty string payload field, or ``None``."""
+    return value if isinstance(value, str) and value else None
 
 
-def _apply_injection(
-    upstream_url: str,
-    injection: InjectedAuth,
-    server_variable_defaults: dict[str, str] | None = None,
-) -> AppliedAuth:
-    """Apply injected auth to the outbound URL + headers (worker side).
-
-    Mirrors the sync router's ``_apply_injection``: server-variable credentials
-    are substituted into the URL template, query-param credentials are merged
-    into the URL query, and cookie credentials into a ``Cookie`` header, so an
-    ``apiKey in: query`` / ``apiKey in: cookie`` credential is applied rather
-    than silently dropped.
-    """
-    if injection.server_variables or server_variable_defaults:
-        upstream_url = apply_server_variables(
-            upstream_url, injection.server_variables, server_variable_defaults
-        )
-
-    if injection.query_params:
-        parsed = urlparse(upstream_url)
-        sep = "&" if parsed.query else ""
-        new_query = parsed.query + sep + urlencode(injection.query_params)
-        upstream_url = urlunparse(parsed._replace(query=new_query))
-
-    headers = dict(injection.headers)
-    if injection.cookies:
-        headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in injection.cookies.items())
-    return AppliedAuth(url=upstream_url, headers=headers)
+def _optional_int(value: Any) -> int | None:
+    """Return an integer payload field, or ``None``."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None

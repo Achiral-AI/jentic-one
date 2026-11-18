@@ -14,12 +14,15 @@ only the router's own logic.
 from __future__ import annotations
 
 import datetime as dt
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from jentic.problem_details import ProblemDetailException, problem_detail_exception_handler
+from pydantic import ValidationError
 
 from jentic_one.control.services.integrations.connect_session_service import (
     AuthCodeConfirmResult,
@@ -50,8 +53,10 @@ from jentic_one.control.services.vendors.service import (
     UnknownVendorError,
 )
 from jentic_one.control.web.app import get_exception_handlers
+from jentic_one.control.web.connect_limits import install_connect_limiters
 from jentic_one.control.web.deps import get_connect_session_service
 from jentic_one.control.web.routers import integrations as integrations_router
+from jentic_one.control.web.schemas.integrations import AmendSessionRequest
 from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.models import ActorType
 from jentic_one.shared.pagination import InvalidCursorError
@@ -88,7 +93,20 @@ def _build_app(*, svc: Any, identity: Identity = _USER_IDENTITY) -> FastAPI:
         app.add_exception_handler(exc_class, handler)
     app.dependency_overrides[get_connect_session_service] = lambda: svc
     app.dependency_overrides[shared_deps.resolve_identity] = lambda: identity
+    # ``:confirm`` reads the state TTL and public origin to set the
+    # browser-binding cookie; nothing else in this router touches ``Context``.
+    app.dependency_overrides[shared_deps.get_ctx] = lambda: _CTX
+    # The connect limiters production installs on the shared-state backend.
+    install_connect_limiters(app, SimpleNamespace(state_backend=MemoryStateBackend()))  # type: ignore[arg-type]
     return app
+
+
+_CTX = SimpleNamespace(
+    config=SimpleNamespace(
+        credentials=SimpleNamespace(connect=SimpleNamespace(state_ttl_seconds=600)),
+        server=SimpleNamespace(public_base_url=""),
+    )
+)
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +258,7 @@ def test_connect_returns_session_id_and_poll_token() -> None:
         "approval_url": "https://example.com/app/agents?approve=sess_9",
         "poll_token": "tok9",
         "resolved_flow": "authorization_code",
+        "revision_id": None,
     }
 
 
@@ -603,6 +622,7 @@ def test_list_sessions_never_includes_poll_token() -> None:
         "error_code",
         "created_at",
         "credential_id",
+        "intent",
     }
 
 
@@ -770,3 +790,18 @@ def test_confirm_shares_connect_rate_limit_bucket() -> None:
     assert "Retry-After" in third.headers
     assert third.headers["content-type"].startswith("application/problem+json")
     assert third.json()["type"] == "rate_limit_exceeded"
+
+
+def test_an_amend_of_nothing_but_nulls_is_refused() -> None:
+    """``{"reason": null}`` carried a field but asked for nothing.
+
+    Every such call appended a revision, so a caller could grow a session's
+    chain without ever changing what it asks for.
+    """
+    with pytest.raises(ValidationError):
+        AmendSessionRequest.model_validate({"reason": None})
+    with pytest.raises(ValidationError):
+        AmendSessionRequest.model_validate({"reason": None, "requested_scopes": None})
+    # One field carrying a value is a change, including clearing the rules.
+    assert AmendSessionRequest.model_validate({"reason": "why"}).reason == "why"
+    assert AmendSessionRequest.model_validate({"requested_scopes": []}).requested_scopes == []

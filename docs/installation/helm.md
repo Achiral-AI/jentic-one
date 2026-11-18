@@ -211,9 +211,14 @@ That last `extraEnv` is **required**, and the install fails without it. The
 pre-auth OAuth rate limiter keys on the client IP, so behind an ingress every
 request arrives from the controller's address and all clients share one bucket —
 a single noisy caller then rate-limits your whole fleet out of `/authorize`. Set
-it to the ingress controller's pod CIDR or IPs (or
+it to the ingress controller's pod CIDR or IPs (a comma-separated list of
+addresses and CIDR networks — escape each comma as `\,` under `--set`; an
+invalid entry fails startup), or
 `ingress.skipTrustedProxiesCheck=true` if you enforce rate limits upstream of
-the cluster). Bringing your own Ingress manifest instead works the same way:
+the cluster. Keep the range as narrow as your cluster allows: any pod inside a
+trusted network can set `X-Forwarded-For` and pick its own rate-limit identity,
+so `10.0.0.0/8` is only a sensible default when nothing untrusted shares it.
+Bringing your own Ingress manifest instead works the same way:
 point it at the `<release>-app` and `<release>-broker` Services on port 8000,
 and set the same key. Then walk through
 the [first brokered call](../guides/first-call.md).
@@ -445,37 +450,39 @@ later rollback still decrypts what was written under the new key)
 
 ## Scaling and HA
 
-Every subchart exposes `replicas` and `resources` in its values
-(`--set broker.replicas=3`). The defaults are sized for evaluation, not
-load: broker/registry/control request 100m/128Mi with a 500m/256Mi limit,
-and app/admin request 256Mi with a 1Gi limit. The app's floor is real, not
-a hint: it boots at roughly 150Mi RSS, and every concurrent password or
-OAuth client-secret verification adds 64Mi (argon2id with
-`memory_cost=65536`) — so a handful of simultaneous logins on a 256Mi limit
-is an OOM-kill, not a slowdown. Do not set the app's memory limit below
-512Mi.
+The general rules — one process per surface on the default `memory`
+shared-state backend, its bounded budgets, container memory and connection-pool
+sizing — are in [Scaling and tuning](../operations/scaling-and-tuning.md).
+When the memory backend's `idem` namespace is full, `Idempotency-Key` calls get
+a `503`; at the defaults one broker process sustains about 30 idempotent
+requests per second, about 3 per caller. What follows is how they map onto the
+chart.
 
-- **Broker** — stateless; run several replicas behind the Service. First set
-  the shared-state backend to Redis so rate limits, circuit breakers, and
-  idempotency records are shared across replicas: with the default `memory`
-  backend that state is per-process
-  ([config/production.yaml.example](../../config/production.yaml.example),
-  [composition-and-processes.md](../architecture/composition-and-processes.md)).
-  The keys are `broker.resilience.backend.backend: redis` and
-  `broker.resilience.backend.redis_url` (via `extraEnv`:
-  `JENTIC__BROKER__RESILIENCE__BACKEND__BACKEND` /
-  `…__REDIS_URL`, identical on every replica). The chart does not bundle
-  Redis — bring your own. **One hard caveat:** the Redis client is an
-  optional extra (`pip install jentic-one[redis]`) that the published
-  `ghcr.io/jentic/jentic-one-app` image does **not** include — configuring
-  the redis backend on that image crash-loops every replica at startup. On
-  the published image today, keep `broker.replicas: 1`; scaling out means
-  building your own image with the `[redis]` extra.
-- **App** — the same shared-state backend also carries the auth surface's
-  OAuth rate limiters and consent-nonce anti-replay, so the same rule
-  applies: keep `app.replicas: 1` on the `memory` backend; configure Redis
-  before scaling out. Multi-replica app surfaces are not part of the CI
-  smoke matrix.
+Every subchart exposes `replicas` and `resources` in its values. The defaults
+are sized for evaluation, not load: registry/control request 100m/128Mi with a
+500m/256Mi limit, the broker requests 100m/256Mi with a 500m/512Mi limit
+(enough for its default shared-state budgets), and app/admin request
+100m/256Mi with a 500m/1Gi limit (enough for the shared-state budgets plus the
+default four concurrent argon2 hashes). Do not set the app's memory limit below
+512Mi; raising `state.memory.*` budgets or `admin.auth.argon2_max_concurrency`
+(set through `extraEnv`) means raising the memory limit with it, by the
+amounts in [container memory](../operations/scaling-and-tuning.md#container-memory).
+
+**Keep `replicas: 1` on every surface except the gateway** (a stateless
+proxy); the chart prints a warning at install/upgrade time when any other
+surface asks for more. Registry and admin keep no per-process state, but
+multi-replica runs of them are not tested either. A shared-state backend
+registered by an extension is selected with `state.backend`
+(`JENTIC__STATE__BACKEND` via `extraEnv`); the published
+`ghcr.io/jentic/jentic-one-app` image does **not** include the deprecated
+`redis` backend's `[redis]` extra.
+
+- **Broker** — scale up rather than out: raise the chart's `broker.resources`
+  and the broker's `broker.resilience.max_in_flight` config key
+  (`JENTIC__BROKER__RESILIENCE__MAX_IN_FLIGHT` via `broker.extraEnv`).
+- **App** — the same one-replica rule applies; the auth surface's limiters and
+  anti-replay ride the same backend. Multi-replica surfaces are not part of
+  the CI smoke matrix.
 - **Bundled PostgreSQL** — a single-instance StatefulSet, dev/eval-grade by
   design; HA means an external managed database (below). Its connection ceiling
   is already raised to 200 (`postgresql.maxConnections`) because three pools per
@@ -483,9 +490,10 @@ is an OOM-kill, not a slowdown. Do not set the app's memory limit below
   raising replicas means raising this and the subchart's memory limit together.
 - **PodDisruptionBudgets** — `podDisruptionBudget.enabled=true` renders one per
   enabled surface at `minAvailable: 1`, so node drains and cluster upgrades
-  cannot take a surface fully offline. Turn it on only *after* raising
-  `replicas` above 1: with a single replica there is no spare pod to evict and
-  the budget blocks every drain instead.
+  cannot take a surface fully offline. With a single replica there is no
+  spare pod to evict and the budget blocks every drain instead, so it only
+  helps the gateway (or a surface on a registered shared backend) once it runs
+  more than one replica.
 - **NetworkPolicy** — `networkPolicy.enabled=true` limits ingress to
   same-release pods plus the namespaces in `networkPolicy.allowFromNamespaces`.
   Put your ingress controller's namespace in that list unless it runs in this

@@ -6,7 +6,6 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from jentic_one.registry.services.errors import (
-    AmbiguousMatchError,
     ApiDeleteBlockedError,
     ApiNotFoundError,
     ArchivedRevisionPinError,
@@ -18,12 +17,10 @@ from jentic_one.registry.services.errors import (
     InvalidApiFilterError,
     InvalidNoteResourceError,
     InvalidOverlayDocumentError,
-    MethodNotAllowedError,
     NoCurrentRevisionError,
     NoteNotFoundError,
     NotePreconditionFailedError,
     NothingToSnoozeError,
-    OperationNotFoundError,
     OverlayApplyConflictError,
     OverlayNotFoundError,
     OverlayRematerializeForbiddenError,
@@ -35,10 +32,16 @@ from jentic_one.registry.services.errors import (
     SearchUnavailableError,
     SnoozeForbiddenError,
     SpecFileMissingError,
+)
+from jentic_one.shared.db.errors import DatabaseConsistencyError, DatabaseUnavailableError
+from jentic_one.shared.discovery.errors import (
+    AmbiguousMatchError,
+    MethodNotAllowedError,
+    OperationNotFoundError,
     TooManyCandidatesError,
 )
-from jentic_one.shared.db.errors import DatabaseConsistencyError
-from jentic_one.shared.web.errors import make_service_error_handler
+from jentic_one.shared.pagination import InvalidCursorError
+from jentic_one.shared.web.errors import DB_UNAVAILABLE_SAFE_DETAILS, make_service_error_handler
 
 _ERROR_MAP: dict[type[Exception], tuple[int, str]] = {
     ApiNotFoundError: (404, "api_not_found"),
@@ -81,6 +84,11 @@ _ERROR_MAP: dict[type[Exception], tuple[int, str]] = {
     ArchivedRevisionPinError: (422, "archived_revision_pin"),
     InvalidNoteResourceError: (422, "invalid_note_resource"),
     InvalidOverlayDocumentError: (422, "invalid_overlay_document"),
+    # The registry answers its own URL lookup, so an index that returns more
+    # candidates than it can rank is a registry fault (500). The broker renders
+    # the same error as 503 ``too_many_candidates`` (``broker/core/problem.py``):
+    # to a proxied caller the registry is a dependency that was unavailable
+    # before dispatch. Both wire statuses are part of each surface's contract.
     TooManyCandidatesError: (500, "url_index_overloaded"),
     RevisionStateConflictError: (409, "revision_state_conflict"),
     # Promoting a revision whose servers declare a host another vendor's live API
@@ -99,13 +107,19 @@ _ERROR_MAP: dict[type[Exception], tuple[int, str]] = {
     # generic client detail so it is logged as a recognised class instead of
     # escaping as an opaque traceback. See #642.
     DatabaseConsistencyError: (500, "internal_error"),
+    # The admin/registry DB cannot answer (e.g. the per-request users-row read
+    # behind a login JWT, #1139): infra, not a client fault — a retryable 503,
+    # matching the admin, auth and control surfaces.
+    DatabaseUnavailableError: (503, "database_unavailable"),
 }
 
 # Never surface raw SQLAlchemy internals (SQL, state, connection details) to the
-# client for the defensively-mapped DatabaseConsistencyError; the raw message is
-# still logged server-side (see make_service_error_handler).
+# client for the defensively-mapped DB errors. Server-side, a consistency error
+# logs its raw message and an unavailable error its SQL-free detail (see
+# make_service_error_handler).
 _SAFE_DETAILS: dict[type[Exception], str] = {
     DatabaseConsistencyError: "An unexpected error occurred",
+    **DB_UNAVAILABLE_SAFE_DETAILS,
 }
 
 
@@ -121,3 +135,13 @@ def _add_allow_header(
 service_error_handler = make_service_error_handler(
     _ERROR_MAP, response_hook=_add_allow_header, safe_details=_SAFE_DETAILS
 )
+
+# A tampered or wrong-shaped pagination cursor (list routes and the search
+# keyset cursor alike) is a client fault: 400 ``invalid_cursor``, matching the
+# admin, auth and control surfaces. Registered as its own handler because
+# `InvalidCursorError` lives outside the `RegistryServiceError` hierarchy.
+_CURSOR_ERROR_MAP: dict[type[Exception], tuple[int, str]] = {
+    InvalidCursorError: (400, "invalid_cursor"),
+}
+
+cursor_error_handler = make_service_error_handler(_CURSOR_ERROR_MAP)

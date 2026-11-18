@@ -132,13 +132,12 @@ telemetry:
   enabled: true
 ```
 
-**Connection-pool sizing:** each process holds up to `pool_max` connections
-per DB at steady state, plus 10 overflow per pool under burst, and **both**
-the app and broker containers open all three pools — the example above holds
-(20+15+10) × 2 = **90 server connections** at steady state, and up to
-**150** if every pool bursts into its overflow. Size against
-your instance's `max_connections` (managed-PG entry tiers are often ~100) or
-front Postgres with a pooler like pgbouncer.
+**Connection pools:** both the app and broker containers open all three
+pools, so the example above holds (20+15+10) × 2 = 90 server connections at
+steady state and up to 150 under burst — size against your Postgres
+`max_connections` or front it with a pooler. Pre-ping, recycling and
+keepalive are on by default; how to size and tune them:
+[Scaling and tuning](../operations/scaling-and-tuning.md#database-connection-pools).
 
 Secrets go in an env file, `/etc/jentic/prod.env` (`chmod 600`, values
 unquoted — `docker --env-file` takes them literally):
@@ -207,6 +206,13 @@ auth:
         …contents of id-signing.pem…
         -----END EC PRIVATE KEY-----
 ```
+
+**Sizing:** the default `memory` shared-state backend is bounded and answers
+`503` when full (about 30 `Idempotency-Key` requests per second per broker),
+and the `app` container needs at least `512m` (`1g` recommended) for its
+shared state and concurrent password hashing. The budgets, the formulas and
+the keys that raise them are in
+[Scaling and tuning](../operations/scaling-and-tuning.md).
 
 ## 3. Prepare the database
 
@@ -308,7 +314,11 @@ OAuth endpoints by the connecting socket IP — behind a proxy that is one IP,
 so **all** OAuth clients share one bucket and busy instances see spurious
 `429`s. The value must be the source IP the app actually sees; for the
 port-published containers above that is the Docker bridge gateway (commonly
-`172.17.0.1`), not `127.0.0.1`:
+`172.17.0.1`), not `127.0.0.1`. Entries are IP addresses or CIDR networks
+(`JENTIC__AUTH__OAUTH_RATE_LIMIT__TRUSTED_PROXIES` takes them comma-separated),
+and an invalid entry fails startup. List only addresses your proxy holds: any
+host inside a trusted network can set `X-Forwarded-For` and pick its own
+rate-limit identity.
 
 ```yaml
 # production.yaml
@@ -348,7 +358,7 @@ Three worked compose examples as an alternative to the two `docker run`s:
 ## 7. Connect the CLIs
 
 - **Admin host:** install `jenticctl` from the release archive
-  ([download + verify](../../cli/README.md#4-manual-download--verify)).
+  ([download + verify](cli.md#manual-download)).
 - **Every host using the instance:** install `jentic` the same way, then
   register — an operator approves each agent in the UI:
 
@@ -368,3 +378,39 @@ Then walk through the [first brokered call](../guides/first-call.md).
 Migrations are applied forward — prefer rolling forward to a fixed release
 over rolling the image back onto a newer schema. The full contract:
 [docs/operations/upgrades.md](../operations/upgrades.md).
+
+## Trial setup on SQLite
+
+The README quickstart's stack without compose: app and broker on SQLite files in
+one volume, configured by [`config/quickstart.env`](../../config/quickstart.env).
+Back up `quickstart.env` with the volume — it holds the encryption key.
+
+```bash
+docker pull ghcr.io/jentic/jentic-one-app:latest
+docker volume create jentic-data
+
+# Grab the quickstart config (SQLite on the volume; fetched from main) — tweak it, or use as is.
+# Skipped if you already have one, so re-running this block keeps your key.
+[ -f quickstart.env ] || curl -fsSLO https://raw.githubusercontent.com/jentic/jentic-one/main/config/quickstart.env
+
+# Generate this install's credential-encryption key into it (once — a new key
+# makes credentials stored under the old one unreadable)
+grep -q '^JENTIC__CREDENTIALS__ENCRYPTION__' quickstart.env || cat >> quickstart.env <<EOF
+JENTIC__CREDENTIALS__ENCRYPTION__ENTRIES__0__ID=v1
+JENTIC__CREDENTIALS__ENCRYPTION__ENTRIES__0__MATERIAL=$(openssl rand -base64 32)
+EOF
+
+# Migrate, then start the two roles
+docker run --rm --env-file quickstart.env -v jentic-data:/data \
+  ghcr.io/jentic/jentic-one-app:latest python -m jentic_one.migrations.run
+docker run -d --name jentic-app --env-file quickstart.env -v jentic-data:/data \
+  -p 127.0.0.1:8000:8000 ghcr.io/jentic/jentic-one-app:latest      # control plane (UI + APIs)
+docker run -d --name jentic-broker --env-file quickstart.env -e JENTIC__APPS=broker -v jentic-data:/data \
+  -p 127.0.0.1:8100:8000 ghcr.io/jentic/jentic-one-app:latest      # data plane (agents call this)
+
+# First admin (prompts for a password), then sign in at http://127.0.0.1:8000
+docker run --rm -it --env-file quickstart.env -v jentic-data:/data \
+  ghcr.io/jentic/jentic-one-app:latest python -m jentic_one create-admin --email you@example.com
+
+curl -fsS http://127.0.0.1:8000/health   # verify the control plane is up
+```

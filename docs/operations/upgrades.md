@@ -1,6 +1,9 @@
 # Upgrades
 
 The contract is the same on every install shape; only the commands differ.
+What changes in each release — breaking changes, required steps, rollback
+notes — is in the [upgrade notes](upgrade-notes.md); read every section
+between your version and the target before you start.
 
 ## The contract
 
@@ -51,19 +54,20 @@ The contract is the same on every install shape; only the commands differ.
 6. **Review what the upgrade carried over.** The upgrade steps keep
    existing access intact and report, rather than remove, admin-level grants
    copied onto successor agents and cross-owner credential bindings — see
-   [Reviewing grants and bindings carried over by the upgrade](../development/releasing.md#reviewing-grants-and-bindings-carried-over-by-the-upgrade)
+   [Reviewing grants and bindings carried over by the upgrade](upgrade-notes.md#reviewing-grants-and-bindings-carried-over-by-the-upgrade)
    for the read-only audit queries.
 
 Rolling *back* the app version is supported only together with restoring the
 matching pre-upgrade snapshot — old code on a newer schema is not a supported
 state. A schema downgrade path exists
-(`python -m jentic_one.migrations.run --direction down`), but it is a
-break-glass tool, not a supported rollback path — know its sharp edges
-before touching it: the default steps back **one revision per database**
-(so a release spanning two revisions leaves a database half-downgraded and
-still exits 0), and several `down` bodies are deliberate no-ops that do not
-restore dropped data. Restore the snapshot
-instead, or roll forward to a fixed release. The version
+(`python -m jentic_one.migrations.run --db <name> --direction down --target <revision>`),
+but it is a break-glass tool, not a supported rollback path — know its sharp
+edges before touching it: `--target` is required and revision/relative targets
+apply to a single `--db` (so you must pass the exact target revision for every
+database a release touched; mid-run failures exit `6` with `DOWNGRADE_STATUS`
+lines naming any partial rollback), and several `down` bodies are deliberate
+no-ops or irreversible guards that do not restore dropped data. Restore the
+snapshot instead, or roll forward to a fixed release. The version
 number's exact promises while in beta: [VERSIONING.md](../../VERSIONING.md).
 
 ## If a migration run fails mid-flight
@@ -119,6 +123,27 @@ itself fails (for example a query error on the admin database), the step
 still marks the sets, prints one `could not list cross-owner bindings`
 warning, and reports `cross_owner_bindings: null`; the upgrade does not
 fail on it.
+
+## Broker JWTs must name an active, registered agent
+
+A signed JWT presented to the broker (`broker.jwt_secret` or
+`broker.jwt_verification.trusted_issuers`) is accepted only when its `sub`
+is the id of an agent registered on the platform, that agent is `active`,
+and, for an owned agent, its owner is active. Check before upgrading:
+
+- **`sub` must be an existing agent id.** An issuer that signs `sub` values
+  which are not platform agent ids gets a `401` on every call. Register the
+  agents and sign their ids as `sub`.
+- **Inactive agents and owners are refused.** Suspending or archiving an
+  agent, or disabling or deleting its owner, refuses that agent's JWTs
+  within `broker.resolve_cache_ttl_seconds`, the same bound the opaque
+  token path has.
+- **The admin database must be reachable.** The broker reads the agent's
+  status from it on a cache miss; if it cannot, the JWT call fails rather
+  than being let through.
+
+A refused token logs a `jwt_refused` WARNING with
+`reason: jwt_actor_inactive`; look for it after upgrading.
 
 ## Binding rules written against the full upstream path
 
@@ -184,6 +209,64 @@ is denied with `403 action_denied` (`reason: ambiguous_path`): different
 upstream servers resolve such a path differently, so no rule check on it is
 sound.
 
+## OAuth connects finish only in the browser that started them
+
+An OAuth connect (the UI's **Connect** / **Reconnect**, or approving an
+agent's request) completes only when the vendor's redirect lands in the
+browser that started it: the start sets a short-lived cookie on the API host,
+and `GET /credentials/oauth/callback` requires it. A callback without it ends
+on the generic error page and changes nothing. Three cases are affected:
+
+- **Callback on another host.** If
+  `credentials.providers.direct_oauth2.redirect_uri` names a different host
+  from `server.public_base_url` (a dedicated callback domain, or an old
+  hostname kept for the vendor app registration), the browser never sends
+  the cookie to the callback and **every** OAuth connect fails. Serve the
+  callback on the public host (or unset `redirect_uri` so it derives from
+  `public_base_url`) and update the redirect URI registered with each vendor
+  OAuth app. Startup logs an `oauth_callback_host_mismatch` WARNING for this
+  case. `localhost` and `127.0.0.1` count as one host.
+- **Connect started outside the browser.** A flow started with `curl`, a
+  script or an API key and then opened in a browser cannot finish. Start it
+  from the browser that opens `authorize_url`.
+- **Connects in flight during the rollout.** A connect started before or
+  during the upgrade, up to `credentials.connect.state_ttl_seconds` (600 s
+  by default), ends on the error page once, because its state predates the
+  browser check. Nothing is written; start it again after the rollout.
+
+A refused callback logs `oauth_callback.connect_flow_error` (credential
+connect) or `oauth_callback.connect_session.state_invalid` (agent request)
+with `error_type: StateBrowserMismatchError`; alert on that to catch either
+case.
+
+## Free-form server hosts use credential-supplied values
+
+An API whose server host contains a free-form or undeclared template no longer
+resolves requests to arbitrary concrete hosts. Legacy arbitrary-host index rows
+are ignored at lookup. Provide concrete values through the credential's
+`server_variables` and use the literal `{name}` host template URL so discovery
+can pair it with those values. Declared variable defaults and enum members
+continue to resolve directly; a direct request to an arbitrary concrete host
+outside those declared values now returns `operation_not_found`.
+
+Re-importing byte-identical content does **not** rebuild an active revision's
+URL index: the import fails with `A revision with identical content already
+exists for this API version` before index construction. Rebuilding requires a
+new revision with changed specification content. Make the intended spec update
+while retaining the API's `vendor/name/version` identity, then:
+
+1. Import it with `jentic apis import <file|url>`; a manual import creates a
+   draft and builds that draft's URL index with the literal host templates.
+2. Find the new draft with `jentic apis revisions <vendor/name/version>`.
+3. Promote it with
+   `jentic apis promote <vendor/name/version> <revision_id>` so its index
+   serves requests; the previous live revision is archived.
+
+The equivalent HTTP flow is `POST /apis`, followed by
+`POST /apis/{vendor}/{name}/{version}/revisions/{revision_id}:promote`. See
+[Import APIs](../guides/importing-apis.md#re-import-revisions-and-promote) for
+job polling, revision inspection, and host-change promotion requirements.
+
 ## Where the commands live, per install
 
 | Install | Upgrade steps |
@@ -196,12 +279,28 @@ sound.
 ## What an upgrade never does
 
 - It never rotates the credential-encryption keyset or other generated
-  secrets — rotating would orphan everything already encrypted. Key rotation
-  is its own explicit procedure, and it is narrower than it sounds: add a
-  new entry to `credentials.encryption.entries` and flip `active_id`. New
-  writes use the new key immediately, but a stored secret re-encrypts only
-  when its row is next rewritten — there is no bulk re-encrypt command and
-  no way to check completion. Retired keys therefore stay in the keyset
-  indefinitely; removing an entry makes any secret still encrypted under it
-  permanently unreadable.
+  secrets — rotating during an upgrade without a coordinated keyset rollout
+  would orphan existing ciphertext. Key rotation is an explicit multi-step
+  procedure:
+  1. Add the new key entry to `credentials.encryption.entries` while retaining
+     the old entry, and set `credentials.encryption.active_id` to the new key
+     ID so all new writes use the new key immediately.
+  2. Roll out the updated keyset across every control, broker, admin, and
+     worker replica and allow any in-flight transient token or pending
+     approval write window to drain so no process still encrypts with the old
+     key.
+  3. Run `rotate_encrypted_storage` with `dry_run=True` to inventory remaining
+     ciphertexts by key ID and storage family across `control_db`
+     (`customer_api_keys`, `token_value_credentials` /
+     `bearer_token_credentials`, `basic_credentials` /
+     `basic_auth_credentials`, `sigv4_credentials`,
+     `device_authorization_credentials`, `oauth_client_credentials`,
+     `authorization_code_app_registration_details` / `oauth_app_registrations`,
+     `oauth_tokens`) and `admin_db` (`provider_configs`, async `jobs`
+     encrypted cookies, and `held_executions` encrypted payloads), then run
+     `rotate_encrypted_storage` with `dry_run=False` to re-encrypt all
+     persisted values in bounded, resumable batches.
+  4. Run `verify_key_retired` (or `assert_only_active_key`) and remove the
+     retired entry from `credentials.encryption.entries` only after this
+     completion check passes with zero remaining ciphertexts on the old key.
 - It never migrates *down*. `--check` before, snapshot always.

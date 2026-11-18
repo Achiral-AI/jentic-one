@@ -13,6 +13,7 @@ from jentic_one.auth.services.oauth_dcr_service import DcrRegisterResult
 from jentic_one.auth.web.errors import service_error_handler
 from jentic_one.auth.web.routers import oauth_client_registration
 from jentic_one.shared.config import AuthConfig, OAuthRateLimitConfig, ServerConfig
+from jentic_one.shared.state.backend import MemoryStateBackend
 
 _BODY = {
     "client_name": "Cursor",
@@ -38,7 +39,10 @@ def _result(*, created: bool, software_id: str | None = "com.cursor.ide") -> Dcr
 
 
 def _make_client(
-    *, oauth_enabled: bool = True, rate_limit: OAuthRateLimitConfig | None = None
+    *,
+    oauth_enabled: bool = True,
+    rate_limit: OAuthRateLimitConfig | None = None,
+    peer: tuple[str, int] = ("testclient", 50000),
 ) -> TestClient:
     app = FastAPI()
     app.include_router(oauth_client_registration.router)
@@ -53,7 +57,8 @@ def _make_client(
     server.mcp.oauth.enabled = oauth_enabled
     mock_ctx.config.server = server
     app.state.ctx = mock_ctx
-    return TestClient(app)
+    app.state.auth_state_backend = MemoryStateBackend()
+    return TestClient(app, client=peer)
 
 
 def test_disabled_returns_plain_404() -> None:
@@ -193,6 +198,27 @@ def test_registration_rate_limit_enforced_per_ip(mock_svc_cls: MagicMock) -> Non
     assert second.status_code == 429
     assert int(second.headers["Retry-After"]) >= 1
     assert second.json()["type"] == "rate_limit_exceeded"
+
+
+@patch("jentic_one.auth.web.routers.oauth_client_registration.OAuthDcrService")
+def test_registration_rate_limit_keys_on_xff_from_trusted_cidr(mock_svc_cls: MagicMock) -> None:
+    """#1880: behind an ingress listed by CIDR, each forwarded client gets its
+    own bucket instead of sharing the controller's."""
+    mock_svc_cls.return_value.register = AsyncMock(return_value=_result(created=True))
+    client = _make_client(
+        rate_limit=OAuthRateLimitConfig(
+            registration_rpm=1, registration_burst=1, trusted_proxies=["10.0.0.0/8"]
+        ),
+        peer=("10.42.0.7", 50000),
+    )
+
+    def register(forwarded_for: str) -> int:
+        headers = {"X-Forwarded-For": forwarded_for}
+        return client.post("/oauth-clients", json=_BODY, headers=headers).status_code
+
+    assert register("203.0.113.7") == 201
+    assert register("198.51.100.9") == 201
+    assert register("203.0.113.7") == 429
 
 
 @patch("jentic_one.auth.web.routers.oauth_client_registration.OAuthDcrService")

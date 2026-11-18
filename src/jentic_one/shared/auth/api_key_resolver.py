@@ -7,14 +7,18 @@ from __future__ import annotations
 
 import enum
 import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import structlog
-from sqlalchemy import text
+from sqlalchemy import Boolean, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from jentic_one.shared.auth.agent_permission_ceiling import cap_agent_permissions
 from jentic_one.shared.auth.identity import Identity
+from jentic_one.shared.auth.owner_status import log_agent_owner_inactive
+from jentic_one.shared.auth.permission_catalog import compute_effective
 from jentic_one.shared.db import DatabaseSession
 from jentic_one.shared.models import ActorType
 
@@ -43,7 +47,7 @@ def is_retired_service_account_key(token: str) -> bool:
 # Theme-5 Phase 4 (key retirement): a retired toolkit key's plaintext keeps
 # authenticating as its successor agent for the same reason (digest copied into
 # ``agent_credentials``). The prefix is DEPRECATED (see
-# ``docs/development/releasing.md``): each successful resolve logs a warning
+# ``docs/operations/upgrade-notes.md``): each successful resolve logs a warning
 # naming the actor; acceptance ends no earlier than 2026-12-01.
 RETIRED_TOOLKIT_KEY_PREFIX = "jntc_live_"
 
@@ -56,19 +60,38 @@ class _AgentArm(enum.Enum):
 
 @dataclass(frozen=True)
 class _InactiveAgent:
-    """Agent-arm outcome: the digest is present, but its agent is not active.
+    """Agent-arm outcome: the digest is present, but its agent may not act.
 
     Carries the agent id so the fail-closed WARNING can name the successor
-    the operator must re-enable.
+    the operator must re-enable. ``owner_inactive`` is set when the agent
+    itself is active but its owning user is not: an owned agent follows its
+    owner's account status.
     """
 
     agent_id: str
+    owner_inactive: bool = False
+
+
+_AGENT_CREDENTIAL_LOOKUP = text(
+    "SELECT a.id AS agent_id, a.name, a.status, a.owner_id,"
+    " CASE WHEN u.deleted_at IS NULL THEN u.active ELSE FALSE END AS owner_active,"
+    " g.permission, og.permission AS owner_permission"
+    " FROM agent_credentials ac"
+    " JOIN agents a ON a.id = ac.agent_id"
+    " LEFT JOIN users u ON u.id = a.owner_id"
+    " LEFT JOIN user_permission_grants og ON og.user_id = a.owner_id"
+    " LEFT JOIN actor_permission_grants g ON g.actor_id = a.id AND g.actor_type = 'agent'"
+    " WHERE ac.api_key_hash = :key_hash"
+).columns(owner_active=Boolean)
 
 
 class ApiKeyResolver:
     """Resolves API keys to an Identity by digest lookup in ``agent_credentials``.
 
-    - ``jak_`` keys query ``agent_credentials`` joined to ``agents``.
+    - ``jak_`` keys query ``agent_credentials`` joined to ``agents``, the
+      owner's ``users`` row, and ``actor_permission_grants`` in one statement:
+      an owned agent authenticates only while both it and its owner are active
+      (an ownerless agent depends on its own status alone).
     - ``jntc_live_`` keys (retired, deprecated) go through the same lookup:
       the theme-5 migration copied each retired key's digest onto its
       successor agent, so the key resolves as that agent. A digest miss, or a
@@ -78,7 +101,10 @@ class ApiKeyResolver:
       INFO line naming the successor agent when one holds the digest.
 
     Implements ``TokenResolverProtocol`` (via ``resolve_access_token``) so it
-    can be wrapped by ``CachedTokenValidator``.
+    can be wrapped by ``CachedTokenValidator``. Behind that cache (the broker),
+    a status change to the agent or its owner takes effect once the cached
+    verdict expires (``broker.resolve_cache_ttl_seconds``); the admin and auth
+    surfaces resolve uncached, so it takes effect on the next request.
     """
 
     def __init__(self, admin_db: DatabaseSession) -> None:
@@ -116,14 +142,20 @@ class ApiKeyResolver:
             actionable_step=(
                 "Service-account (sak_) keys stopped working in 0.41. Mint a jak_ key "
                 "for the successor agent and switch this caller to it (see "
-                "'Upgrading to 0.41.0' in docs/development/releasing.md)."
+                "docs/operations/upgrade-notes.md, 0.41.0)."
             ),
         )
 
     async def _resolve_retired(
         self, raw_key: str, *, event: str, deadline_note: str
     ) -> Identity | None:
-        """Retired-prefix arm: resolve as the successor agent, or fail closed."""
+        """Retired-prefix arm: resolve as the successor agent, or fail closed.
+
+        A successor refused only because its owner is not active returns early
+        with the ``agent_owner_inactive`` event alone: the key is not logged as
+        ``migrated_key_fail_closed``, which is reserved for a successor agent
+        whose own status is not active.
+        """
         arm = await self._lookup_agent(raw_key)
         if isinstance(arm, Identity):
             # One WARNING per resolve, naming the successor now serving the
@@ -133,11 +165,14 @@ class ApiKeyResolver:
                 agent_id=arm.sub,
                 actionable_step=(
                     "Rotate this caller to its successor agent's jak_ key; "
-                    f"{deadline_note} (see docs/development/releasing.md)."
+                    f"{deadline_note} (see docs/operations/upgrade-notes.md)."
                 ),
             )
             return arm
         if isinstance(arm, _InactiveAgent):
+            if arm.owner_inactive:
+                # Already logged as ``agent_owner_inactive`` by the lookup.
+                return None
             # The successor is the authoritative identity and it is
             # disabled/archived: fail closed (the operator kill lever).
             logger.warning(
@@ -170,37 +205,51 @@ class ApiKeyResolver:
         return arm if isinstance(arm, Identity) else None
 
     async def _credential_row(self, raw_key: str) -> Any:
-        """The agent holding ``raw_key``'s digest, read in its own admin session."""
-        async with self._admin_db.session() as session:
-            return await self._fetch_credential_row(session, raw_key)
+        """The agent holding ``raw_key``'s digest, read in its own admin read session."""
+        async with self._admin_db.read_session() as session:
+            rows = await self._fetch_credential_rows(session, raw_key)
+        return rows[0] if rows else None
 
-    async def _fetch_credential_row(self, session: AsyncSession, raw_key: str) -> Any:
-        """The agent holding ``raw_key``'s digest: ``agent_id, name, status, owner_id``.
+    async def _fetch_credential_rows(self, session: AsyncSession, raw_key: str) -> Sequence[Any]:
+        """The agent holding ``raw_key``'s digest and its granted permissions.
 
+        Columns: ``agent_id, name, status, owner_id, owner_active, permission``.
         ``name`` rides along off the already-joined ``agents`` row (no extra
         query) so the resolved ``Identity`` can carry a human-readable actor
-        name into audit event summaries (#1543).
+        name into audit event summaries (#1543). ``owner_active`` is
+        ``u.active AND u.deleted_at IS NULL``, read by the same statement (an
+        outer join): NULL for an ownerless agent or a missing owner row, and
+        FALSE when the owner is disabled or deleted. ``permission`` comes from
+        an outer join to ``actor_permission_grants`` (NULL when the agent holds
+        no grants), so the credential lookup and grant read complete in one
+        statement (#1944).
         """
         key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
-        stmt = text(
-            "SELECT a.id AS agent_id, a.name, a.status, a.owner_id"
-            " FROM agent_credentials ac"
-            " JOIN agents a ON a.id = ac.agent_id"
-            " WHERE ac.api_key_hash = :key_hash"
-        )
-        return (await session.execute(stmt, {"key_hash": key_hash})).one_or_none()
+        return (await session.execute(_AGENT_CREDENTIAL_LOOKUP, {"key_hash": key_hash})).all()
 
     async def _lookup_agent(self, raw_key: str) -> Identity | _AgentArm | _InactiveAgent:
-        # One admin session per lookup: the credential row and the active
-        # agent's grants are read on the same pooled connection (#1703), as the
-        # ``at_`` path does. Grants are only read for an active agent.
-        async with self._admin_db.session() as session:
-            row = await self._fetch_credential_row(session, raw_key)
-            if row is None:
-                return _AgentArm.MISS
-            if row.status != "active":
-                return _InactiveAgent(agent_id=row.agent_id)
-            permissions = await self._load_permissions(session, row.agent_id, ActorType.AGENT)
+        # One autocommit read session and one statement per lookup (#1703, #1944):
+        # the credential row, owner liveness, and active agent's grants are read
+        # in a single round-trip without BEGIN/ROLLBACK overhead.
+        async with self._admin_db.read_session() as session:
+            rows = await self._fetch_credential_rows(session, raw_key)
+        if not rows:
+            return _AgentArm.MISS
+        row = rows[0]
+        if row.status != "active":
+            return _InactiveAgent(agent_id=row.agent_id)
+        if row.owner_id is not None and not row.owner_active:
+            # The owner is disabled or deleted, or its row is missing:
+            # fail closed.
+            log_agent_owner_inactive(row.agent_id, row.owner_id)
+            return _InactiveAgent(agent_id=row.agent_id, owner_inactive=True)
+        raw_permissions = [r.permission for r in rows if r.permission is not None]
+        owner_effective = (
+            compute_effective({r.owner_permission for r in rows if r.owner_permission is not None})
+            if row.owner_id is not None and hasattr(row, "owner_permission")
+            else None
+        )
+        permissions = cap_agent_permissions(raw_permissions, owner_effective)
         return Identity(
             sub=row.agent_id,
             actor_name=row.name or "",
@@ -208,15 +257,6 @@ class ApiKeyResolver:
             permissions=permissions,
             parent_actor_id=row.owner_id,
             active=True,
+            auth_token_sha256=hashlib.sha256(raw_key.encode()).hexdigest(),
+            auth_method="api_key",
         )
-
-    async def _load_permissions(
-        self, session: AsyncSession, actor_id: str, actor_type: ActorType
-    ) -> list[str]:
-        """The actor's granted permissions, read on the caller's ``session``."""
-        stmt = text(
-            "SELECT permission FROM actor_permission_grants"
-            " WHERE actor_id = :actor_id AND actor_type = :actor_type"
-        )
-        result = await session.execute(stmt, {"actor_id": actor_id, "actor_type": actor_type.value})
-        return [row.permission for row in result.all()]

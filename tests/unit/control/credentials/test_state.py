@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 from datetime import UTC, datetime
 
@@ -9,11 +10,17 @@ import pytest
 
 from jentic_one.control.services.credentials.schemas.connect import ConnectState
 from jentic_one.control.services.credentials.state import (
+    BROWSER_BINDING_COOKIE_PREFIX,
+    BrowserBindingClaim,
     StateExpiredError,
     StateInvalidError,
+    browser_binding_matches,
     decode_state,
     encode_state,
     generate_nonce,
+    new_browser_binding,
+    pkce_challenge_s256,
+    pkce_verifier_for,
 )
 
 SECRET = "test-secret-for-state-signing"
@@ -115,3 +122,85 @@ def test_state_without_redirect_uri_decodes_to_none() -> None:
     token = encode_state(SECRET, state, ttl_seconds=600)
     decoded = decode_state(SECRET, token)
     assert decoded.redirect_uri is None
+
+
+# --- browser binding ---
+
+
+def test_new_browser_binding_hashes_its_value() -> None:
+    binding = new_browser_binding(host="localhost")
+    assert binding.digest == hashlib.sha256(binding.value.encode()).hexdigest()
+    assert binding.claim == BrowserBindingClaim(digest=binding.digest, host="localhost")
+    assert binding.cookie_name == f"{BROWSER_BINDING_COOKIE_PREFIX}{binding.digest[:16]}"
+    # The raw value is the secret half: never in a repr (and so never in a log line).
+    assert binding.value not in repr(binding)
+
+
+def test_new_browser_binding_is_random_per_flow() -> None:
+    assert len({new_browser_binding().value for _ in range(50)}) == 50
+
+
+def test_state_roundtrips_browser_binding_claims() -> None:
+    binding = new_browser_binding(host="127.0.0.1")
+    state = _make_state().model_copy(
+        update={"browser_binding_hash": binding.digest, "browser_host": binding.host}
+    )
+    decoded = decode_state(SECRET, encode_state(SECRET, state, ttl_seconds=600))
+    assert decoded.browser_binding_hash == binding.digest
+    assert decoded.browser_host == "127.0.0.1"
+
+
+def test_state_without_browser_binding_decodes_to_none() -> None:
+    decoded = decode_state(SECRET, encode_state(SECRET, _make_state(), ttl_seconds=600))
+    assert decoded.browser_binding_hash is None
+    assert decoded.browser_host is None
+
+
+def test_browser_binding_matches_only_the_minted_value() -> None:
+    binding = new_browser_binding()
+    state = _make_state().model_copy(update={"browser_binding_hash": binding.digest})
+    assert browser_binding_matches(state, binding.value)
+    assert not browser_binding_matches(state, new_browser_binding().value)
+    assert not browser_binding_matches(state, None)
+    assert not browser_binding_matches(state, "")
+    # The hash itself is not the cookie value.
+    assert not browser_binding_matches(state, binding.digest)
+
+
+def test_unbound_state_never_matches() -> None:
+    """A state signed before binding existed is refused, never accepted unbound."""
+    assert not browser_binding_matches(_make_state(), new_browser_binding().value)
+
+
+# --- PKCE S256 ---
+
+
+def test_pkce_verifier_is_deterministic_secret_bound_and_rfc7636_shaped() -> None:
+    unreserved = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+    verifier = pkce_verifier_for(SECRET, "nonce-1")
+    assert len(verifier) == 43
+    assert set(verifier) <= unreserved
+    # Deterministic for the same (secret, nonce).
+    assert pkce_verifier_for(SECRET, "nonce-1") == verifier
+    # Bound to both secret and nonce.
+    assert pkce_verifier_for("other-secret", "nonce-1") != verifier
+    assert pkce_verifier_for(SECRET, "nonce-2") != verifier
+    # Challenge is RFC 7636 S256 (43-char base64url SHA-256 without padding).
+    challenge = pkce_challenge_s256(verifier)
+    assert len(challenge) == 43
+    assert set(challenge) <= unreserved
+
+
+def test_state_round_trips_pkce_claim() -> None:
+    state = _make_state().model_copy(update={"pkce": True})
+    token = encode_state(SECRET, state, ttl_seconds=600)
+    decoded = decode_state(SECRET, token)
+    assert decoded.pkce is True
+
+
+def test_legacy_state_without_pkc_decodes_pkce_false() -> None:
+    state = _make_state()
+    assert state.pkce is False
+    token = encode_state(SECRET, state, ttl_seconds=600)
+    decoded = decode_state(SECRET, token)
+    assert decoded.pkce is False

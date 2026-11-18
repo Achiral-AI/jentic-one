@@ -13,6 +13,7 @@ from jentic_one.admin.core.schema.users import User
 from jentic_one.admin.repos import UserPermissionGrantRepository
 from jentic_one.admin.services._support.tokens import issue_jwt
 from jentic_one.shared.context import Context
+from tests.web.admin.conftest import ADMIN_EMAIL, ADMIN_PASSWORD
 
 pytestmark = pytest.mark.integration
 
@@ -84,10 +85,14 @@ def test_set_non_grantable_permission(authed_client: TestClient, admin_user_id: 
     assert resp.status_code == 422
 
 
-def test_set_permissions_on_more_privileged_user_forbidden(
+def test_set_permissions_on_another_user_not_found(
     unauthed_client: TestClient, web_context: Context, admin_user_id: str, managed_user_id: str
 ) -> None:
-    """A users:write holder cannot change the permissions of an org:admin."""
+    """A users:write holder cannot change another user's permissions (404, like GET).
+
+    The target is outside a non-admin caller's ``User`` scope, so its grants
+    stay as they are; the caller can still set their own.
+    """
 
     async def _grant() -> None:
         async with web_context.admin_db.transaction() as session:
@@ -114,8 +119,24 @@ def test_set_permissions_on_more_privileged_user_forbidden(
         json={"permissions": ["users:read"]},
         headers={"Authorization": f"Bearer {token}"},
     )
-    assert resp.status_code == 403
-    assert resp.json()["type"] == "user_management_forbidden"
+    assert resp.status_code == 404
+    assert resp.json()["type"] == "user_not_found"
+
+    async def _assigned(user_id: str) -> set[str]:
+        async with web_context.admin_db.session() as session:
+            sets = await UserPermissionGrantRepository.get_permission_sets(session, [user_id])
+        return sets[user_id]
+
+    assert asyncio.get_event_loop().run_until_complete(_assigned(admin_user_id)) == {"org:admin"}
+
+    resp = unauthed_client.put(
+        f"/users/{managed_user_id}/permissions",
+        json={"permissions": ["users:write"]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["id"] == managed_user_id
+    assert resp.json()["permissions"]["assigned"] == ["users:write"]
 
 
 def test_removing_org_admin_from_last_active_admin_conflicts(
@@ -151,6 +172,63 @@ def test_removing_org_admin_from_last_active_admin_conflicts(
         )
         assert resp.status_code == 409
         assert resp.json()["type"] == "last_active_admin"
+        # The refused edit changes nothing, the caller's session included.
+        assert authed_client.get("/permissions").status_code == 200
     finally:
         if others:
             loop.run_until_complete(_reactivate(others))
+
+
+def test_narrowing_permissions_refuses_the_existing_login_jwt(
+    unauthed_client: TestClient, web_context: Context, admin_user_id: str, managed_user_id: str
+) -> None:
+    """A login JWT minted before its user's permissions narrow gets 401, not the old set.
+
+    The admin signs in for a real login JWT (it embeds ``org:admin``); a
+    second org admin then narrows the admin to ``users:write``. The old JWT is
+    refused on its next request and cannot refresh, and a fresh login carries
+    the narrower set.
+    """
+
+    async def _make_second_admin() -> None:
+        async with web_context.admin_db.transaction() as session:
+            await UserPermissionGrantRepository.set_permissions(
+                session,
+                managed_user_id,
+                permissions={"org:admin"},
+                granted_by=None,
+                created_by="usr_test",
+            )
+
+    asyncio.get_event_loop().run_until_complete(_make_second_admin())
+    config = web_context.config.admin.auth
+    other_admin = issue_jwt(
+        {"sub": managed_user_id, "email": "web-managed@test.local", "actor_type": "user"},
+        config.jwt_secret.get_secret_value(),
+        config.jwt_ttl_seconds,
+    )
+
+    def _login() -> dict[str, str]:
+        resp = unauthed_client.post(
+            "/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
+        )
+        assert resp.status_code == 200
+        return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+
+    stale = _login()
+    assert unauthed_client.get("/events", headers=stale).status_code == 200
+
+    resp = unauthed_client.put(
+        f"/users/{admin_user_id}/permissions",
+        json={"permissions": ["users:write"]},
+        headers={"Authorization": f"Bearer {other_admin}"},
+    )
+    assert resp.status_code == 200
+
+    assert unauthed_client.get("/events", headers=stale).status_code == 401
+    assert unauthed_client.get(f"/users/{admin_user_id}", headers=stale).status_code == 401
+    assert unauthed_client.post("/auth/refresh", headers=stale).status_code == 401
+
+    fresh = _login()
+    assert unauthed_client.get(f"/users/{admin_user_id}", headers=fresh).status_code == 200
+    assert unauthed_client.get("/events", headers=fresh).status_code == 403

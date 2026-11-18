@@ -98,15 +98,21 @@ async def _seed(
 async def test_daily_buckets_groups_by_day(
     admin_db: DatabaseSession, clean_execution_records: None
 ) -> None:
-    now = datetime.now(UTC)
-    # Two executions today, one yesterday — must collapse into two day buckets.
+    # Anchored at a fixed mid-day timestamp, not the wall clock: seeding relative
+    # to ``now`` puts ``now - 30min`` on the previous day between 00:00 and
+    # 00:30 UTC (#1806). The window is anchored on the same timestamp, so
+    # nothing here depends on the current time.
+    now = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
+    # Two executions on the anchor day, one the day before — two day buckets.
     await _seed(admin_db, now, "completed")
     await _seed(admin_db, now - timedelta(minutes=30), "failed")
     await _seed(admin_db, now - timedelta(days=1), "completed")
 
     cutoff = now - timedelta(days=7)
     async with admin_db.session() as session:
-        buckets = await MonitoringRepository.daily_buckets(session, cutoff)
+        buckets = await MonitoringRepository.daily_buckets(
+            session, cutoff, now + timedelta(minutes=1)
+        )
 
     assert len(buckets) == 2
     # Each bucket date is a YYYY-MM-DD string on both backends.
@@ -114,10 +120,11 @@ async def test_daily_buckets_groups_by_day(
         assert len(bucket.date) == 10
         assert bucket.date[4] == "-" and bucket.date[7] == "-"
     by_date = {b.date: b for b in buckets}
-    today = by_date[now.strftime("%Y-%m-%d")]
-    assert today.total == 2
-    assert today.success == 1
-    assert today.failed == 1
+    anchor_day = by_date["2026-01-15"]
+    assert anchor_day.total == 2
+    assert anchor_day.success == 1
+    assert anchor_day.failed == 1
+    assert by_date["2026-01-14"].total == 1
 
 
 async def test_daily_buckets_respects_cutoff(
@@ -128,7 +135,9 @@ async def test_daily_buckets_respects_cutoff(
     await _seed(admin_db, now - timedelta(days=10), "completed")  # before cutoff
 
     async with admin_db.session() as session:
-        buckets = await MonitoringRepository.daily_buckets(session, now - timedelta(days=7))
+        buckets = await MonitoringRepository.daily_buckets(
+            session, now - timedelta(days=7), now + timedelta(minutes=1)
+        )
 
     assert len(buckets) == 1
     assert buckets[0].total == 1
@@ -138,8 +147,9 @@ async def test_daily_buckets_empty(
     admin_db: DatabaseSession, clean_execution_records: None
 ) -> None:
     async with admin_db.session() as session:
+        now = datetime.now(UTC)
         buckets = await MonitoringRepository.daily_buckets(
-            session, datetime.now(UTC) - timedelta(days=7)
+            session, now - timedelta(days=7), now + timedelta(minutes=1)
         )
     assert buckets == []
 
@@ -167,12 +177,132 @@ async def test_top_operations_ranks_by_total(
     )
 
     async with admin_db.session() as session:
-        ops = await MonitoringRepository.top_operations(session, now - timedelta(days=7))
+        ops = await MonitoringRepository.top_operations(
+            session, now - timedelta(days=7), now + timedelta(minutes=1)
+        )
 
     assert ops[0].operation_id == "listUsers"
     assert ops[0].total == 3
     failed_op = next(o for o in ops if o.operation_id == "getRepo")
     assert failed_op.failed == 1
+
+
+async def test_top_operations_breaks_ties_deterministically_across_limit(
+    admin_db: DatabaseSession, clean_execution_records: None
+) -> None:
+    """Pins #1801: tied operations sort deterministically by (api_vendor, api_name, operation_id),
+    including which rows win at the LIMIT cut-off."""
+    now = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
+    # Seed in reverse lexical order so insertion/heap scan order disagrees with the tie-breaker.
+    tied_ops = [
+        ("stripe", "payments", "refundCharge"),
+        ("stripe", "payments", "createCharge"),
+        ("stripe", "billing", "listInvoices"),
+        ("github", "rest", "listRepos"),
+    ]
+    for vendor, name, op_id in tied_ops:
+        for _ in range(2):
+            await _seed(
+                admin_db,
+                now,
+                "completed",
+                api_vendor=vendor,
+                api_name=name,
+                operation_id=op_id,
+            )
+
+    cutoff = now - timedelta(hours=1)
+    until = now + timedelta(minutes=1)
+    async with admin_db.session() as session:
+        all_four = await MonitoringRepository.top_operations(session, cutoff, until, limit=10)
+        cut_two = await MonitoringRepository.top_operations(session, cutoff, until, limit=2)
+
+    expected_order = [
+        ("github", "rest", "listRepos", 2),
+        ("stripe", "billing", "listInvoices", 2),
+        ("stripe", "payments", "createCharge", 2),
+        ("stripe", "payments", "refundCharge", 2),
+    ]
+    assert [(o.api_vendor, o.api_name, o.operation_id, o.total) for o in all_four] == expected_order
+    assert [(o.api_vendor, o.api_name, o.operation_id, o.total) for o in cut_two] == expected_order[
+        :2
+    ]
+
+
+@pytest.mark.parametrize(
+    ("group_by", "expected_keys"),
+    [
+        ("agent", ["agent/agt_alpha", "agent/agt_beta", "agent/agt_gamma", "user/usr_alpha"]),
+        ("api", ["acme/widgets", "github/repos", "stripe/payments", "unknown/unknown"]),
+        ("credential", ["cred_a", "cred_b", "cred_m", "unknown"]),
+    ],
+)
+async def test_grouped_top_breaks_ties_deterministically_across_limit(
+    admin_db: DatabaseSession,
+    clean_execution_records: None,
+    group_by: str,
+    expected_keys: list[str],
+) -> None:
+    """Pins #1801: grouped_top orders tied counts by key ascending on both backends,
+    handling nullable attribution columns consistently and selecting identical rows at LIMIT."""
+    now = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
+    # Seed in reverse order so physical table order opposes the deterministic tie-breaker.
+    rows: list[dict[str, object]] = [
+        {
+            "actor_type": "user",
+            "actor_id": "usr_alpha",
+            "api_vendor": None,
+            "api_name": None,
+            "credential_id": None,
+        },
+        {
+            "actor_type": "agent",
+            "actor_id": "agt_gamma",
+            "api_vendor": "stripe",
+            "api_name": "payments",
+            "credential_id": "cred_m",
+        },
+        {
+            "actor_type": "agent",
+            "actor_id": "agt_beta",
+            "api_vendor": "github",
+            "api_name": "repos",
+            "credential_id": "cred_b",
+        },
+        {
+            "actor_type": "agent",
+            "actor_id": "agt_alpha",
+            "api_vendor": "acme",
+            "api_name": "widgets",
+            "credential_id": "cred_a",
+        },
+    ]
+    for attrs in rows:
+        for _ in range(2):
+            async with admin_db.session() as session:
+                await ExecutionRecordRepository.create(
+                    session,
+                    toolkit_id="tk_test000000000000000000",
+                    trace_id="abcdef1234567890abcdef12",
+                    started_at=now,
+                    status="completed",
+                    created_by="usr_test",
+                    actor_id=str(attrs["actor_id"]),
+                    actor_type=str(attrs["actor_type"]),
+                    api_vendor=attrs["api_vendor"],  # type: ignore[arg-type]
+                    api_name=attrs["api_name"],  # type: ignore[arg-type]
+                    credential_id=attrs["credential_id"],  # type: ignore[arg-type]
+                )
+                await session.commit()
+
+    cutoff = now - timedelta(hours=1)
+    until = now + timedelta(minutes=1)
+    async with admin_db.session() as session:
+        full = await MonitoringRepository.grouped_top(session, cutoff, until, group_by, 10)
+        boundary = await MonitoringRepository.grouped_top(session, cutoff, until, group_by, 2)
+
+    assert [r.key for r in full] == expected_keys
+    assert [r.key for r in boundary] == expected_keys[:2]
 
 
 async def test_overall_stats_counts_and_percentiles(
@@ -304,13 +434,15 @@ async def test_overall_stats_counts_unfinished_execution_jobs(
 
     async with admin_db.session() as session:
         stats = await MonitoringRepository.overall_stats(session, cutoff, until)
+        active = await MonitoringRepository.active_now(session)
 
     assert stats.total == 1
     assert stats.success == 1
-    # Only the two running execution jobs (one in the window, one before it) are
-    # active; queued jobs never are, wherever they sit.
     assert stats.pending == 2
-    assert stats.active_now == 2
+    # Only the two running execution jobs (one in the window, one before it) are
+    # active; queued jobs never are, wherever they sit. `active_now` carries no
+    # time bound, which is why the job three hours back still counts.
+    assert active == 2
 
 
 async def test_overall_stats_unfinished_counts_follow_filters(
@@ -330,13 +462,13 @@ async def test_overall_stats_unfinished_counts_follow_filters(
             stats = await MonitoringRepository.overall_stats(
                 session, cutoff, until, filters=filters
             )
-        return stats.pending, stats.active_now
+            active = await MonitoringRepository.active_now(session, filters=filters)
+        return stats.pending, active
 
     assert await _stats(UsageQueryFilters()) == (3, 2)
     assert await _stats(UsageQueryFilters(actor_id="usr_test")) == (2, 1)
     assert await _stats(UsageQueryFilters(actor_id="agnt_other")) == (1, 1)
     assert await _stats(UsageQueryFilters(api_vendor="github", api_name="rest")) == (2, 2)
     assert await _stats(UsageQueryFilters(api_vendor="stripe", api_name="payments")) == (1, 0)
-    # Execution jobs carry no toolkit, and no unfinished execution has a final status.
-    assert await _stats(UsageQueryFilters(toolkit_id="tk_test000000000000000000")) == (0, 0)
+    # No unfinished execution has a final status.
     assert await _stats(UsageQueryFilters(status="completed")) == (0, 0)

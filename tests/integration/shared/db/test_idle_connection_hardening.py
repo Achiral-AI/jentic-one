@@ -1,14 +1,18 @@
 """Integration tests for idle-connection hardening on Postgres (#1082).
 
 Covers the engine wiring that keeps pooled connections healthy across a
-dropped/idle connection: TCP keepalive on the client socket and transparent
-replacement of a pooled connection the server has terminated — and that real
-errors on a live connection are not mistaken for a lost one.
+dropped/idle connection: TCP keepalive on the client socket, transparent
+replacement of a pooled connection the server has terminated (pre-ping on),
+mapping that dead connection to a retryable ``DatabaseUnavailableError`` when
+pre-ping is off — and that real errors on a live connection are not mistaken
+for a lost one.
 """
 
 from __future__ import annotations
 
+import asyncio
 import socket
+from collections.abc import AsyncGenerator
 
 import asyncpg
 import pytest
@@ -112,31 +116,186 @@ async def test_terminated_pooled_connection_is_replaced_transparently(
 ) -> None:
     """A pooled connection killed server-side costs a reconnect, not an error.
 
-    Mirrors a connection dropped while idle (VM sleep, proxy timeout): the next
-    checkout's pre-ping detects it and the pool reconnects before the caller's
-    statement runs.
+    Even within ``pool_pre_ping_idle_s``, once the client transport observes the
+    peer close, checkout's pre-ping check detects the closed driver connection
+    without a wire round trip and reconnects before the caller's statement runs
+    — so even a bare ``transaction()`` (no retry) succeeds.
     """
     _require_postgres(admin_db)
+    async with admin_db.transaction() as session:
+        raw = await (await session.connection()).get_raw_connection()
+        driver = raw.driver_connection
+        assert driver is not None
+        stale_pid = await _backend_pid(session)
+    await _terminate_backend(admin_db, stale_pid)
+    async with asyncio.timeout(2.0):
+        while not driver.is_closed():
+            await asyncio.sleep(0.001)
 
-    async def _pid(session: AsyncSession) -> int:
-        return int((await session.execute(text("SELECT pg_backend_pid()"))).scalar_one())
+    async with admin_db.transaction() as session:
+        fresh_pid = await _backend_pid(session)
+    assert fresh_pid != stale_pid
 
-    stale_pid = await admin_db.run_in_transaction(_pid)
 
-    # Kill the pooled backend from a separate, unpooled engine (a checkout
-    # from the same pool would hand back the very connection being killed).
-    killer_engine = create_async_engine(admin_db.engine.url, poolclass=NullPool)
+async def _backend_pid(session: AsyncSession) -> int:
+    return int((await session.execute(text("SELECT pg_backend_pid()"))).scalar_one())
+
+
+async def _terminate_backend(db: DatabaseSession, pid: int) -> None:
+    """Kill ``pid`` from a separate, unpooled engine (not a checkout from ``db``'s pool)."""
+    killer_engine = create_async_engine(db.engine.url, poolclass=NullPool)
     try:
         async with killer_engine.connect() as killer:
             killed = (
-                await killer.execute(text("SELECT pg_terminate_backend(:pid)"), {"pid": stale_pid})
+                await killer.execute(text("SELECT pg_terminate_backend(:pid, 5000)"), {"pid": pid})
             ).scalar_one()
     finally:
         await killer_engine.dispose()
     assert killed is True
 
-    fresh_pid = await admin_db.run_in_transaction(_pid)
+
+@pytest.mark.asyncio
+async def test_idle_gated_pre_ping_skips_active_checkouts_and_pings_after_idle(
+    admin_db: DatabaseSession, integration_config: AppConfig
+) -> None:
+    """Active checkouts skip wire pings; checkouts after ``pool_pre_ping_idle_s`` ping (#1935)."""
+    _require_postgres(admin_db)
+    config = integration_config.databases.admin.model_copy(
+        update={"pool_max": 1, "pool_pre_ping": True, "pool_pre_ping_idle_s": 0.05}
+    )
+    db = DatabaseSession(config)
+    await db.connect()
+    wire_queries: list[str] = []
+    try:
+        # First checkout creates the connection (fresh -> no pre-ping); attach wire logger.
+        async with db.read_session() as session:
+            raw = await (await session.connection()).get_raw_connection()
+            driver = raw.driver_connection
+            assert driver is not None
+            driver.add_query_logger(lambda rec: wire_queries.append(rec.query))
+            first_pid = await _backend_pid(session)
+        assert ";" not in wire_queries
+
+        # Immediate back-to-back checkouts across read_session, session, and transaction
+        # reuse the same connection within the 50ms window without any wire ping.
+        wire_queries.clear()
+        async with db.read_session() as session:
+            assert await _backend_pid(session) == first_pid
+        assert wire_queries == []
+
+        async with db.session() as session:
+            assert await _backend_pid(session) == first_pid
+        assert ";" not in wire_queries
+
+        wire_queries.clear()
+        assert await db.run_in_transaction(_backend_pid) == first_pid
+        assert ";" not in wire_queries
+
+        # Once the connection sits idle past pool_pre_ping_idle_s, checkout runs the wire ping.
+        wire_queries.clear()
+        await asyncio.sleep(0.08)
+        async with db.read_session() as session:
+            assert await _backend_pid(session) == first_pid
+        assert wire_queries == ["BEGIN;", ";", "ROLLBACK;"]
+
+        # And a checkout right after skips the wire ping again.
+        wire_queries.clear()
+        async with db.read_session() as session:
+            assert await _backend_pid(session) == first_pid
+        assert wire_queries == []
+
+        # A backend killed while idle past the threshold is replaced on checkout via wire ping.
+        await _terminate_backend(db, first_pid)
+        await asyncio.sleep(0.08)
+        async with db.transaction() as session:
+            fresh_pid = await _backend_pid(session)
+        assert fresh_pid != first_pid
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_zero_pre_ping_idle_threshold_pings_on_immediate_checkout(
+    admin_db: DatabaseSession, integration_config: AppConfig
+) -> None:
+    """``pool_pre_ping_idle_s: 0`` runs the wire ping on every checkout after creation."""
+    _require_postgres(admin_db)
+    config = integration_config.databases.admin.model_copy(
+        update={"pool_max": 1, "pool_pre_ping": True, "pool_pre_ping_idle_s": 0}
+    )
+    db = DatabaseSession(config)
+    await db.connect()
+    wire_queries: list[str] = []
+    try:
+        async with db.read_session() as session:
+            raw = await (await session.connection()).get_raw_connection()
+            assert raw.driver_connection is not None
+            raw.driver_connection.add_query_logger(lambda rec: wire_queries.append(rec.query))
+            await _backend_pid(session)
+
+        wire_queries.clear()
+        async with db.read_session() as session:
+            await _backend_pid(session)
+        assert wire_queries == ["BEGIN;", ";", "ROLLBACK;"]
+    finally:
+        await db.close()
+
+
+@pytest.fixture()
+async def no_pre_ping_db(
+    admin_db: DatabaseSession, integration_config: AppConfig
+) -> AsyncGenerator[DatabaseSession, None]:
+    """An admin ``DatabaseSession`` built with ``pool_pre_ping: false``."""
+    _require_postgres(admin_db)
+    config = integration_config.databases.admin.model_copy(update={"pool_pre_ping": False})
+    db = DatabaseSession(config)
+    await db.connect()
+    try:
+        yield db
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_without_pre_ping_terminated_connection_is_retried(
+    no_pre_ping_db: DatabaseSession,
+) -> None:
+    """With pre-ping off, ``run_in_transaction`` recovers from a dead pooled connection.
+
+    asyncpg surfaces the terminated backend as a bare ``DBAPIError`` (not
+    ``OperationalError``); it must still be classified as transient so the
+    unit of work is re-run on a fresh connection instead of escaping as a 500.
+    """
+    assert no_pre_ping_db.engine.pool._pre_ping is False
+    stale_pid = await no_pre_ping_db.run_in_transaction(_backend_pid)
+    await _terminate_backend(no_pre_ping_db, stale_pid)
+
+    fresh_pid = await no_pre_ping_db.run_in_transaction(_backend_pid)
     assert fresh_pid != stale_pid
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["transaction", "session"])
+async def test_without_pre_ping_terminated_connection_raises_unavailable(
+    no_pre_ping_db: DatabaseSession, scope: str
+) -> None:
+    """A dead pooled connection maps to ``DatabaseUnavailableError`` (a 503), SQL redacted.
+
+    Covers both the write path (``transaction()``, no retry of its own) and
+    the read path (``session()``), and that the pool recovers on the next use.
+    """
+    stale_pid = await no_pre_ping_db.run_in_transaction(_backend_pid)
+    await _terminate_backend(no_pre_ping_db, stale_pid)
+
+    manager = no_pre_ping_db.transaction() if scope == "transaction" else no_pre_ping_db.session()
+    with pytest.raises(DatabaseUnavailableError) as caught:
+        async with manager as session:
+            await _backend_pid(session)
+    assert is_connection_loss(caught.value)
+    assert "[SQL:" not in str(caught.value)
+    assert "pg_backend_pid" not in str(caught.value)
+
+    assert await no_pre_ping_db.run_in_transaction(_backend_pid) != stale_pid
 
 
 @pytest.mark.asyncio

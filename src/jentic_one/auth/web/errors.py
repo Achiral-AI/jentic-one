@@ -8,9 +8,11 @@ import structlog
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
+from jentic_one.admin.services.errors import PasswordHasherBusyError
 from jentic_one.auth.services.errors import (
     ActorNotFoundError,
     AgentAlreadyOwnedError,
+    AgentPermissionExceedsOwnerError,
     ClaimActorNotAllowedError,
     ClaimTokenInvalidError,
     CredentialBindingConflictError,
@@ -35,7 +37,7 @@ from jentic_one.auth.services.errors import (
 from jentic_one.shared.db.errors import DatabaseUnavailableError
 from jentic_one.shared.metrics import get_meter
 from jentic_one.shared.pagination import InvalidCursorError
-from jentic_one.shared.web.errors import make_service_error_handler
+from jentic_one.shared.web.errors import DB_UNAVAILABLE_SAFE_DETAILS, make_service_error_handler
 
 _logger = structlog.get_logger(__name__)
 _meter = get_meter("jentic_one.auth")
@@ -65,8 +67,10 @@ _ERROR_MAP: dict[type[Exception], tuple[int, str]] = {
     RegistrationAccessDeniedError: (401, "registration_access_denied"),
     OperationNotSupportedError: (403, "operation_not_supported"),
     OwnerTransferForbiddenError: (403, "owner_transfer_forbidden"),
+    AgentPermissionExceedsOwnerError: (409, "agent_permission_exceeds_owner"),
     PermissionNotGrantableError: (403, "agent_permission_not_grantable"),
     UnknownPermissionError: (422, "unknown_agent_permission"),
+    PasswordHasherBusyError: (503, "password_hasher_busy"),
 }
 
 
@@ -76,11 +80,13 @@ def _rate_limit_response_hook(
     status_code: int,
     response: JSONResponse,
 ) -> JSONResponse:
-    """Propagate Retry-After on 429 and bump the rate-limited-requests metric."""
+    """Propagate Retry-After on 429/503 and bump the rate-limited-requests metric."""
     if isinstance(exc, RateLimitExceededError):
         retry_after_s = max(1, math.ceil(exc.retry_after))
         response.headers["Retry-After"] = str(retry_after_s)
         _rate_limit_counter.add(1, {"path": request.url.path})
+    elif isinstance(exc, PasswordHasherBusyError):
+        response.headers["Retry-After"] = str(exc.retry_after_s)
     return response
 
 
@@ -113,7 +119,7 @@ _DB_ERROR_MAP: dict[type[Exception], tuple[int, str]] = {
 # caller (CWE-209), so send a static, generic detail and log the raw message
 # server-side (handled by the factory).
 _DB_SAFE_DETAILS: dict[type[Exception], str] = {
-    DatabaseUnavailableError: "The database is temporarily unavailable; please retry.",
+    **DB_UNAVAILABLE_SAFE_DETAILS,
 }
 
 database_error_handler = make_service_error_handler(_DB_ERROR_MAP, safe_details=_DB_SAFE_DETAILS)

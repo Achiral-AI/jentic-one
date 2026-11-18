@@ -8,12 +8,21 @@ from datetime import UTC, datetime
 
 from sqlalchemy import Boolean, text
 
+from jentic_one.shared.auth.agent_permission_ceiling import cap_agent_permissions
 from jentic_one.shared.auth.identity import Identity
+from jentic_one.shared.auth.owner_status import log_agent_owner_inactive
+from jentic_one.shared.auth.permission_catalog import (
+    USER_OAUTH_PASSTHROUGH_SCOPES,
+    compute_effective,
+    effective_user_oauth_scopes,
+)
 from jentic_one.shared.auth.verify import scopes_to_permissions
 from jentic_one.shared.db import DatabaseSession
 from jentic_one.shared.models import ActorType
 
 ACCESS_TOKEN_PREFIX = "at_"
+#: ``actor_status`` of an active, owned agent whose owner is not active.
+_OWNER_INACTIVE = "owner_inactive"
 
 
 class InProcessTokenResolver:
@@ -34,10 +43,12 @@ class InProcessTokenResolver:
         now = datetime.now(UTC)
 
         # actor_status re-checks the actor row on every resolve (#1136): a
-        # disabled/archived agent's outstanding token must stop resolving as
+        # disabled/archived agent's outstanding token (or an owned agent's
+        # whose owner is disabled or deleted) must stop resolving as
         # active, bounded only by the broker's short verdict-cache TTL. NULL
         # (actor row missing) fails closed; the users table models "disabled"
-        # as active=false, normalised here to the same status string.
+        # as active=false and "deleted" as deleted_at set (refused even on a
+        # row that reads active), normalised here to the same status string.
         # oauth_client_active mirrors that guarantee for third-party clients
         # (kill-switch on deactivate must reach broker traffic, not just auth
         # surface). NULL indicates no issuing client, treated as active.
@@ -54,13 +65,25 @@ class InProcessTokenResolver:
             " t.expires_at, t.revoked_at, t.oauth_client_id, t.oauth_grant_id,"
             " CASE t.actor_type"
             "  WHEN 'agent' THEN"
-            "   (SELECT a.status FROM agents a WHERE a.id = t.actor_id)"
+            # An owned agent follows its owner's account status: while the
+            # owner is disabled or deleted the agent reads 'owner_inactive'.
+            # Ownerless agents depend on their own status alone. One PK probe
+            # on agents, one on users.
+            "   (SELECT CASE"
+            "     WHEN a.status <> 'active' THEN a.status"
+            "     WHEN a.owner_id IS NULL THEN 'active'"
+            "     WHEN EXISTS (SELECT 1 FROM users o"
+            "      WHERE o.id = a.owner_id AND o.active AND o.deleted_at IS NULL) THEN 'active'"
+            "     ELSE 'owner_inactive' END"
+            "    FROM agents a WHERE a.id = t.actor_id)"
             # Service-account sessions are retired (theme 8; the tables were
             # dropped in Phase 4). Kept as an explicit fail-closed arm: a
             # bare deletion would drop a residual row into ELSE 'active'.
             "  WHEN 'service_account' THEN 'retired'"
             "  WHEN 'user' THEN"
-            "   (SELECT CASE WHEN u.active THEN 'active' ELSE 'disabled' END"
+            "   (SELECT CASE"
+            "     WHEN u.active AND u.deleted_at IS NULL AND NOT u.must_change_password"
+            "     THEN 'active' ELSE 'disabled' END"
             "    FROM users u WHERE u.id = t.actor_id)"
             "  ELSE 'active'"
             " END AS actor_status,"
@@ -70,6 +93,9 @@ class InProcessTokenResolver:
             # gate, so a NULL/missing row just degrades to the id.
             " (SELECT a.name FROM agents a WHERE a.id = t.actor_id"
             "   AND t.actor_type = 'agent') AS actor_name,"
+            # Only read to name the owner in the ``agent_owner_inactive`` log.
+            " (SELECT a.owner_id FROM agents a WHERE a.id = t.actor_id"
+            "   AND t.actor_type = 'agent') AS actor_owner_id,"
             " (SELECT c.active FROM oauth_clients c"
             "  WHERE c.client_id = t.oauth_client_id) AS oauth_client_active,"
             " (SELECT c.approval_status = 'approved' FROM oauth_clients c"
@@ -88,31 +114,67 @@ class InProcessTokenResolver:
             oauth_client_approved=Boolean,
             oauth_grant_active=Boolean,
         )
-        async with self._admin_db.session() as session:
+        # Read-only: the token lookup and optional grant lookup need no shared
+        # snapshot at READ COMMITTED, so autocommit drops the BEGIN/ROLLBACK
+        # round trips (#1942).
+        async with self._admin_db.read_session() as session:
             result = await session.execute(stmt, {"token_hash": token_hash})
             row = result.one_or_none()
 
             if row is None:
                 return None
 
-            # The mint-time snapshot is an OAuth2 scope set; cross it into the
-            # permission vocabulary the rest of the platform enforces on.
-            permissions = scopes_to_permissions(_as_scope_list(row.scopes))
+            raw_scopes = _as_scope_list(row.scopes)
 
             # Long-lived agent tokens (is_ephemeral=False) resolve permissions
             # live from actor_permission_grants so grant edits take effect
-            # immediately. Ephemeral minted tokens keep their downscoped snapshot;
-            # user tokens do not draw permissions from actor_permission_grants.
+            # immediately. Ephemeral agent tokens keep their downscoped snapshot.
+            # User tokens intersect their snapshot with live user_permission_grants
+            # expanded through effective_user_oauth_scopes (#1442).
             if not row.is_ephemeral and row.actor_type == ActorType.AGENT.value:
                 grants = await session.execute(
                     text(
-                        "SELECT permission FROM actor_permission_grants"
-                        " WHERE actor_id = :actor_id AND actor_type = :actor_type"
-                        " ORDER BY permission"
+                        "SELECT g.permission, og.permission AS owner_permission"
+                        " FROM actor_permission_grants g"
+                        " LEFT JOIN user_permission_grants og ON og.user_id = :owner_id"
+                        " WHERE g.actor_id = :actor_id AND g.actor_type = :actor_type"
+                        " ORDER BY g.permission"
                     ),
-                    {"actor_id": row.actor_id, "actor_type": row.actor_type},
+                    {
+                        "actor_id": row.actor_id,
+                        "actor_type": row.actor_type,
+                        "owner_id": row.actor_owner_id,
+                    },
                 )
-                permissions = [str(g.permission) for g in grants.all()]
+                grant_rows = grants.all()
+                raw_permissions = [
+                    str(g.permission) for g in grant_rows if g.permission is not None
+                ]
+                owner_effective = (
+                    compute_effective(
+                        {
+                            str(g.owner_permission)
+                            for g in grant_rows
+                            if g.owner_permission is not None
+                        }
+                    )
+                    if row.actor_owner_id is not None
+                    else None
+                )
+                permissions = scopes_to_permissions(
+                    cap_agent_permissions(raw_permissions, owner_effective)
+                )
+            elif row.actor_type == ActorType.USER.value:
+                user_grants = await session.execute(
+                    text("SELECT permission FROM user_permission_grants WHERE user_id = :user_id"),
+                    {"user_id": row.actor_id},
+                )
+                user_ceiling = effective_user_oauth_scopes(
+                    {str(g.permission) for g in user_grants.all()}
+                )
+                permissions = scopes_to_permissions([s for s in raw_scopes if s in user_ceiling])
+            else:
+                permissions = scopes_to_permissions(raw_scopes)
 
         # SQLite returns DATETIME columns from a ``text()`` query as ISO strings
         # (Postgres returns aware ``datetime``); normalise so comparisons and the
@@ -125,8 +187,10 @@ class InProcessTokenResolver:
             bool(row.oauth_client_active) and bool(row.oauth_client_approved)
         )
         if oauth_client_id is not None:
-            ceiling = _as_scope_list(row.oauth_client_allowed_scopes)
+            ceiling = set(_as_scope_list(row.oauth_client_allowed_scopes))
             if row.oauth_client_allowed_scopes is not None:
+                if row.actor_type == ActorType.USER.value:
+                    ceiling |= USER_OAUTH_PASSTHROUGH_SCOPES
                 permissions = [s for s in permissions if s in ceiling]
 
         oauth_grant_id = row.oauth_grant_id
@@ -141,6 +205,10 @@ class InProcessTokenResolver:
             # A retired actor type (``toolkit``, ``service_account``) on a
             # residual row: not an identity any more. Fail closed.
             return None
+
+        if row.actor_status == _OWNER_INACTIVE:
+            # Logged once per verdict-cache miss, not per request.
+            log_agent_owner_inactive(row.actor_id, row.actor_owner_id)
 
         active = (
             revoked_at is None
@@ -158,6 +226,8 @@ class InProcessTokenResolver:
             active=active,
             oauth_client_id=oauth_client_id,
             oauth_grant_id=oauth_grant_id,
+            auth_token_sha256=token_hash,
+            auth_method="access_token",
         )
 
 

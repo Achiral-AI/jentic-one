@@ -17,18 +17,18 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from jentic_one.broker.core.exceptions import (
-    AmbiguousMatchError,
+from jentic_one.broker.core.errors import (
+    AmbiguousCredentialMatchError,
     CredentialNeedsReconnectError,
     CredentialNotProvisionedError,
     CredentialRefreshTransientError,
     CredentialUndecryptableError,
-    ErrorOrigin,
 )
 from jentic_one.broker.services.credentials.errors import (
     AmbiguousCredentialError,
     RefreshInvalidGrantError,
     RefreshTransientError,
+    RefreshUndecryptableError,
 )
 from jentic_one.broker.services.credentials.errors import (
     CredentialNotProvisionedError as ResolveNotProvisioned,
@@ -36,6 +36,7 @@ from jentic_one.broker.services.credentials.errors import (
 from jentic_one.broker.services.credentials.orchestrator import CredentialService
 from jentic_one.broker.services.credentials.resolver import ResolvedCredential
 from jentic_one.shared.auth.identity import Identity
+from jentic_one.shared.broker.execution import ErrorOrigin
 from jentic_one.shared.broker.protocols import ConnectableRegistration
 from jentic_one.shared.config import (
     VendorAuthConfig,
@@ -529,7 +530,7 @@ async def test_not_provisioned_ignores_public_base_url(
 async def test_ambiguous_maps_to_409(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_resolver(monkeypatch, AmbiguousCredentialError("stripe", "", "", 2))
 
-    with pytest.raises(AmbiguousMatchError) as exc:
+    with pytest.raises(AmbiguousCredentialMatchError) as exc:
         await _service(_ctx()).inject(
             api_vendor="stripe", api_name="", api_version="", identity=_IDENTITY
         )
@@ -737,6 +738,36 @@ async def test_decryption_error_during_oauth_refresh_also_maps(
             api_vendor="google", api_name="sheets", api_version="v4", identity=_IDENTITY
         )
     assert exc.value.type == "credential_undecryptable"
+
+
+@pytest.mark.asyncio
+async def test_refresh_undecryptable_error_maps_to_424_undecryptable_with_directive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RefreshUndecryptableError from TokenRefresher maps to 424 credential_undecryptable
+    with a prompt_human directive and an actionable credential.undecryptable event."""
+    _patch_resolved(monkeypatch, _resolved_oauth2())
+    _patch_refresher(monkeypatch, RefreshUndecryptableError("cred_oauth"))
+    emit_evt = AsyncMock(return_value="evt_1")
+    monkeypatch.setattr(
+        "jentic_one.broker.services.credentials.orchestrator.emit_event_best_effort", emit_evt
+    )
+
+    with pytest.raises(CredentialUndecryptableError) as exc:
+        await _service(_ctx()).inject(
+            api_vendor="stripe", api_name="charges", api_version="v1", identity=_IDENTITY
+        )
+
+    err = exc.value
+    assert err.type == "credential_undecryptable"
+    assert err.extra == {"credential_id": "cred_oauth", "api_vendor": "stripe"}
+    assert err.directive is not None
+    assert err.directive.strategy == "prompt_human"
+    assert err.directive.parameters == {"credential_id": "cred_oauth", "vendor": "stripe"}
+    emit_evt.assert_awaited_once()
+    assert emit_evt.await_args is not None
+    assert emit_evt.await_args.kwargs["type"] == "credential.undecryptable"
+    assert emit_evt.await_args.kwargs["requires_action"] is True
 
 
 @pytest.mark.asyncio

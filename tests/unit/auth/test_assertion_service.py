@@ -1,4 +1,10 @@
-"""Unit tests for AssertionService."""
+"""Unit tests for AssertionService.
+
+The ``jti`` replay record is stubbed here (``_claim_jti``); its behaviour
+against a real admin database (replay across service instances, expiry,
+concurrent claims) is pinned by
+``tests/integration/auth/test_assertion_jti_replay.py``.
+"""
 
 from __future__ import annotations
 
@@ -12,8 +18,22 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from jwt.algorithms import OKPAlgorithm
 
+from jentic_one.auth.services import assertion_service
 from jentic_one.auth.services.assertion_service import AssertionService
 from jentic_one.auth.services.errors import InvalidGrantError
+
+
+@pytest.fixture(autouse=True)
+def claimed_jtis(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, float]]:
+    """Stub the admin-DB replay record: every claim succeeds and is recorded."""
+    claims: list[tuple[str, str, float]] = []
+
+    async def _claim(session: Any, *, issuer: str, jti: str, exp: float) -> bool:
+        claims.append((issuer, jti, exp))
+        return True
+
+    monkeypatch.setattr(AssertionService, "_claim_jti", staticmethod(_claim))
+    return claims
 
 
 def _make_ctx() -> MagicMock:
@@ -80,7 +100,7 @@ async def test_verify_and_exchange_happy_path(
     ctx = _make_ctx()
     private_key, jwks = _generate_keypair()
     agent = _make_active_agent(jwks)
-    mock_agent_repo.get_by_id_for_update = AsyncMock(return_value=agent)
+    mock_agent_repo.get_with_owner_active = AsyncMock(return_value=(agent, True))
 
     grant = MagicMock()
     grant.permission = "read"
@@ -113,7 +133,7 @@ async def test_verify_pending_agent_gets_distinct_pending_detail(
     private_key, jwks = _generate_keypair()
     agent = _make_active_agent(jwks)
     agent.status = "pending"
-    mock_agent_repo.get_by_id_for_update = AsyncMock(return_value=agent)
+    mock_agent_repo.get_with_owner_active = AsyncMock(return_value=(agent, True))
 
     svc = AssertionService(ctx)
     assertion = _make_assertion(private_key)
@@ -131,7 +151,7 @@ async def test_verify_pending_agent_bad_signature_stays_generic(
     _, jwks = _generate_keypair()
     agent = _make_active_agent(jwks)
     agent.status = "pending"
-    mock_agent_repo.get_by_id_for_update = AsyncMock(return_value=agent)
+    mock_agent_repo.get_with_owner_active = AsyncMock(return_value=(agent, True))
 
     other_private_key = Ed25519PrivateKey.generate()
     svc = AssertionService(ctx)
@@ -152,7 +172,7 @@ async def test_verify_terminal_statuses_stay_generic(
     private_key, jwks = _generate_keypair()
     agent = _make_active_agent(jwks)
     agent.status = status
-    mock_agent_repo.get_by_id_for_update = AsyncMock(return_value=agent)
+    mock_agent_repo.get_with_owner_active = AsyncMock(return_value=(agent, True))
 
     svc = AssertionService(ctx)
     assertion = _make_assertion(private_key)
@@ -160,12 +180,31 @@ async def test_verify_terminal_statuses_stay_generic(
         await svc.verify_and_exchange(assertion)
 
 
+@patch("jentic_one.auth.services.assertion_service.TokenService")
+@patch("jentic_one.auth.services.assertion_service.AgentRepository")
+async def test_verify_active_agent_with_inactive_owner_stays_generic(
+    mock_agent_repo: MagicMock, mock_token_svc_cls: MagicMock
+) -> None:
+    """An active agent whose owner is disabled or deleted mints no tokens and
+    gets the same generic rejection as a disabled agent."""
+    ctx = _make_ctx()
+    private_key, jwks = _generate_keypair()
+    agent = _make_active_agent(jwks)
+    agent.owner_id = "usr_inactive_owner"
+    mock_agent_repo.get_with_owner_active = AsyncMock(return_value=(agent, False))
+
+    svc = AssertionService(ctx)
+    with pytest.raises(InvalidGrantError, match="Assertion is invalid"):
+        await svc.verify_and_exchange(_make_assertion(private_key, jti="owner-off-jti"))
+    mock_token_svc_cls.return_value.issue_pair.assert_not_called()
+
+
 @patch("jentic_one.auth.services.assertion_service.AgentRepository")
 async def test_verify_rejects_bad_signature(mock_agent_repo: MagicMock) -> None:
     ctx = _make_ctx()
     _, jwks = _generate_keypair()
     agent = _make_active_agent(jwks)
-    mock_agent_repo.get_by_id_for_update = AsyncMock(return_value=agent)
+    mock_agent_repo.get_with_owner_active = AsyncMock(return_value=(agent, True))
 
     other_private_key = Ed25519PrivateKey.generate()
     svc = AssertionService(ctx)
@@ -179,7 +218,7 @@ async def test_verify_rejects_expired_assertion(mock_agent_repo: MagicMock) -> N
     ctx = _make_ctx()
     private_key, jwks = _generate_keypair()
     agent = _make_active_agent(jwks)
-    mock_agent_repo.get_by_id_for_update = AsyncMock(return_value=agent)
+    mock_agent_repo.get_with_owner_active = AsyncMock(return_value=(agent, True))
 
     svc = AssertionService(ctx)
     assertion = _make_assertion(private_key, exp=time.time() - 10)
@@ -192,7 +231,7 @@ async def test_verify_rejects_wrong_audience(mock_agent_repo: MagicMock) -> None
     ctx = _make_ctx()
     private_key, jwks = _generate_keypair()
     agent = _make_active_agent(jwks)
-    mock_agent_repo.get_by_id_for_update = AsyncMock(return_value=agent)
+    mock_agent_repo.get_with_owner_active = AsyncMock(return_value=(agent, True))
 
     svc = AssertionService(ctx)
     assertion = _make_assertion(private_key, aud="https://wrong.example.com/oauth/token")
@@ -200,31 +239,78 @@ async def test_verify_rejects_wrong_audience(mock_agent_repo: MagicMock) -> None
         await svc.verify_and_exchange(assertion)
 
 
+@patch("jentic_one.auth.services.assertion_service.AgentRepository")
+async def test_verify_rejects_a_jti_whose_record_is_already_claimed(
+    mock_agent_repo: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused replay-record claim is a generic rejection, before any token is minted."""
+    ctx = _make_ctx()
+    private_key, jwks = _generate_keypair()
+    mock_agent_repo.get_with_owner_active = AsyncMock(return_value=(_make_active_agent(jwks), True))
+    monkeypatch.setattr(AssertionService, "_claim_jti", staticmethod(AsyncMock(return_value=False)))
+
+    with (
+        patch("jentic_one.auth.services.assertion_service.TokenService") as token_cls,
+        pytest.raises(InvalidGrantError, match="Assertion is invalid"),
+    ):
+        await AssertionService(ctx).verify_and_exchange(_make_assertion(private_key))
+    token_cls.assert_not_called()
+
+
 @patch("jentic_one.auth.services.assertion_service.ActorPermissionGrantRepository")
 @patch("jentic_one.auth.services.assertion_service.AgentRepository")
 @patch("jentic_one.auth.services.assertion_service.TokenService")
-async def test_verify_rejects_replayed_jti(
+async def test_verify_claims_the_jti_for_the_verified_issuer(
     mock_token_svc_cls: MagicMock,
     mock_agent_repo: MagicMock,
     mock_permission_repo: MagicMock,
+    claimed_jtis: list[tuple[str, str, float]],
 ) -> None:
     ctx = _make_ctx()
     private_key, jwks = _generate_keypair()
     agent = _make_active_agent(jwks)
-    mock_agent_repo.get_by_id_for_update = AsyncMock(return_value=agent)
+    mock_agent_repo.get_with_owner_active = AsyncMock(return_value=(agent, True))
     mock_permission_repo.list_for_actor = AsyncMock(return_value=[])
+    mock_token_svc_cls.return_value = MagicMock(issue_pair=AsyncMock(return_value=("at", "rt")))
+    exp = time.time() + 60
 
-    token_svc_instance = MagicMock()
-    token_svc_instance.issue_pair = AsyncMock(return_value=("at_1", "rt_1"))
-    mock_token_svc_cls.return_value = token_svc_instance
+    await AssertionService(ctx).verify_and_exchange(
+        _make_assertion(private_key, jti="the-jti", exp=exp)
+    )
 
-    svc = AssertionService(ctx)
-    assertion = _make_assertion(private_key, jti="same-jti")
-    await svc.verify_and_exchange(assertion)
+    assert claimed_jtis == [("agnt_test123", "the-jti", exp)]
 
-    assertion2 = _make_assertion(private_key, jti="same-jti")
-    with pytest.raises(InvalidGrantError, match="invalid"):
-        await svc.verify_and_exchange(assertion2)
+
+@pytest.mark.parametrize("status", ["pending", "rejected"])
+@patch("jentic_one.auth.services.assertion_service.AgentRepository")
+async def test_a_non_active_agent_writes_no_jti_record(
+    mock_agent_repo: MagicMock, status: str, claimed_jtis: list[tuple[str, str, float]]
+) -> None:
+    """Approval polling (a fresh jti per attempt) never writes replay records."""
+    ctx = _make_ctx()
+    private_key, jwks = _generate_keypair()
+    agent = _make_active_agent(jwks)
+    agent.status = status
+    mock_agent_repo.get_with_owner_active = AsyncMock(return_value=(agent, True))
+
+    with pytest.raises(InvalidGrantError):
+        await AssertionService(ctx).verify_and_exchange(_make_assertion(private_key))
+    assert claimed_jtis == []
+
+
+def test_the_jti_record_stores_a_digest_never_the_claim() -> None:
+    digest = assertion_service.jti_digest("some-jti")
+    assert len(digest) == 64
+    assert "some-jti" not in digest
+    assert digest == assertion_service.jti_digest("some-jti")
+    assert digest != assertion_service.jti_digest("some-jti2")
+
+
+def test_a_lone_surrogate_jti_hashes_rather_than_erroring() -> None:
+    """A signed claim of ``"\\ud800"`` decodes to a str strict UTF-8 cannot encode."""
+    digest = assertion_service.jti_digest("\ud800")
+    assert len(digest) == 64
+    assert digest != assertion_service.jti_digest("\ud801")
 
 
 async def test_verify_rejects_non_eddsa_algorithm() -> None:
@@ -239,7 +325,7 @@ async def test_verify_rejects_non_eddsa_algorithm() -> None:
 async def test_verify_rejects_unknown_agent(mock_agent_repo: MagicMock) -> None:
     ctx = _make_ctx()
     private_key, _ = _generate_keypair()
-    mock_agent_repo.get_by_id_for_update = AsyncMock(return_value=None)
+    mock_agent_repo.get_with_owner_active = AsyncMock(return_value=None)
 
     svc = AssertionService(ctx)
     assertion = _make_assertion(private_key)
@@ -278,7 +364,7 @@ async def test_verify_accepts_request_scoped_audience_zero_config(
     (request-scoped) and the bind-derived audience are both accepted."""
     ctx = _make_zero_config_ctx()
     private_key, jwks = _generate_keypair()
-    mock_agent_repo.get_by_id_for_update = AsyncMock(return_value=_make_active_agent(jwks))
+    mock_agent_repo.get_with_owner_active = AsyncMock(return_value=(_make_active_agent(jwks), True))
     mock_scope_repo.list_for_actor = AsyncMock(return_value=[])
     mock_token_svc_cls.return_value = MagicMock(issue_pair=AsyncMock(return_value=("at", "rt")))
 
@@ -296,7 +382,7 @@ async def test_verify_rejects_audience_not_matching_request_or_bind(
 ) -> None:
     ctx = _make_zero_config_ctx()
     private_key, jwks = _generate_keypair()
-    mock_agent_repo.get_by_id_for_update = AsyncMock(return_value=_make_active_agent(jwks))
+    mock_agent_repo.get_with_owner_active = AsyncMock(return_value=(_make_active_agent(jwks), True))
 
     svc = AssertionService(ctx)
     with pytest.raises(InvalidGrantError, match="invalid"):

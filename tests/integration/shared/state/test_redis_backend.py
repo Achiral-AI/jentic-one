@@ -7,6 +7,8 @@ unset or the server is unreachable, so the suite stays green without Redis.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import os
 import uuid
 from collections.abc import AsyncIterator
@@ -15,7 +17,19 @@ import pytest
 
 redis = pytest.importorskip("redis.asyncio")
 
+from jentic_one.broker.core.errors import IdempotencyCompletionError  # noqa: E402
+from jentic_one.broker.services.idempotency import (  # noqa: E402
+    IdempotencyState,
+    SharedStateIdempotencyStore,
+)
+from jentic_one.shared.config import SecurityConfig  # noqa: E402
+from jentic_one.shared.events.repeated_failure import (  # noqa: E402
+    AxisKey,
+    RepeatedFailureCounter,
+)
+from jentic_one.shared.state import SharedStateBackend  # noqa: E402
 from jentic_one.shared.state.redis import RedisStateBackend  # noqa: E402
+from jentic_one.testing import BaseStateBackendContract  # noqa: E402
 
 pytestmark = pytest.mark.integration
 
@@ -35,11 +49,22 @@ async def _redis_available(url: str) -> bool:
 
 @pytest.fixture()
 async def redis_url() -> str:
+    in_ci = os.environ.get("CI") == "true"
     if not _REDIS_URL:
+        if in_ci:
+            pytest.fail("JENTIC_TEST_REDIS_URL must be set in CI")
         pytest.skip("JENTIC_TEST_REDIS_URL not set; Redis integration tests skipped")
     if not await _redis_available(_REDIS_URL):
+        if in_ci:
+            pytest.fail(f"Redis not reachable at {_REDIS_URL} in CI")
         pytest.skip(f"Redis not reachable at {_REDIS_URL}; skipping")
     return _REDIS_URL
+
+
+def test_redis_suite_is_not_skipped_in_ci() -> None:
+    """In CI on the postgres leg, JENTIC_TEST_REDIS_URL must be configured."""
+    if os.environ.get("CI") == "true" and os.environ.get("JENTIC_TEST_BACKEND") != "sqlite":
+        assert _REDIS_URL, "JENTIC_TEST_REDIS_URL must be set on the CI postgres integration leg"
 
 
 @pytest.fixture()
@@ -119,3 +144,105 @@ async def test_distinct_prefixes_are_isolated(redis_url: str) -> None:
     finally:
         await a.aclose()
         await b.aclose()
+
+
+class _RedisContract(BaseStateBackendContract):
+    """The shipped contract on a real Redis, one fresh key prefix per backend."""
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+
+    def backend_factory(self) -> SharedStateBackend:
+        return RedisStateBackend(self.url, key_prefix=f"jentic:test:{uuid.uuid4().hex}:")
+
+
+CONTRACT_TESTS = sorted(
+    name
+    for name, _ in inspect.getmembers(BaseStateBackendContract, inspect.isfunction)
+    if name.startswith("test_")
+)
+
+
+@pytest.mark.parametrize("name", CONTRACT_TESTS)
+async def test_redis_backend_meets_the_contract(redis_url: str, name: str) -> None:
+    result = getattr(_RedisContract(redis_url), name)()
+    if inspect.isawaitable(result):
+        await result
+
+
+async def test_repeated_failure_counter_is_shared_across_instances(
+    redis_url: str, prefix: str
+) -> None:
+    """Two broker instances on one Redis gate the repeated-failure scan on the
+    cluster-wide count: failures split across replicas still reach the threshold."""
+    a = RedisStateBackend(redis_url, key_prefix=prefix)
+    b = RedisStateBackend(redis_url, key_prefix=prefix)
+    config = SecurityConfig(execution_repeated_failure_threshold=4)
+    key = AxisKey("agt_redis", "credential", "cred_redis", "op_redis")
+    try:
+        gates = [RepeatedFailureCounter(a), RepeatedFailureCounter(b)]
+        decisions = [await gates[i % 2].should_scan(key, (), config) for i in range(4)]
+        assert decisions == [False, False, False, True]
+    finally:
+        await a.aclose()
+        await b.aclose()
+
+
+async def test_incr_and_read_matches_the_memory_backend(redis_url: str, prefix: str) -> None:
+    """The one-round-trip windowed step: increments (TTL set only on creation),
+    then reads in order, with missing keys as ``None`` — same as memory."""
+    backend = RedisStateBackend(redis_url, key_prefix=prefix)
+    raw = redis.from_url(redis_url)
+    try:
+        await backend.set("marker", b"1", ttl_s=100.0)
+        assert await backend.incr_and_read(["a", "b"], ["prev", "marker"], ttl_s=10.0) == (
+            [1, 1],
+            [None, b"1"],
+        )
+        assert await backend.incr_and_read(["a"], ["b"], ttl_s=50.0) == ([2], [b"1"])
+        assert await backend.incr_and_read([], ["missing"], ttl_s=10.0) == ([], [None])
+        # The TTL comes from the creating call, prefixed like every other key.
+        assert 0 < await raw.pttl(f"{prefix}a") <= 10_000
+    finally:
+        await raw.aclose()
+        await backend.aclose()
+
+
+async def test_redis_idempotency_lease_renews_and_fences_stale_completion(
+    redis_url: str, prefix: str
+) -> None:
+    """The production Redis CAS preserves lease ownership across broker instances."""
+    backend = RedisStateBackend(redis_url, key_prefix=prefix)
+    store = SharedStateIdempotencyStore(
+        backend,
+        pending_ttl_s=0.4,
+        done_ttl_s=30.0,
+        max_response_bytes=1024,
+    )
+    key = f"key-{uuid.uuid4().hex}"
+    try:
+        claim = await store.begin("agent-1", key, "fp-1")
+        assert claim.state is IdempotencyState.FRESH
+        assert claim.claim_id is not None
+        async with store.lease("agent-1", key, "fp-1", claim.claim_id) as lease:
+            await asyncio.sleep(1.0)
+            pending = await store.begin("agent-1", key, "fp-1")
+            assert pending.state is IdempotencyState.IN_PROGRESS
+            lease.mark_dispatched()
+            await lease.complete(status_code=201, headers={}, body=b"original")
+
+        stale = await store.begin("agent-1", key, "fp-1")
+        assert stale.state is IdempotencyState.REPLAY
+        assert stale.stored is not None
+        assert stale.stored.body == b"original"
+
+        # A writer holding an older generation cannot replace the completed record.
+        with pytest.raises(IdempotencyCompletionError):
+            async with store.lease("agent-1", key, "fp-1", claim.claim_id) as lease:
+                lease.mark_dispatched()
+                await lease.complete(status_code=200, headers={}, body=b"stale")
+        replay = await store.begin("agent-1", key, "fp-1")
+        assert replay.stored is not None
+        assert replay.stored.body == b"original"
+    finally:
+        await backend.aclose()

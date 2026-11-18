@@ -7,6 +7,7 @@ from typing import Any
 from jentic_one.admin.core.permissions import IMPLICATION_MAP, compute_effective
 from jentic_one.admin.core.schema.users import User
 from jentic_one.admin.repos import (
+    AgentRepository,
     AuditRepository,
     ExternalIdentityRepository,
     InviteTokenRepository,
@@ -16,10 +17,11 @@ from jentic_one.admin.repos import (
 )
 from jentic_one.admin.scoping.filters import build_access_filters
 from jentic_one.admin.services._support.actor_jobs import cancel_queued_executions_for_actor
-from jentic_one.admin.services._support.pagination import Page, decode_cursor, encode_cursor
+from jentic_one.admin.services._support.oauth_sweep import sweep_user_oauth_credentials
 from jentic_one.admin.services._support.user_management import (
     ensure_can_change_email,
     ensure_can_manage,
+    ensure_not_deleted,
     ensure_not_last_active_admin,
 )
 from jentic_one.admin.services.errors import (
@@ -38,10 +40,17 @@ from jentic_one.admin.services.schemas.users import (
     UserUpdatePayload,
     UserView,
 )
+from jentic_one.admin.services.user_hooks import run_user_deleted_hooks
 from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.context import Context
 from jentic_one.shared.models import InviteState
 from jentic_one.shared.models.audit import AuditAction, AuditTargetType
+from jentic_one.shared.pagination import Page, decode_cursor, encode_cursor
+
+
+def _tombstone_email(user_id: str) -> str:
+    """The anonymized email a deleted user's retained row carries."""
+    return f"deleted-{user_id}@local"
 
 
 def _derive_invite_state(stored: str, user_id: str, active_invite_user_ids: set[str]) -> str:
@@ -112,16 +121,14 @@ class UserService:
         ``invite_state`` filters on the derived state, so ``expired`` matches
         pending users whose invite has lapsed and ``pending`` excludes them.
         """
-        cursor_dt = None
-        if cursor is not None:
-            cursor_dt, _ = decode_cursor(cursor)
+        cursor_key = decode_cursor(cursor, id_kind="str") if cursor is not None else None
 
         access_filters = build_access_filters(identity, User)
         async with self._ctx.admin_db.session() as session:
             users = await UserRepository.list_all(
                 session,
                 limit=limit + 1,
-                cursor=cursor_dt,
+                cursor=cursor_key,
                 invite_state=invite_state,
                 filters=access_filters,
             )
@@ -294,6 +301,9 @@ class UserService:
                 session, [user_id, identity.sub]
             )
             ensure_can_manage(user_id, identity, permission_sets)
+            # A deleted row keeps its tombstone email: rewriting it would make
+            # the retained row look like a live account again.
+            ensure_not_deleted(user, "update")
 
             before = {
                 "email": user.email,
@@ -355,23 +365,57 @@ class UserService:
 
         return await self.get(user_id, identity=identity)
 
+    @staticmethod
+    async def _load_manageable(session: Any, user_id: str, identity: Identity) -> User:
+        """Load a user the caller may manage, or raise.
+
+        The target is resolved through the caller's ``User`` access filter, so
+        a user the caller cannot read answers not found (404); a visible user
+        then passes ``ensure_can_manage`` against the caller's stored grants.
+        """
+        user = await UserRepository.get_by_id(
+            session, user_id, filters=build_access_filters(identity, User, for_write=True)
+        )
+        if user is None:
+            raise UserNotFoundError(user_id)
+        permission_sets = await UserPermissionGrantRepository.get_permission_sets(
+            session, [user_id, identity.sub]
+        )
+        ensure_can_manage(user_id, identity, permission_sets)
+        return user
+
     async def delete(self, user_id: str, *, identity: Identity) -> None:
+        """Delete a user: tombstone the row and end everything it still holds.
+
+        Idempotent: a user already deleted keeps its original ``deleted_at``
+        and no second ``DELETE`` audit entry is written — including when two
+        deletes race, since ``mark_deleted`` only marks an unmarked row. The
+        user-deleted hooks still run on every successful delete, a repeat one
+        included: that is how an operator re-runs a hook that failed.
+        """
+        owned_agent_ids = await self._delete_in_transaction(user_id, identity=identity)
+        self._invalidate_broker_caches(user_id, owned_agent_ids)
+        await run_user_deleted_hooks(self._ctx, user_id, identity=identity)
+
+    async def _delete_in_transaction(self, user_id: str, *, identity: Identity) -> list[str]:
+        """Tombstone the user; return the ids of the agents it owns."""
         async with self._ctx.admin_db.transaction() as session:
-            user = await UserRepository.get_by_id(session, user_id)
-            if user is None:
-                raise UserNotFoundError(user_id)
-            permission_sets = await UserPermissionGrantRepository.get_permission_sets(
-                session, [user_id, identity.sub]
-            )
-            ensure_can_manage(user_id, identity, permission_sets)
+            user = await self._load_manageable(session, user_id, identity)
+            owned_agent_ids = await AgentRepository.list_ids_by_owner(session, user_id)
+            if user.deleted_at is not None:
+                return owned_agent_ids
             await ensure_not_last_active_admin(session, user_id)
-            await UserRepository.update(
-                session,
-                user_id,
-                email=f"deleted-{user_id}@local",
-                active=False,
-            )
+            if not await UserRepository.mark_deleted(
+                session, user_id, email=_tombstone_email(user_id)
+            ):
+                return owned_agent_ids
+            await UserRepository.revoke_login_sessions(session, user_id)
+            await sweep_user_oauth_credentials(session, user_id)
             await ExternalIdentityRepository.delete_for_user(session, user_id)
+            # An outstanding invite would otherwise still set a password on
+            # the tombstoned row; redeem refuses a deleted user as well.
+            for token in await InviteTokenRepository.get_active_for_user(session, user_id):
+                await InviteTokenRepository.redeem(session, token.id)
             await cancel_queued_executions_for_actor(
                 session,
                 actor_id=user_id,
@@ -390,18 +434,25 @@ class UserService:
             audit_events_counter.add(
                 1, {"action": AuditAction.DELETE, "target_type": AuditTargetType.USER}
             )
+        return owned_agent_ids
 
     async def disable(self, user_id: str, *, identity: Identity) -> bool:
         async with self._ctx.admin_db.transaction() as session:
-            user = await UserRepository.get_by_id(session, user_id)
-            if user is None:
-                raise UserNotFoundError(user_id)
-            permission_sets = await UserPermissionGrantRepository.get_permission_sets(
-                session, [user_id, identity.sub]
-            )
-            ensure_can_manage(user_id, identity, permission_sets)
+            user = await self._load_manageable(session, user_id, identity)
+            # Disabling a deleted row would audit a state change that cannot
+            # happen: delete already deactivated it for good.
+            ensure_not_deleted(user, "disable")
             await ensure_not_last_active_admin(session, user_id)
             await UserRepository.disable(session, user_id)
+            owned_agent_ids = await AgentRepository.list_ids_by_owner(session, user_id)
+            # Ends every login JWT issued so far for good: re-enabling the
+            # user restores the account, not the sessions it had (#1139).
+            await UserRepository.revoke_login_sessions(session, user_id)
+            await sweep_user_oauth_credentials(session, user_id)
+            # Cancel outstanding invite tokens so a pre-disable invite is no
+            # longer active and stays invalidated if the user is re-enabled.
+            for token in await InviteTokenRepository.get_active_for_user(session, user_id):
+                await InviteTokenRepository.redeem(session, token.id)
             # A queued execution job runs with its creator's authority, so
             # one left queued would run for a user who can no longer act
             # (#1674). Re-enabling does not requeue it.
@@ -423,17 +474,17 @@ class UserService:
             audit_events_counter.add(
                 1, {"action": AuditAction.DISABLE, "target_type": AuditTargetType.USER}
             )
+        self._invalidate_broker_caches(user_id, owned_agent_ids)
         return True
 
     async def enable(self, user_id: str, *, identity: Identity) -> bool:
         async with self._ctx.admin_db.transaction() as session:
-            if await UserRepository.get_by_id(session, user_id) is None:
-                raise UserNotFoundError(user_id)
-            permission_sets = await UserPermissionGrantRepository.get_permission_sets(
-                session, [user_id, identity.sub]
-            )
-            ensure_can_manage(user_id, identity, permission_sets)
+            user = await self._load_manageable(session, user_id, identity)
+            # Delete is terminal: the tombstoned row is kept for history and
+            # audit references, never brought back to an active account.
+            ensure_not_deleted(user, "enable")
             await UserRepository.enable(session, user_id)
+            owned_agent_ids = await AgentRepository.list_ids_by_owner(session, user_id)
             await AuditRepository.record(
                 session,
                 action=AuditAction.ENABLE,
@@ -445,19 +496,30 @@ class UserService:
             audit_events_counter.add(
                 1, {"action": AuditAction.ENABLE, "target_type": AuditTargetType.USER}
             )
+        self._invalidate_broker_caches(user_id, owned_agent_ids)
         return True
+
+    def _invalidate_broker_caches(self, user_id: str, owned_agent_ids: list[str]) -> None:
+        """Evict the broker's cached verdicts for ``user_id`` and the agents it owns.
+
+        Runs after the account change commits. An owned agent's effective
+        status follows its owner's account, so the agents' cached token and
+        status verdicts go stale with the user's. The per-agent eviction also
+        drops each agent's binding and rule cache entries, which do not depend
+        on the owner's status; they reload on the next request. In-process
+        only: another broker process keeps its entries until
+        ``resolve_cache_ttl_seconds`` expires them.
+        """
+        self._ctx.invalidate_broker_caches(user_id=user_id)
+        for agent_id in owned_agent_ids:
+            self._ctx.invalidate_broker_caches(agent_id=agent_id)
 
     async def reissue_invite(self, user_id: str, *, identity: Identity) -> InviteIssued:
         async with self._ctx.admin_db.session() as session:
-            user = await UserRepository.get_by_id(session, user_id)
-            if user is None:
-                raise UserNotFoundError(user_id)
-            permission_sets = await UserPermissionGrantRepository.get_permission_sets(
-                session, [user_id, identity.sub]
-            )
-            ensure_can_manage(user_id, identity, permission_sets)
-        if user.invite_state == InviteState.REDEEMED:
-            raise ConflictError("Cannot reissue invite for a user who has already redeemed")
+            user = await self._load_manageable(session, user_id, identity)
+        ensure_not_deleted(user, "reissue an invite for")
+        if user.invite_state in (InviteState.REDEEMED, InviteState.ACCEPTED):
+            raise ConflictError("Cannot reissue an invite for a user who has already signed in")
 
         invite_service = InviteService(self._ctx)
         issued = await invite_service.reissue(user_id, identity=identity)

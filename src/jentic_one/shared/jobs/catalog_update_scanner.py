@@ -12,7 +12,9 @@ module set precisely because ``self`` can be GC'd), so the scanner constructs a 
 ``CatalogService(ctx)`` each tick and *awaits* the sweep to completion rather than
 detaching it. The per-API ``last_checked_at < interval`` gate inside ``_probe_one``
 means the scanner and the manual ``POST /catalog:refresh`` trigger coexist without
-double-probing within an interval.
+double-probing within an interval, and the sweep's single-flight locks (in-process and
+a registry-DB advisory lock) mean only one sweep runs at a time across every process —
+a scanner tick that loses the race skips quietly.
 
 Gated on both the ``registry`` DB (candidates + check rows) and the ``admin`` DB
 (event emit); a standalone-registry deployment gets no scanner.
@@ -22,16 +24,13 @@ from __future__ import annotations
 
 import asyncio
 import random
-from typing import TYPE_CHECKING
-
-import structlog
+from typing import TYPE_CHECKING, ClassVar
 
 from jentic_one.registry.services.catalog.service import CatalogService
+from jentic_one.shared.jobs.periodic import PeriodicScanner
 
 if TYPE_CHECKING:
     from jentic_one.shared.context import Context
-
-logger = structlog.get_logger(__name__)
 
 #: How often the loop wakes to check whether a sweep is due. The real cadence is the
 #: config's ``update_check_interval_seconds`` (default daily); this just bounds how
@@ -40,8 +39,10 @@ logger = structlog.get_logger(__name__)
 _TICK_SECONDS = 30.0
 
 
-class CatalogUpdateScanner:
+class CatalogUpdateScanner(PeriodicScanner):
     """Periodically runs the catalog update-notify sweep on an owned cadence."""
+
+    name: ClassVar[str] = "catalog_update_scanner"
 
     def __init__(
         self,
@@ -58,29 +59,8 @@ class CatalogUpdateScanner:
         #: a sweep fires so replicas de-phase across cycles (see ``_due_interval``).
         self._due_interval: float | None = None
 
-    async def run(self) -> None:
-        """Main loop — run a sweep whenever one is due, until cancelled.
-
-        A single tick must never kill the loop: a transient DB/upstream error during a
-        sweep is caught and logged so the scanner keeps running (mirrors
-        ``CredentialExpiryScanner.run``). The sweep itself is best-effort per API.
-        """
-        self._running = True
-        logger.info("catalog_update_scanner_started")
-        try:
-            while self._running:
-                try:
-                    await self._tick()
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception("catalog_update_scanner_tick_error")
-                await asyncio.sleep(self._tick_seconds)
-        except asyncio.CancelledError:
-            logger.info("catalog_update_scanner_cancelled")
-        finally:
-            self._running = False
-            logger.info("catalog_update_scanner_stopped")
+    def _sleep_seconds(self) -> float:
+        return self._tick_seconds
 
     def _max_due_interval(self, interval: int) -> float:
         """Upper bound of the jittered gate for the *current* interval.
@@ -132,7 +112,3 @@ class CatalogUpdateScanner:
     async def sweep(self) -> None:
         """Run one update-notify sweep to completion (awaitable)."""
         await CatalogService(self._ctx).run_update_sweep()
-
-    def stop(self) -> None:
-        """Signal the scanner to stop after the current tick."""
-        self._running = False

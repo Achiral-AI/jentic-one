@@ -36,7 +36,7 @@ func newAPIRootCmd(core *cmdcore.App) *cobra.Command {
 		"the public catalog into your local registry, inspect operations, and execute\n" +
 		"against them.\n\n" +
 		"New here? If you're a person setting up a local agent, run `jentic setup`\n" +
-		"to set one up end to end (identity + skills + isolation). If you're an agent\n" +
+		"to set one up end to end (identity + skills). If you're an agent\n" +
 		"that just needs tokens for an existing identity, run `jentic register`. Then\n" +
 		"browse the public catalog with `jentic catalog`. To install and operate\n" +
 		"jentic-one locally, use the `jenticctl` CLI (e.g. `jenticctl install`). Use\n" +
@@ -87,6 +87,9 @@ func newAPIRootCmd(core *cmdcore.App) *cobra.Command {
 	// theme-7 Phase 1b). NOT fenced: connecting is the agent's own recovery
 	// surface — approval still blocks on a human in the browser.
 	cmdcore.AddGrouped(root, "apis", newConnectCmd(app))
+	// The agent's own access through a binding (`jentic access show`): what a
+	// connect-session edit is relative to. Not fenced — read-only.
+	cmdcore.AddGrouped(root, "apis", newAccessCmd(app))
 	cmdcore.AddGrouped(root, "agent", newSearchCmd(app))
 	cmdcore.AddGrouped(root, "agent", newInspectCmd(app))
 	cmdcore.AddGrouped(root, "agent", newExecuteCmd(app))
@@ -100,10 +103,9 @@ func newAPIRootCmd(core *cmdcore.App) *cobra.Command {
 	// self-description (Phase 5 item 7a). Not fenced (server-scope-gated).
 	cmdcore.AddGrouped(root, "agent", newAPICmd(app))
 	// The agent-client commands manage and drive the local coding agent
-	// (generate its skills, launch it under isolation, tear its account down),
+	// (generate its skills, serve MCP, wipe its local state),
 	// distinct from the catalog find/run operations above.
 	cmdcore.AddGrouped(root, "client", localagentcmd.NewSkillCmd(app.App))
-	cmdcore.AddGrouped(root, "client", fenced(localagentcmd.NewRunCmd(app.App)))
 	cmdcore.AddGrouped(root, "client", fenced(newResetCmd(app)))
 	// Agent-side read-only self-check (F8-4, impl/5.1 §3c). Not fenced: it never
 	// mutates host state and is exactly the diagnostic an agent needs where

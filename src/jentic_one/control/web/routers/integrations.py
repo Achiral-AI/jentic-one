@@ -9,65 +9,92 @@ ad-hoc error ``JSONResponse`` bodies.
 
 from __future__ import annotations
 
-from typing import Annotated
+from dataclasses import asdict
+from typing import Annotated, Any
 
 import structlog
 from fastapi import APIRouter, Body, Depends, Path, Query, Request, Response
-from jentic.problem_details import Forbidden, TooManyRequests
+from jentic.problem_details import BadRequest, Forbidden, TooManyRequests
 
 from jentic_one.control.services.integrations.connect_session_service import (
     ApiTarget,
     AuthCodeConfirmResult,
     ConfirmChecks,
+    ConfirmResult,
     ConfirmVariant,
     ConnectedConfirmResult,
     ConnectSessionService,
     DeviceAuthorizationConfirmResult,
+    EditReview,
     ExistingCredentialConfirm,
     OwnClientConfirm,
     ReviewData,
     SecretConfirm,
+    SessionAmend,
 )
+from jentic_one.control.services.integrations.edits import EditRequest, RuleAdd
 from jentic_one.control.services.integrations.flow_handlers.manual import (
     ApiKeySecret,
     BasicSecret,
     BearerSecret,
 )
+from jentic_one.control.web.connect_binding import (
+    mint_browser_binding,
+    set_browser_binding_cookie,
+)
+from jentic_one.control.web.connect_limits import ROUTE_LIMITER_ATTR, connect_limiter
 from jentic_one.control.web.deps import get_connect_session_service
 from jentic_one.control.web.schemas.integrations import (
+    AmendSessionRequest,
+    AmendSessionResponse,
     ApiKeyConfirmSessionRequest,
-    ApiReferenceResponse,
     AuthCodeConfirmSessionResponse,
     BasicConfirmSessionRequest,
     BearerConfirmSessionRequest,
     ConfirmSessionRequest,
     ConfirmSessionResponse,
     ConnectedConfirmSessionResponse,
+    ConnectOptionsResponse,
     ConnectSessionListResponse,
     ConnectSessionState,
     ConnectSessionSummaryResponse,
     DeviceAuthorizationConfirmSessionResponse,
+    EditAgentRef,
+    EditBindingRef,
+    EditConfirmSessionRequest,
+    EditConflict,
+    EditConnectionRequest,
+    EditConnectionResponse,
+    EditCurrentAccess,
+    EditResultAccess,
+    EditRuleSetView,
+    EditRulesRequest,
+    EditRuleView,
+    EditScopesRequest,
     ExistingCredentialConfirmSessionRequest,
     ExistingCredentialResponse,
     IntegrationsConnectRequest,
     IntegrationsConnectResponse,
     OAuthConfirmSessionRequest,
     OwnOAuthClientConfirmSessionRequest,
-    ReauthorizeConfirmSessionRequest,
-    ReauthorizeConfirmSessionResponse,
     ReviewAgentResponse,
+    ReviewEditResponse,
     ReviewProvenanceResponse,
     ReviewSchemeResponse,
     ReviewScopeResponse,
     ReviewSessionResponse,
+    SessionApiReferenceResponse,
+    SessionRevisionListResponse,
+    SessionRevisionRef,
+    SessionRevisionResponse,
     StatusResponse,
 )
 from jentic_one.control.web.schemas.permission_rules import PermissionRuleSchema
 from jentic_one.shared.auth.identity import Identity
+from jentic_one.shared.context import Context
 from jentic_one.shared.models import ActorType
 from jentic_one.shared.resilience import RateLimiter
-from jentic_one.shared.state import MemoryStateBackend
-from jentic_one.shared.web import get_current_identity
+from jentic_one.shared.web import get_ctx, get_current_identity
 from jentic_one.shared.web import openapi_examples as ex
 from jentic_one.shared.web.openapi_responses import (
     conflict,
@@ -97,37 +124,12 @@ router = APIRouter(tags=["Integrations"])
 # Per-actor rate limit for the vendor-calling endpoints
 # ---------------------------------------------------------------------------
 #
-# ``POST /integrations:connect`` and ``POST /connect-sessions/{id}:confirm``
-# both end up firing the vendor's device-authorization / authorization
-# endpoint (`:confirm` is where the device-flow ``begin`` actually happens,
-# and a failed ``begin`` rolls the session back to ``created``, so it is
-# retryable in a tight loop). A ``credentials:write`` caller that spams
-# either endpoint can get the platform IP throttled by GitHub / Google /
-# etc., which would fail-fast every legitimate user on the same install.
-# One shared per-actor bucket caps both, well below any vendor's own
-# throttle: ``_CONNECT_RPM`` sustained requests per minute,
-# ``_CONNECT_BURST`` bucket capacity for a short spike.
-#
-# In-memory only (per-worker) — sufficient for the abuse case (one actor
-# spamming), not a coordinated-cluster limit. If a multi-worker cluster-wide
-# limit is ever needed, wire ``build_state_backend(ctx.config.<...>.backend)``
-# instead of the memory backend below.
-_CONNECT_RPM = 30
-_CONNECT_BURST = 10
+# Policy and wiring live in ``control/web/connect_limits.py``: one per-actor
+# bucket on the configured shared-state backend caps both endpoints.
 
 
 def _get_connect_limiter(request: Request) -> RateLimiter:
-    limiter: RateLimiter | None = getattr(request.app.state, "integrations_connect_limiter", None)
-    if limiter is not None:
-        return limiter
-    limiter = RateLimiter(
-        MemoryStateBackend(),
-        default_rpm=_CONNECT_RPM,
-        burst=_CONNECT_BURST,
-        namespace="integrations_connect",
-    )
-    request.app.state.integrations_connect_limiter = limiter
-    return limiter
+    return connect_limiter(request.app, ROUTE_LIMITER_ATTR)
 
 
 async def _enforce_connect_rate_limit(request: Request, identity: Identity) -> None:
@@ -160,10 +162,13 @@ async def _enforce_connect_rate_limit(request: Request, identity: Identity) -> N
     "/integrations:connect",
     status_code=201,
     summary="Start an integration connect session",
-    response_model=None,
+    response_model=IntegrationsConnectResponse,
     responses=with_responses(
         not_found("Unknown vendor or API, or API targets are not enabled"),
-        conflict("The API declares no supported scheme, or its hosts cannot be pinned"),
+        conflict(
+            "The API declares no supported scheme, its hosts cannot be pinned, the agent "
+            "is inactive, or the agent's binding for the API is suspended"
+        ),
         too_many_requests("Rate limit, open-session cap, or a recent rejection"),
     ),
 )
@@ -185,7 +190,10 @@ async def integrations_connect(
     `connect_session_agent_not_found`, the same as an unknown agent. Naming
     an owned agent also takes `agents:write`, which confirming for it needs
     (403 `connect_session_confirmation_forbidden` otherwise), and an active
-    agent (409 `connect_session_agent_inactive` otherwise). When
+    agent (409 `connect_session_agent_inactive` otherwise). An agent whose
+    binding to a credential covering the requested API is suspended gets
+    409 `connect_session_binding_suspended`: only the operator can resume
+    that binding, so a new connect for the same API is refused. When
     named, confirm creates the direct agent-credential binding + permission
     rules; when omitted, the credential connects unbound and an agent can
     be bound later through the credentials API.
@@ -227,6 +235,157 @@ async def integrations_connect(
         approval_url=created.approval_url,
         poll_token=created.poll_token,
         resolved_flow=created.resolved_flow,
+        revision_id=created.revision_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+@router.get(
+    "/integrations/{vendor}/{name}/{version}/connect-options",
+    summary="How a connection to an API would be made",
+    response_model=ConnectOptionsResponse,
+    responses=with_responses(not_found("The registry holds no such API")),
+)
+async def integrations_connect_options(
+    vendor: Annotated[
+        str,
+        Path(description="The API's vendor.", openapi_examples=ex.example("googleapis.com")),
+    ],
+    name: Annotated[str, Path(description="The API's name.", openapi_examples=ex.example("gmail"))],
+    version: Annotated[
+        str, Path(description="The API's version.", openapi_examples=ex.example("v1"))
+    ],
+    registration_id: Annotated[
+        str | None,
+        Query(
+            description="Pin a shared OAuth app, as `oauth_app_registration_id` on `:connect`.",
+            openapi_examples=ex.example(ex.OAUTH_APP_REGISTRATION_ID),
+        ),
+    ] = None,
+    identity: Identity = get_current_identity(
+        required_permissions=["credentials:connect", "credentials:write"]
+    ),
+    svc: ConnectSessionService = Depends(get_connect_session_service),
+) -> ConnectOptionsResponse:
+    """List the API's declared security schemes and how `:connect` would collect each.
+
+    Resolved as `:connect` resolves an API target, so a scope marked
+    `requestable` is one `requested_scopes` may name: for OAuth, the
+    connecting app's scope catalog (the spec's other scopes are listed but
+    not requestable); with no app, the spec's scopes. An API the registry
+    doesn't hold is 404 `unknown_api`: import it first.
+    """
+    options = await svc.connect_options(
+        ApiTarget(vendor=vendor, name=name, version=version), registration_id=registration_id
+    )
+    return ConnectOptionsResponse.model_validate(asdict(options))
+
+
+def _scope_change(scopes: EditScopesRequest | None) -> dict[str, Any]:
+    """An edit's scope change as :class:`EditRequest` fields."""
+    if scopes is None:
+        return {}
+    return {
+        "add_scopes": list(scopes.add),
+        "remove_scopes": list(scopes.remove),
+        "set_scopes": list(scopes.set_scopes) if scopes.set_scopes is not None else None,
+        "scope_comments": dict(scopes.comments),
+    }
+
+
+# POST /integrations:edit-connection — begin an edit of an existing binding
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/integrations:edit-connection",
+    status_code=201,
+    summary="Ask to change a credential binding",
+    response_model=EditConnectionResponse,
+    responses=with_responses(
+        not_found("No binding the caller may edit for this credential"),
+        conflict("The calling agent already has an open edit of this binding; amend it"),
+        too_many_requests("Rate limit or open-session cap"),
+    ),
+)
+async def integrations_edit_connection(
+    body: EditConnectionRequest,
+    request: Request,
+    response: Response,
+    identity: Identity = get_current_identity(
+        required_permissions=["credentials:connect", "credentials:write"]
+    ),
+    svc: ConnectSessionService = Depends(get_connect_session_service),
+    ctx: Context = Depends(get_ctx),
+) -> EditConnectionResponse:
+    """Open a connect session that edits an existing binding instead of creating one.
+
+    The change (rules to add, remove or replace, and resuming a suspended
+    binding) is resolved against the binding as it is now, and a human
+    approves it on the review page; nothing changes until then. An agent
+    edits its own binding and must omit `agent_id`; a human names the agent
+    and must be its owner or an org admin. A change that is already in place
+    is 422 `nothing_to_change`, and a rule id the binding does not hold is 422
+    `unknown_rule`. A binding can have several open edits, each rebased as
+    others land; an agent asking again while its own is open is 409
+    `edit_open` with that session's `session_id`, to amend instead.
+    """
+    await _enforce_connect_rate_limit(request, identity)
+
+    if identity.actor_type == ActorType.AGENT:
+        if body.agent_id is not None:
+            raise Forbidden(
+                detail="agent callers must not pass agent_id — the caller's identity is used",
+                instance="/integrations:edit-connection",
+            )
+        agent_id = identity.sub
+    elif body.agent_id is None:
+        raise BadRequest(
+            detail="agent_id is required: name the agent whose binding to change",
+            type="agent_id_required",
+            instance="/integrations:edit-connection",
+        )
+    else:
+        agent_id = body.agent_id
+
+    rules = body.rules or EditRulesRequest()
+    binding = mint_browser_binding(request)
+    created = await svc.create_edit_session(
+        credential_id=body.credential_id,
+        agent_id=agent_id,
+        identity=identity,
+        request=EditRequest(
+            add=[
+                RuleAdd(rule=a.rule.model_dump(exclude_none=True), before=a.before)
+                for a in rules.add
+            ],
+            remove=list(rules.remove),
+            set_rules=(
+                [r.model_dump(exclude_none=True) for r in rules.set_rules]
+                if rules.set_rules is not None
+                else None
+            ),
+            **_scope_change(body.scopes),
+            resume=body.resume,
+            reason=body.reason,
+        ),
+        apply=body.apply,
+        browser_binding=binding.claim,
+    )
+    # An applied scope change that signs in by redirect finishes only in this
+    # browser, like a confirm's.
+    if isinstance(created.challenge, AuthCodeConfirmResult):
+        set_browser_binding_cookie(
+            response, request, ctx, binding, authorize_url=created.challenge.authorize_url
+        )
+    return EditConnectionResponse(
+        session_id=created.session_id,
+        approval_url=created.approval_url,
+        poll_token=created.poll_token,
+        revision_id=created.revision_id,
+        resolved_flow=created.resolved_flow,
+        status=("applied" if created.applied else "consenting" if created.challenge else "pending"),
+        challenge=_confirm_response(created.challenge) if created.challenge else None,
     )
 
 
@@ -293,6 +452,7 @@ async def list_connect_sessions(
                 error_code=s.error_code,
                 created_at=s.created_at,
                 credential_id=s.credential_id,
+                intent=s.intent,  # type: ignore[arg-type]
             )
             for s in page.data
         ],
@@ -309,7 +469,7 @@ async def list_connect_sessions(
 @router.get(
     "/connect-sessions/{session_id}",
     summary="Get review data for a connect session",
-    response_model=None,
+    response_model=ReviewSessionResponse,
     responses=with_responses(conflict("The session's OAuth app changed; start a new session")),
 )
 async def get_connect_session(
@@ -367,7 +527,14 @@ def _review_response(data: ReviewData) -> ReviewSessionResponse:
         requested_permission_rules=[
             PermissionRuleSchema.model_validate(r) for r in data.requested_permission_rules
         ],
-        api_reference=ApiReferenceResponse(
+        revision=(
+            SessionRevisionRef(id=data.revision_id, number=data.revision_number)
+            if data.revision_id is not None and data.revision_number is not None
+            else None
+        ),
+        last_rejected_at=data.last_rejected_at,
+        stale=data.stale,
+        api_reference=SessionApiReferenceResponse(
             vendor=data.api_vendor,
             name=data.api_name,
             version=data.api_version,
@@ -416,11 +583,102 @@ def _review_response(data: ReviewData) -> ReviewSessionResponse:
                 type=c.type,
                 granted_scopes=c.granted_scopes,
                 missing_scopes=c.missing_scopes,
-                other_bound_agent_ids=c.other_bound_agent_ids,
+                other_bound_agents=[
+                    EditAgentRef(agent_id=a.agent_id, name=a.name) for a in c.other_bound_agents
+                ],
+                other_bound_agents_truncated=c.other_bound_agents_truncated,
                 can_bind=c.can_bind,
-                can_reauthorize=c.can_reauthorize,
+                needs_vendor_consent=c.needs_vendor_consent,
             )
             for c in data.existing_credentials
+        ],
+        edit=_edit_response(data.edit) if data.edit is not None else None,
+    )
+
+
+def _edit_response(edit: EditReview) -> ReviewEditResponse:
+    current = edit.current
+    rule_set = current.get("rule_set")
+    return ReviewEditResponse(
+        binding=EditBindingRef(
+            agent_id=edit.agent_id,
+            credential_id=edit.credential_id,
+            credential_name=edit.credential_name,
+        ),
+        revision=SessionRevisionRef(id=edit.revision_id, number=edit.revision_number),
+        current=EditCurrentAccess(
+            rules=[EditRuleView.model_validate(r) for r in current["rules"]],
+            rule_set=EditRuleSetView.model_validate(rule_set) if rule_set is not None else None,
+            suspended=current["suspended"],
+            granted_scopes=current.get("granted_scopes"),
+        ),
+        result=EditResultAccess.model_validate(edit.result),
+        widens_access=edit.widens_access,
+        needs_vendor_consent=edit.needs_vendor_consent,
+        conflicts=[EditConflict.model_validate(c) for c in edit.conflicts],
+        other_bound_agents=[
+            EditAgentRef(agent_id=a.agent_id, name=a.name) for a in edit.other_bound_agents
+        ],
+        other_bound_agents_truncated=edit.other_bound_agents_truncated,
+    )
+
+
+@router.get(
+    "/connect-sessions/{session_id}/revisions",
+    summary="List a connect session's revisions",
+    response_model=SessionRevisionListResponse,
+)
+async def list_connect_session_revisions(
+    session_id: Annotated[
+        str,
+        Path(
+            description="ID of the connect session.",
+            openapi_examples=ex.example(ex.CONNECT_SESSION_ID),
+        ),
+    ],
+    poll_token: str | None = Query(
+        default=None,
+        description=_POLL_TOKEN_DESCRIPTION,
+        openapi_examples=ex.example(ex.OPAQUE_TOKEN),
+    ),
+    cursor: str | None = Query(
+        default=None,
+        description="Opaque cursor from a previous page's `next_cursor`.",
+        openapi_examples=ex.example(ex.CURSOR),
+    ),
+    limit: int = Query(
+        default=50,
+        ge=1,
+        le=200,
+        description="Maximum number of revisions to return (1-200, default 50).",
+        openapi_examples=ex.example(25),
+    ),
+    identity: Identity = get_current_identity(required_permissions=["credentials:write"]),
+    svc: ConnectSessionService = Depends(get_connect_session_service),
+) -> SessionRevisionListResponse:
+    """One page of what the session has asked for, oldest first.
+
+    The review shows the current revision against today's access; this is the
+    history behind it, one entry per ask and amend. Gated like the review
+    read, and bounded like the session list.
+    """
+    revisions, has_more, next_cursor = await svc.list_revisions(
+        session_id, poll_token=poll_token, identity=identity, limit=limit, cursor=cursor
+    )
+    return SessionRevisionListResponse(
+        limit=limit,
+        has_more=has_more,
+        next_cursor=next_cursor,
+        data=[
+            SessionRevisionResponse(
+                id=r.id,
+                number=r.number,
+                created_by=r.created_by,
+                created_at=r.created_at,
+                proposal=dict(r.proposal),
+                result=dict(r.result),
+            )
+            for r in revisions
         ],
     )
 
@@ -433,12 +691,13 @@ def _review_response(data: ReviewData) -> ReviewSessionResponse:
 @router.post(
     "/connect-sessions/{session_id}:confirm",
     summary="Confirm a connect session",
-    response_model=None,
+    response_model=ConfirmSessionResponse,
     responses=with_responses(
         not_found(),
+        too_many_requests("Rate limit"),
         conflict(
             "Session not awaiting confirmation, its OAuth app, scheme or hosts changed, "
-            "or the review is stale"
+            "the review is stale, or the agent's binding for the API is suspended"
         ),
     ),
 )
@@ -451,6 +710,7 @@ async def confirm_connect_session(
         ),
     ],
     request: Request,
+    response: Response,
     body: Annotated[
         ConfirmSessionRequest,
         Body(
@@ -467,6 +727,7 @@ async def confirm_connect_session(
     ),
     identity: Identity = get_current_identity(required_permissions=["credentials:write"]),
     svc: ConnectSessionService = Depends(get_connect_session_service),
+    ctx: Context = Depends(get_ctx),
 ) -> ConfirmSessionResponse:
     """Called by the review page after the human confirms selections.
 
@@ -474,18 +735,41 @@ async def confirm_connect_session(
     variant): OAuth scopes, a secret for a ``manual_*`` session
     (``api_key`` / ``bearer`` / ``basic``), the approver's own OAuth client
     for an ``awaiting_app`` session, or a credential the approver already
-    holds (``existing_credential``, ``reauthorize``). Secrets are write-only:
+    holds (``existing_credential``), or an edit session's
+    final rules (``edit``, naming the reviewed ``revision_id``). Secrets are write-only:
     they never appear in a response, audit entry or log.
 
     Shares the ``:connect`` per-actor rate bucket — this is the endpoint
     that actually fires the vendor's device-authorization call, and a
     failed ``begin`` leaves the session retryable, so it must not be
     free to hammer during a vendor incident. Gated like the review read
-    (``poll_token`` or owner / ``org:admin``; 403 otherwise).
+    (``poll_token`` or owner / ``org:admin``; 403 otherwise). An agent
+    whose binding to a credential covering the session's API is suspended
+    (including one picked at confirm) is refused with 409
+    ``connect_session_binding_suspended``.
+
+    A response carrying an ``authorize_url`` also sets a short-lived
+    ``HttpOnly`` cookie scoped to the OAuth callback path: the vendor
+    sign-in completes only in the approver's browser that called this
+    endpoint, whoever opened the session.
     """
     await _enforce_connect_rate_limit(request, identity)
+    binding = mint_browser_binding(request)
 
-    if isinstance(body, OAuthConfirmSessionRequest):
+    result: ConfirmResult
+    if isinstance(body, EditConfirmSessionRequest):
+        result = await svc.confirm_edit(
+            session_id,
+            poll_token=poll_token,
+            identity=identity,
+            revision_id=body.revision_id,
+            permission_rules=[r.model_dump(exclude_none=True) for r in body.permission_rules],
+            resume=body.resume,
+            confirmed_scopes=body.confirmed_scopes,
+            resolve_conflicts=body.resolve_conflicts,
+            browser_binding=binding.claim,
+        )
+    elif isinstance(body, OAuthConfirmSessionRequest):
         result = await svc.confirm(
             session_id,
             poll_token=poll_token,
@@ -495,12 +779,27 @@ async def confirm_connect_session(
             identity=identity,
             expected_agent_id=body.expected_agent_id,
             digest=body.digest,
+            revision_id=body.revision_id,
+            browser_binding=binding.claim,
         )
     else:
         result = await svc.confirm_variant(
-            session_id, poll_token=poll_token, variant=_to_variant(body), identity=identity
+            session_id,
+            poll_token=poll_token,
+            variant=_to_variant(body),
+            identity=identity,
+            browser_binding=binding.claim,
+        )
+    if isinstance(result, AuthCodeConfirmResult):
+        set_browser_binding_cookie(
+            response, request, ctx, binding, authorize_url=result.authorize_url
         )
 
+    return _confirm_response(result)
+
+
+def _confirm_response(result: ConfirmResult) -> ConfirmSessionResponse:
+    """A confirm's outcome on the wire: the vendor step to run, or the connected credential."""
     if isinstance(result, DeviceAuthorizationConfirmResult):
         return DeviceAuthorizationConfirmSessionResponse(
             user_code=result.user_code,
@@ -510,11 +809,8 @@ async def confirm_connect_session(
         )
     if isinstance(result, AuthCodeConfirmResult):
         return AuthCodeConfirmSessionResponse(authorize_url=result.authorize_url)
-    if isinstance(result, ConnectedConfirmResult):
-        return ConnectedConfirmSessionResponse(credential_id=result.credential_id)
-    return ReauthorizeConfirmSessionResponse(
-        credential_id=result.credential_id, authorize_url=result.authorize_url
-    )
+    assert isinstance(result, ConnectedConfirmResult)
+    return ConnectedConfirmSessionResponse(credential_id=result.credential_id)
 
 
 def _to_variant(
@@ -522,14 +818,14 @@ def _to_variant(
     | BearerConfirmSessionRequest
     | BasicConfirmSessionRequest
     | OwnOAuthClientConfirmSessionRequest
-    | ExistingCredentialConfirmSessionRequest
-    | ReauthorizeConfirmSessionRequest,
+    | ExistingCredentialConfirmSessionRequest,
 ) -> ConfirmVariant:
     checks = ConfirmChecks(
         permission_rules=[r.model_dump() for r in body.permission_rules],
         expected_agent_id=body.expected_agent_id,
         digest=body.digest,
         agent_id=body.agent_id,
+        revision_id=body.revision_id,
     )
     if isinstance(body, ApiKeyConfirmSessionRequest):
         return SecretConfirm(kind=body.kind, secret=ApiKeySecret(key=body.key), checks=checks)
@@ -550,10 +846,94 @@ def _to_variant(
             confirmed_scopes=body.confirmed_scopes,
             checks=checks,
         )
-    return ExistingCredentialConfirm(
-        credential_id=body.credential_id,
-        reauthorize=isinstance(body, ReauthorizeConfirmSessionRequest),
-        checks=checks,
+    return ExistingCredentialConfirm(credential_id=body.credential_id, checks=checks)
+
+
+# ---------------------------------------------------------------------------
+# POST /connect-sessions/{id}:amend
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/connect-sessions/{session_id}:amend",
+    summary="Amend an open connect session's request",
+    response_model=AmendSessionResponse,
+    responses=with_responses(
+        not_found(),
+        conflict(
+            "The session is closed (`session_closed`), holds every revision it may "
+            "(`too_many_revisions`), moved since it was read (`revision_changed`), or the "
+            "agent already has an open request for this target (`connect_open`)"
+        ),
+        too_many_requests("Rate limit"),
+    ),
+)
+async def amend_connect_session(
+    session_id: Annotated[
+        str,
+        Path(
+            description="ID of the connect session.",
+            openapi_examples=ex.example(ex.CONNECT_SESSION_ID),
+        ),
+    ],
+    body: AmendSessionRequest,
+    request: Request,
+    identity: Identity = get_current_identity(
+        required_permissions=["credentials:connect", "credentials:write"]
+    ),
+    svc: ConnectSessionService = Depends(get_connect_session_service),
+) -> AmendSessionResponse:
+    """Change what an open session asks for; the reviewer sees the new revision.
+
+    The session's initiator, or a human who may confirm it (a reviewer
+    editing the request; the revision records who made it), while it is open
+    (not yet confirmed or ended); a closed session is 409 `session_closed`.
+    The fields sent replace those parts of the ask and the rest stay. Edit sessions take `rules` and
+    `resume`, relative to the binding as it was when the edit opened; create
+    sessions take `requested_permission_rules` and `requested_scopes`, which
+    replace the ask outright; both take `reason`. The session id, approval
+    URL and poll token stay the same, and any confirm must name the new
+    `revision_id`.
+    """
+    await _enforce_connect_rate_limit(request, identity)
+    fields = frozenset(body.model_fields_set)
+    rules = body.rules
+    amended = await svc.amend_session(
+        session_id,
+        identity=identity,
+        amend=SessionAmend(
+            fields=fields,
+            rules=(
+                EditRequest(
+                    add=[
+                        RuleAdd(rule=a.rule.model_dump(exclude_none=True), before=a.before)
+                        for a in rules.add
+                    ],
+                    remove=list(rules.remove),
+                    set_rules=(
+                        [r.model_dump(exclude_none=True) for r in rules.set_rules]
+                        if rules.set_rules is not None
+                        else None
+                    ),
+                )
+                if rules is not None
+                else None
+            ),
+            resume=bool(body.resume),
+            reason=body.reason,
+            requested_permission_rules=(
+                [r.model_dump(exclude_none=True) for r in body.requested_permission_rules]
+                if body.requested_permission_rules is not None
+                else None
+            ),
+            requested_scopes=body.requested_scopes,
+            scopes=EditRequest(**_scope_change(body.scopes)) if body.scopes is not None else None,
+        ),
+    )
+    return AmendSessionResponse(
+        session_id=amended.session_id,
+        revision_id=amended.revision_id,
+        revision_number=amended.revision_number,
     )
 
 
@@ -565,7 +945,7 @@ def _to_variant(
 @router.get(
     "/connect-sessions/{session_id}/status",
     summary="Poll a connect session's status",
-    response_model=None,
+    response_model=StatusResponse,
 )
 async def poll_connect_session_status(
     session_id: Annotated[
@@ -615,12 +995,65 @@ async def poll_connect_session_status(
         credential_id=result.credential_id,
         bound_scopes=result.bound_scopes,
         error_code=result.error_code,
+        stale=result.stale,
     )
 
 
 # ---------------------------------------------------------------------------
 # POST /connect-sessions/{id}:cancel — user aborts before terminal
 # ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/connect-sessions/{session_id}:rebase",
+    summary="Resolve an open edit against the binding as it is now",
+    response_model=AmendSessionResponse,
+    responses=with_responses(
+        not_found(),
+        conflict(
+            "The session is closed (`session_closed`), or holds every revision it may, so it "
+            "cannot be brought up to date (`too_many_revisions`)"
+        ),
+        too_many_requests("Rate limit"),
+    ),
+)
+async def rebase_connect_session(
+    session_id: Annotated[
+        str,
+        Path(
+            description="ID of the connect session.",
+            openapi_examples=ex.example(ex.CONNECT_SESSION_ID),
+        ),
+    ],
+    request: Request,
+    poll_token: str | None = Query(
+        default=None,
+        description=_POLL_TOKEN_DESCRIPTION,
+        openapi_examples=ex.example(ex.OPAQUE_TOKEN),
+    ),
+    identity: Identity = get_current_identity(
+        required_permissions=["credentials:connect", "credentials:write"]
+    ),
+    svc: ConnectSessionService = Depends(get_connect_session_service),
+) -> AmendSessionResponse:
+    """Bring an open edit up to date with its binding, as a new revision.
+
+    What a reader asks for when the review or the status reports the session
+    `stale`: the ask is re-resolved against the binding as it is now, and any
+    part of it the binding no longer fits comes back as a conflict on that
+    revision. Reads never do this themselves, so a GET appends nothing.
+
+    Idempotent: a session already current answers with the revision it
+    already had. Its initiator, or a human who may confirm it, as an amend
+    takes; a closed session is 409 `session_closed`.
+    """
+    await _enforce_connect_rate_limit(request, identity)
+    rebased = await svc.rebase_session(session_id, poll_token=poll_token, identity=identity)
+    return AmendSessionResponse(
+        session_id=rebased.session_id,
+        revision_id=rebased.revision_id,
+        revision_number=rebased.revision_number,
+    )
 
 
 @router.post(
@@ -650,7 +1083,8 @@ async def cancel_connect_session(
     """Terminate a still-active session at the user's request.
 
     Gated like ``/status`` — the ``poll_token`` the SPA already holds, or
-    the target agent's owner / ``org:admin`` without it.
+    the target agent's owner / ``org:admin`` without it. The audit entry
+    for the cancel names the caller, with the session's initiator alongside.
 
     A still-existing but already-terminal session is a 204 no-op — a
     "Cancel" click racing the poll scanner doesn't error. A session
@@ -692,9 +1126,9 @@ async def reject_connect_session(
     Only the target agent's owner (holding ``credentials:write`` and
     ``agents:write``) or ``org:admin``; there is no poll-token path and an
     agent can never reject. Everyone else gets the uniform 403. The agent's
-    ``/status`` then reports ``failed`` with ``error_code: rejected``, and
-    its repeat ``:connect`` for the same target answers 429
-    ``recently_rejected`` for the rejection cooldown. Closing the dialog
+    ``/status`` then reports ``failed`` with ``error_code: rejected``. With a
+    rejection cooldown set (off by default), its repeat ``:connect`` for the
+    same target answers 429 ``recently_rejected`` until it lapses. Closing the dialog
     without rejecting makes no call; an unmount cancel stays ``cancelled``.
     """
     await svc.reject_session(session_id, identity=identity)

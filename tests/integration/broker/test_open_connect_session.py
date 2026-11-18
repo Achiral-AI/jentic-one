@@ -22,7 +22,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import delete
 
-from jentic_one.broker.core.exceptions import ActionDeniedError, CredentialNotProvisionedError
+from jentic_one.broker.core.errors import ActionDeniedError, CredentialNotProvisionedError
 from jentic_one.broker.repos.credential_binding_resolver import CredentialBindingResolver
 from jentic_one.broker.repos.open_connect_session import (
     _OPEN_SESSION_FOR_API,
@@ -39,6 +39,7 @@ from jentic_one.shared.context import Context
 from jentic_one.shared.db.session import DatabaseSession
 from jentic_one.shared.models import ActorType
 from jentic_one.shared.schemas import APIReference
+from tests.harness.db_round_trips import trace_round_trips
 
 pytestmark = pytest.mark.integration
 
@@ -78,6 +79,8 @@ async def _seed_session(
     api_vendor: str = _VENDOR,
     api_name: str | None = _API_NAME,
     created_at: datetime | None = None,
+    intent: str = "create",
+    initiator_actor_id: str | None = None,
 ) -> None:
     credential_id = f"cred_{session_id}"
     async with control_db.session() as session:
@@ -99,7 +102,8 @@ async def _seed_session(
                 credential_id=credential_id,
                 vendor="github",
                 agent_id=agent_id,
-                initiator_actor_id=agent_id or "usr_1",
+                initiator_actor_id=initiator_actor_id or agent_id or "usr_1",
+                intent=intent,
                 state=state,
                 resolved_flow="device_authorization",
                 poll_token_hash=f"{session_id:0<64}"[:64],
@@ -124,7 +128,11 @@ async def test_reader_finds_a_created_session(
     control_db: DatabaseSession, clean_sessions: None
 ) -> None:
     await _seed_session(control_db, session_id="cs_open_created")
-    assert await _find(control_db) == "cs_open_created"
+    with trace_round_trips(control_db) as trace:
+        found = await _find(control_db)
+    assert found == "cs_open_created"
+    assert len(trace.statements) == 1, trace.statements
+    trace.assert_no_begin_or_rollback()
 
 
 @pytest.mark.parametrize("state", ["polling", "awaiting_app"])
@@ -133,6 +141,31 @@ async def test_reader_finds_a_live_session(
 ) -> None:
     await _seed_session(control_db, session_id=f"cs_open_{state}", state=state)
     assert await _find(control_db) == f"cs_open_{state}"
+
+
+async def test_reader_finds_an_open_edit_whoever_opened_it(
+    control_db: DatabaseSession, clean_sessions: None
+) -> None:
+    """The denial relays an open edit of the binding, however it was opened.
+
+    A human opening a reviewable edit for the agent is exactly the review the
+    denial should point at; keyed on the agent's own initiation, the denial
+    tells the agent to file a second request for a change already waiting for
+    its owner. The edit is not an answer to a missing credential either, so
+    the API-target query must not return it.
+    """
+    await _seed_session(
+        control_db,
+        session_id="cs_open_edit",
+        intent="edit",
+        initiator_actor_id="usr_owner",
+    )
+    reader = OpenConnectSessionReader(control_db)
+    assert (
+        await reader.find_open_edit_id(agent_id=_AGENT, credential_id="cred_cs_open_edit")
+        == "cs_open_edit"
+    )
+    assert await _find(control_db) is None
 
 
 def test_open_states_mirror_the_control_live_states() -> None:

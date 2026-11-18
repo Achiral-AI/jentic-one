@@ -21,7 +21,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 import httpx
 import pytest
@@ -53,6 +53,7 @@ from jentic_one.control.services.credentials.providers.direct_oauth2 import (
 )
 from jentic_one.control.services.credentials.schemas.provision import OAuthTokenView
 from jentic_one.control.services.credentials.service import CredentialService
+from jentic_one.control.services.credentials.state import new_browser_binding
 from jentic_one.control.services.integrations import identity_echo
 from jentic_one.control.services.integrations.connect_session_service import (
     AuthCodeConfirmResult,
@@ -76,6 +77,17 @@ from jentic_one.shared.context import Context
 from jentic_one.shared.db.session import DatabaseSession
 
 pytestmark = pytest.mark.integration
+
+# The approver's browser; its cookie value accompanies each callback below.
+_BINDING = new_browser_binding()
+
+
+async def _revision(ctx: Context, session_id: str) -> str:
+    """The session's current revision, which every confirm names."""
+    async with ctx.control_db.session() as session:
+        row = await ConnectSessionRepository.get_by_id(session, session_id)
+    assert row is not None and row.current_revision_id is not None
+    return row.current_revision_id
 
 
 _USER_ID = "usr_alice"
@@ -235,10 +247,12 @@ async def test_confirm_against_db_registration_stamps_fk_and_skips_occ(
 
     confirmed = await svc.confirm(
         created.session_id,
+        revision_id=await _revision(ctx, created.session_id),
         poll_token=created.poll_token,
         confirmed_scopes=["scope-a"],
         permission_rules=[],
         identity=_USER_IDENTITY,
+        browser_binding=_BINDING.claim,
     )
     assert isinstance(confirmed, AuthCodeConfirmResult)
     q = parse_qs(urlsplit(confirmed.authorize_url).query)
@@ -346,10 +360,12 @@ async def test_legacy_embedded_path_still_writes_oauth_client_credentials(
     )
     confirmed = await svc.confirm(
         created.session_id,
+        revision_id=await _revision(ctx, created.session_id),
         poll_token=created.poll_token,
         confirmed_scopes=["scope-a"],
         permission_rules=[],
         identity=_USER_IDENTITY,
+        browser_binding=_BINDING.claim,
     )
     assert isinstance(confirmed, AuthCodeConfirmResult)
     q = parse_qs(urlsplit(confirmed.authorize_url).query)
@@ -393,10 +409,12 @@ async def test_complete_from_callback_through_registration_end_to_end(
     )
     confirmed = await svc.confirm(
         created.session_id,
+        revision_id=await _revision(ctx, created.session_id),
         poll_token=created.poll_token,
         confirmed_scopes=["scope-a"],
         permission_rules=[],
         identity=_USER_IDENTITY,
+        browser_binding=_BINDING.claim,
     )
     assert isinstance(confirmed, AuthCodeConfirmResult)
     raw_state = _state_from_authorize_url(confirmed.authorize_url)
@@ -412,23 +430,23 @@ async def test_complete_from_callback_through_registration_end_to_end(
         },
     )
 
-    class _FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return False
-
-        async def post(self, url, data=None, **kwargs):
-            posted_payloads.append(dict(data or {}))
-            return token_response
+    def _vendor(request: httpx.Request) -> httpx.Response:
+        posted_payloads.append(dict(parse_qsl(request.content.decode())))
+        return token_response
 
     identity_result = identity_echo.IdentityEchoResult(display="alice", raw={"username": "alice"})
     with (
-        patch("httpx.AsyncClient", return_value=_FakeClient()),
+        patch(
+            "jentic_one.shared.http.idp_client.build_always_pinned_transport",
+            return_value=httpx.MockTransport(_vendor),
+        ),
         patch.object(identity_echo, "echo_identity", new=AsyncMock(return_value=identity_result)),
     ):
-        result = await svc.complete_from_callback(raw_state=raw_state, code="the-code")
+        result = await svc.complete_from_callback(
+            raw_state=raw_state,
+            code="the-code",
+            browser_binding=_BINDING.value,
+        )
 
     assert result.status == "connected"
     # The same-slug config entry lends its identity probe to the registration.
@@ -477,10 +495,12 @@ async def test_finalise_fails_session_when_registration_disabled_mid_flow(
     )
     await svc.confirm(
         created.session_id,
+        revision_id=await _revision(ctx, created.session_id),
         poll_token=created.poll_token,
         confirmed_scopes=["scope-a"],
         permission_rules=[],
         identity=_USER_IDENTITY,
+        browser_binding=_BINDING.claim,
     )
 
     async with ctx.control_db.transaction() as session:
@@ -550,10 +570,12 @@ async def test_config_session_ignores_registration_added_after_connect(
     assert review.vendor_display_name == "Shared Auth Vendor"
     confirmed = await svc.confirm(
         created.session_id,
+        revision_id=await _revision(ctx, created.session_id),
         poll_token=created.poll_token,
         confirmed_scopes=["scope-a"],
         permission_rules=[],
         identity=_USER_IDENTITY,
+        browser_binding=_BINDING.claim,
     )
     assert isinstance(confirmed, AuthCodeConfirmResult)
     q = parse_qs(urlsplit(confirmed.authorize_url).query)
@@ -587,10 +609,12 @@ async def test_confirm_cancels_when_config_entry_removed_after_connect(
     with pytest.raises(OAuthAppChangedError):
         await svc.confirm(
             created.session_id,
+            revision_id=await _revision(ctx, created.session_id),
             poll_token=created.poll_token,
             confirmed_scopes=["scope-a"],
             permission_rules=[],
             identity=_USER_IDENTITY,
+            browser_binding=_BINDING.claim,
         )
     await _assert_session_cancelled(ctx, created.session_id, row.credential_id)
 
@@ -624,10 +648,12 @@ async def test_confirm_cancels_when_pinned_registration_disabled(
     with pytest.raises(OAuthAppChangedError):
         await svc.confirm(
             created.session_id,
+            revision_id=await _revision(ctx, created.session_id),
             poll_token=created.poll_token,
             confirmed_scopes=["scope-a"],
             permission_rules=[],
             identity=_USER_IDENTITY,
+            browser_binding=_BINDING.claim,
         )
     await _assert_session_cancelled(ctx, created.session_id, row.credential_id)
 
@@ -663,16 +689,9 @@ async def _refresh_capturing_post(ctx: Context, credential_id: str) -> tuple[str
         200, json={"access_token": "at_new", "expires_in": 3600, "scope": "scope-a"}
     )
 
-    class _FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return False
-
-        async def post(self, url, data=None, **kwargs):
-            posted.append(dict(data or {}))
-            return token_response
+    def _vendor(request: httpx.Request) -> httpx.Response:
+        posted.append(dict(parse_qsl(request.content.decode())))
+        return token_response
 
     async def _decrypt() -> str:
         return "old-refresh"
@@ -688,7 +707,10 @@ async def _refresh_capturing_post(ctx: Context, credential_id: str) -> tuple[str
         expires_at=datetime.now(UTC),
         decrypt=_decrypt,
     )
-    with patch("httpx.AsyncClient", return_value=_FakeClient()):
+    with patch(
+        "jentic_one.shared.http.idp_client.build_always_pinned_transport",
+        return_value=httpx.MockTransport(_vendor),
+    ):
         result = await provider.refresh(ctx, token=token_view)
     assert len(posted) == 1
     return result.access_token, posted[0]
@@ -805,10 +827,12 @@ async def _pinned_session_awaiting_callback(
     )
     confirmed = await svc.confirm(
         created.session_id,
+        revision_id=await _revision(ctx, created.session_id),
         poll_token=created.poll_token,
         confirmed_scopes=["scope-a"],
         permission_rules=[],
         identity=_USER_IDENTITY,
+        browser_binding=_BINDING.claim,
     )
     assert isinstance(confirmed, AuthCodeConfirmResult)
     return created.session_id, _state_from_authorize_url(confirmed.authorize_url)
@@ -834,7 +858,11 @@ async def test_callback_fails_as_registration_inactive_when_disabled_after_confi
     async with ctx.control_db.transaction() as session:
         await OAuthAppRegistrationRepository.update_base(session, registration.id, is_active=False)
 
-    result = await svc.complete_from_callback(raw_state=raw_state, code="the-code")
+    result = await svc.complete_from_callback(
+        raw_state=raw_state,
+        code="the-code",
+        browser_binding=_BINDING.value,
+    )
 
     assert result.status == "failed"
     assert result.error_code == "registration_inactive"

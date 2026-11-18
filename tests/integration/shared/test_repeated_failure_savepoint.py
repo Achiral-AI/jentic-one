@@ -24,7 +24,7 @@ from jentic_one.admin.core.schema.execution_records import ExecutionRecord
 from jentic_one.shared.config import SecurityConfig
 from jentic_one.shared.db.session import DatabaseSession
 from jentic_one.shared.events.repeated_failure import maybe_emit_repeated_failure
-from jentic_one.shared.executions import record_execution
+from jentic_one.shared.executions import ExecutionRecordInput, record_execution
 from jentic_one.shared.models import ExecutionStatus
 from jentic_one.shared.schemas import OperationInfo
 
@@ -32,7 +32,7 @@ pytestmark = pytest.mark.integration
 
 _PREFIX = "integ-rf-savepoint-"
 _ACTOR = "agt_rf_savepoint"
-_TOOLKIT = "tk_rf_savepoint"
+_CREDENTIAL = "cred_rf_savepoint"
 _OPERATION = OperationInfo(id="op_rf_savepoint", path="/v1/things", method="GET")
 
 
@@ -66,21 +66,24 @@ async def test_db_error_inside_the_detector_keeps_the_flushed_records(
         for i in range(3):
             await record_execution(
                 session,
-                execution_id=f"{_PREFIX}{i}",
-                toolkit_id=_TOOLKIT,
-                trace_id="a" * 32,
-                started_at=datetime.now(UTC),
-                status=ExecutionStatus.FAILED,
-                operation=_OPERATION,
-                actor_id=_ACTOR,
-                actor_type="agent",
+                ExecutionRecordInput(
+                    execution_id=f"{_PREFIX}{i}",
+                    toolkit_id=None,
+                    credential_id=_CREDENTIAL,
+                    trace_id="a" * 32,
+                    started_at=datetime.now(UTC),
+                    status=ExecutionStatus.FAILED,
+                    operation=_OPERATION,
+                    actor_id=_ACTOR,
+                    actor_type="agent",
+                ),
             )
         # Threshold reached → the detector reaches the (failing) emit.
         await maybe_emit_repeated_failure(
             session,
             actor_id=_ACTOR,
             actor_type="agent",
-            toolkit_id=_TOOLKIT,
+            credential_id=_CREDENTIAL,
             operation=_OPERATION,
             trace_id="a" * 32,
             config=config,

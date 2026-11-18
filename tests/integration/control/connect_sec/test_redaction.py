@@ -14,23 +14,25 @@ import asyncio
 import json
 import logging
 import socket
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
 import structlog
 import uvicorn
-from opentelemetry import metrics
-from opentelemetry.sdk.metrics import MeterProvider
+from httpx import ASGITransport, AsyncClient
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from sqlalchemy import inspect, text
 
+from jentic_one.control.services.credentials.state import OAUTH_CALLBACK_PATH
+from jentic_one.control.web.routers import credentials as credentials_router
 from jentic_one.shared.config import AppConfig
 from jentic_one.shared.context import Context
 from jentic_one.shared.db.session import DatabaseSession
 from jentic_one.shared.logging import configure_logging
-from jentic_one.shared.metrics import reset_metrics
+from jentic_one.shared.redaction import REDACTED
 from tests.integration.control.connect_sec.support import (
     AGENT,
     AGENT_ID,
@@ -58,15 +60,6 @@ _CIPHERTEXT_COLUMNS = {
     ("customer_api_keys", "encrypted_key"): _PASTED_KEY,
     ("oauth_client_credentials", "encrypted_client_secret"): _CLIENT_SECRET,
 }
-
-
-@pytest.fixture()
-def metric_reader() -> Iterator[InMemoryMetricReader]:
-    reader = InMemoryMetricReader()
-    reset_metrics()
-    metrics.set_meter_provider(MeterProvider(metric_readers=[reader]))
-    yield reader
-    reset_metrics()
 
 
 async def _table_rows(db: DatabaseSession) -> dict[str, list[dict[str, Any]]]:
@@ -108,7 +101,7 @@ async def _sweep_databases(ctx: Context, needles: tuple[str, ...]) -> list[str]:
 
 async def test_entered_secrets_and_poll_tokens_never_leak(
     env: Context,
-    metric_reader: InMemoryMetricReader,
+    otel_metric_reader: InMemoryMetricReader,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     await import_spec(env, KEY_SCHEME)
@@ -157,6 +150,7 @@ async def test_entered_secrets_and_poll_tokens_never_leak(
                         "kind": "api_key",
                         "key": _PASTED_KEY,
                         "digest": key_review["digest"],
+                        "revision_id": key_review["revision"]["id"],
                     },
                 )
             )
@@ -172,6 +166,7 @@ async def test_entered_secrets_and_poll_tokens_never_leak(
                         "token_url": "https://idp.approver.example/token",
                         "confirmed_scopes": ["read"],
                         "digest": oauth_review["digest"],
+                        "revision_id": oauth_review["revision"]["id"],
                     },
                 )
             )
@@ -206,7 +201,7 @@ async def test_entered_secrets_and_poll_tokens_never_leak(
         audit_count = (await session.execute(text("SELECT COUNT(*) FROM audit_entries"))).scalar()
     assert audit_count and audit_count >= 3
     # Metrics: names, attributes, values.
-    data = metric_reader.get_metrics_data()
+    data = otel_metric_reader.get_metrics_data()
     assert data is not None
     exported = data.to_json()
     assert "connect" in exported
@@ -220,14 +215,17 @@ def _free_port() -> int:
 
 
 @pytest.fixture()
-def restore_logging() -> Iterator[None]:
+def restore_logging(request: pytest.FixtureRequest) -> None:
     root = logging.getLogger()
     handlers, level = root.handlers[:], root.level
     structlog_config = structlog.get_config()
-    yield
-    root.handlers[:] = handlers
-    root.setLevel(level)
-    structlog.configure(**structlog_config)
+
+    def _restore() -> None:
+        root.handlers[:] = handlers
+        root.setLevel(level)
+        structlog.configure(**structlog_config)
+
+    request.addfinalizer(_restore)
 
 
 class _Lines(logging.Handler):
@@ -287,3 +285,93 @@ async def test_poll_token_never_reaches_an_access_log_line(
     lines = [line for line in access.lines if session_id in line]
     assert any("/status?poll_token=" in line for line in lines), access.lines
     assert not [line for line in access.lines if token in line]
+
+
+async def test_callback_error_text_with_token_never_reaches_audit_or_error_detail(
+    env: Context,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    await import_spec(env, OAUTH_SCHEME, name=f"{NAME}-oauth")
+    callback_secret = "canary_callback_error_token_" + "Z" * 20  # pragma: allowlist secret
+    caplog.set_level(logging.DEBUG)
+
+    async with client(env, AGENT) as agent:
+        oauth_ask = await agent.post(
+            "/integrations:connect",
+            json={
+                "api": {"vendor": VENDOR, "name": f"{NAME}-oauth", "version": VERSION},
+                "requested_scopes": ["read"],
+            },
+        )
+    assert oauth_ask.status_code == 201, oauth_ask.text
+    session_id = oauth_ask.json()["session_id"]
+
+    app = build_app(env, OWNER)
+    app.include_router(credentials_router.router)
+
+    with structlog.testing.capture_logs() as logs:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="https://t",
+            follow_redirects=False,
+        ) as owner:
+            review_resp = await owner.get(f"/connect-sessions/{session_id}")
+            assert review_resp.status_code == 200, review_resp.text
+            review = review_resp.json()
+
+            confirmed = await owner.post(
+                f"/connect-sessions/{session_id}:confirm",
+                json={
+                    "permission_rules": RULES,
+                    "expected_agent_id": AGENT_ID,
+                    "kind": "own_oauth_client",
+                    "client_id": "approver-client",
+                    "client_secret": _CLIENT_SECRET,
+                    "authorize_url": "https://idp.approver.example/authorize",
+                    "token_url": "https://idp.approver.example/token",
+                    "confirmed_scopes": ["read"],
+                    "digest": review["digest"],
+                    "revision_id": review["revision"]["id"],
+                },
+            )
+            assert confirmed.status_code == 200, confirmed.text
+            state = parse_qs(urlsplit(confirmed.json()["authorize_url"]).query)["state"][-1]
+
+            callback_resp = await owner.get(
+                OAUTH_CALLBACK_PATH,
+                params={
+                    "state": state,
+                    "error": f"access_denied access_token={callback_secret}",
+                },
+            )
+            assert callback_resp.status_code in (302, 303), callback_resp.text
+
+    terminal_events = [e for e in logs if e.get("event") == "connect_session.terminal"]
+    assert len(terminal_events) == 1
+    assert callback_secret not in str(terminal_events[0].get("error_detail", ""))
+    assert REDACTED in str(terminal_events[0].get("error_detail", ""))
+
+    log_text = _texts(logs) + "\n".join(
+        f"{r.getMessage()} {r.args!r} {r.__dict__!r}" for r in caplog.records if r.name != "httpx"
+    )
+    assert callback_secret not in log_text
+
+    async with env.admin_db.session() as session:
+        reason = (
+            await session.execute(
+                text(
+                    "SELECT reason FROM audit_entries WHERE target_id = :sid AND action = 'revoke'"
+                ),
+                {"sid": session_id},
+            )
+        ).scalar_one()
+    assert reason is not None
+    assert callback_secret not in reason
+    assert REDACTED in reason
+
+    for db in (env.control_db, env.admin_db, env.registry_db):
+        for table, rows in (await _table_rows(db)).items():
+            for row in rows:
+                for column, value in row.items():
+                    if value is not None:
+                        assert callback_secret not in _texts(value), f"{table}.{column}"

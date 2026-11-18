@@ -113,7 +113,7 @@ export class AgentsService {
         });
     }
     /**
-     * Archive Agent
+     * Archive an agent
      * Archive an agent — or, with ``purge=true``, hard-delete it.
      *
      * Archive keeps the row for history, but the action is not reversible and
@@ -154,6 +154,7 @@ export class AgentsService {
                 400: `Bad Request`,
                 401: `Unauthorized`,
                 403: `Forbidden`,
+                409: `Archive on an already-archived agent (\`invalid_transition\`); \`purge=true\` accepts any status`,
                 422: `Unprocessable Entity`,
                 500: `Internal Server Error`,
                 503: `Service Unavailable`,
@@ -166,8 +167,9 @@ export class AgentsService {
      *
      * Returns the agent's name, description, owner, `status`, approval or
      * denial details, and whether it currently has an API key (`has_api_key`).
-     * Readable by the agent itself, its owner, and `org:admin`; an agent outside
-     * the caller's visibility answers 404.
+     * Readable by the agent itself, its owner, `org:admin`, and a caller holding
+     * `agents:read` (implied by `agents:write`); an agent outside the caller's
+     * visibility answers 404.
      * @returns AgentResponse Successful Response
      * @throws ApiError
      */
@@ -189,6 +191,7 @@ export class AgentsService {
                 400: `Bad Request`,
                 401: `Unauthorized`,
                 403: `Forbidden`,
+                404: `No such agent, or an agent outside the caller's visibility (\`actor_not_found\`) — a 404 here can mean the agent exists but is not visible to you, so retrying will not help`,
                 422: `Unprocessable Entity`,
                 500: `Internal Server Error`,
                 503: `Service Unavailable`,
@@ -202,10 +205,13 @@ export class AgentsService {
      * Only the fields present in the body change; an empty body returns the
      * agent unchanged. Allowed for the agent's owner or an `org:admin` (anyone
      * else gets 404). Changing `owner_id` transfers ownership, is
-     * `org:admin`-only, and revokes every active OAuth client grant bound to
-     * the agent, so the new owner must re-consent any connected client. The
-     * agent's API key, permissions and credential bindings are unaffected. An
-     * archived agent cannot be updated (409). Returns the updated agent.
+     * `org:admin`-only, revokes every active OAuth client grant bound to the
+     * agent (so the new owner must re-consent any connected client), suspends
+     * active credential bindings to credentials outside the new owner's
+     * ownership, and revokes agent permission grants above the new owner's
+     * permission ceiling (grant those permissions to the new owner first to
+     * keep them on the agent). The agent's API key is unaffected. An archived
+     * agent cannot be updated (409). Returns the updated agent.
      * @returns AgentResponse Successful Response
      * @throws ApiError
      */
@@ -234,6 +240,8 @@ export class AgentsService {
                 400: `Bad Request`,
                 401: `Unauthorized`,
                 403: `Forbidden`,
+                404: `No such agent, or a caller who is neither the agent's owner nor an \`org:admin\` — anyone else gets 404 (\`actor_not_found\`), so a 404 here can mean the agent exists but is not yours to update`,
+                409: `An archived agent cannot be updated (\`invalid_transition\`)`,
                 422: `Unprocessable Entity`,
                 500: `Internal Server Error`,
                 503: `Service Unavailable`,
@@ -318,9 +326,10 @@ export class AgentsService {
      *
      * Each binding names the credential, the API it serves, when it was bound,
      * whether it is `suspended` (and why), and any attached permission
-     * `rule_set_id`. Credential secrets are never returned. Readable by the
-     * agent itself, its owner, and `org:admin` (404 otherwise). The list is not
-     * paginated.
+     * `rule_set_id`. Credential secrets are never returned. Readable like
+     * `GET /agents/{agent_id}`: by the agent itself, its owner, `org:admin`, and a
+     * caller holding `agents:read` (implied by `agents:write`); 404 otherwise.
+     * The list is not paginated.
      * @returns CredentialBindingListResponse Successful Response
      * @throws ApiError
      */
@@ -342,6 +351,7 @@ export class AgentsService {
                 400: `Bad Request`,
                 401: `Unauthorized`,
                 403: `Forbidden`,
+                404: `No such agent, or an agent the caller may not read — readable by the agent itself, its owner, \`org:admin\`, and a caller holding \`agents:read\`; 404 otherwise (\`actor_not_found\`), so a 404 here can mean the agent exists but is not visible to you`,
                 422: `Unprocessable Entity`,
                 500: `Internal Server Error`,
                 503: `Service Unavailable`,
@@ -387,6 +397,8 @@ export class AgentsService {
                 400: `Bad Request`,
                 401: `Unauthorized`,
                 403: `Forbidden`,
+                404: `The agent is not visible to the caller (\`actor_not_found\`), or a credential that does not exist or that the caller does not own (\`credential_not_found\`)`,
+                409: `The same credential is already bound to this agent (\`credential_binding_conflict\`)`,
                 422: `Unprocessable Entity`,
                 500: `Internal Server Error`,
                 503: `Service Unavailable`,
@@ -439,6 +451,7 @@ export class AgentsService {
                 400: `Bad Request`,
                 401: `Unauthorized`,
                 403: `Forbidden`,
+                404: `The agent is not visible to the caller (\`actor_not_found\`), or a missing binding (\`credential_binding_not_found\`) — also returned when an agent tries to purge its own binding, which it may only suspend`,
                 422: `Unprocessable Entity`,
                 500: `Internal Server Error`,
                 503: `Service Unavailable`,
@@ -481,6 +494,7 @@ export class AgentsService {
                 400: `Bad Request`,
                 401: `Unauthorized`,
                 403: `Forbidden`,
+                404: `No binding exists (\`credential_binding_not_found\`), the agent is not visible to the caller (\`actor_not_found\`), or the credential is not owned by the caller — including an agent resuming its own binding (\`credential_not_found\`)`,
                 422: `Unprocessable Entity`,
                 500: `Internal Server Error`,
                 503: `Service Unavailable`,
@@ -488,7 +502,7 @@ export class AgentsService {
         });
     }
     /**
-     * Update Agent Jwks
+     * Replace an agent's JWKS
      * Update an agent's JWKS (public keys for JWT-bearer authentication).
      *
      * The JWKS must contain at least one Ed25519 public key and must not contain
@@ -539,8 +553,8 @@ export class AgentsService {
      * granted scopes, the consenting user, its `status`, created and last-used
      * timestamps, and `can_revoke` for the caller. Filter by `status`
      * (`active` or `revoked`); results are cursor-paginated. Allowed for the
-     * agent's owner or an admin. An agent the caller cannot see answers 404,
-     * the same as one that does not exist. Revoke a grant with
+     * agent's owner or an admin; any other caller gets 404, the same as for an
+     * agent that does not exist. Revoke a grant with
      * `POST /oauth-grants/{grant_id}:revoke`.
      * @returns OAuthGrantListResponse Successful Response
      * @throws ApiError
@@ -591,7 +605,7 @@ export class AgentsService {
         });
     }
     /**
-     * Get Agent Permissions
+     * List an agent's permissions
      * List permissions granted to an agent.
      * @returns AgentPermissionsResponse Successful Response
      * @throws ApiError
@@ -621,8 +635,12 @@ export class AgentsService {
         });
     }
     /**
-     * Replace Agent Permissions
+     * Replace an agent's permissions
      * Replace all permissions for an agent.
+     *
+     * Newly added permissions must be grantable by the caller (403
+     * `agent_permission_not_grantable`) and within the agent owner's permission
+     * ceiling (409 `agent_permission_exceeds_owner`).
      * @returns AgentPermissionsResponse Successful Response
      * @throws ApiError
      */
@@ -651,6 +669,8 @@ export class AgentsService {
                 400: `Bad Request`,
                 401: `Unauthorized`,
                 403: `Forbidden`,
+                404: `Agent not found.`,
+                409: `Agent is archived, or a newly added permission exceeds the agent owner's permission ceiling (\`agent_permission_exceeds_owner\`).`,
                 422: `Unprocessable Entity`,
                 500: `Internal Server Error`,
                 503: `Service Unavailable`,
@@ -658,14 +678,16 @@ export class AgentsService {
         });
     }
     /**
-     * Approve Agent
+     * Approve an agent
      * Approve a pending agent.
      *
      * Allowed for the agent's owner or an ``org:admin``. An agent with no owner
      * (an unclaimed self-registration) can be approved only by an ``org:admin``,
      * who becomes its owner. Any other caller gets a 404, whatever the agent's
      * status, so the response does not reveal agents outside the caller's
-     * ownership.
+     * ownership. Self-requested permissions above the owner's permission ceiling
+     * are dropped on approval; an explicit grant above the owner's ceiling
+     * fails with 409 (``agent_permission_exceeds_owner``).
      * @returns AgentResponse Successful Response
      * @throws ApiError
      */
@@ -687,6 +709,8 @@ export class AgentsService {
                 400: `Bad Request`,
                 401: `Unauthorized`,
                 403: `Forbidden`,
+                404: `No such agent, or a caller who is neither the agent's owner nor an \`org:admin\` (and only an \`org:admin\` for an unowned agent). Returned whatever the agent's status (\`actor_not_found\`), so a 404 here can mean the agent exists but is outside the caller's ownership`,
+                409: `Agent is not pending (\`invalid_transition\`), or an explicit permission grant on the agent exceeds the agent owner's permission ceiling (\`agent_permission_exceeds_owner\`)`,
                 422: `Unprocessable Entity`,
                 500: `Internal Server Error`,
                 503: `Service Unavailable`,
@@ -694,7 +718,7 @@ export class AgentsService {
         });
     }
     /**
-     * Claim Agent
+     * Claim an agent
      * Claim ownership of a self-registered agent using its claim token.
      *
      * Authenticated by the platform bearer token but requires **no** agent
@@ -747,7 +771,7 @@ export class AgentsService {
         });
     }
     /**
-     * Deny Agent
+     * Deny an agent
      * Deny a pending agent.
      *
      * Same authorization as approve: the agent's owner or an ``org:admin``, and
@@ -781,6 +805,7 @@ export class AgentsService {
                 400: `Bad Request`,
                 401: `Unauthorized`,
                 403: `Forbidden`,
+                404: `No such agent, or a caller who is neither the agent's owner nor an \`org:admin\` (and only an \`org:admin\` for an unowned agent). Returned whatever the agent's status (\`actor_not_found\`), so a 404 here can mean the agent exists but is outside the caller's ownership`,
                 422: `Unprocessable Entity`,
                 500: `Internal Server Error`,
                 503: `Service Unavailable`,
@@ -788,7 +813,7 @@ export class AgentsService {
         });
     }
     /**
-     * Disable Agent
+     * Disable an agent
      * Disable an active agent.
      * @returns void
      * @throws ApiError
@@ -818,7 +843,7 @@ export class AgentsService {
         });
     }
     /**
-     * Enable Agent
+     * Enable an agent
      * Enable a disabled agent.
      * @returns void
      * @throws ApiError
@@ -848,7 +873,7 @@ export class AgentsService {
         });
     }
     /**
-     * Generate Agent Api Key
+     * Generate an agent's API key
      * Generate a new API key for an active agent. Rotates any existing key.
      * @returns ApiKeyResponse Successful Response
      * @throws ApiError
@@ -878,7 +903,7 @@ export class AgentsService {
         });
     }
     /**
-     * Revoke Agent Api Key
+     * Revoke an agent's API key
      * Revoke an agent's API key without generating a new one.
      * @returns void
      * @throws ApiError

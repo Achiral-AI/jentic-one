@@ -13,7 +13,7 @@
 # stages stay on the official python/node images — they never ship.
 ARG PYTHON_IMAGE=python:3.12-slim@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36
 ARG NODE_IMAGE=node:22-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436
-ARG UBUNTU_IMAGE=ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
+ARG UBUNTU_IMAGE=ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
 
 # UI build stage — produces ui/dist, bundled into the wheel via the
 # [tool.hatch.build.targets.wheel.force-include] "ui/dist" -> jentic_one/static.
@@ -39,6 +39,20 @@ COPY openapi/ openapi/
 COPY --from=ui-builder /ui/dist ui/dist
 
 RUN uv build --wheel --out-dir /build/dist
+# The wheel's metadata carries only the open ranges from pyproject.toml, so
+# `pip install <wheel>` alone would re-resolve them against PyPI at build time.
+# The service stages install this hash-pinned export of uv.lock first and the
+# wheel with --no-deps, so the image ships exactly the locked set CI tests
+# (#1819). Universal markers keep it valid for amd64 and arm64 alike.
+# --locked fails the build when uv.lock is out of date with pyproject.toml: a
+# dependency declared there but missing from the lock would otherwise be
+# absent from the image. EXTRAS (space-separated, e.g. `redis`) selects
+# optional extras; the --no-deps wheel install ignores `[extra]`, so extras
+# reach the image only through this export.
+ARG EXTRAS=""
+RUN uv export --locked --no-dev --no-emit-project \
+        $(for e in ${EXTRAS}; do printf -- '--extra %s ' "$e"; done) \
+        -o /build/dist/requirements.txt
 
 FROM ${UBUNTU_IMAGE} AS runtime
 

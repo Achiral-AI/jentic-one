@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 from jentic_one.shared.permissions.matching import MatchMode, validate_path
 from jentic_one.shared.web import openapi_examples as ex
@@ -42,8 +42,11 @@ class BasePermissionRuleSchema(BaseModel):
             "spec's path (`/widgets`), never the full upstream path with the "
             "server's base path (`/eu/widgets` for a server `https://host/{region}`). "
             "Interpreted per `match_mode`: `regex` uses "
-            "full-match semantics (the pattern must describe the whole path); "
-            "`prefix` and `exact` are literal. None matches all paths."
+            "full-match semantics (the pattern must describe the whole path) and is "
+            "limited to linear-time shapes: a repeated group may not contain another "
+            "repeat or ambiguous alternation, and back-references and lookarounds are "
+            "refused (422 `unsafe_regex`); paths over 2048 characters never match a "
+            "regex rule. `prefix` and `exact` are literal. None matches all paths."
         ),
     )
     match_mode: MatchMode = Field(
@@ -58,7 +61,20 @@ class BasePermissionRuleSchema(BaseModel):
     operations: list[str] | None = Field(
         default=None,
         examples=[[ex.OPERATION_ID]],
-        description="OpenAPI operation IDs to match. None matches all operations.",
+        description=(
+            "OpenAPI operationIds to match by exact string equality (survives revision "
+            "promotion; existing `op_…` registry operation IDs also match their revision). "
+            "None matches all operations."
+        ),
+    )
+    comment: str | None = Field(
+        default=None,
+        max_length=500,
+        # Also ``_comment``, the name reads return it under, so a rule read
+        # back can be sent as is.
+        validation_alias=AliasChoices("comment", "_comment"),
+        examples=["Lets the agent draft replies, never send them."],
+        description="Why the rule is there, in words. Shown wherever the rule is listed.",
     )
 
     @model_validator(mode="after")
@@ -110,6 +126,14 @@ class PermissionRuleSchema(BasePermissionRuleSchema):
 class PermissionRuleReadSchema(BaseModel):
     """Permission rule response (includes system fields)."""
 
+    id: str | None = Field(
+        default=None,
+        description=(
+            "ID of the rule (`apr_…` on a binding, `prr_…` in a rule set), so a connect-session "
+            "edit can name it in `remove` or `before`."
+        ),
+        examples=[ex.PERMISSION_RULE_ID],
+    )
     effect: Literal["allow", "deny", "require-approval"] = Field(
         description="Whether this rule allows, denies, or holds the matched request for "
         "human approval (`require-approval`).",
@@ -135,7 +159,10 @@ class PermissionRuleReadSchema(BaseModel):
     )
     operations: list[str] | None = Field(
         default=None,
-        description="OpenAPI operation IDs the rule matches; null matches all.",
+        description=(
+            "OpenAPI operationIds the rule matches by exact equality (existing `op_…` "
+            "registry operation IDs also match their revision); null matches all."
+        ),
         examples=[[ex.OPERATION_ID]],
     )
     is_system: bool = Field(
@@ -178,6 +205,68 @@ class PermissionRuleListResponse(BaseModel):
     )
 
 
+class BindingRuleSetSchema(BaseModel):
+    """The shared rule set a binding points at."""
+
+    id: str = Field(description="ID of the rule set (`prs_…`).", examples=[ex.RULE_SET_ID])
+    name: str = Field(description="Name of the rule set.", examples=["Stripe read-only"])
+    curated: bool = Field(
+        description="True for a curated set, which an edit can copy but never change.",
+        examples=[False],
+    )
+    rules: list[PermissionRuleReadSchema] = Field(
+        description="The set's rules, in evaluation order. They apply instead of `data`."
+    )
+
+
+class ScopeOptionSchema(BaseModel):
+    """One scope the credential's vendor offers, which an edit can add or remove."""
+
+    name: str = Field(description="The scope as the vendor names it.", examples=["gmail.send"])
+    classification: Literal["read", "write", "admin"] = Field(
+        description="What the scope lets a holder do.", examples=["write"]
+    )
+    description: str = Field(
+        description="What the scope grants, in words.", examples=["Send email as the user."]
+    )
+
+
+class BindingAccessResponse(PermissionRuleListResponse):
+    """A binding's permission rules plus the rest of what it grants."""
+
+    rule_set: BindingRuleSetSchema | None = Field(
+        default=None,
+        description=(
+            "The shared rule set the binding points at; null when its own rules (`data`) apply. "
+            "While a set is attached, `data` is dormant."
+        ),
+    )
+    granted_scopes: list[str] | None = Field(
+        default=None,
+        description="Scopes the credential's OAuth grant holds; null when it has none.",
+        examples=[["repo", "read:user"]],
+    )
+    suspended: bool = Field(
+        description="True when the binding is suspended and the agent cannot use it.",
+        examples=[False],
+    )
+    scopes_editable: bool = Field(
+        default=False,
+        description=(
+            "True when an edit can change the credential's OAuth scopes (add or remove); "
+            "the approver signs in to the vendor again for the new set."
+        ),
+        examples=[True],
+    )
+    scope_catalog: list[ScopeOptionSchema] | None = Field(
+        default=None,
+        description=(
+            "The scopes the credential's vendor offers; an edit can add only these. Null when "
+            "its client has no catalog, in which case a scope is passed to the vendor as named."
+        ),
+    )
+
+
 class PermissionTestRequest(BaseModel):
     """Request body for :test — dry-run a request shape against the binding's rules."""
 
@@ -197,7 +286,12 @@ class PermissionTestRequest(BaseModel):
     )
     operation_id: str | None = Field(
         default=None,
-        description="Optional OpenAPI operation id resolved from the request URL.",
+        description=(
+            "Optional OpenAPI operationId (or `op_…` registry operation ID) of the "
+            "hypothetical request. When omitted, the dry-run resolves the operation from "
+            "`(method, path)` against the credential's covered live API(s); when supplied, "
+            "it must agree with the resolved operation."
+        ),
         examples=[ex.OPERATION_ID],
     )
 

@@ -14,12 +14,12 @@ Two servers expose the same loop; **check `tools/list` to tell them apart**:
   local `jentic mcp` **stdio server** — a machine that has the CLI, so CLI
   recovery *may* also be available (defeasible: `--exclude-tools
   get_started` can hide it there, so treat presence as a strong hint,
-  absence as the reliable direction). The stdio server serves **ten** tools:
-  the nine below plus `get_started`.
+  absence as the reliable direction). The stdio server serves **fourteen**
+  tools: the thirteen below plus `get_started`.
 - If `get_started` is **absent**, you are on the daemon's **HTTP `/mcp`
   mount**: **no CLI exists** — never tell the operator to run `jentic …` "on
   this machine"; there is no this-machine. The mount serves exactly the
-  **nine** tools below.
+  **thirteen** tools below.
 
 Both flavors drive the same loop against the same backend; every tool result
 carries an `instance` stamp (`backend`/`host`/`instance_id`) — your
@@ -69,6 +69,11 @@ for anything else:
 request_connection {"vendor": "github", "reason": "read open PRs to summarise them"}
 request_connection {"api": {"vendor": "stripe-com", "name": "stripe-com-api", "version": "2024-06-20"}, "reason": "list this month's charges"}
 ```
+
+Before asking for an OAuth connection, read which scopes you can name with
+`inspect_api {"api": "vendor/name/version"}` (`jentic apis auth` on the CLI):
+each declared scheme, how a connection would collect it, and the scopes marked
+`requestable`. Ask only for those, in `requested_scopes`.
 
 It returns `{session_id, approval_url, resolved_flow}` — relay the
 `approval_url` to your human operator, who approves in their browser (and
@@ -221,14 +226,18 @@ the directive's `suggested_rules` as `requested_permission_rules`) and relay
 the `approval_url`;
 a denial carrying a `provisioning_url` means a connect request you opened
 is still waiting — relay that link to your operator rather than calling
-`request_connection` again. The denial taxonomy
-(`no_credential_binding`, `credential_undecryptable`,
-`credential_identity_mismatch`,
+`request_connection` again (a repeat call returns that open request,
+`already_open`; change it with `amend_request`). A rules denial
+(`action_denied`) is **change-shaped**: call `show_access`, then
+`request_access_change` with `parameters.edit`, and relay the
+`approval_url`. The denial taxonomy
+(`no_credential_binding`, `credential_binding_suspended`,
+`credential_undecryptable`, `credential_identity_mismatch`,
 `ambiguous_credential_binding` — the per-code meanings are surface-independent
 and live in `references/recovery.md`) applies unchanged — the same codes,
 delivered in the envelope instead of stderr.
 
-## The 9 mount tools (each maps onto the loop)
+## The 13 mount tools (each maps onto the loop)
 
 - `whoami` — your identity, status, permissions, and credential bindings with the
   APIs each one serves; start here and decide access from it.
@@ -236,6 +245,19 @@ delivered in the envelope instead of stderr.
   registry API) when no binding serves the API you need; relay the returned
   `approval_url` to your operator (they approve — you never poll or
   approve), then confirm with `whoami` and retry.
+- `show_access` — what your binding to one credential lets you do: rules
+  with their ids, the shared rule set (whose rules apply instead), granted
+  scopes, suspension. Read it before asking for a change, and when a change
+  request is refused with `next_tool: show_access`.
+- `request_access_change` — ask for a change to one binding (rules to add,
+  remove or replace, OAuth scopes to add, resume); the recovery for
+  `action_denied`, whose `parameters.edit` names the credential and the rule
+  to ask for. Relay the `approval_url`; nothing changes until a human
+  approves. If one is already open you get it back with
+  `next_tool: amend_request`.
+- `amend_request` — change an open request (an access change, or a
+  `request_connection` ask) instead of asking again; the approval link stays
+  the same.
 - `search_apis` — search the imported registry for operations by
   natural-language query; each hit carries the `target` to pass to
   `inspect_operation`/`execute`.
@@ -253,8 +275,11 @@ delivered in the envelope instead of stderr.
   the mount reports a duplicate as an `already_imported` success (the stdio
   server reports the same duplicate as a failed dead-letter import; either
   way it's already there).
+- `inspect_api` — how a connection to one registry API would be made: its
+  security schemes, how each is collected, and the OAuth scopes you may
+  request (`requestable: true`). Run it before `request_connection`.
 
-The stdio server serves these nine plus `get_started` (pre-auth setup
+The stdio server serves these thirteen plus `get_started` (pre-auth setup
 diagnosis on a CLI machine).
 
 **Structural facts:** every tool result carries an `instance` stamp

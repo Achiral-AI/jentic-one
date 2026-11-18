@@ -20,12 +20,11 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
-	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/jentic/jentic-one/cli/client/generated/control"
+	"github.com/jentic/jentic-one/cli/internal/agentops"
 	"github.com/jentic/jentic-one/cli/internal/cli/ux"
 )
 
@@ -107,6 +106,31 @@ const requestConnectionInstruction = "Relay the approval_url to your human opera
 // OAuth app): it can take hours, and this surface has no status tool, so the
 // agent ends its turn and retries execute later (next_tool).
 var requestConnectionHumanEntryInstruction = humanEntryNextStep("whoami")
+
+// requestConnectionOpenInstruction answers a repeat ask while the agent's
+// earlier request for the target is still open (409 connect_open).
+const requestConnectionOpenInstruction = "You already asked for this connection and the request " +
+	"is still open: relay its approval_url to your human operator instead of asking again. Once they " +
+	"confirm, call whoami to see the new credential binding, then retry the call that was blocked."
+
+// openSession is the 409 connect_open body's pointer at the open session.
+type openSession struct {
+	Type        string `json:"type"`
+	SessionID   string `json:"session_id"`
+	ApprovalURL string `json:"approval_url"`
+}
+
+// connectOpenSession returns the open session a 409 connect_open names, or nil.
+func connectOpenSession(resp *control.IntegrationsConnectHTTPResp, callErr error) *openSession {
+	if callErr != nil || resp == nil || resp.StatusCode() != http.StatusConflict {
+		return nil
+	}
+	var open openSession
+	if err := json.Unmarshal(resp.Body, &open); err != nil || open.Type != "connect_open" || open.SessionID == "" {
+		return nil
+	}
+	return &open
+}
 
 // connectResponse is the typed projection of the 201 body. Decoded from the
 // raw bytes (the generated JSON201 is untyped); poll_token is decoded but
@@ -234,8 +258,24 @@ func (s *mcpServer) handleRequestConnection(ctx context.Context, req *mcp.CallTo
 	// Never set body.AgentId: the caller IS the agent — the control plane
 	// injects the caller's identity, and a supplied agent_id is refused (403).
 	resp, callErr := client.IntegrationsConnectWithResponse(cctx, body)
+	if open := connectOpenSession(resp, callErr); open != nil {
+		s.logger.Info("request_connection already open", "target", target, "session_id", open.SessionID)
+		return s.result(cctx, map[string]any{
+			"schema_version": mcpSchemaVersion,
+			"session_id":     open.SessionID,
+			"approval_url":   open.ApprovalURL,
+			"already_open":   true,
+			"instruction":    requestConnectionOpenInstruction,
+		}), nil
+	}
 	if err := apiErrorFor(resp, callErr); err != nil {
-		return s.requestConnectionError(cctx, client, target, api != nil, err, connectRetryAfter(resp)), nil
+		var retryAfterS float64
+		if resp != nil && resp.HTTPResponse != nil {
+			if v, ok := agentops.RetryAfterSeconds(resp.HTTPResponse.Header); ok {
+				retryAfterS = v
+			}
+		}
+		return s.requestConnectionError(cctx, client, target, api != nil, err, retryAfterS), nil
 	}
 	var created connectResponse
 	if err := json.Unmarshal(resp.Body, &created); err != nil {
@@ -259,28 +299,13 @@ func (s *mcpServer) handleRequestConnection(ctx context.Context, req *mcp.CallTo
 	return s.result(cctx, payload), nil
 }
 
-// connectRetryAfter extracts the Retry-After seconds the route stamps on its
-// 429 (integrations.py: per-actor connect rate limit), so the tool's
-// retryable envelope carries the same retry_after_s extra as the Python
-// mount's. Zero when absent/unparseable.
-func connectRetryAfter(resp *control.IntegrationsConnectHTTPResp) float64 {
-	if resp == nil || resp.HTTPResponse == nil {
-		return 0
-	}
-	secs, err := strconv.ParseFloat(strings.TrimSpace(resp.HTTPResponse.Header.Get("Retry-After")), 64)
-	if err != nil || secs < 0 {
-		return 0
-	}
-	return secs
-}
-
 // requestConnectionError maps the route's failure surface onto the coded
 // taxonomy (§3.7 posture):
 //   - the API-target and session-cap codes (apiTargetCoded) — unknown_api,
 //     auth_type_required/auth_type_not_declared (retry with auth_type),
 //     manual_flows_disabled / no_declared_scheme / host_variable_not_pinned
-//     (report to the user), too_many_open_sessions / recently_rejected (do
-//     not ask again).
+//     (report to the user), too_many_open_sessions (do not open more),
+//     recently_rejected / connect_session_binding_suspended (do not ask again).
 //   - 404 (unknown vendor) / 400 (unsupported flow) — a correctable ask:
 //     RESOLVE_FAILED with the rediscovery/operator step.
 //   - 400 ambiguous_vendor — several shared OAuth apps serve the vendor and
@@ -387,6 +412,7 @@ const requestConnectionRegistrationRetry = "call request_connection again with "
 // destructiveHint (execute alone carries that, §3.2).
 func (s *mcpServer) connectToolSpecs() []mcpToolSpec {
 	return []mcpToolSpec{
+		s.inspectAPIToolSpec(),
 		{
 			tool: &mcp.Tool{
 				Name:  "request_connection",

@@ -6,12 +6,51 @@ from collections.abc import Sequence
 
 import structlog
 
+from jentic_one.shared.auth.actor_status import SESSION_GENERATION_CLAIM, read_user_status
 from jentic_one.shared.auth.identity import Identity
 from jentic_one.shared.auth.tokens import InvalidTokenError, decode_jwt
 from jentic_one.shared.context import Context
+from jentic_one.shared.db.errors import DatabaseUnavailableError
 from jentic_one.shared.models import ActorType
 
 logger = structlog.get_logger(__name__)
+
+
+async def _ensure_user_accepts_token(ctx: Context, user_id: str, generation: object) -> None:
+    """Refuse a user token whose ``users`` row is missing, deleted, inactive, or a newer generation.
+
+    One primary-key read — the same per-verdict cost the opaque ``at_`` path
+    pays to re-check its actor row (#1136). Deliberately uncached: a login JWT
+    stays valid for ``jwt_ttl_seconds``, so the users row is the only thing
+    that can end it early, and a disable (or a delete, which also clears
+    ``active``) must take effect on the very next request.
+
+    ``generation`` is the token's ``sgen`` claim (absent → ``0``). The row's
+    generation moves on at disable, delete, password change/reset and a
+    permission edit that narrows the user's effective set, so a token minted
+    before any of those stays refused even once the account is active again;
+    the bundle a password change returns carries the new value.
+    """
+    try:
+        status = await read_user_status(ctx.admin_db, user_id)
+    except DatabaseUnavailableError:
+        logger.warning("jwt_user_status_unavailable", sub=user_id)
+        raise
+    # Every refusal is the same uniform 401 as any other bad token; the reason
+    # is logged server-side so an operator can tell a deleted or forged
+    # subject from a disabled user or a revoked session.
+    if status is None:
+        logger.warning("jwt_user_inactive", sub=user_id, reason="missing")
+        raise InvalidTokenError("Token subject is not an active user")
+    if status.deleted:
+        logger.warning("jwt_user_inactive", sub=user_id, reason="deleted")
+        raise InvalidTokenError("Token subject is not an active user")
+    if not status.active:
+        logger.warning("jwt_user_inactive", sub=user_id, reason="inactive")
+        raise InvalidTokenError("Token subject is not an active user")
+    if generation != status.session_generation:
+        logger.warning("jwt_user_inactive", sub=user_id, reason="revoked")
+        raise InvalidTokenError("Token belongs to a revoked login session")
 
 
 def scopes_to_permissions(scopes: Sequence[object]) -> list[str]:
@@ -29,7 +68,7 @@ def scopes_to_permissions(scopes: Sequence[object]) -> list[str]:
     Two other places depend on the same identity without converting through here:
     :data:`jentic_one.shared.auth.permission_catalog.MCP_TOOL_SCOPES` (an OAuth2
     ceiling defined as a permission baseline) and
-    :func:`jentic_one.auth.web.routers.authorize._scope_to_permission_description`
+    :func:`jentic_one.auth.web.scope_descriptions.scope_to_permission_description`
     (consent copy looked up in the permission catalogue). Changing the translation
     here means revisiting both.
 
@@ -46,34 +85,21 @@ async def resolve_permissions_for_actor(
     ctx: Context,
     actor_type: ActorType,
     actor_id: str,
-    parent_actor_id: str | None,
-) -> tuple[list[str], list[str]]:
-    """Resolve native and inherited permissions for an actor by type.
-
-    Returns:
-        tuple[list[str], list[str]]: (permissions, parent_permissions)
-    """
+    parent_actor_id: str | None = None,
+) -> list[str]:
+    """Resolve native permissions for an actor by type."""
     # NOTE: Moving this to module-level would cause a circular dependency (shared -> admin).
     # A test-arch exception will handle this lazy import until permission
     # resolution is extracted out of the admin surface.
     from jentic_one.admin.services.permission_service import PermissionService
 
-    svc = PermissionService(ctx)
-    permissions: list[str] = []
-    parent_permissions: list[str] = []
-
+    _ = parent_actor_id
     if actor_type == ActorType.USER:
+        svc = PermissionService(ctx)
         view = await svc.get_effective_for_user(actor_id)
-        permissions = view.effective
-    elif actor_type == ActorType.AGENT:
-        # TODO: fetch the agent's direct permissions via svc.get_effective_for_agent
-        if parent_actor_id:
-            view = await svc.get_effective_for_user(parent_actor_id)
-            parent_permissions = view.effective
-        else:
-            logger.warning("Agent token missing parent_actor_id")
+        return view.effective
 
-    return permissions, parent_permissions
+    return []
 
 
 async def verify_token(token: str, *, secret: str, ctx: Context) -> Identity:
@@ -85,9 +111,23 @@ async def verify_token(token: str, *, secret: str, ctx: Context) -> Identity:
     be a USER (the most-privileged interpretation). Raises the same
     ``InvalidTokenError`` as a bad signature; the web layer maps it to 401.
 
+    User tokens re-check the ``users`` row on every verification (#1139): a
+    disabled, deleted or missing user, or a token from a revoked login session
+    (its ``sgen`` claim behind ``users.session_generation``), is refused with ``InvalidTokenError``
+    (uniform 401). Disabling a user therefore ends their outstanding login JWTs
+    on the next verification rather than at ``jwt_ttl_seconds``, and
+    re-enabling them does not bring those tokens back. A long-lived response
+    (the ``/events/stream`` SSE feed) re-verifies its credential while open. An
+    admin DB that cannot answer raises ``DatabaseUnavailableError`` (503), not
+    a 401 — the caller is not admitted either way.
+
     When the JWT already embeds ``permissions`` in its claims (e.g. login
-    JWTs), those are trusted directly — no DB lookup. Otherwise falls back
-    to the database-resolved permission path for backwards compatibility.
+    JWTs), those are trusted directly — no permission lookup. For a login JWT
+    that is sound because narrowing a user's permissions revokes their login
+    sessions (``PermissionService.set_assigned``), so the generation check
+    above refuses any token whose embedded set is wider than the user's
+    current grants. Otherwise falls back to the database-resolved permission
+    path for backwards compatibility.
     """
     claims = decode_jwt(token, secret)
     actor_type_claim = claims.get("actor_type")
@@ -109,14 +149,22 @@ async def verify_token(token: str, *, secret: str, ctx: Context) -> Identity:
     sub = claims["sub"]
     parent_actor_id = claims.get("parent_actor_id")
 
+    sgen_raw = claims.get(SESSION_GENERATION_CLAIM, 0)
+    session_generation = (
+        int(sgen_raw)
+        if actor_type == ActorType.USER
+        and isinstance(sgen_raw, int)
+        and not isinstance(sgen_raw, bool)
+        else None
+    )
+    if actor_type == ActorType.USER:
+        await _ensure_user_accepts_token(ctx, str(sub), sgen_raw)
+
     embedded_permissions = claims.get("permissions")
     if embedded_permissions is not None and isinstance(embedded_permissions, list):
         permissions = [str(p) for p in embedded_permissions]
-        parent_permissions: list[str] = []
     else:
-        permissions, parent_permissions = await resolve_permissions_for_actor(
-            ctx, actor_type, sub, parent_actor_id
-        )
+        permissions = await resolve_permissions_for_actor(ctx, actor_type, sub, parent_actor_id)
 
     # A token minted by this deployment's own authorization server carries its
     # grant as OAuth2 scopes; fold them into the permission set the rest of the
@@ -130,8 +178,9 @@ async def verify_token(token: str, *, secret: str, ctx: Context) -> Identity:
         sub=sub,
         email=claims.get("email", ""),
         permissions=permissions,
-        parent_permissions=parent_permissions,
         must_change_password=claims.get("must_change_password", False),
         actor_type=actor_type,
         parent_actor_id=parent_actor_id,
+        auth_method="jwt",
+        session_generation=session_generation,
     )

@@ -9,7 +9,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from jentic_one.broker.core.exceptions import AmbiguousMatchError, InvalidCredentialNameError
+from jentic_one.broker.core.errors import (
+    AmbiguousCredentialMatchError,
+    InvalidCredentialNameError,
+)
 from jentic_one.broker.services.credentials.errors import (
     AmbiguousCredentialError,
     CredentialCandidate,
@@ -67,6 +70,7 @@ async def test_credential_name_none_when_header_absent(monkeypatch: pytest.Monke
             allowed_credential_ids: Any = None,
             request_server_variables: Any = None,
             server_variables_unresolved: bool = False,
+            candidate_filter: Any = None,
         ) -> Any:
             captured["credential_name"] = credential_name
             return await original_resolve(api=api, caller=caller, credential_name=credential_name)
@@ -126,6 +130,7 @@ async def test_credential_name_forwarded_when_header_present(
             allowed_credential_ids: Any = None,
             request_server_variables: Any = None,
             server_variables_unresolved: bool = False,
+            candidate_filter: Any = None,
         ) -> Any:
             captured["credential_name"] = credential_name
             return await original_resolve(api=api, caller=caller, credential_name=credential_name)
@@ -176,7 +181,7 @@ async def test_ambiguous_response_contains_candidates(monkeypatch: pytest.Monkey
         lambda ctx: MagicMock(resolve=resolve),
     )
 
-    with pytest.raises(AmbiguousMatchError) as raised:
+    with pytest.raises(AmbiguousCredentialMatchError) as raised:
         await CredentialService(_ctx()).inject(
             api_vendor="stripe",
             api_name="payments",

@@ -8,18 +8,31 @@ Exercises the full claim/replay state machine over the in-process memory backend
 - a retry while the original is still pending is ``IN_PROGRESS`` with a ``Retry-After``,
 - callers are isolated (one caller's key never replays another's),
 - a short pending TTL frees a crashed claim before the long replay window,
-- sensitive response headers are scrubbed and oversized bodies are dropped.
+- sensitive and per-exchange (``Server-Timing``) response headers are not stored
+  and oversized bodies are dropped,
+- the memory backend's byte budget tracks the real memory it allocates.
 """
 
 from __future__ import annotations
 
-import pytest
+import asyncio
+import gc
+import json
+import tracemalloc
 
+import pytest
+import structlog
+
+from jentic_one.broker.core.errors import IdempotencyCompletionError, IdempotencyUnavailableError
+from jentic_one.broker.core.problem import broker_error_problem, status_for_broker_error
 from jentic_one.broker.services.idempotency import (
+    MAX_RECORD_HEADER_BYTES,
     IdempotencyState,
     SharedStateIdempotencyStore,
 )
-from jentic_one.shared.state.backend import MemoryStateBackend
+from jentic_one.shared.config import IdempotencyConfig
+from jentic_one.shared.state import MEMORY_BACKEND, MemoryBackendConfig
+from jentic_one.shared.state.backend import MemoryStateBackend, NamespaceBudget
 
 
 class _Clock:
@@ -74,6 +87,37 @@ async def test_fresh_then_replay() -> None:
 
 
 @pytest.mark.asyncio
+async def test_replay_reads_body_records_written_before_claim_generation_keys() -> None:
+    """A rolling upgrade does not discard live idempotent response bodies."""
+    backend = MemoryStateBackend(clock=_Clock())
+    store = _store(backend)
+    await backend.set(
+        store._slot("agent-1", "key-1"),
+        json.dumps(
+            {
+                "phase": "done",
+                "fp": "fp-a",
+                "token": "claim-a",
+                "status": 200,
+                "headers": {},
+                "body_omitted": False,
+                "body_ref": True,
+            }
+        ).encode(),
+        ttl_s=store._done_ttl,
+    )
+    await backend.set(
+        store._body_slot("agent-1", "key-1", "fp-a"), b"stored-body", ttl_s=store._done_ttl
+    )
+
+    replay = await store.begin("agent-1", "key-1", "fp-a")
+
+    assert replay.stored is not None
+    assert replay.stored.body == b"stored-body"
+    assert replay.stored.body_omitted is False
+
+
+@pytest.mark.asyncio
 async def test_same_key_different_fingerprint_conflicts() -> None:
     store = _store(MemoryStateBackend(clock=_Clock()))
 
@@ -117,6 +161,140 @@ async def test_pending_claim_expires_before_replay_window() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_record_never_replays_the_body_of_a_request_that_reclaimed_its_key() -> None:
+    """Fenced completion rejects a stale claim whose slot was reclaimed by a newer request.
+
+    A outlives its claim and B re-claims the key with another request. When A
+    later tries to complete with its stale claim token, the store refuses to
+    overwrite B's claim or response, so B's response remains intact.
+    """
+    clock = _Clock()
+    backend = MemoryStateBackend(clock=clock)
+    store = SharedStateIdempotencyStore(
+        backend, pending_ttl_s=10.0, done_ttl_s=3_600.0, max_response_bytes=1024
+    )
+    claim_a = await store.begin("agent-1", "key-1", "fp-a")
+    assert claim_a.state is IdempotencyState.FRESH
+    clock.advance(11.0)
+    claim_b = await store.begin("agent-1", "key-1", "fp-b")
+    assert claim_b.state is IdempotencyState.FRESH
+
+    # Stale claim A cannot overwrite B's pending claim.
+    assert (
+        await store.complete(
+            "agent-1",
+            "key-1",
+            "fp-a",
+            status_code=200,
+            headers={},
+            body=b"body-a",
+            claim_id=claim_a.claim_id,
+        )
+        is False
+    )
+
+    # Active claim B completes normally.
+    assert (
+        await store.complete(
+            "agent-1",
+            "key-1",
+            "fp-b",
+            status_code=201,
+            headers={},
+            body=b"body-b",
+            claim_id=claim_b.claim_id,
+        )
+        is True
+    )
+
+    # Stale claim A also cannot overwrite B's DONE record.
+    assert (
+        await store.complete(
+            "agent-1",
+            "key-1",
+            "fp-a",
+            status_code=200,
+            headers={},
+            body=b"body-a",
+            claim_id=claim_a.claim_id,
+        )
+        is False
+    )
+
+    replay_b = await store.begin("agent-1", "key-1", "fp-b")
+    assert replay_b.state is IdempotencyState.REPLAY
+    assert replay_b.stored is not None
+    assert replay_b.stored.status_code == 201
+    assert replay_b.stored.body == b"body-b"
+
+    conflict_a = await store.begin("agent-1", "key-1", "fp-a")
+    assert conflict_a.state is IdempotencyState.CONFLICT
+
+
+@pytest.mark.asyncio
+async def test_stale_completion_releases_only_its_own_same_fingerprint_body() -> None:
+    class _BlockingBodyBackend(MemoryStateBackend):
+        def __init__(self) -> None:
+            super().__init__(clock=clock)
+            self.body_a_started = asyncio.Event()
+            self.release_body_a = asyncio.Event()
+
+        async def set(self, key: str, value: bytes, *, ttl_s: float) -> None:
+            if value == b"body-a":
+                self.body_a_started.set()
+                await self.release_body_a.wait()
+            await super().set(key, value, ttl_s=ttl_s)
+
+    clock = _Clock()
+    backend = _BlockingBodyBackend()
+    store = SharedStateIdempotencyStore(
+        backend, pending_ttl_s=10.0, done_ttl_s=3_600.0, max_response_bytes=1024
+    )
+    claim_a = await store.begin("agent-1", "key-1", "fp-a")
+    assert claim_a.state is IdempotencyState.FRESH and claim_a.claim_id is not None
+
+    complete_a = asyncio.create_task(
+        store.complete(
+            "agent-1",
+            "key-1",
+            "fp-a",
+            status_code=200,
+            headers={},
+            body=b"body-a",
+            claim_id=claim_a.claim_id,
+        )
+    )
+    await asyncio.wait_for(backend.body_a_started.wait(), timeout=1.0)
+    clock.advance(11.0)
+
+    claim_b = await store.begin("agent-1", "key-1", "fp-a")
+    assert claim_b.state is IdempotencyState.FRESH and claim_b.claim_id is not None
+    assert await store.complete(
+        "agent-1",
+        "key-1",
+        "fp-a",
+        status_code=201,
+        headers={},
+        body=b"body-b",
+        claim_id=claim_b.claim_id,
+    )
+
+    backend.release_body_a.set()
+    assert await asyncio.wait_for(complete_a, timeout=1.0) is False
+    body_a_slot = store._body_slot("agent-1", "key-1", "fp-a", claim_a.claim_id)
+    assert await backend.get(body_a_slot) == b""
+
+    replay_b = await store.begin("agent-1", "key-1", "fp-a")
+    assert replay_b.state is IdempotencyState.REPLAY
+    assert replay_b.stored is not None
+    assert replay_b.stored.status_code == 201
+    assert replay_b.stored.body == b"body-b"
+    clock.advance(2.0)
+    assert await backend.get(body_a_slot) is None
+    assert (await store.begin("agent-1", "key-1", "fp-a")).stored is not None
+
+
+@pytest.mark.asyncio
 async def test_sensitive_headers_scrubbed_on_store() -> None:
     store = _store(MemoryStateBackend(clock=_Clock()))
 
@@ -130,6 +308,7 @@ async def test_sensitive_headers_scrubbed_on_store() -> None:
             "content-type": "application/json",
             "Set-Cookie": "session=abc",
             "Authorization": "Bearer secret",
+            "Server-Timing": "db;dur=12.5",
         },
         body=b"{}",
     )
@@ -139,6 +318,9 @@ async def test_sensitive_headers_scrubbed_on_store() -> None:
     assert "content-type" in replay.stored.headers
     assert "Set-Cookie" not in replay.stored.headers
     assert "Authorization" not in replay.stored.headers
+    # Per-exchange latency: a replay makes no upstream call, so it must not
+    # re-assert the original upstream's timing.
+    assert "Server-Timing" not in replay.stored.headers
 
 
 @pytest.mark.asyncio
@@ -162,3 +344,411 @@ async def test_oversized_body_omitted_but_still_replays() -> None:
     assert replay.stored.body == b""
     # Status/headers still replay so the side-effect isn't repeated.
     assert replay.stored.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_in_flight_retry_is_never_fresh_when_the_store_is_full() -> None:
+    """A full store refuses new claims; it never drops a live one.
+
+    Evicting the in-flight claim to make room would let the client's retry
+    claim the key ``FRESH`` and run the upstream call a second time.
+    """
+    backend = MemoryStateBackend(clock=_Clock(), max_entries=10)
+    store = _store(backend)
+    assert (await store.begin("agent-1", "in-flight", "fp")).state is IdempotencyState.FRESH
+    for i in range(9):
+        assert (await store.begin("agent-1", f"other-{i}", "fp")).state is IdempotencyState.FRESH
+
+    with pytest.raises(IdempotencyUnavailableError) as refused:
+        await store.begin("agent-1", "overflow", "fp")
+    assert status_for_broker_error(refused.value) == 503
+    assert int(refused.value.headers["Retry-After"]) >= 1
+
+    retry = await store.begin("agent-1", "in-flight", "fp")
+    assert retry.state is IdempotencyState.IN_PROGRESS
+
+
+@pytest.mark.asyncio
+async def test_complete_stores_the_record_without_its_body_when_the_body_does_not_fit() -> None:
+    backend = MemoryStateBackend(clock=_Clock(), max_bytes=1_500)
+    store = _store(backend, max_response_bytes=10_000)
+    assert (await store.begin("agent-1", "key-1", "fp")).state is IdempotencyState.FRESH
+
+    await store.complete(
+        "agent-1", "key-1", "fp", status_code=201, headers={"x": "1"}, body=b"b" * 2_000
+    )
+
+    replay = await store.begin("agent-1", "key-1", "fp")
+    assert replay.state is IdempotencyState.REPLAY
+    assert replay.stored is not None
+    assert replay.stored.status_code == 201
+    assert replay.stored.body_omitted is True
+
+
+async def _claim_bytes(caller: str, key: str, fp: str) -> int:
+    """Budgeted bytes of one PENDING claim, measured on a scratch backend."""
+    scratch = MemoryStateBackend(clock=_Clock())
+    await _store(scratch).begin(caller, key, fp)
+    return scratch._usage["idem"].bytes
+
+
+@pytest.mark.asyncio
+async def test_a_retry_after_the_claim_ttl_does_not_rerun_when_the_record_does_not_fit() -> None:
+    """Once the upstream call ran, some record always replaces the claim.
+
+    The ``idem`` budget holds exactly the claim, so neither the full record
+    nor a body-less one fits; the status-only tombstone, never larger than the
+    claim, does. A retry after ``pending_ttl_s`` must replay, not run again.
+    """
+    clock = _Clock()
+    budget = await _claim_bytes("agent-1", "k", "fp")
+    backend = MemoryStateBackend(
+        clock=clock, namespace_budgets={"idem": NamespaceBudget(max_entries=10, max_bytes=budget)}
+    )
+    store = _store(backend, pending_ttl_s=35.0, max_response_bytes=100_000)
+    claim = await store.begin("agent-1", "k", "fp")
+    assert claim.state is IdempotencyState.FRESH
+
+    with structlog.testing.capture_logs() as logs:
+        await store.complete(
+            "agent-1", "k", "fp", status_code=201, headers={"h": "v" * 200}, body=b"x" * 50_000
+        )
+
+    assert "idempotency_record_stored_as_tombstone" in {entry["event"] for entry in logs}
+    # The tombstone references no body, so the stored body is released at
+    # once instead of spending the caller's idem-body share for an hour.
+    body_usage = backend._usage["idem-body"]
+    assert body_usage.bytes < 1_000
+    clock.advance(36.0)
+    retry = await store.begin("agent-1", "k", "fp")
+    assert retry.state is IdempotencyState.REPLAY
+    assert retry.stored is not None
+    assert retry.stored.status_code == 201
+    assert retry.stored.body_omitted is True
+    assert await backend.get(store._body_slot("agent-1", "k", "fp", claim.claim_id or "")) is None
+    assert body_usage.entries == 0 and body_usage.bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_a_full_body_budget_drops_bodies_but_never_refuses_a_claim() -> None:
+    backend = MemoryStateBackend(
+        clock=_Clock(),
+        namespace_budgets={"idem-body": NamespaceBudget(max_entries=1_000, max_bytes=2_000)},
+    )
+    store = _store(backend, max_response_bytes=10_000)
+    for i in range(5):
+        assert (await store.begin("agent-1", f"k{i}", "fp")).state is IdempotencyState.FRESH
+        await store.complete(
+            "agent-1", f"k{i}", "fp", status_code=200, headers={}, body=b"b" * 1_000
+        )
+
+    first = await store.begin("agent-1", "k0", "fp")
+    last = await store.begin("agent-1", "k4", "fp")
+    assert first.stored is not None and first.stored.body == b"b" * 1_000
+    assert last.stored is not None and last.stored.body_omitted is True
+    assert (await store.begin("agent-1", "next", "fp")).state is IdempotencyState.FRESH
+
+
+@pytest.mark.asyncio
+async def test_one_caller_over_its_share_does_not_lock_out_another() -> None:
+    backend = MemoryStateBackend(
+        clock=_Clock(),
+        namespace_budgets={
+            "idem": NamespaceBudget(max_entries=20, max_bytes=10**9, max_owner_share=0.1)
+        },
+    )
+    store = _store(backend)
+    for i in range(2):
+        assert (await store.begin("agent-1", f"k{i}", "fp")).state is IdempotencyState.FRESH
+    with pytest.raises(IdempotencyUnavailableError):
+        await store.begin("agent-1", "k2", "fp")
+
+    assert (await store.begin("agent-2", "k0", "fp")).state is IdempotencyState.FRESH
+
+
+@pytest.mark.asyncio
+async def test_a_colon_in_the_caller_does_not_merge_owner_shares() -> None:
+    backend = MemoryStateBackend(
+        clock=_Clock(),
+        namespace_budgets={
+            "idem": NamespaceBudget(max_entries=10, max_bytes=10**9, max_owner_share=0.1)
+        },
+    )
+    store = _store(backend)
+    assert (await store.begin("urn:a", "k", "fp")).state is IdempotencyState.FRESH
+    assert (await store.begin("urn:b", "k", "fp")).state is IdempotencyState.FRESH
+
+
+@pytest.mark.asyncio
+async def test_long_headers_are_capped_so_records_stay_bounded() -> None:
+    store = _store(MemoryStateBackend(clock=_Clock()))
+    await store.begin("agent-1", "k", "fp")
+    headers = {f"x-h{i}": "v" * 100 for i in range(20)} | {"content-type": "text/plain"}
+    await store.complete("agent-1", "k", "fp", status_code=200, headers=headers, body=b"ok")
+
+    replay = await store.begin("agent-1", "k", "fp")
+    assert replay.stored is not None
+    assert replay.stored.headers["content-type"] == "text/plain"
+    assert len(json.dumps(replay.stored.headers, separators=(",", ":"))) <= MAX_RECORD_HEADER_BYTES
+    assert replay.stored.body == b"ok"
+
+
+@pytest.mark.asyncio
+async def test_the_header_cap_keeps_the_headers_a_replay_needs() -> None:
+    store = _store(MemoryStateBackend(clock=_Clock()))
+    await store.begin("agent-1", "k", "fp")
+    filler = {f"x-filler-{i}": "v" * 60 for i in range(6)}
+    wanted = {
+        "Location": "/things/42",
+        "ETag": '"abc123"',
+        "Content-Location": "/things/42",
+        "Retry-After": "5",
+        "Content-Type": "application/json",
+    }
+    headers = {"server": "nginx", "date": "Sat, 17 Oct 2026 00:00:00 GMT", **filler, **wanted}
+    await store.complete("agent-1", "k", "fp", status_code=201, headers=headers, body=b"{}")
+
+    replay = await store.begin("agent-1", "k", "fp")
+    assert replay.stored is not None
+    assert wanted.items() <= replay.stored.headers.items()
+    # The priority headers come last in the response, yet fillers are dropped.
+    assert not filler.keys() <= replay.stored.headers.keys()
+    assert len(json.dumps(replay.stored.headers, separators=(",", ":"))) <= MAX_RECORD_HEADER_BYTES
+
+
+_TYPICAL_HEADERS = {
+    "content-type": "application/json",
+    "content-length": "1024",
+    "date": "Sat, 17 Oct 2026 00:00:00 GMT",
+    "server": "nginx",
+    "x-request-id": "0f8fad5b-d9cb-469f-a165-70867728950e",
+    "jentic-execution-id": "exec_" + "e" * 27,
+    "jentic-upstream-status": "200",
+}
+_FILL_BUDGET_BYTES = 12 * 1024 * 1024
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("filled", "body_len"), [("idem", 0), ("idem-body", 1024)])
+async def test_the_byte_budget_tracks_real_memory(filled: str, body_len: int) -> None:
+    """Filled to its budget, a namespace holds about the memory the budget says.
+
+    Runs typical requests (20 callers, seven response headers, a claim then
+    a record each) until ``filled`` refuses, then compares the bytes
+    ``tracemalloc`` traces for the whole backend with its budgeted bytes. An
+    understated ``ENTRY_OVERHEAD_BYTES`` would let a memory limit sized from
+    the budgets be OOM-killed before the store ever refuses; an overstated
+    one refuses requests the memory could hold.
+    """
+    clock = _Clock()
+    unbounded = NamespaceBudget(max_entries=10**8, max_bytes=10**12, max_owner_share=0.1)
+    full = NamespaceBudget(max_entries=10**8, max_bytes=_FILL_BUDGET_BYTES, max_owner_share=0.1)
+    budgets = {"idem": unbounded, "idem-body": unbounded, filled: full}
+    gc.collect()
+    tracemalloc.start()
+    try:
+        base = tracemalloc.get_traced_memory()[0]
+        backend = MemoryStateBackend(clock=clock, namespace_budgets=budgets, max_total_bytes=10**12)
+        store = _store(backend, done_ttl_s=3_600.0, max_response_bytes=1_000_000)
+        usage = backend._usage
+        for i in range(10**6):
+            caller, key, fp = f"agnt_{i % 20:027d}", f"{i:036d}", f"{i:064x}"
+            try:
+                await store.begin(caller, key, fp)
+            except IdempotencyUnavailableError:
+                break
+            body_bytes = usage["idem-body"].bytes if "idem-body" in usage else 0
+            await store.complete(
+                caller,
+                key,
+                fp,
+                status_code=200,
+                headers=dict(_TYPICAL_HEADERS),
+                body=bytes(bytearray(body_len)),
+            )
+            if body_len and usage["idem-body"].bytes == body_bytes:
+                break
+            clock.advance(0.001)
+        gc.collect()
+        real = tracemalloc.get_traced_memory()[0] - base
+    finally:
+        tracemalloc.stop()
+
+    assert usage[filled].bytes >= 0.99 * _FILL_BUDGET_BYTES
+    assert 0.85 <= real / backend._total_bytes <= 1.15
+
+
+@pytest.mark.asyncio
+async def test_default_budgets_hold_the_documented_sustained_rate() -> None:
+    """The built-in budgets hold about 30 req/s (3 per caller) for the 1 h memory TTL.
+
+    Uses the budgeted size of a typical record and 1 KiB body, which
+    ``test_the_byte_budget_tracks_real_memory`` keeps within 15% of real
+    memory, and checks the built-in budgets fit the backend-wide cap.
+    """
+    backend = MemoryStateBackend(clock=_Clock())
+    store = _store(backend, max_response_bytes=256 * 1024)
+    caller, key = "agnt_" + "a" * 27, "0f8fad5b-d9cb-469f-a165-70867728950e"
+    fp = "f" * 64
+    await store.begin(caller, key, fp)
+    await store.complete(
+        caller, key, fp, status_code=200, headers=_TYPICAL_HEADERS, body=b"x" * 1024
+    )
+    record_bytes = backend._usage["idem"].bytes
+    body_bytes = backend._usage["idem-body"].bytes
+
+    memory = MemoryBackendConfig()
+    budgets = memory.budgets()
+    ttl_s = IdempotencyConfig().replay_ttl_s(MEMORY_BACKEND)
+    assert ttl_s == 3_600
+    idem, body = budgets["idem"], budgets["idem-body"]
+    records_per_s = min(idem.max_entries, idem.max_bytes // record_bytes) / ttl_s
+    bodies_per_s = min(body.max_entries, body.max_bytes // body_bytes) / ttl_s
+    assert 28 <= records_per_s <= 32
+    assert 4.5 <= bodies_per_s <= 5.5
+    assert idem.max_owner_share is not None
+    assert records_per_s * idem.max_owner_share >= 2.8
+    # idem, idem-body and one default-sized namespace (the breaker's) fit the cap.
+    assert idem.max_bytes + body.max_bytes + memory.max_bytes_per_namespace <= (
+        memory.max_total_bytes
+    )
+
+
+@pytest.mark.asyncio
+async def test_claim_lease_renews_in_flight_and_releases_only_on_pre_send_error() -> None:
+    clock = _Clock()
+    backend = MemoryStateBackend(clock=clock)
+    store = _store(backend, pending_ttl_s=0.12)
+
+    first = await store.begin("agent-1", "key-lease", "fp-1")
+    assert first.state is IdempotencyState.FRESH
+    assert first.claim_id is not None
+
+    with pytest.raises(RuntimeError, match="pre-send"):
+        async with store.lease("agent-1", "key-lease", "fp-1", first.claim_id):
+            raise RuntimeError("pre-send")
+
+    # Released on pre-send failure -> immediately claimable FRESH.
+    reclaimed = await store.begin("agent-1", "key-lease", "fp-1")
+    assert reclaimed.state is IdempotencyState.FRESH
+    assert reclaimed.claim_id is not None
+
+    with pytest.raises(RuntimeError, match="post-send"):
+        async with store.lease("agent-1", "key-lease", "fp-1", reclaimed.claim_id) as lease:
+            lease.mark_dispatched()
+            await asyncio.sleep(0.08)
+            raise RuntimeError("post-send")
+
+    # Dispatched call that raised is NOT released early -> still IN_PROGRESS.
+    in_flight = await store.begin("agent-1", "key-lease", "fp-1")
+    assert in_flight.state is IdempotencyState.IN_PROGRESS
+
+
+@pytest.mark.asyncio
+async def test_stale_lease_completion_reports_an_indeterminate_post_dispatch_outcome() -> None:
+    """A response without a durable replay record is not reported as success."""
+    clock = _Clock()
+    store = _store(MemoryStateBackend(clock=clock), pending_ttl_s=10.0)
+    first = await store.begin("agent-1", "key-complete", "fp-complete")
+    assert first.state is IdempotencyState.FRESH
+    assert first.claim_id is not None
+
+    async with store.lease("agent-1", "key-complete", "fp-complete", first.claim_id) as lease:
+        lease.mark_dispatched()
+        clock.advance(11.0)
+        replacement = await store.begin("agent-1", "key-complete", "fp-complete")
+        assert replacement.state is IdempotencyState.FRESH
+        assert replacement.claim_id is not None
+        await store.complete(
+            "agent-1",
+            "key-complete",
+            "fp-complete",
+            status_code=201,
+            headers={},
+            body=b"replacement",
+            claim_id=replacement.claim_id,
+        )
+
+        with pytest.raises(IdempotencyCompletionError) as exc_info:
+            await lease.complete(status_code=200, headers={}, body=b"stale")
+
+    assert lease.completed is True
+    assert exc_info.value.headers == {}
+    assert "Retry-After" not in exc_info.value.headers
+    assert status_for_broker_error(exc_info.value) == 500
+    problem = broker_error_problem(exc_info.value)
+    assert problem["type"] == "idempotency_completion_failed"
+    assert problem["status"] == 500
+    replay = await store.begin("agent-1", "key-complete", "fp-complete")
+    assert replay.state is IdempotencyState.REPLAY
+    assert replay.stored is not None
+    assert replay.stored.body == b"replacement"
+
+
+@pytest.mark.asyncio
+async def test_lease_completion_backend_failure_remains_an_error_on_repeated_calls() -> None:
+    """A terminal lease never turns an unrecorded upstream outcome into success."""
+
+    class _FailingSetBackend(MemoryStateBackend):
+        def __init__(self) -> None:
+            super().__init__(clock=_Clock())
+            self.fail_records = False
+
+        async def set(self, key: str, value: bytes, *, ttl_s: float) -> None:
+            if self.fail_records and key.startswith("idem:"):
+                raise RuntimeError("state backend unavailable")
+            await super().set(key, value, ttl_s=ttl_s)
+
+    backend = _FailingSetBackend()
+    store = _store(backend)
+    claim = await store.begin("agent-1", "key-backend-error", "fp-backend-error")
+    assert claim.state is IdempotencyState.FRESH
+    assert claim.claim_id is not None
+    backend.fail_records = True
+
+    async with store.lease(
+        "agent-1", "key-backend-error", "fp-backend-error", claim.claim_id
+    ) as lease:
+        lease.mark_dispatched()
+        with pytest.raises(IdempotencyCompletionError) as first:
+            await lease.complete(status_code=200, headers={}, body=b"response")
+        with pytest.raises(IdempotencyCompletionError) as repeated:
+            await lease.complete(status_code=200, headers={}, body=b"response")
+
+    assert isinstance(first.value.__cause__, RuntimeError)
+    assert repeated.value is first.value
+    assert status_for_broker_error(first.value) == 500
+    assert first.value.headers == {}
+
+
+@pytest.mark.asyncio
+async def test_repeated_non_sensitive_headers_survive_replay_while_set_cookie_is_scrubbed() -> None:
+    backend = MemoryStateBackend(clock=_Clock())
+    store = _store(backend)
+    first = await store.begin("agent-1", "key-multi", "fp-multi")
+    assert first.state is IdempotencyState.FRESH
+    await store.complete(
+        "agent-1",
+        "key-multi",
+        "fp-multi",
+        status_code=200,
+        headers=[
+            ("content-type", "application/json"),
+            ("x-custom-tag", "alpha"),
+            ("x-custom-tag", "beta"),
+            ("set-cookie", "a=1; Path=/"),
+            ("set-cookie", "b=2; Path=/"),
+        ],
+        body=b'{"ok":true}',
+        claim_id=first.claim_id,
+    )
+    replay = await store.begin("agent-1", "key-multi", "fp-multi")
+    assert replay.state is IdempotencyState.REPLAY
+    assert replay.stored is not None
+    assert replay.stored.header_items == (
+        ("content-type", "application/json"),
+        ("x-custom-tag", "alpha"),
+        ("x-custom-tag", "beta"),
+    )
+    assert all(k.lower() != "set-cookie" for k, _ in replay.stored.header_items)
+    assert "set-cookie" not in {k.lower() for k in replay.stored.headers}

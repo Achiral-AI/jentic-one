@@ -3,6 +3,7 @@ package mcpcfg
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -330,6 +331,19 @@ func TestClaudeCodeSteps(t *testing.T) {
 	}
 }
 
+// TestClaudeCodeAddCommandPrefixesAddStep pins ClaudeCodeAddCommand to the
+// add step ClaudeCodeSteps executes: callers report it as the registration
+// route, so it must be the exact leading argv of that step.
+func TestClaudeCodeAddCommandPrefixesAddStep(t *testing.T) {
+	const claude = "/usr/local/bin/claude"
+	steps := ClaudeCodeSteps(claude, PlainEntry("/bin/jentic", "ctx"), false)
+	add := ClaudeCodeAddCommand(claude)
+	got := steps[len(steps)-1].Argv
+	if len(got) < len(add) || !slices.Equal(got[:len(add)], add) {
+		t.Errorf("add step argv %q does not start with ClaudeCodeAddCommand %q", got, add)
+	}
+}
+
 // TestClaudeCodeProbeArgv pins the read-only probe that decides between
 // no-op, add-only, and remove-then-add.
 func TestClaudeCodeProbeArgv(t *testing.T) {
@@ -371,22 +385,10 @@ func TestPlainEntryPinsContext(t *testing.T) {
 	}
 }
 
-func TestSudoShimEntry(t *testing.T) {
-	e := SudoShimEntry("_jentic-cursor", "/abs/jentic", "cursor")
-	if e.Command != "sudo" {
-		t.Errorf("command = %q", e.Command)
-	}
-	// -H is load-bearing: without it macOS's `env_keep HOME` leaks the
-	// operator's home into the isolated server's XDG resolution.
-	want := "-n -H -u _jentic-cursor /abs/jentic mcp --context cursor"
-	if got := strings.Join(e.Args, " "); got != want {
-		t.Errorf("args:\n got %q\nwant %q", got, want)
-	}
-}
-
 // TestEntryPins covers the read-back helpers doctor keys off: the binary an
 // entry actually spawns and the context it actually pins, for both plain and
-// sudo-shim shapes.
+// sudo-shim shapes (the latter still exists in runtime configs written by
+// older releases).
 func TestEntryPins(t *testing.T) {
 	plainE := PlainEntry("/abs/jentic", "cursor")
 	if got := plainE.PinnedBinary(); got != "/abs/jentic" {
@@ -395,7 +397,7 @@ func TestEntryPins(t *testing.T) {
 	if got := plainE.PinnedContext(); got != "cursor" {
 		t.Errorf("plain PinnedContext = %q", got)
 	}
-	shim := SudoShimEntry("_jentic-cursor", "/abs/jentic", "cursor")
+	shim := Entry{Command: "sudo", Args: []string{"-n", "-H", "-u", "_jentic-cursor", "/abs/jentic", "mcp", "--context", "cursor"}}
 	if got := shim.PinnedBinary(); got != "/abs/jentic" {
 		t.Errorf("shim PinnedBinary = %q", got)
 	}
