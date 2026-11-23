@@ -11,6 +11,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from jentic_one.migrations.run import downgrade, upgrade
 
 _DB = "control"
@@ -32,13 +34,38 @@ def _tables(conn: sqlite3.Connection) -> set[str]:
     return {row[0] for row in rows}
 
 
-def _rebuild_skipped_state(db_path: Path) -> None:
+_REPAIR = "9f110b37d4c9"  # pragma: allowlist secret
+
+_CONNECT_REVISIONS_COLUMNS = {
+    table: columns for table, columns in _SKIPPED_COLUMNS.items() if table == "connect_sessions"
+}
+_FLOW_COMPLETION_COLUMNS = {
+    table: columns for table, columns in _SKIPPED_COLUMNS.items() if table != "connect_sessions"
+}
+
+
+def _rebuild_skipped_state(
+    db_path: Path,
+    *,
+    drop_revisions: bool = True,
+    drop_flow_completion: bool = True,
+) -> None:
+    dropped: dict[str, tuple[str, ...]] = {}
     with sqlite3.connect(db_path) as conn:
-        conn.execute("DROP TABLE connect_session_revisions")
-        for table, columns in _SKIPPED_COLUMNS.items():
+        if drop_revisions:
+            conn.execute("DROP TABLE connect_session_revisions")
+            dropped |= _CONNECT_REVISIONS_COLUMNS
+        if drop_flow_completion:
+            dropped |= _FLOW_COMPLETION_COLUMNS
+        for table, columns in dropped.items():
             for column in columns:
                 conn.execute(f'ALTER TABLE "{table}" DROP COLUMN "{column}"')
         conn.execute("UPDATE alembic_version SET version_num = ?", (_STAMP,))
+
+
+def _version(db_path: Path) -> str:
+    with sqlite3.connect(db_path) as conn:
+        return str(conn.execute("SELECT version_num FROM alembic_version").fetchone()[0])
 
 
 def _assert_skipped_schema_present(db_path: Path) -> None:
@@ -56,6 +83,27 @@ def test_upgrade_applies_revisions_skipped_by_the_reparent(sqlite_stack: Path) -
     upgrade(_DB)
 
     _assert_skipped_schema_present(db_path)
+    assert _version(db_path) == _REPAIR
+
+
+@pytest.mark.parametrize(
+    ("drop_revisions", "drop_flow_completion"),
+    [(True, False), (False, True)],
+    ids=["only-connect-revisions-missing", "only-flow-completion-missing"],
+)
+def test_upgrade_applies_only_the_missing_revision(
+    sqlite_stack: Path, *, drop_revisions: bool, drop_flow_completion: bool
+) -> None:
+    db_path = sqlite_stack / f"{_DB}.db"
+    upgrade(_DB)
+    _rebuild_skipped_state(
+        db_path, drop_revisions=drop_revisions, drop_flow_completion=drop_flow_completion
+    )
+
+    upgrade(_DB)
+
+    _assert_skipped_schema_present(db_path)
+    assert _version(db_path) == _REPAIR
 
 
 def test_upgrade_on_a_linear_install_leaves_the_schema_alone(sqlite_stack: Path) -> None:
