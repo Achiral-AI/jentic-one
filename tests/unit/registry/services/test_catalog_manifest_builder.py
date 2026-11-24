@@ -60,6 +60,28 @@ def test_parse_dedup_and_sort() -> None:
     assert [e.api_id for e in entries] == ["alpha.com", "zeta.com"]
 
 
+@pytest.mark.parametrize(
+    ("domain", "sub", "versions", "expected"),
+    [
+        # apis.json lists versions in sorted order; the highest wins, not the first.
+        ("googleapis.com", "drive", ["v2", "v3"], "v3"),
+        ("googleapis.com", "drivelabels", ["v2", "v2beta"], "v2"),
+        ("azure.com", "alerts", ["2019-05-05-preview", "2019-06-01"], "2019-06-01"),
+        ("cloudflare.com", "main", ["4.0.0", "v0"], "4.0.0"),
+        ("acme.io", "main", ["1.10.0", "1.9.0"], "1.10.0"),
+        # Equal versions spelled two ways: the later listing wins.
+        ("bamboohr.com", "main", ["1.0.0", "v1"], "v1"),
+        ("airtable.com", "main", ["0.1", "0.1.0"], "0.1.0"),
+    ],
+)
+def test_parse_keeps_the_highest_version(
+    domain: str, sub: str, versions: list[str], expected: str
+) -> None:
+    data = {"include": [_include(_manifest_url(domain, sub, v)) for v in versions]}
+    [entry] = mb.parse_apis_json(data)
+    assert entry.spec_url and entry.spec_url.endswith(f"/{expected}/openapi.json")
+
+
 def test_parse_ignores_malformed_and_non_dict() -> None:
     data = {"include": ["not-a-dict", {"url": "https://example.com/nope.json"}, {}]}
     assert mb.parse_apis_json(data) == []

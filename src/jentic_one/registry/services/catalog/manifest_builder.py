@@ -28,6 +28,9 @@ _INCLUDE_URL_RE = re.compile(r"/apis/openapi/([^/]+)/([^/]+)/([^/]+)/apis\.json"
 # umbrella sub-name; the api_id is just the domain.
 _VERSION_SUBDIR_RE = re.compile(r"^(main|master|latest|heads|v\d|[0-9])", re.IGNORECASE)
 
+# Marks a pre-release, which ranks below the release of the same number.
+_PRERELEASE_RE = re.compile(r"alpha|beta|preview|rc|dev", re.IGNORECASE)
+
 _CATALOG_PATH = "apis/openapi"
 _GITHUB_REPO = "jentic/jentic-public-apis"
 
@@ -81,16 +84,31 @@ def github_tree_url(path: str) -> str:
     return f"https://github.com/{_GITHUB_REPO}/tree/main/{path}"
 
 
+def _version_key(version: str) -> tuple[tuple[int, ...], bool]:
+    """Order catalog versions: by their numbers, then a release above a pre-release.
+
+    Trailing zeros are dropped so one version spelled two ways (``1.0.0`` and
+    ``v1``) compares equal.
+    """
+    numbers = [int(n) for n in re.findall(r"\d+", version)]
+    while numbers and numbers[-1] == 0:
+        numbers.pop()
+    return tuple(numbers), not _PRERELEASE_RE.search(version)
+
+
 def parse_apis_json(data: dict[str, Any]) -> list[ManifestEntry]:
     """Build catalog entries from the curated ``apis.json`` index document.
 
     Mirrors mini's ``_build_manifest_from_apis_json``: one entry per unique
     ``api_id`` with umbrella-vendor expansion (a non-version ``sub`` segment is
-    folded into the id as ``domain/sub``). Pure: takes the already-fetched dict.
+    folded into the id as ``domain/sub``). Where several versions share an
+    ``api_id`` the highest is kept (see ``_version_key``); of equal versions, the
+    one listed last. ``apis.json`` lists versions in sorted order, so keeping the
+    first listing kept the oldest (Drive v2 over v3). Pure: takes the
+    already-fetched dict.
     """
     includes = data.get("include") or []
-    entries: list[ManifestEntry] = []
-    seen: set[str] = set()
+    chosen: dict[str, tuple[tuple[tuple[int, ...], bool], ManifestEntry]] = {}
     for entry in includes:
         if not isinstance(entry, dict):
             continue
@@ -98,26 +116,26 @@ def parse_apis_json(data: dict[str, Any]) -> list[ManifestEntry]:
         match = _INCLUDE_URL_RE.search(url)
         if not match:
             continue
-        domain, sub, _version = match.groups()
+        domain, sub, version = match.groups()
         api_id = domain if _VERSION_SUBDIR_RE.match(sub) else f"{domain}/{sub}"
-        if api_id in seen:
+        key = _version_key(version)
+        if api_id in chosen and key < chosen[api_id][0]:
             continue
-        seen.add(api_id)
         path = f"{_CATALOG_PATH}/{domain}/{sub}" if sub != domain else f"{_CATALOG_PATH}/{domain}"
         spec_url = (
             url.replace("/apis.json", "/openapi.json") if url.endswith("/apis.json") else None
         )
-        entries.append(
+        chosen[api_id] = (
+            key,
             ManifestEntry(
                 api_id=api_id,
                 path=path,
                 spec_url=spec_url,
                 github_url=github_tree_url(path),
                 vendor=vendor_from_api_id(api_id),
-            )
+            ),
         )
-    entries.sort(key=lambda e: e.api_id)
-    return entries
+    return sorted((entry for _key, entry in chosen.values()), key=lambda e: e.api_id)
 
 
 # ── search / scoring (pure) ──────────────────────────────────────────────────
